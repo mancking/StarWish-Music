@@ -84,6 +84,7 @@
         }
       ],
       "icon": "resources/icon.ico",
+      "requestExecutionLevel": "asInvoker",
       "artifactName": "星河音乐-${version}-${arch}.${ext}"
     },
     "nsis": {
@@ -102,10 +103,10 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/mancking/starwish-music.git"
+    "url": "https://github.com/mancking/StarWish-Music.git"
   },
-  "homepage": "https://github.com/mancking/starwish-music#readme",
+  "homepage": "https://github.com/mancking/StarWish-Music#readme",
   "bugs": {
-    "url": "https://github.com/mancking/starwish-music/issues"
+    "url": "https://github.com/mancking/StarWish-Music/issues"
   }
 }
