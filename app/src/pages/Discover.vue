@@ -4,6 +4,7 @@ import { useRoute, useRouter } from 'vue-router'
 import Icon from '@/components/Icon.vue'
 import SongList from '@/components/SongList.vue'
 import PlaylistCard from '@/components/PlaylistCard.vue'
+import PlatformSelect, { type PlatformOption } from '@/components/PlatformSelect.vue'
 import { call } from '@/api'
 import { usePlayerStore } from '@/stores/player'
 import { useUiStore } from '@/stores/ui'
@@ -33,15 +34,28 @@ const toplistSongs = ref<Song[]>([])
 const tlLoading = ref(false)
 const tlError = ref('')
 
+/** 客户端分页：榜单通常为 100 首，按页切分 */
+const tlPageSize = 25
+const tlPage = ref(1)
+const tlPaged = computed(() => {
+  const s = (tlPage.value - 1) * tlPageSize
+  return toplistSongs.value.slice(s, s + tlPageSize)
+})
+const tlTotalPages = computed(() => Math.max(1, Math.ceil(toplistSongs.value.length / tlPageSize)))
+
 const newSongs = ref<Song[]>([])
 const newLoading = ref(true)
 
-const TAGS = [
-  '全部', '流行', '摇滚', '民谣', '电子', '说唱', '轻音乐', '爵士', '古典', '乡村',
-  '影视原声', 'ACG', '怀旧', '伤感', '治愈', '运动', '夜晚', '学习', '浪漫', '减压', '通勤', '派对',
+/** 歌单标签：按分组组织，与参考样式一致 */
+const TAG_GROUPS: { name: string; tags: string[] }[] = [
+  { name: '热门标签', tags: ['全部', '流行', '摇滚', '民谣', '电子', '说唱', '轻音乐', '爵士', '古典', '乡村'] },
+  { name: '专区', tags: ['影视原声', 'ACG', '怀旧', '儿童', '校园', '游戏', 'KTV', 'DJ', '器乐', '新世纪'] },
+  { name: '主题', tags: ['伤感', '治愈', '励志', '甜蜜', '兴奋', '安静', '思念', '怀旧金曲', '翻唱', '现场'] },
+  { name: '心情', tags: ['运动', '夜晚', '学习', '浪漫', '减压', '通勤', '派对', '咖啡', '驾车', '午后'] },
 ]
+const TAGS = TAG_GROUPS.flatMap(g => g.tags)
 
-const platforms = computed(() => {
+const platforms = computed<PlatformOption[]>(() => {
   if (!tree.value) return []
   return Object.keys(tree.value.tree).map(k => ({ key: k, name: platformLabel(k) }))
 })
@@ -87,6 +101,7 @@ async function loadTree(): Promise<void> {
 
 async function selectToplist(name: string, id: string): Promise<void> {
   currentItem.value = { name, id }
+  tlPage.value = 1
   tlLoading.value = true
   tlError.value = ''
   toplistSongs.value = []
@@ -197,8 +212,19 @@ onMounted(() => {
     <!-- 歌单 -->
     <section v-if="tab === 'playlists'" class="pane">
       <div class="filter-bar">
-        <div class="tags">
-          <button v-for="t in TAGS" :key="t" class="chip" :class="{ active: cat === t }" @click="selectCat(t)">{{ t }}</button>
+        <div class="tags-scroll">
+          <div v-for="g in TAG_GROUPS" :key="g.name" class="tag-group">
+            <div class="tag-group-name">{{ g.name }}</div>
+            <div class="tags">
+              <button
+                v-for="t in g.tags"
+                :key="t"
+                class="chip"
+                :class="{ active: cat === t }"
+                @click="selectCat(t)"
+              >{{ t }}</button>
+            </div>
+          </div>
         </div>
         <div class="sorts">
           <button class="chip" :class="{ active: order === 'hot' }" @click="order = 'hot'; loadPlaylists(true)">最热</button>
@@ -233,16 +259,15 @@ onMounted(() => {
 
     <!-- 榜单 -->
     <section v-else-if="tab === 'toplists'" class="pane toplist-pane">
-      <div class="platform-tabs">
-        <button
-          v-for="p in platforms"
-          :key="p.key"
-          class="chip"
-          :class="{ active: platform === p.key }"
-          @click="changePlatform(p.key)"
-        >
-          {{ p.name }}
-        </button>
+      <div class="tl-toolbar">
+        <div class="tl-title">
+          <span class="title-text">官方榜</span>
+        </div>
+        <PlatformSelect
+          v-model="platform"
+          :options="platforms"
+          align="right"
+        />
       </div>
 
       <div class="tl-layout">
@@ -282,7 +307,32 @@ onMounted(() => {
             <Icon name="info" :size="28" :stroke="1.3" />
             <div class="empty-desc">{{ tlError }}</div>
           </div>
-          <SongList v-else :songs="toplistSongs" :loading="tlLoading" :show-album="true" empty-text="该榜单暂无数据" />
+          <template v-else>
+            <SongList :songs="tlPaged" :loading="tlLoading" :show-album="true" empty-text="该榜单暂无数据" />
+            <nav v-if="tlTotalPages > 1" class="pagination" aria-label="分页">
+              <button class="pg-btn" :disabled="tlPage === 1" @click="tlPage = 1" title="首页">
+                <Icon name="chevron-left" :size="13" />
+                <Icon name="chevron-left" :size="13" style="margin-left: -7px" />
+              </button>
+              <button class="pg-btn" :disabled="tlPage === 1" @click="tlPage--" title="上一页">
+                <Icon name="chevron-left" :size="13" />
+              </button>
+              <button
+                v-for="p in tlTotalPages"
+                :key="p"
+                class="pg-num"
+                :class="{ active: p === tlPage }"
+                @click="tlPage = p"
+              >{{ p }}</button>
+              <button class="pg-btn" :disabled="tlPage === tlTotalPages" @click="tlPage++" title="下一页">
+                <Icon name="chevron-right" :size="13" />
+              </button>
+              <button class="pg-btn" :disabled="tlPage === tlTotalPages" @click="tlPage = tlTotalPages" title="末页">
+                <Icon name="chevron-right" :size="13" />
+                <Icon name="chevron-right" :size="13" style="margin-left: -7px" />
+              </button>
+            </nav>
+          </template>
         </div>
       </div>
     </section>
@@ -364,10 +414,34 @@ onMounted(() => {
   gap: 16px;
   margin-bottom: 16px;
 }
-.tags {
+.tags-scroll {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 220px;
+  overflow-y: auto;
+  padding: 4px 4px 4px 0;
+}
+.tag-group {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  min-height: 26px;
+}
+.tag-group-name {
+  font-size: 10.5px;
+  color: var(--text-3);
+  letter-spacing: 1px;
+  width: 56px;
+  flex: none;
+  padding-top: 6px;
+  text-transform: uppercase;
+}
+.tag-group .tags {
   display: flex;
   flex-wrap: wrap;
-  gap: 7px;
+  gap: 6px;
   flex: 1;
 }
 .sorts {
@@ -389,6 +463,39 @@ onMounted(() => {
   display: flex;
   gap: 7px;
   margin-bottom: 14px;
+}
+.tl-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin-bottom: 14px;
+  padding: 10px 14px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+.tl-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+.tl-title .title-text {
+  position: relative;
+  padding-left: 10px;
+}
+.tl-title .title-text::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 4px;
+  bottom: 4px;
+  width: 3px;
+  border-radius: 3px;
+  background: var(--accent);
 }
 .tl-layout {
   display: grid;
@@ -458,6 +565,44 @@ onMounted(() => {
 .tl-count {
   font-size: 11.5px;
   color: var(--text-3);
+}
+.pagination {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  margin: 18px 0 4px;
+}
+.pg-btn,
+.pg-num {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 30px;
+  height: 30px;
+  padding: 0 8px;
+  border-radius: 7px;
+  font-size: 12px;
+  color: var(--text-2);
+  background: var(--panel);
+  border: 1px solid transparent;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+.pg-btn:hover:not(:disabled),
+.pg-num:hover:not(.active) {
+  background: var(--panel-2);
+  color: var(--text);
+  border-color: var(--line-2);
+}
+.pg-num.active {
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-color: var(--accent-soft);
+  font-weight: 600;
+}
+.pg-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
 }
 @media (max-width: 1300px) {
   .pl-grid {

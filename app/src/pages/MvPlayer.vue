@@ -50,7 +50,7 @@ const videoSrc = computed(() => (videoUrl.value ? `swmedia://stream/?u=${encodeU
 const hasParts = computed(() => parts.value.length > 1)
 const forceLoad = ref(false)
 /** 超长分P（整场合集）体积可能数 GB，直接加载会长时间卡住，先提示用户选集 */
-const tooLong = computed(() => (current.value?.duration || 0) > 3600 && !forceLoad.value)
+const tooLong = computed(() => (current.value?.duration || 0) > 7200 && !forceLoad.value)
 
 /** 格式化播放量：B站风格 "277.8万 次播放" */
 function fmtCount(n: number): string {
@@ -117,7 +117,7 @@ async function load(): Promise<void> {
 async function selectPart(p: Part, autoplay = true): Promise<void> {
   current.value = p
   forceLoad.value = false
-  if ((p.duration || 0) > 3600) {
+  if ((p.duration || 0) > 7200) {
     loading.value = false
     videoUrl.value = ''
     videoError.value = ''

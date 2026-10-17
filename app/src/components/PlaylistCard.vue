@@ -21,17 +21,22 @@ function fmt(n?: number): string {
 <template>
   <div class="pl-card" @click="emit('open')">
     <div class="art">
-      <Cover :src="playlist.pic" :alt="playlist.name" size="100%" :radius="12" cover="1" class="cv" />
+      <Cover :src="playlist.pic" :alt="playlist.name" size="100%" :radius="10" cover="1" class="cv" />
       <button v-if="showPlay" class="play" title="播放" @click.stop="emit('play')">
         <Icon name="play" :size="17" />
       </button>
-      <span v-if="playlist.played" class="plays">
-        <Icon name="play" :size="10" />{{ fmt(playlist.played) }}
-      </span>
     </div>
-    <div class="name clamp-2">{{ playlist.name }}</div>
-    <div v-if="playlist.author || playlist.count" class="meta ellipsis">
-      {{ playlist.author }}<span v-if="playlist.count"> · {{ playlist.count }} 首</span>
+    <div class="name">{{ playlist.name }}</div>
+    <div v-if="playlist.author" class="meta ellipsis">{{ playlist.author }}</div>
+    <div class="stats">
+      <span class="stat">
+        <Icon name="music" :size="12" class="ic" />
+        <span>{{ playlist.count || 0 }}</span>
+      </span>
+      <span v-if="playlist.played" class="stat">
+        <Icon name="headphones" :size="12" class="ic" />
+        <span>{{ fmt(playlist.played) }}</span>
+      </span>
     </div>
   </div>
 </template>
@@ -41,12 +46,14 @@ function fmt(n?: number): string {
   cursor: pointer;
   min-width: 0;
   user-select: none;
+  display: flex;
+  flex-direction: column;
 }
 .art {
   position: relative;
   width: 100%;
   aspect-ratio: 1;
-  border-radius: 12px;
+  border-radius: 10px;
   overflow: hidden;
   transition: transform 0.24s var(--ease), box-shadow 0.24s var(--ease);
   background: var(--panel);
@@ -84,31 +91,40 @@ function fmt(n?: number): string {
   background: var(--accent);
   color: #fff;
 }
-.plays {
-  position: absolute;
-  left: 9px;
-  top: 8px;
-  display: inline-flex;
-  align-items: center;
-  gap: 3px;
-  padding: 2px 6px;
-  border-radius: 20px;
-  background: rgba(0, 0, 0, 0.42);
-  backdrop-filter: blur(8px);
-  color: #fff;
-  font-size: 10px;
-  font-variant-numeric: tabular-nums;
-}
 .name {
   margin-top: 9px;
   font-size: 12.5px;
   font-weight: 500;
   line-height: 1.45;
   min-height: 36px;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 .meta {
   margin-top: 2px;
   font-size: 11px;
+  color: var(--text-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.stats {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}
+.stat {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.ic {
   color: var(--text-3);
 }
 </style>

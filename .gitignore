@@ -3,6 +3,14 @@ dist/
 out/
 release/
 
+# 例外：允许仓库根的打包产物进版本控制
+!星河音乐-2.0.0-win-unpacked/
+!星河音乐-2.0.0-win-unpacked/**/*
+!星河音乐-2.0.0-便携版.exe
+!星河音乐-2.0.0-portable.exe
+!星河音乐-2.0.0-Setup.exe
+!星河音乐-2.0.0.exe
+
 # 本地数据与测试产物
 .smoke-data/
 .check-data/
@@ -71,3 +79,7 @@ app/scripts/cdp-*.mjs
 app/scripts/feature-check.cjs
 app/scripts/mv-*.cjs
 app/scripts/ui-shots.cjs
+
+# 本次会话的临时压缩包
+V261017.zip
+V261017/

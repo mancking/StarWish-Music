@@ -3,6 +3,7 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import Icon from '@/components/Icon.vue'
 import SongList from '@/components/SongList.vue'
+import PlatformSelect, { type PlatformOption } from '@/components/PlatformSelect.vue'
 import { call } from '@/api'
 import { usePlayerStore } from '@/stores/player'
 import { useUiStore } from '@/stores/ui'
@@ -23,7 +24,7 @@ const keyword = computed(() => String(route.query.q || '').trim())
 
 const HOT = ['周杰伦', '林俊杰', '陈奕迅', '五月天', '邓紫棋', '薛之谦', '李荣浩', '毛不易', 'Taylor Swift', '米津玄師']
 
-const platforms = [
+const platforms: PlatformOption[] = [
   { key: '', name: '全部音源' },
   { key: 'wy', name: '音源 A' },
   { key: 'qq', name: '音源 B' },
@@ -55,12 +56,8 @@ function quickSearch(k: string): void {
   router.push({ path: '/search', query: { q: k } })
 }
 
-function changePlatform(p: string): void {
-  platform.value = p
-  void search()
-}
-
 watch(keyword, () => void search())
+watch(platform, () => void search())
 onMounted(() => void search())
 </script>
 
@@ -102,16 +99,12 @@ onMounted(() => void search())
       </header>
 
       <div class="platform-bar">
-        <button
-          v-for="p in platforms"
-          :key="p.key"
-          class="chip"
-          :class="{ active: platform === p.key }"
-          @click="changePlatform(p.key)"
-        >
-          {{ p.name }}
-        </button>
-        <button class="icon-btn" title="重新搜索" @click="search"><Icon name="refresh" :size="15" /></button>
+        <PlatformSelect
+          v-model="platform"
+          :options="platforms"
+          align="right"
+        />
+        <button class="icon-btn" title="重新搜索" @click="search"><Icon name="refresh" :size="14" /></button>
       </div>
 
       <div v-if="error" class="empty" style="padding: 60px 20px">
@@ -202,7 +195,22 @@ onMounted(() => void search())
 .platform-bar {
   display: flex;
   align-items: center;
-  gap: 7px;
+  justify-content: flex-end;
+  gap: 8px;
   margin: 16px 0 14px;
+}
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  color: var(--text-2);
+  transition: background 0.15s, color 0.15s;
+}
+.icon-btn:hover {
+  background: var(--hover);
+  color: var(--text);
 }
 </style>

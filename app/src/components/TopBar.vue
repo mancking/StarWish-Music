@@ -43,19 +43,17 @@ function focusSearch(): void {
 }
 
 defineExpose({ focusSearch })
-
-const canBack = computed(() => window.history.length > 1)
 </script>
 
 <template>
-  <header class="topbar drag" :style="{ paddingRight: isWin ? '148px' : '14px' }">
+  <header class="topbar drag" :class="{ win: isWin }">
     <div class="nav no-drag">
-      <button class="icon-btn" title="后退" @click="router.back()"><Icon name="chevron-left" :size="18" /></button>
-      <button class="icon-btn" title="前进" @click="router.forward()"><Icon name="chevron-right" :size="18" /></button>
+      <button class="icon-btn" title="后退" @click="router.back()"><Icon name="chevron-left" :size="17" /></button>
+      <button class="icon-btn" title="前进" @click="router.forward()"><Icon name="chevron-right" :size="17" /></button>
     </div>
 
     <div class="search no-drag">
-      <Icon name="search" :size="15" class="search-icon" />
+      <Icon name="search" :size="14" class="search-icon" />
       <input
         ref="input"
         v-model="keyword"
@@ -65,12 +63,14 @@ const canBack = computed(() => window.history.length > 1)
         @keydown.enter="submit"
         @keydown.esc="($event.target as HTMLInputElement).blur()"
       />
-      <button v-if="keyword" class="clear" @click="clear"><Icon name="close" :size="13" /></button>
+      <button v-if="keyword" class="clear" title="清空" @click="clear"><Icon name="close" :size="13" /></button>
     </div>
+
+    <div class="spacer no-drag" />
 
     <div class="actions no-drag">
       <button class="icon-btn" :title="ui.theme === 'dark' ? '切换到浅色' : '切换到深色'" @click="toggleTheme">
-        <Icon :name="ui.theme === 'dark' ? 'sun' : 'moon'" :size="17" />
+        <Icon :name="ui.theme === 'dark' ? 'sun' : 'moon'" :size="16" />
       </button>
       <button
         class="icon-btn"
@@ -78,9 +78,12 @@ const canBack = computed(() => window.history.length > 1)
         title="桌面歌词（Ctrl+Alt+L）"
         @click="toggleLyric"
       >
-        <Icon name="lyric" :size="17" />
+        <Icon name="lyric" :size="16" />
       </button>
     </div>
+
+    <!-- Windows 标题栏避让区（titleBarOverlay） -->
+    <div v-if="isWin" class="win-ctl-area no-drag" aria-hidden="true" />
   </header>
 </template>
 
@@ -90,12 +93,26 @@ const canBack = computed(() => window.history.length > 1)
   flex: none;
   display: flex;
   align-items: center;
-  gap: 14px;
-  padding-left: 14px;
+  gap: 12px;
+  padding: 0 14px;
   background: var(--bg);
   border-bottom: 1px solid var(--line);
   position: relative;
   z-index: 4;
+  -webkit-app-region: drag;
+}
+.topbar.win {
+  /* Windows 上把窗口控制按钮（约 138px）整体让出，避免遮挡 */
+  padding-right: 0;
+}
+.nav,
+.search,
+.actions,
+.icon-btn,
+.clear,
+.spacer,
+.win-ctl-area {
+  -webkit-app-region: no-drag;
 }
 .nav {
   display: flex;
@@ -108,13 +125,13 @@ const canBack = computed(() => window.history.length > 1)
 }
 .search {
   flex: 1;
-  max-width: 430px;
-  height: 32px;
+  max-width: 440px;
+  height: 30px;
   display: flex;
   align-items: center;
   gap: 8px;
   padding: 0 10px;
-  border-radius: 10px;
+  border-radius: 9px;
   background: var(--panel);
   border: 1px solid transparent;
   transition: border-color 0.18s, background 0.18s;
@@ -141,14 +158,46 @@ const canBack = computed(() => window.history.length > 1)
 .clear {
   color: var(--text-3);
   display: flex;
+  width: 18px;
+  height: 18px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
 }
 .clear:hover {
   color: var(--text);
+  background: var(--hover);
+}
+.spacer {
+  flex: 1;
+  min-width: 0;
 }
 .actions {
-  margin-left: auto;
   display: flex;
   align-items: center;
   gap: 2px;
+}
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  color: var(--text-2);
+  transition: background 0.15s, color 0.15s;
+}
+.icon-btn:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+.icon-btn.active {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+.win-ctl-area {
+  width: 138px;
+  height: 100%;
+  flex: none;
 }
 </style>

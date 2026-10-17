@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import Modal from './Modal.vue'
 import Icon from './Icon.vue'
@@ -19,9 +19,30 @@ const open = computed({
   },
 })
 
+/** 支持的音源（与 importPlaylistByLink 中可识别的平台一致） */
+const PLATFORMS: { key: string; name: string; hint: string }[] = [
+  { key: 'wy', name: '音源 A', hint: '网易云音乐' },
+  { key: 'qq', name: '音源 B', hint: 'QQ 音乐' },
+  { key: 'kg', name: '音源 C', hint: '酷狗音乐' },
+  { key: 'kw', name: '音源 D', hint: '酷我音乐' },
+  { key: 'mg', name: '音源 E', hint: '咪咕音乐' },
+  { key: 'bili', name: '视频源', hint: 'B 站合集 / 收藏' },
+]
+
+const platform = ref<string>(PLATFORMS[0].key)
 const input = ref('')
 const busy = ref(false)
 const error = ref('')
+
+// 打开时重置状态
+watch(open, v => {
+  if (v) {
+    error.value = ''
+    input.value = ''
+  }
+})
+
+const current = computed(() => PLATFORMS.find(p => p.key === platform.value) || PLATFORMS[0])
 
 async function submit(): Promise<void> {
   const text = input.value.trim()
@@ -34,7 +55,7 @@ async function submit(): Promise<void> {
   try {
     const r = await call<{ name: string; pic: string; description: string; songs: Song[]; platform: string }>(
       'music:importPlaylist',
-      { input: text }
+      { input: text, platform: platform.value }
     )
     if (!r.songs.length) throw new Error('该歌单没有可导入的歌曲')
     const pl = await library.createPlaylist(r.name || '导入的歌单')
@@ -55,58 +76,221 @@ async function submit(): Promise<void> {
 </script>
 
 <template>
-  <Modal v-model="open" title="导入平台歌单" :width="500">
-    <p class="tip">粘贴任意主流音乐平台或视频合集的分享链接，系统会自动识别来源并保存为本地歌单，可离线浏览列表。</p>
+  <Modal v-model="open" title="导入歌单" :width="640" :padding="0">
+    <div class="layout">
+      <!-- 左侧音源选择 -->
+      <aside class="side">
+        <div class="side-label">选择音源</div>
+        <button
+          v-for="p in PLATFORMS"
+          :key="p.key"
+          class="side-item"
+          :class="{ active: platform === p.key }"
+          @click="platform = p.key"
+        >
+          <span class="dot" :class="p.key" />
+          <span class="info">
+            <span class="name">{{ p.name }}</span>
+            <span class="hint">{{ p.hint }}</span>
+          </span>
+          <Icon v-if="platform === p.key" name="check" :size="13" class="ck" />
+        </button>
+      </aside>
 
-    <textarea
-      v-model="input"
-      class="textarea"
-      rows="3"
-      spellcheck="false"
-      placeholder="粘贴歌单 / 合集分享链接"
-      @keydown.ctrl.enter="submit"
-    />
+      <!-- 右侧输入区 -->
+      <div class="main">
+        <div class="row">
+          <div class="in-wrap">
+            <Icon name="external" :size="14" class="in-icon" />
+            <input
+              v-model="input"
+              class="input"
+              type="text"
+              spellcheck="false"
+              placeholder="输入歌单链接或歌单 ID"
+              @keydown.enter="submit"
+            />
+          </div>
+          <button class="btn primary" :disabled="busy" @click="submit">
+            <Icon v-if="busy" name="loading" :size="14" class="spin" />
+            <span>{{ busy ? '解析中…' : '打开' }}</span>
+          </button>
+        </div>
 
-    <div v-if="error" class="error"><Icon name="info" :size="14" />{{ error }}</div>
+        <div v-if="error" class="error">
+          <Icon name="info" :size="14" />{{ error }}
+        </div>
 
-    <template #footer>
-      <button class="btn ghost" @click="open = false">取消</button>
-      <button class="btn primary" :disabled="busy" @click="submit">
-        <Icon v-if="busy" name="loading" :size="15" class="spin" />
-        {{ busy ? '解析中…' : '开始导入' }}
-      </button>
-    </template>
+        <div class="tip">
+          <p>请确认要打开的歌单与左侧选择的音源是否对应；不同音源的分享链接不互通。</p>
+          <p>支持用歌单 ID 或概念版链接打开；部分平台（如 B 站合集）需登录态或 Cookie 才能解析。</p>
+        </div>
+      </div>
+    </div>
   </Modal>
 </template>
 
 <style scoped>
-.tip {
-  font-size: 12px;
-  color: var(--text-3);
-  line-height: 1.7;
-  margin-bottom: 12px;
+.layout {
+  display: flex;
+  min-height: 240px;
 }
-.textarea {
-  width: 100%;
-  padding: 10px 12px;
-  border-radius: 10px;
-  border: 1px solid var(--line-2);
+.side {
+  width: 200px;
+  flex: none;
   background: var(--panel);
-  outline: none;
-  font-size: 12.5px;
-  resize: vertical;
-  line-height: 1.6;
+  border-right: 1px solid var(--line);
+  padding: 12px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
 }
-.textarea:focus {
-  border-color: var(--accent);
+.side-label {
+  font-size: 10.5px;
+  color: var(--text-3);
+  letter-spacing: 1.2px;
+  padding: 0 10px 8px;
+  text-transform: uppercase;
 }
-.error {
+.side-item {
   display: flex;
   align-items: center;
+  gap: 9px;
+  height: 38px;
+  padding: 0 10px;
+  border-radius: 8px;
+  font-size: 12.5px;
+  color: var(--text-2);
+  text-align: left;
+  transition: background 0.12s, color 0.12s;
+}
+.side-item:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+.side-item.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 500;
+}
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-3);
+  flex: none;
+}
+.dot.wy {
+  background: #c20c0c;
+}
+.dot.qq {
+  background: #2db24c;
+}
+.dot.kg {
+  background: #2c8af8;
+}
+.dot.kw {
+  background: #ff6f00;
+}
+.dot.mg {
+  background: #ff5470;
+}
+.dot.bili {
+  background: #00a1d6;
+}
+.info {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.name {
+  font-size: 12.5px;
+  font-weight: 500;
+}
+.hint {
+  font-size: 10.5px;
+  color: var(--text-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.side-item.active .hint {
+  color: var(--accent);
+  opacity: 0.7;
+}
+.ck {
+  flex: none;
+  color: var(--accent);
+}
+.main {
+  flex: 1;
+  min-width: 0;
+  padding: 16px 18px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.in-wrap {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  height: 36px;
+  padding: 0 10px;
+  border-radius: 8px;
+  border: 1px solid var(--line-2);
+  background: var(--panel);
+  transition: border-color 0.15s, background 0.15s;
+}
+.in-wrap:focus-within {
+  border-color: var(--accent);
+  background: var(--panel-2);
+}
+.in-icon {
+  color: var(--text-3);
+  flex: none;
+  margin-right: 6px;
+}
+.input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  outline: none;
+  background: none;
+  font-size: 12.5px;
+  color: var(--text);
+}
+.input::placeholder {
+  color: var(--text-3);
+}
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   gap: 6px;
-  margin-top: 10px;
-  font-size: 12px;
-  color: #ff7a8c;
+  height: 36px;
+  padding: 0 18px;
+  border-radius: 8px;
+  font-size: 12.5px;
+  font-weight: 500;
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  cursor: pointer;
+  transition: opacity 0.15s, transform 0.15s;
+}
+.btn:hover {
+  opacity: 0.92;
+}
+.btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
 }
 .spin {
   animation: spin 1s linear infinite;
@@ -115,5 +299,26 @@ async function submit(): Promise<void> {
   to {
     transform: rotate(360deg);
   }
+}
+.error {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: #ff7a8c;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: rgba(255, 122, 140, 0.08);
+}
+.tip {
+  margin-top: auto;
+  padding-top: 10px;
+  border-top: 1px dashed var(--line);
+  font-size: 11.5px;
+  color: var(--text-3);
+  line-height: 1.7;
+}
+.tip p + p {
+  margin-top: 4px;
 }
 </style>

@@ -3,8 +3,8 @@ import { onBeforeUnmount, onMounted, watch } from 'vue'
 import Icon from './Icon.vue'
 
 const props = withDefaults(
-  defineProps<{ modelValue: boolean; title?: string; width?: number; closable?: boolean }>(),
-  { title: '', width: 460, closable: true }
+  defineProps<{ modelValue: boolean; title?: string; width?: number; closable?: boolean; padding?: number | string }>(),
+  { title: '', width: 460, closable: true, padding: undefined }
 )
 const emit = defineEmits<{ (e: 'update:modelValue', v: boolean): void }>()
 
@@ -39,7 +39,7 @@ onBeforeUnmount(() => {
             <h3>{{ title }}</h3>
             <button v-if="closable" class="icon-btn" @click="close"><Icon name="close" :size="17" /></button>
           </header>
-          <div class="body"><slot /></div>
+          <div class="body" :style="padding !== undefined ? { padding: typeof padding === 'number' ? padding + 'px' : padding } : undefined"><slot /></div>
           <footer v-if="$slots.footer" class="foot"><slot name="footer" /></footer>
         </div>
       </div>

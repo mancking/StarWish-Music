@@ -84,7 +84,7 @@ async function onMenuSelect(i: number): Promise<void> {
 
 function qualityTag(s: Song): string {
   const q = s.qualitys || []
-  if (q.includes('flac24bit')) return 'Hi-Res'
+  if (q.includes('flac24bit')) return '24bit'
   if (q.includes('flac')) return 'SQ'
   if (q.includes('320k')) return 'HQ'
   return ''
@@ -145,7 +145,7 @@ function albumOf(s: Song): string {
           <span class="name-text">
             <span class="title-line">
               <span class="title ellipsis">{{ s.name }}</span>
-              <span v-if="qualityTag(s)" class="tag" :class="{ hires: qualityTag(s) === 'Hi-Res' }">{{ qualityTag(s) }}</span>
+              <span v-if="qualityTag(s)" class="tag" :class="{ quality: qualityTag(s) === '24bit' }">{{ qualityTag(s) }}</span>
             </span>
             <span class="sub ellipsis">{{ s.singer }}</span>
           </span>
@@ -287,8 +287,23 @@ function albumOf(s: Song): string {
   font-size: 11.5px;
   color: var(--text-3);
 }
-.tag.hires {
+.tag {
+  display: inline-flex;
+  align-items: center;
+  height: 15px;
+  padding: 0 4px;
+  border-radius: 3px;
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.3px;
+  background: transparent;
+  color: var(--accent);
+  border: 1px solid var(--accent-soft);
+  flex: none;
+}
+.tag.quality {
   color: #f0b429;
+  border-color: rgba(240, 180, 41, 0.32);
 }
 .col-album {
   font-size: 12px;
