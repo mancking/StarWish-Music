@@ -22,7 +22,20 @@ const player = usePlayerStore()
 const ui = useUiStore()
 
 const bvid = computed(() => String(route.params.bvid || ''))
-const info = ref<{ cid: string; title: string; pic: string; author: string } | null>(null)
+const info = ref<{
+  cid: string
+  title: string
+  pic: string
+  author: string
+  play: number
+  danmaku: number
+  like: number
+  coin: number
+  favorite: number
+  duration: number
+  pubdate: number
+  desc: string
+} | null>(null)
 const parts = ref<Part[]>([])
 const current = ref<Part | null>(null)
 const videoUrl = ref('')
@@ -39,6 +52,23 @@ const forceLoad = ref(false)
 /** 超长分P（整场合集）体积可能数 GB，直接加载会长时间卡住，先提示用户选集 */
 const tooLong = computed(() => (current.value?.duration || 0) > 3600 && !forceLoad.value)
 
+/** 格式化播放量：B站风格 "277.8万 次播放" */
+function fmtCount(n: number): string {
+  if (n >= 100000000) return `${(n / 100000000).toFixed(1)}亿`
+  if (n >= 10000) return `${(n / 10000).toFixed(1)}万`
+  return String(n || 0)
+}
+
+/** 把 Unix 时间戳格式化为 "2024-01-15" */
+function fmtDate(ts: number): string {
+  if (!ts) return ''
+  const d = new Date(ts * 1000)
+  const y = d.getFullYear()
+  const m = String(d.getMonth() + 1).padStart(2, '0')
+  const day = String(d.getDate()).padStart(2, '0')
+  return `${y}-${m}-${day}`
+}
+
 async function load(): Promise<void> {
   loading.value = true
   videoError.value = ''
@@ -47,7 +77,20 @@ async function load(): Promise<void> {
   parts.value = []
   current.value = null
   try {
-    const i = await call<{ cid: string; title: string; pic: string; author: string }>('music:mvinfo', { bvid: bvid.value })
+    const i = await call<{
+      cid: string
+      title: string
+      pic: string
+      author: string
+      play: number
+      danmaku: number
+      like: number
+      coin: number
+      favorite: number
+      duration: number
+      pubdate: number
+      desc: string
+    }>('music:mvinfo', { bvid: bvid.value })
     info.value = i
     try {
       parts.value = await call<Part[]>('music:mvparts', { bvid: bvid.value })
@@ -200,6 +243,24 @@ onBeforeUnmount(() => {
 
         <div class="meta">
           <h1 class="clamp-2">{{ info?.title || '视频加载中' }}</h1>
+          <div class="stats-row">
+            <span class="stat-item">
+              <Icon name="play" :size="13" />
+              <b>{{ fmtCount(info?.play || 0) }}</b> 次播放
+            </span>
+            <span class="stat-sep">·</span>
+            <span class="stat-item">
+              <Icon name="message" :size="13" />
+              <b>{{ fmtCount(info?.danmaku || 0) }}</b> 弹幕
+            </span>
+            <span class="stat-sep">·</span>
+            <span class="stat-item">
+              <Icon name="heart" :size="13" />
+              <b>{{ fmtCount(info?.like || 0) }}</b> 点赞
+            </span>
+            <span v-if="info?.pubdate" class="stat-sep">·</span>
+            <span v-if="info?.pubdate" class="stat-item time">{{ fmtDate(info.pubdate) }}</span>
+          </div>
           <div class="meta-row">
             <span class="author"><Icon name="user" :size="13" />{{ info?.author || '未知作者' }}</span>
             <span v-if="current" class="part-now">P{{ current.page }} · {{ current.part }}</span>
@@ -208,6 +269,7 @@ onBeforeUnmount(() => {
               <button class="btn sm ghost" @click="load"><Icon name="refresh" :size="13" />刷新</button>
             </div>
           </div>
+          <p v-if="info?.desc" class="desc clamp-3">{{ info.desc }}</p>
         </div>
       </div>
 
@@ -349,11 +411,47 @@ onBeforeUnmount(() => {
   font-weight: 650;
   line-height: 1.45;
 }
+.stats-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--text-3);
+  flex-wrap: wrap;
+}
+.stat-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.stat-item b {
+  color: var(--text-2);
+  font-weight: 600;
+}
+.stat-sep {
+  opacity: 0.4;
+}
+.stat-item.time {
+  font-variant-numeric: tabular-nums;
+}
+.desc {
+  margin-top: 10px;
+  padding: 10px 12px;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--text-2);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  max-height: 60px;
+  overflow: hidden;
+}
 .meta-row {
   display: flex;
   align-items: center;
   gap: 14px;
-  margin-top: 8px;
+  margin-top: 10px;
   font-size: 11.5px;
   color: var(--text-3);
   flex-wrap: wrap;

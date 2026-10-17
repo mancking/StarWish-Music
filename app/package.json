@@ -84,7 +84,7 @@
         }
       ],
       "icon": "resources/icon.ico",
-      "requestExecutionLevel": "asInvoker",
+      "requestedExecutionLevel": "asInvoker",
       "artifactName": "星河音乐-${version}-${arch}.${ext}"
     },
     "nsis": {

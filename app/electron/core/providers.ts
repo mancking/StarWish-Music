@@ -544,18 +544,42 @@ export async function searchBiliVideo(keyword: string, page = 1): Promise<MvItem
     .filter(v => v.bvid)
 }
 
-export async function biliVideoInfo(bvid: string): Promise<{ cid: string; title: string; pic: string; author: string }> {
+export async function biliVideoInfo(
+  bvid: string
+): Promise<{
+  cid: string
+  title: string
+  pic: string
+  author: string
+  play: number
+  danmaku: number
+  like: number
+  coin: number
+  favorite: number
+  duration: number
+  pubdate: number
+  desc: string
+}> {
   const res = await request(`https://api.bilibili.com/x/web-interface/view?${qs({ bvid })}`, {
     headers: biliHeaders(),
     timeout: 15000,
   })
   const d = res.body?.data
   if (!d) throw new Error('视频信息获取失败')
+  const stat = d.stat || {}
   return {
     cid: String(d.cid || ''),
     title: d.title || '',
     pic: https(d.pic || ''),
     author: d.owner?.name || '',
+    play: num(stat.view),
+    danmaku: num(stat.danmaku),
+    like: num(stat.like),
+    coin: num(stat.coin),
+    favorite: num(stat.favorite),
+    duration: num(d.duration),
+    pubdate: num(d.pubdate),
+    desc: String(d.desc || ''),
   }
 }
 

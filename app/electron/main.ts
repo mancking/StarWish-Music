@@ -45,6 +45,20 @@ function resolveDataDir(): string {
 const dataDir = resolveDataDir()
 setUserDataDir(dataDir)
 ensureDir(dataDir)
+
+// 关键修复：显式设置 Electron 内部临时目录为我们已知可写的子目录
+// 解决 "Error writing temporary file. Make sure your temp folder is valid." 错误
+// （系统 %TEMP% 在某些环境下不可写或被占用）
+const tempDir = ensureDir(path.join(dataDir, 'temp'))
+try {
+  app.setPath('temp', tempDir)
+  // 同时设置环境变量，Chromium 子进程（GPU、Renderer）也会使用
+  process.env.TEMP = tempDir
+  process.env.TMP = tempDir
+} catch (e: any) {
+  logger.warn('设置临时目录失败', e?.message)
+}
+
 app.setPath('userData', dataDir)
 app.setAppUserModelId('com.starwish.music')
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required')
