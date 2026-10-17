@@ -1,0 +1,452 @@
+import type { LyricResult, MvItem, PlaylistMeta, Song, ToplistTree } from '../../shared/types'
+import { parseLyric } from '../../shared/lrc'
+import { createLogger } from './log'
+import { lxHost } from './lx-host'
+import {
+  biliAudioUrl,
+  biliParts,
+  biliPlayUrl,
+  biliVideoInfo,
+  importPlaylistByLink,
+  itunesCover,
+  kugouPlaylistDetail,
+  neteaseNewSongs,
+  neteasePlaylistDetail,
+  neteasePlaylists,
+  qqPlaylistDetail,
+  searchBiliVideo,
+  searchKugou,
+  searchNetease,
+  searchQQ,
+  toplistSongs,
+  toplistTree,
+} from './providers'
+import { getJson, qs, request, UA } from './http'
+import { resolveCoverUrl } from './cover'
+import { biliHeaders } from './bili'
+
+const logger = createLogger('music')
+
+const QUALITY_CHAIN: Record<string, string[]> = {
+  flac24bit: ['flac24bit', 'flac', '320k', '128k'],
+  flac: ['flac', '320k', '128k'],
+  '320k': ['320k', '128k'],
+  '128k': ['128k'],
+}
+
+function normName(s: string): string {
+  return String(s || '')
+    .toLowerCase()
+    .replace(/[\s\-_·.,，。、'"“”‘’()（）[\]【】!！?？&+]/g, '')
+    .replace(/feat\..*$/, '')
+}
+
+/** 去掉括号内的版本说明，提升跨平台匹配成功率 */
+function baseName(s: string): string {
+  return normName(
+    String(s || '')
+      .replace(/[（(\[【][^)）\]】]*[)）\]】]/g, '')
+      .replace(/\s*[-–—]\s*(live|remix|cover|伴奏|翻自|原唱).*$/i, '')
+  )
+}
+
+function mainSinger(s: string): string {
+  return normName(String(s || '').split(/[\/、,;&]/)[0])
+}
+
+/** 按关键词相关度排序：原名优先、歌手命中优先，翻唱/DJ 版本降权 */
+function rankByQuery(list: Song[], keyword: string): Song[] {
+  const q = normName(keyword)
+  if (!q) return list
+  return list
+    .map((s, i) => {
+      let score = 0
+      const n = normName(s.name)
+      if (n === q) score += 120
+      else if (n.startsWith(q) || q.startsWith(n)) score += 70
+      else if (n.includes(q) || q.includes(n)) score += 35
+      const singer = mainSinger(s.singer)
+      if (singer && q.includes(singer)) score += 80
+      if (s.source === 'wy') score += 5
+      if (s.duration > 0) score += 3
+      if (s.pic) score += 1
+      if (/原唱|翻唱|cover|伴奏|dj|remix|片段|铃声|抖音/i.test(s.name)) score -= 10
+      return { s, score, i }
+    })
+    .sort((a, b) => b.score - a.score || a.i - b.i)
+    .map(x => x.s)
+}
+
+function dedupeKey(s: Song): string {
+  return `${normName(s.name)}|${mainSinger(s.singer)}`
+}
+
+/** 多平台聚合搜索：原生接口保证可用性，插件补足曲库深度 */
+export async function searchAll(
+  keyword: string,
+  page = 1,
+  opts: { platform?: string; limit?: number } = {}
+): Promise<Song[]> {
+  const kw = String(keyword || '').trim()
+  if (!kw) return []
+  const limit = opts.limit ?? 60
+
+  if (opts.platform) {
+    // 指定平台：优先原生，再插件
+    let native: Song[] = []
+    try {
+      if (opts.platform === 'wy') native = await searchNetease(kw, page, 40)
+      else if (opts.platform === 'qq') native = await searchQQ(kw, page, 40)
+      else if (opts.platform === 'kg') native = await searchKugou(kw, page, 40)
+    } catch (e: any) {
+      logger.warn('原生搜索失败', opts.platform, e?.message)
+    }
+    let plugin: Song[] = []
+    try {
+      plugin = await lxHost.search(kw, page, limit, { platform: opts.platform, perSourceCap: 30, waitMs: 3500 })
+    } catch {
+      /* ignore */
+    }
+    return mergeSongs(rankByQuery([...native, ...plugin], kw), limit)
+  }
+
+  const timed = async (name: string, p: Promise<Song[]>): Promise<Song[]> => {
+    const t0 = performance.now()
+    try {
+      const r = await p
+      logger.info(`搜索 ${name}`, `${Math.round(performance.now() - t0)}ms`, `${r.length} 条`)
+      return r
+    } catch (e: any) {
+      logger.warn(`搜索 ${name} 失败`, `${Math.round(performance.now() - t0)}ms`, e?.message)
+      return []
+    }
+  }
+  const [wy, qq, kg, plugin] = await Promise.all([
+    timed('wy', searchNetease(kw, page, 30)),
+    timed('qq', searchQQ(kw, page, 20)),
+    timed('kg', searchKugou(kw, page, 20)),
+    timed('plugin', lxHost.search(kw, page, limit, { perSourceCap: 6, waitMs: 2600 })),
+  ])
+  return mergeSongs(rankByQuery([...wy, ...qq, ...kg, ...plugin], kw), limit)
+}
+
+function mergeSongs(list: Song[], limit: number): Song[] {
+  const out: Song[] = []
+  const seen = new Set<string>()
+  const kw = ''
+  for (const s of list) {
+    if (!s || !s.name) continue
+    const key = dedupeKey(s)
+    if (!key || seen.has(key)) continue
+    seen.add(key)
+    out.push(s)
+    if (out.length >= limit) break
+  }
+  return out
+}
+
+export interface ResolvedUrl {
+  url: string
+  quality: string
+  matched?: Song
+  via: string
+}
+
+/** 取播放地址：质量降级 → 自动换源 */
+export async function resolveUrl(
+  song: Song,
+  quality: string,
+  autoSwitch = true,
+  avoidSources: string[] = []
+): Promise<ResolvedUrl> {
+  const chain = QUALITY_CHAIN[quality] || ['128k']
+  const errors: string[] = []
+  const skipPrimary = avoidSources.includes(song.source)
+
+  if (song.source === 'bili' && !skipPrimary) {
+    try {
+      const bvid = String(song.extra?.bvid || song.songId.split('-p')[0])
+      const cid = String(song.extra?.cid || '')
+      if (!cid) throw new Error('缺少分 P 信息')
+      return { url: await biliAudioUrl(bvid, cid), quality: '128k', via: 'B站直链' }
+    } catch (e: any) {
+      errors.push(`B站: ${e?.message || e}`)
+    }
+  }
+
+  if (song.localPath) {
+    return { url: song.localPath, quality: 'local', via: '本地文件' }
+  }
+
+  if (!skipPrimary) {
+    for (const q of chain) {
+      try {
+        const r = await lxHost.resolveUrl(song, q)
+        return { url: r.url, quality: q, via: r.from }
+      } catch (e: any) {
+        errors.push(`${q}: ${e?.message || e}`)
+      }
+    }
+  }
+
+  if (!autoSwitch) {
+    throw new Error(`无法获取播放地址（${errors.slice(0, 2).join('；')}）`)
+  }
+
+  // 自动换源：按 歌名+歌手 搜索，取名称高度相似的候选
+  const target = baseName(song.name)
+  const altTarget = normName(song.name)
+  let candidates: Song[] = []
+  try {
+    candidates = await searchAll(`${song.name} ${String(song.singer).split('/')[0]}`, 1, { limit: 24 })
+  } catch {
+    candidates = []
+  }
+  const pick = candidates
+    .filter(c => c.id !== song.id && !avoidSources.includes(c.source))
+    .filter(c => {
+      const b = baseName(c.name)
+      return b === target || b === altTarget || (b.length > 1 && target.includes(b)) || (target.length > 1 && b.includes(target))
+    })
+    .slice(0, 4)
+  for (const c of pick) {
+    for (const q of ['128k', '320k']) {
+      try {
+        const r = await lxHost.resolveUrl(c, q)
+        logger.info(`自动换源成功：${song.name} -> ${c.source}/${c.name}`)
+        return { url: r.url, quality: q, matched: c, via: `${r.from}（换源）` }
+      } catch {
+        /* 下一个 */
+      }
+    }
+  }
+  throw new Error(
+    `该歌曲暂时无法播放：${errors.slice(0, 2).join('；') || '所有音源均取链失败'}。可在设置中更换音源或重试`
+  )
+}
+
+/** 歌词：插件 → 平台官方 → 同名搜索兜底 */
+const lyricCache = new Map<string, LyricResult>()
+
+async function wyLyric(id: string): Promise<string> {
+  const res = await getJson<any>(
+    `https://music.163.com/api/song/lyric?id=${encodeURIComponent(id)}&lv=-1&kv=-1&tv=-1`,
+    { 'User-Agent': UA, Referer: 'https://music.163.com/', Cookie: 'os=pc' },
+    10000
+  )
+  const lrc = res?.lrc?.lyric || ''
+  const trans = res?.tlyric?.lyric || ''
+  return lrc ? lrc + (trans ? '\n' + trans : '') : ''
+}
+
+async function qqLyric(mid: string): Promise<string> {
+  const url = `https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg?${qs({
+    songmid: mid,
+    format: 'json',
+    nobase64: 1,
+    g_tk: 5381,
+  })}`
+  const res = await request(url, {
+    headers: { 'User-Agent': UA, Referer: 'https://y.qq.com/portal/player.html' },
+    timeout: 10000,
+  })
+  let body: any = res.body
+  if (typeof body === 'string') {
+    const m = body.match(/\{[\s\S]*\}/)
+    body = m ? JSON.parse(m[0]) : null
+  }
+  const lrc = body?.lyric || ''
+  return typeof lrc === 'string' ? lrc.replace(/&#(\d+);/g, (_: string, d: string) => String.fromCharCode(Number(d))) : ''
+}
+
+/** 酷狗歌词：按 hash 取 krc 候选，再下载 lrc 文本（base64） */
+async function kugouLyric(hash: string): Promise<string> {
+  if (!hash) return ''
+  const headers = { 'User-Agent': UA, Referer: 'https://www.kugou.com/' }
+  const search = await getJson<any>(
+    `https://krcs.kugou.com/search?${qs({ ver: 1, man: 'yes', client: 'mobi', keyword: '', duration: '', hash })}`,
+    headers,
+    10000
+  )
+  const cand = (search?.candidates || [])[0]
+  if (!cand?.id || !cand?.accesskey) return ''
+  const data = await getJson<any>(
+    `https://lyrics.kugou.com/download?${qs({
+      ver: 1,
+      client: 'pc',
+      id: cand.id,
+      accesskey: cand.accesskey,
+      fmt: 'lrc',
+      charset: 'utf8',
+    })}`,
+    headers,
+    10000
+  )
+  if (!data?.content) return ''
+  try {
+    return Buffer.from(String(data.content), 'base64').toString('utf8')
+  } catch {
+    return ''
+  }
+}
+
+/** 歌词：插件 → 平台官方 → 网易云同名匹配，多路候选取行数最多的一份 */
+export async function getLyric(song: Song): Promise<LyricResult> {
+  const empty: LyricResult = { lines: [], raw: '', offset: 0, hasTrans: false, hasWordByWord: false }
+  if (!song) return empty
+  const cached = lyricCache.get(song.id)
+  if (cached) return cached
+
+  const cands: { raw: string; source: string }[] = []
+  const push = (raw: string, source: string) => {
+    if (raw && raw.trim().length > 20) cands.push({ raw, source })
+  }
+
+  // 本地音乐：内嵌歌词 / 同名 .lrc 优先
+  if (song.source === 'local') {
+    const embedded = String(song.extra?.lyrics || '')
+    if (embedded.trim()) push(embedded, '内嵌歌词')
+    if (song.localPath) {
+      try {
+        const fs = await import('node:fs')
+        const path = await import('node:path')
+        const lrcPath = song.localPath.replace(path.extname(song.localPath), '.lrc')
+        if (fs.existsSync(lrcPath)) push(fs.readFileSync(lrcPath, 'utf8'), '同目录歌词')
+      } catch {
+        /* ignore */
+      }
+    }
+    const parsedLocal = cands.map(c => ({ c, p: parseLyric(c.raw) })).find(x => x.p.lines.length)
+    if (parsedLocal) {
+      const res: LyricResult = {
+        lines: parsedLocal.p.lines,
+        raw: parsedLocal.c.raw,
+        source: parsedLocal.c.source,
+        offset: parsedLocal.p.offset,
+        hasTrans: parsedLocal.p.lines.some(l => !!l.trans),
+        hasWordByWord: parsedLocal.p.hasWordByWord,
+      }
+      lyricCache.set(song.id, res)
+      return res
+    }
+    // 本地纯音乐不做同名猜测，避免匹配到错误歌词
+    return empty
+  }
+
+  try {
+    push(await lxHost.getLyric(song), '音源插件')
+  } catch {
+    /* 插件歌词失败继续 */
+  }
+
+  if (song.source === 'kg') {
+    try {
+      push(await kugouLyric(String(song.extra?.hash || song.songId)), '在线音源')
+    } catch {
+      /* ignore */
+    }
+  } else if (song.source === 'qq') {
+    try {
+      push(await qqLyric(String(song.extra?.songmid || song.songId)), '在线音源')
+    } catch {
+      /* ignore */
+    }
+  } else if (song.source === 'wy') {
+    try {
+      push(await wyLyric(song.songId), '在线音源')
+    } catch {
+      /* ignore */
+    }
+  }
+
+  if (song.source !== 'wy' && cands.every(c => c.source === '音源插件')) {
+    try {
+      const list = await searchNetease(`${song.name} ${String(song.singer).split('/')[0]}`, 1, 6)
+      const cand =
+        list.find(x => song.duration > 30 && Math.abs(x.duration - song.duration) < 12) ||
+        list.find(
+          x => normName(x.name) === normName(song.name) && normName(x.singer).includes(mainSinger(song.singer))
+        )
+      if (cand) push(await wyLyric(cand.songId), '在线音源')
+    } catch {
+      /* ignore */
+    }
+  }
+
+  let best: LyricResult | null = null
+  for (const c of cands) {
+    const parsed = parseLyric(c.raw)
+    if (!parsed.lines.length) continue
+    const res: LyricResult = {
+      lines: parsed.lines,
+      raw: c.raw,
+      source: c.source,
+      offset: parsed.offset,
+      hasTrans: parsed.lines.some(l => !!l.trans),
+      hasWordByWord: parsed.hasWordByWord,
+    }
+    if (!best || res.lines.length > best.lines.length) best = res
+  }
+
+  if (!best) return empty
+  if (lyricCache.size > 300) {
+    const first = lyricCache.keys().next().value
+    if (first) lyricCache.delete(first)
+  }
+  lyricCache.set(song.id, best)
+  logger.info('歌词匹配成功', song.name, best.source, best.lines.length + ' 行')
+  return best
+}
+
+export async function getCover(song: Song): Promise<string> {
+  return resolveCoverUrl(song)
+}
+
+export async function getPlaylists(cat: string, order: string, page: number): Promise<PlaylistMeta[]> {
+  return neteasePlaylists(cat, order, page)
+}
+
+export async function getPlaylistDetail(
+  id: string,
+  source: string
+): Promise<{ name: string; pic: string; description: string; songs: Song[] }> {
+  if (source === 'qq') return qqPlaylistDetail(id)
+  if (source === 'kg') return kugouPlaylistDetail(id)
+  return neteasePlaylistDetail(id)
+}
+
+export async function getToplistTree(): Promise<ToplistTree> {
+  return toplistTree()
+}
+
+export async function getToplist(platform: string, id: string): Promise<{ name: string; songs: Song[] }> {
+  return toplistSongs(platform, id)
+}
+
+export async function getNewSongs(): Promise<Song[]> {
+  return neteaseNewSongs(12)
+}
+
+export async function importPlaylist(input: string, platform?: string) {
+  return importPlaylistByLink(input, platform)
+}
+
+export async function searchMv(keyword: string, page = 1): Promise<MvItem[]> {
+  return searchBiliVideo(keyword, page)
+}
+
+export async function getMvInfo(bvid: string) {
+  return biliVideoInfo(bvid)
+}
+
+export async function getMvParts(bvid: string) {
+  return biliParts(bvid)
+}
+
+export async function getMvUrl(bvid: string, cid: string) {
+  return biliPlayUrl(bvid, cid)
+}
+
+export async function itunesFallbackCover(term: string): Promise<string> {
+  return itunesCover(term)
+}

@@ -1,0 +1,111 @@
+{
+  "name": "starwish-music",
+  "productName": "星河音乐",
+  "version": "2.0.0",
+  "description": "星河音乐 StarWish Music —— 多音源聚合桌面音乐播放器（Electron + Vue3 + TypeScript 新架构）",
+  "main": "dist/electron/main.js",
+  "author": "StarWish Music 开发组",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "build:renderer": "vite build",
+    "build:electron": "node scripts/build-electron.mjs",
+    "build": "npm run build:renderer && npm run build:electron",
+    "start": "npm run build && electron .",
+    "typecheck": "vue-tsc --noEmit -p tsconfig.json",
+    "icon": "node scripts/make-icon.mjs",
+    "dist": "npm run build && electron-builder --win portable nsis",
+    "dist:portable": "npm run build && electron-builder --win portable",
+    "test:core": "node scripts/test-core.mjs"
+  },
+  "dependencies": {
+    "music-metadata": "^10.9.1",
+    "qrcode": "^1.5.4",
+    "sql.js": "^1.13.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/qrcode": "^1.5.6",
+    "@vitejs/plugin-vue": "^5.2.1",
+    "electron": "^31.7.7",
+    "electron-builder": "^24.13.3",
+    "esbuild": "^0.24.2",
+    "pinia": "^2.3.0",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.7",
+    "vue": "^3.5.13",
+    "vue-router": "^4.5.0",
+    "vue-tsc": "^2.2.0"
+  },
+  "build": {
+    "appId": "com.starwish.music",
+    "productName": "星河音乐",
+    "copyright": "Copyright © 2026 StarWish Music",
+    "directories": {
+      "output": "dist/release",
+      "buildResources": "resources"
+    },
+    "asar": true,
+    "files": [
+      "dist/electron/**/*",
+      "dist/renderer/**/*",
+      "node_modules/sql.js/dist/sql-wasm.wasm",
+      "node_modules/sql.js/dist/sql-wasm.js",
+      "package.json",
+      "!**/*.map"
+    ],
+    "extraResources": [
+      {
+        "from": "sources",
+        "to": "sources",
+        "filter": [
+          "**/*.js"
+        ]
+      },
+      {
+        "from": "resources",
+        "to": "resources"
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "resources/icon.ico",
+      "artifactName": "星河音乐-${version}-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "星河音乐",
+      "artifactName": "StarWish-${version}-Setup.${ext}",
+      "deleteAppDataOnUninstall": false
+    },
+    "portable": {
+      "artifactName": "星河音乐-${version}-便携版.${ext}"
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mancking/starwish-music.git"
+  },
+  "homepage": "https://github.com/mancking/starwish-music#readme",
+  "bugs": {
+    "url": "https://github.com/mancking/starwish-music/issues"
+  }
+}

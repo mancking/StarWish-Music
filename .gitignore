@@ -1,0 +1,73 @@
+node_modules/
+dist/
+out/
+release/
+
+# 本地数据与测试产物
+.smoke-data/
+.check-data/
+.check-cache/
+.test-music/
+.pkg-data/
+.pkg2-data/
+.pkg3-data/
+.pkg4-data/
+*.log
+
+# 旧版实现（仅本地留档）
+app/_legacy-v11/
+app/web/
+app/main.js
+app/preload.js
+app/server.js
+app/assets/
+
+# 系统
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 本地参考资料 / 第三方仓库 / 素材（不随源码发布）
+.workbuddy-ai/
+0912-update/
+0912-update.zip
+1/
+dist/
+starmusic/
+sync_client/
+lx-music-desktop-master/
+lx-music-desktop-master.zip
+MusicFreePlugins-master/
+MusicFreePlugins-master.zip
+musicxx_extern_plugin/
+musicxx_extern_plugin-main.zip
+musicxx-main.zip
+agentxx-main.zip
+any-listen-main.zip
+biu-master.zip
+keep-alive-master.zip
+lx-music-source-main.zip
+lyric_xx-main.zip
+mediaxx-main.zip
+MusicFree-master.zip
+SPlayer-dev.zip
+platform-tools-latest-windows.zip
+string_util_xx-main.zip
+音源制作.txt
+SPlayer*.jpg
+
+# 设计预览与第三方界面参考图
+docs/ui-preview*
+docs/screenshots/
+
+# 第三方音源脚本（仅保留自研示例）
+app/sources/*.js
+!app/sources/starwish-unified.js
+!app/sources/starwish-bilibili.js
+app/verify-final-state.json
+
+# 本地诊断脚本
+app/scripts/cdp-*.mjs
+app/scripts/feature-check.cjs
+app/scripts/mv-*.cjs
+app/scripts/ui-shots.cjs
