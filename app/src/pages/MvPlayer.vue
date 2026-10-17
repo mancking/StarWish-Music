@@ -115,9 +115,11 @@ async function load(): Promise<void> {
 }
 
 async function selectPart(p: Part, autoplay = true): Promise<void> {
+  // 只有切换到「另一集」时才清除强制加载标志；
+  // 否则「仍要加载」按钮先置 true、再调本函数，会被这里立刻清掉，导致按钮永久失效。
+  if (current.value?.cid !== p.cid) forceLoad.value = false
   current.value = p
-  forceLoad.value = false
-  if ((p.duration || 0) > 7200) {
+  if ((p.duration || 0) > 7200 && !forceLoad.value) {
     loading.value = false
     videoUrl.value = ''
     videoError.value = ''

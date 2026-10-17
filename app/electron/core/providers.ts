@@ -96,8 +96,11 @@ export async function neteasePlaylistDetail(id: string): Promise<{ name: string;
   for (const url of endpoints) {
     try {
       const body = await limited(hostOf(url), 3, () => getJson<any>(url, WY_HEADERS, 12000))
-      if (body?.playlist) {
-        pl = body.playlist
+      // /api/v6|v3 把歌单放在 playlist，/api/playlist/detail 放在 result，两者字段结构一致。
+      // 只认 playlist 会把 v1 的成功响应判为失败，抛出误导性的「code 200」。
+      const got = body?.playlist || body?.result
+      if (got) {
+        pl = got
         if ((pl.tracks || []).length) break
       } else {
         lastErr = body?.message || body?.msg || `code ${body?.code}`
@@ -325,6 +328,8 @@ export async function miguPlaylistDetail(id: string): Promise<{ name: string; pi
 
 /* ============================ 榜单 ============================ */
 
+// 榜单索引兜底表：各平台索引接口失败时使用。
+// ID 取自落雪（lx-music-desktop）榜单硬编码表，并已联网逐个核验可用。
 const FALLBACK_TREE: ToplistTree['tree'] = {
   wy: {
     name: '网易云音乐',
@@ -336,7 +341,46 @@ const FALLBACK_TREE: ToplistTree['tree'] = {
           { n: '新歌榜', id: '3779629' },
           { n: '热歌榜', id: '3778678' },
           { n: '原创榜', id: '2884035' },
-          { n: '网络热歌榜', id: '3777338' },
+          { n: '网络热歌榜', id: '6723173524' },
+        ],
+      },
+      {
+        g: '更多榜单',
+        items: [
+          { n: '中文说唱榜', id: '991319590' },
+          { n: '电音榜', id: '1978921795' },
+          { n: '古典榜', id: '71384707' },
+          { n: 'ACG榜', id: '71385702' },
+          { n: '韩语榜', id: '745956260' },
+          { n: '日语榜', id: '5059644681' },
+          { n: 'ACG动画榜', id: '3001835560' },
+          { n: 'ACG游戏榜', id: '3001795926' },
+          { n: 'ACG VOCALOID榜', id: '3001890046' },
+          { n: '法国NRJ周榜', id: '27135204' },
+          { n: '欧美热歌榜', id: '2809513713' },
+          { n: '欧美新歌榜', id: '2809577409' },
+          { n: '日本Oricon榜', id: '60131' },
+          { n: '美国Billboard榜', id: '60198' },
+          { n: 'UK排行榜周榜', id: '180106' },
+          { n: 'KTV唛榜', id: '21845217' },
+          { n: 'Beatport电子舞曲榜', id: '3812895' },
+          { n: '民谣榜', id: '5059661515' },
+          { n: '摇滚榜', id: '5059633707' },
+          { n: '国风榜', id: '5059642708' },
+          { n: '听歌识曲榜', id: '6688069460' },
+          { n: '潜力爆款榜', id: '5338990334' },
+          { n: '黑胶VIP爱听榜', id: '5453912201' },
+          { n: '黑胶VIP新歌榜', id: '7785123708' },
+          { n: '黑胶VIP热歌榜', id: '7785066739' },
+          { n: '黑胶VIP爱搜榜', id: '7785091694' },
+          { n: '俄语榜', id: '6732051320' },
+          { n: '越南语榜', id: '6732014811' },
+          { n: '泰语榜', id: '7095271308' },
+          { n: '中文慢摇DJ榜', id: '6886768100' },
+          { n: '俄罗斯top hit榜', id: '6939992364' },
+          { n: 'BEAT排行榜', id: '7356827205' },
+          { n: 'LOOK直播歌曲榜', id: '7603212484' },
+          { n: '赏音榜', id: '7775163417' },
         ],
       },
     ],
@@ -345,17 +389,83 @@ const FALLBACK_TREE: ToplistTree['tree'] = {
     name: 'QQ音乐',
     groups: [
       {
-        g: '核心榜',
+        g: '热门榜',
         items: [
-          { n: '飙升榜', id: '4' },
-          { n: '热歌榜', id: '26' },
-          { n: '新歌榜', id: '27' },
-          { n: '流行指数榜', id: '62' },
+          { n: '巅峰榜·流行指数', id: '4' },
+          { n: '巅峰榜·热歌', id: '26' },
+          { n: '巅峰榜·新歌', id: '27' },
+          { n: '飙升榜', id: '62' },
+          { n: '巅峰榜·网络歌曲', id: '28' },
+          { n: '巅峰榜·内地', id: '5' },
+          { n: '巅峰榜·欧美', id: '3' },
+          { n: '巅峰榜·韩国', id: '16' },
+          { n: '巅峰榜·日本', id: '17' },
+          { n: '国乐榜', id: '78' },
+        ],
+      },
+      {
+        g: '全部榜单',
+        items: [
+          { n: '说唱榜', id: '58' },
+          { n: '电音榜', id: '57' },
+          { n: '香港地区榜', id: '59' },
+          { n: '抖音热歌榜', id: '60' },
+          { n: '巅峰榜·影视金曲', id: '29' },
+          { n: '巅峰榜·MV', id: '201' },
+          { n: '巅峰榜·K歌金曲', id: '36' },
+          { n: '台湾地区榜', id: '61' },
+          { n: 'DJ舞曲榜', id: '63' },
+          { n: '综艺新歌榜', id: '64' },
+          { n: '国风热歌榜', id: '65' },
+          { n: '听歌识曲榜', id: '67' },
+          { n: '动漫音乐榜', id: '72' },
+          { n: '游戏音乐榜', id: '73' },
+          { n: '有声榜', id: '75' },
         ],
       },
     ],
   },
-  kg: { name: '酷狗音乐', groups: [{ g: '核心榜', items: [{ n: '酷狗TOP500', id: '8888' }] }] },
+  kg: {
+    name: '酷狗音乐',
+    groups: [
+      {
+        g: '热门榜',
+        items: [
+          { n: 'TOP500', id: '8888' },
+          { n: '国潮音乐榜', id: '85897' },
+          { n: '新歌榜', id: '74534' },
+          { n: '民谣榜', id: '51341' },
+          { n: '电音榜', id: '33160' },
+          { n: 'DJ热歌榜', id: '24971' },
+          { n: '国乐榜', id: '80025' },
+          { n: '短视频收藏人气榜', id: '52767' },
+        ],
+      },
+      {
+        g: '全部榜单',
+        items: [
+          { n: '内地榜', id: '31308' },
+          { n: '伤感榜', id: '51340' },
+          { n: '日本榜', id: '31312' },
+          { n: '80后热歌榜', id: '49225' },
+          { n: '00后热歌榜', id: '49224' },
+          { n: '台湾地区榜', id: '54848' },
+          { n: '说唱先锋榜', id: '44412' },
+          { n: 'ACG新歌榜', id: '33162' },
+          { n: '欧美金曲榜', id: '33166' },
+          { n: '影视金曲榜', id: '33163' },
+          { n: '儿歌榜', id: '65234' },
+          { n: '闽南语榜', id: '60170' },
+          { n: '古典榜', id: '59899' },
+          { n: '粤剧榜', id: '108332' },
+          { n: '京剧榜', id: '108333' },
+          { n: '南音榜', id: '108335' },
+          { n: '小语种热歌榜', id: '36107' },
+          { n: '越南语榜', id: '60171' },
+        ],
+      },
+    ],
+  },
 }
 
 let treeCache: { at: number; data: ToplistTree } | null = null
@@ -393,20 +503,29 @@ export async function toplistTree(force = false): Promise<ToplistTree> {
   }
 
   // QQ：官方榜单索引
+  // 旧端点 fcg_v8_toplist_opt.fcg 已失效（返回空字符串或 code 304），
+  // 必须用 fcg_myqq_toplist.fcg，榜单在 body.data.topList，字段为 topTitle / id。
   try {
     const body = await getJson<any>(
-      `https://c.y.qq.com/v8/fcg-bin/fcg_v8_toplist_opt.fcg?${qs({
-        page: 'index',
+      `https://c.y.qq.com/v8/fcg-bin/fcg_myqq_toplist.fcg?${qs({
+        g_tk: '1928093487',
+        inCharset: 'utf-8',
+        outCharset: 'utf-8',
+        notice: 0,
         format: 'json',
-        tpl: 3,
-        v8debug: 1,
+        uin: 0,
+        needNewCode: 1,
+        platform: 'h5',
       })}`,
       QQ_HEADERS,
       12000
     )
-    const raw = body?.topList || []
+    const raw = body?.data?.topList || body?.topList || []
     const items = raw
-      .map((x: any) => ({ n: stripHtml(x.ListName || x.topname || ''), id: String(x.topID || x.topId || '') }))
+      .map((x: any) => ({
+        n: stripHtml(x.topTitle || x.ListName || x.topname || ''),
+        id: String(x.id ?? x.topID ?? x.topId ?? ''),
+      }))
       .filter((x: any) => x.n && x.id)
     if (items.length) {
       tree.qq = {
@@ -486,9 +605,14 @@ export async function toplistSongs(platform: string, id: string): Promise<{ name
     return { name: body?.topinfo?.ListName || 'QQ音乐榜单', songs }
   }
   if (p === 'kg') {
+    // 必须带 version/ranktype/area_code：缺少时酷狗只返回极少数歌曲
+    // （实测 rankid=8888 从 total=500 退化为 total=2），不是权限问题而是参数校验。
     const body = await getJson<any>(
       `http://mobilecdn.kugou.com/api/v3/rank/song?${qs({
         format: 'json',
+        version: 9108,
+        ranktype: 1,
+        area_code: 1,
         rankid: id,
         page: 1,
         pagesize: 100,
@@ -502,15 +626,16 @@ export async function toplistSongs(platform: string, id: string): Promise<{ name
       .map((s: any): Song => {
         const fn = String(s.filename || '')
         const parts = fn.split(' - ')
+        const singer = (s.authors || []).map((a: any) => a.author_name).filter(Boolean).join('/')
         return {
           id: `kg:${s.hash}`,
           source: 'kg',
           songId: String(s.hash || ''),
-          name: parts.length > 1 ? parts.slice(1).join(' - ') : s.songname || fn,
-          singer: s.singername || (parts.length > 1 ? parts[0] : '未知歌手'),
+          name: s.songname || (parts.length > 1 ? parts.slice(1).join(' - ') : fn),
+          singer: singer || s.singername || (parts.length > 1 ? parts[0] : '未知歌手'),
           album: s.album_name || '',
           duration: num(s.duration),
-          pic: '',
+          pic: s.album_cover ? String(s.album_cover).replace('{size}', '480') : '',
           qualitys: ['128k', '320k'],
           extra: { hash: s.hash || '' },
         }

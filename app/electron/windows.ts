@@ -1,7 +1,8 @@
-import { BrowserWindow, screen, nativeImage } from 'electron'
+import { BrowserWindow, screen, nativeImage, nativeTheme } from 'electron'
 import path from 'node:path'
 import fs from 'node:fs'
 import { resourcesDir } from './core/paths'
+import { endWindowInitWatch } from './core/crash-guard'
 import { createLogger } from './core/log'
 
 const logger = createLogger('windows')
@@ -57,9 +58,32 @@ export function createMainWindow(): BrowserWindow {
     },
   })
 
-  win.once('ready-to-show', () => {
+  // 窗口以 show:false 构造，等 ready-to-show 再显示；但若渲染进程始终不触发该事件
+  // （页面加载失败、GPU 初始化卡住、容器环境无合成器），窗口就永远不会出现——用户
+  // 看到的正是「双击后任务管理器有进程、却没有任何窗口」。这里加两重兜底：超时强制
+  // 显示，以及加载失败时也显示（让用户看到错误页而不是彻底沉默）。
+  let shown = false
+  const showOnce = (): void => {
+    if (shown || win.isDestroyed()) return
+    shown = true
     win.show()
-  })
+    // 延后清除标记：GPU/viz 首帧合成的崩溃发生在 show() 之后极短时间内，
+    // 立刻清除会让看门狗在真正崩溃的场景下失效（下次启动不会降级，陷入崩溃循环）。
+    setTimeout(endWindowInitWatch, 15000)
+  }
+  win.once('ready-to-show', showOnce)
+  const showTimer = setTimeout(() => {
+    if (!shown) {
+      logger.warn('ready-to-show 超时，强制显示窗口')
+      showOnce()
+    }
+  }, 8000)
+
+  // 构造完成立刻按当前主题定色。此前只在 main.ts 的 bootstrap 里调 applyTitleBarTheme，
+  // 而那发生在 createMainWindow 之前（此时 wins.main 仍为 null，函数直接空转返回），
+  // 于是浅色主题下窗口一直保留上面硬编码的深色 #0b0d12 标题栏按钮区。
+  wins.main = win
+  applyTitleBarTheme(nativeTheme.shouldUseDarkColors)
 
   if (isDev) {
     win.loadURL(DEV_URL)
@@ -79,11 +103,12 @@ export function createMainWindow(): BrowserWindow {
   })
   win.webContents.on('did-fail-load', (_e, code, desc, url) => {
     logger.error('页面加载失败', code, desc, url)
+    showOnce()
   })
   win.on('closed', () => {
+    clearTimeout(showTimer)
     wins.main = null
   })
-  wins.main = win
   return win
 }
 

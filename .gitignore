@@ -74,6 +74,9 @@ app/sources/*.js
 !app/sources/starwish-bilibili.js
 app/verify-final-state.json
 
+# 本地诊断产物
+_probe/
+
 # 本地诊断脚本
 app/scripts/cdp-*.mjs
 app/scripts/feature-check.cjs

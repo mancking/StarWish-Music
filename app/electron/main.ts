@@ -9,6 +9,7 @@ import { initBiliLogin, biliCookie } from './core/bili'
 import { lxHost } from './core/lx-host'
 import { registerCoverProtocol } from './core/cover'
 import { registerMediaProtocol } from './core/media'
+import { beginWindowInitWatch } from './core/crash-guard'
 import { player } from './core/player-service'
 import { registerIpc, navigateMain } from './ipc'
 import {
@@ -63,6 +64,15 @@ app.setPath('userData', dataDir)
 app.setAppUserModelId('com.starwish.music')
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required')
 app.commandLine.appendSwitch('disable-features', 'HardwareMediaKeyHandling')
+
+// 崩溃看门狗：窗口创建/首帧合成阶段若因 GPU（D3D11/viz）初始化失败而崩溃，进程会在
+// 写入「启动完成」日志后立刻死掉，表现为「任务管理器有进程但永远没有窗口」。标记文件
+// 在窗口真正显示后由 windows.ts 清除；若下次启动仍发现它，说明上次死在窗口初始化阶段，
+// 本次自动关闭硬件加速降级重试，避免陷入永久崩溃循环（虚拟显示器驱动、异常显卡驱动）。
+if (beginWindowInitWatch()) {
+  logger.warn('检测到上次启动在窗口初始化阶段崩溃，本次关闭硬件加速降级启动')
+  app.disableHardwareAcceleration()
+}
 
 protocol.registerSchemesAsPrivileged([
   {
