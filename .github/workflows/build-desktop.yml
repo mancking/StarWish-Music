@@ -27,7 +27,8 @@ jobs:
               app/dist/release/*.AppImage
               app/dist/release/*.deb
           - name: mac-x64
-            os: macos-13
+            # ponytail: macos-13 已于 2025-12-04 退役，Intel 镜像用 macos-15-intel（2027 秋退役）
+            os: macos-15-intel
             artifact: starwish-macos-x64
             build: npx electron-builder --mac zip --x64 --publish never
             glob: |
