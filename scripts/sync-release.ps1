@@ -58,7 +58,7 @@ Copy-Item 'D:\music\app\android\app\build\outputs\apk\debug\app-debug.apk' (Join
 Stage '*.AppImage' 'StarWish-2.0.0-x86_64.AppImage'
 Stage '*amd64.deb' 'starwish-music_2.0.0_amd64.deb'
 Stage '*arm64-mac.zip' 'StarWish-2.0.0-arm64-mac.zip'
-Stage '*x64-mac.zip' 'StarWish-2.0.0-x64-mac.zip' -notLike '*arm*'
+Stage '*-mac.zip' 'StarWish-2.0.0-x64-mac.zip' -notLike '*arm*'
 
 $uploads = @(
   'StarWish-2.0.0-win-portable.exe',
