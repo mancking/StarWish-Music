@@ -225,6 +225,34 @@
   #app .empty {
     padding: 36px 16px;
   }
+
+  /* 设置页：190px+1fr 两栏在窄屏把右栏挤成 1 字宽（中文竖排），
+     塌成单栏、分类变横向 tab 条；行内固定宽控件允许换行 */
+  #app .layout {
+    grid-template-columns: 1fr;
+  }
+  #app .cats {
+    flex-direction: row;
+    overflow-x: auto;
+    position: static;
+    gap: 4px;
+    padding-bottom: 4px;
+  }
+  #app .cat {
+    flex: none;
+    height: 34px;
+    white-space: nowrap;
+  }
+  #app .panel {
+    max-width: none;
+  }
+  #app .row,
+  #app .sec-head {
+    flex-wrap: wrap;
+  }
+  #app .row .label {
+    flex: 1 1 140px;
+  }
 }
 
 /* ---------- 车机 / 横屏：压缩纵向节奏 ---------- */

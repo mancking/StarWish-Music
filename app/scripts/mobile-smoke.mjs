@@ -134,6 +134,9 @@ async function main() {
   let win = null
   app.on('browser-window-created', (_e, w) => {
     w.webContents.on('console-message', (_ev, level, message, line, sourceId) => {
+      // Electron 开发态自身的安全提示（如 CSP unsafe-eval 提醒），官方注明
+      // 打包后不再显示，Android 端跑的是系统 WebView 根本没有它 —— 非应用错误。
+      if (message.includes('Electron Security Warning')) return
       if (level >= 2) consoleErrors.push({ level, message, line, source: sourceId })
     })
     w.webContents.on('render-process-gone', (_e, d) => {
@@ -196,13 +199,22 @@ async function main() {
   check('首页渲染出内容区块', typeof home === 'number' && home > 0, { nodes: home })
 
   // 5. 路由可切：跳到发现页（歌单/榜单页）
+  //    vue-router 初始导航可能在我设 hash 后才落定并把它归位成 '#/'，
+  //    固定等待一锤定音会偶发假失败 —— 轮询重设直到真正进入。
   const discover = await js(`
     (async () => {
       const w = window
-      location.hash = '#/discover'
-      await new Promise(r => setTimeout(r, 800))
+      const want = '#/discover'
+      for (let i = 0; i < 20; i++) {
+        const txt = document.body.innerText
+        if (location.hash === want && /推荐歌单|榜单|标签/.test(txt)) {
+          return { hash: location.hash, hasTag: true, tries: i }
+        }
+        location.hash = want
+        await new Promise(r => setTimeout(r, 300))
+      }
       const txt = document.body.innerText
-      return { hash: location.hash, hasTag: /推荐歌单|榜单|标签/.test(txt) }
+      return { hash: location.hash, hasTag: /推荐歌单|榜单|标签/.test(txt), tried: 20 }
     })()
   `).catch((e) => ({ err: String(e && e.message) }))
   check('发现页路由可进入', !!(discover && discover.hasTag), discover)
