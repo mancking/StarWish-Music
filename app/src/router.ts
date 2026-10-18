@@ -7,6 +7,7 @@ const routes = [
   { path: '/mv/:bvid', name: 'mv-player', component: () => import('@/pages/MvPlayer.vue'), meta: { title: '视频播放' } },
   { path: '/search', name: 'search', component: () => import('@/pages/Search.vue'), meta: { title: '搜索' } },
   { path: '/playlist/:id', name: 'playlist', component: () => import('@/pages/Playlist.vue'), meta: { title: '歌单' } },
+  { path: '/podcast/:id', name: 'podcast', component: () => import('@/pages/Playlist.vue'), meta: { title: '播客' } },
   { path: '/toplist/:platform/:id', name: 'toplist', component: () => import('@/pages/Playlist.vue'), meta: { title: '排行榜' } },
   { path: '/favorites', name: 'favorites', component: () => import('@/pages/Favorites.vue'), meta: { title: '我喜欢的音乐' } },
   { path: '/local', name: 'local', component: () => import('@/pages/Local.vue'), meta: { title: '本地音乐' } },

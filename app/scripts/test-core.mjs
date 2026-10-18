@@ -72,6 +72,37 @@ async function main() {
     const bareTotal = bare.body?.data?.total ?? 0
     pass('kg 缺参数对照（仅记录，不断言）', `total=${bareTotal}`)
   }
+
+  // 4) Set-Cookie 读取契约：Headers.forEach 会丢掉第一条 Set-Cookie，必须用 getSetCookie()
+  //    （回归自 B 站扫码登录报「登录成功但未获取到 SESSDATA」：只认 forEach 时 SESSDATA 消失）
+  {
+    const http = await import('node:http')
+    const srv = http.createServer((_req, res) => {
+      res.writeHead(200, {
+        'Content-Type': 'application/json',
+        'Set-Cookie': ['SESSDATA=abc%2Cdef; Path=/; HttpOnly', 'DedeUserID=12345; Path=/'],
+      })
+      res.end('{"code":0}')
+    })
+    await new Promise((r) => srv.listen(0, '127.0.0.1', r))
+    const res = await fetch(`http://127.0.0.1:${srv.address().port}/`)
+    const naive = {}
+    res.headers.forEach((v, k) => {
+      naive[k.toLowerCase()] = v
+    })
+    const jar = typeof res.headers.getSetCookie === 'function' ? res.headers.getSetCookie() : []
+    srv.close()
+
+    const naiveHasSess = /SESSDATA=/.test(naive['set-cookie'] || '')
+    const fullHasSess = jar.some((c) => /SESSDATA=/.test(c))
+    if (fullHasSess && !naiveHasSess) {
+      pass('set-cookie 必须走 getSetCookie()', `forEach 丢 SESSDATA（${(naive['set-cookie'] || '').slice(0, 40)}），getSetCookie 取到 ${jar.length} 条`)
+    } else if (fullHasSess) {
+      pass('set-cookie 必须走 getSetCookie()', `getSetCookie 取到 ${jar.length} 条（本运行时 forEach 也已保留，契约仍成立）`)
+    } else {
+      fail('set-cookie 必须走 getSetCookie()', `getSetCookie 未取到 SESSDATA，条数=${jar.length}，naive=${JSON.stringify(naive['set-cookie'] || '')}`)
+    }
+  }
 }
 
 try {

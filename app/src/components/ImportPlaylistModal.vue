@@ -21,12 +21,12 @@ const open = computed({
 
 /** 支持的音源（与 importPlaylistByLink 中可识别的平台一致） */
 const PLATFORMS: { key: string; name: string; hint: string }[] = [
-  { key: 'wy', name: '音源 A', hint: '网易云音乐' },
-  { key: 'qq', name: '音源 B', hint: 'QQ 音乐' },
-  { key: 'kg', name: '音源 C', hint: '酷狗音乐' },
-  { key: 'kw', name: '音源 D', hint: '酷我音乐' },
-  { key: 'mg', name: '音源 E', hint: '咪咕音乐' },
-  { key: 'bili', name: '视频源', hint: 'B 站合集 / 收藏' },
+  { key: 'wy', name: '小芸音乐', hint: '分享歌单 / ID' },
+  { key: 'qq', name: '小秋音乐', hint: '分享歌单 / ID' },
+  { key: 'kg', name: '小枸音乐', hint: '分享歌单 / 歌单 ID' },
+  { key: 'kw', name: '小蜗音乐', hint: '分享歌单 / ID' },
+  { key: 'mg', name: '小蜜音乐', hint: '分享歌单 / ID' },
+  { key: 'bili', name: '视频源', hint: 'B 站合集 / 收藏夹' },
 ]
 
 const platform = ref<string>(PLATFORMS[0].key)

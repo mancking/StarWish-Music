@@ -48,6 +48,9 @@ const codeName = ref('')
 
 const deleteTarget = ref<SourceInfo | null>(null)
 const restoring = ref(false)
+const dataMoving = ref(false)
+/** 数据目录改过之后，存下重启后的目标路径，用于提示横幅 */
+const dataRestart = ref('')
 
 const qrOpen = ref(false)
 const qrImg = ref('')
@@ -167,18 +170,66 @@ async function doImport(): Promise<void> {
 }
 
 const cachePath = computed(() => setting.value.cacheDir || `${appInfo.value?.userData || ''}\\cache`)
+const coverPath = computed(() => setting.value.coverDir || `${cachePath.value}\\covers`)
+const mediaPath = computed(() => setting.value.mediaDir || `${cachePath.value}\\media`)
+const dataPath = computed(() => appInfo.value?.userData || '')
+
+type DirKind = 'cache' | 'cover' | 'media'
+
+async function pickDir(title: string): Promise<string> {
+  return (await call<string>('cache:pickDir', { title })) || ''
+}
 
 async function changeCacheDir(): Promise<void> {
   try {
-    const dir = await call<string>('cache:pickDir')
+    const dir = await pickDir('选择缓存目录')
     if (!dir) return
-    const r = await call<{ settings: AppSettings; dir: string; size: number }>('cache:setDir', { dir })
+    await call('cache:setDir', { dir, kind: 'cache' })
     cache.value = await call('cache:size').catch(() => cache.value)
     ui.toast('缓存目录已更新，已有缓存已迁移', 'success')
     await loadMeta()
   } catch (e: any) {
     ui.toast(e.message, 'error')
   }
+}
+
+async function changeSubDir(kind: Exclude<DirKind, 'cache'>, label: string): Promise<void> {
+  try {
+    const dir = await pickDir(`选择${label}目录`)
+    if (!dir) return
+    await call('cache:setDir', { dir, kind })
+    cache.value = await call('cache:size').catch(() => cache.value)
+    ui.toast(`${label}目录已更新，已有缓存已迁移`, 'success')
+    await loadMeta()
+  } catch (e: any) {
+    ui.toast(e.message, 'error')
+  }
+}
+
+async function changeDataDir(): Promise<void> {
+  if (dataMoving.value) return
+  try {
+    const dir = await pickDir('选择数据目录')
+    if (!dir) return
+    if (parseDir(dir) === parseDir(dataPath.value)) {
+      ui.toast('新目录与当前数据目录相同', 'info')
+      return
+    }
+    dataMoving.value = true
+    const r = await call<{ dir: string; restart: boolean }>('data:setDir', { dir })
+    if (r.restart) {
+      dataRestart.value = r.dir
+      ui.toast('数据目录已迁移，重启后生效', 'success')
+    }
+  } catch (e: any) {
+    ui.toast(e.message, 'error')
+  } finally {
+    dataMoving.value = false
+  }
+}
+
+function parseDir(s: string): string {
+  return String(s || '').replace(/[\\/]+$/, '').toLowerCase()
 }
 
 async function resetCacheDir(): Promise<void> {
@@ -191,8 +242,54 @@ async function resetCacheDir(): Promise<void> {
   }
 }
 
-async function openCacheDir(): Promise<void> {
-  await call('cache:openDir').catch(() => {})
+async function openCacheDir(kind: DirKind = 'cache'): Promise<void> {
+  await call('cache:openDir', { kind }).catch(() => {})
+}
+
+async function clearCache(scope: 'cover' | 'media' | 'all'): Promise<void> {
+  try {
+    cache.value = await call('cache:clear', { scope })
+    ui.toast(scope === 'cover' ? '封面缓存已清理' : scope === 'media' ? '媒体缓存已清理' : '缓存已清理', 'success')
+    await loadMeta()
+  } catch (e: any) {
+    ui.toast(e.message, 'error')
+  }
+}
+
+async function resetDataDir(): Promise<void> {
+  if (dataMoving.value) return
+  try {
+    dataMoving.value = true
+    const r = await call<{ dir: string; restart: boolean }>('data:setDir', { dir: '' })
+    if (r.restart) {
+      dataRestart.value = r.dir
+      ui.toast('已恢复默认数据目录，重启后生效', 'success')
+    } else {
+      ui.toast('当前已是默认数据目录', 'info')
+    }
+  } catch (e: any) {
+    ui.toast(e.message, 'error')
+  } finally {
+    dataMoving.value = false
+  }
+}
+
+async function clearDataJunk(): Promise<void> {
+  try {
+    const r = await call<{ freed: number }>('data:clear')
+    ui.toast(`已清理 ${fmtBytes(r.freed)} 可再生的数据`, 'success')
+    await loadMeta()
+  } catch (e: any) {
+    ui.toast(e.message, 'error')
+  }
+}
+
+async function openDataDir(): Promise<void> {
+  await call('data:openDir').catch(() => {})
+}
+
+async function restartApp(): Promise<void> {
+  await call('app:relaunch').catch(() => {})
 }
 
 async function restoreSources(): Promise<void> {
@@ -206,20 +303,6 @@ async function restoreSources(): Promise<void> {
   } finally {
     restoring.value = false
   }
-}
-
-async function clearCache(): Promise<void> {
-  try {
-    cache.value = await call('cache:clear')
-    ui.toast('缓存已清理', 'success')
-    await loadMeta()
-  } catch (e: any) {
-    ui.toast(e.message, 'error')
-  }
-}
-
-async function openDataDir(): Promise<void> {
-  await call('app:openUserData').catch(() => {})
 }
 
 async function startBiliLogin(): Promise<void> {
@@ -540,29 +623,59 @@ onBeforeUnmount(stopPoll)
         <!-- 缓存 -->
         <section v-else-if="cat === 'cache'">
           <h2>网络与缓存</h2>
+          <div v-if="dataRestart" class="banner">
+            <Icon name="info" :size="15" />
+            <span>数据目录已切换到 <b>{{ dataRestart }}</b>，重启后生效。</span>
+            <button class="btn sm" @click="restartApp">立即重启</button>
+          </div>
           <div class="row">
             <div class="label"><b>缓存目录</b><span class="path">{{ cachePath }}</span></div>
             <div class="inline">
               <button class="btn sm" @click="changeCacheDir"><Icon name="folder-open" :size="14" />更改目录</button>
-              <button class="btn sm ghost" @click="openCacheDir"><Icon name="external" :size="14" />打开</button>
+              <button class="btn sm ghost" @click="openCacheDir('cache')"><Icon name="external" :size="14" />打开</button>
               <button v-if="setting.cacheDir" class="btn sm ghost" @click="resetCacheDir">恢复默认</button>
             </div>
           </div>
           <div class="row">
-            <div class="label"><b>封面缓存</b><span>列表缩略图与播放页大图</span></div>
-            <span class="val">{{ fmtBytes(cache.cover) }}</span>
+            <div class="label">
+              <b>封面缓存</b>
+              <span class="path">{{ coverPath }}</span>
+            </div>
+            <div class="inline">
+              <span class="val">{{ fmtBytes(cache.cover) }}</span>
+              <button class="btn sm ghost" @click="changeSubDir('cover', '封面缓存')"><Icon name="folder-open" :size="14" />更改目录</button>
+              <button class="btn sm ghost" @click="openCacheDir('cover')"><Icon name="external" :size="14" />打开</button>
+              <button class="btn sm ghost" @click="clearCache('cover')"><Icon name="trash" :size="14" />清理</button>
+            </div>
           </div>
           <div class="row">
-            <div class="label"><b>媒体缓存</b><span>音频 / 视频流临时文件</span></div>
-            <span class="val">{{ fmtBytes(cache.media) }}</span>
+            <div class="label">
+              <b>媒体缓存</b>
+              <span class="path">{{ mediaPath }}</span>
+            </div>
+            <div class="inline">
+              <span class="val">{{ fmtBytes(cache.media) }}</span>
+              <button class="btn sm ghost" @click="changeSubDir('media', '媒体缓存')"><Icon name="folder-open" :size="14" />更改目录</button>
+              <button class="btn sm ghost" @click="openCacheDir('media')"><Icon name="external" :size="14" />打开</button>
+              <button class="btn sm ghost" @click="clearCache('media')"><Icon name="trash" :size="14" />清理</button>
+            </div>
           </div>
           <div class="row">
-            <div class="label"><b>清理缓存</b><span>不会影响收藏、歌单与本地曲库</span></div>
-            <button class="btn sm" @click="clearCache"><Icon name="trash" :size="14" />立即清理</button>
+            <div class="label"><b>全部缓存</b><span>共 {{ fmtBytes(cache.total) }}，清理不会影响收藏、歌单与本地曲库</span></div>
+            <button class="btn sm" @click="clearCache('all')"><Icon name="trash" :size="14" />全部清理</button>
           </div>
           <div class="row">
-            <div class="label"><b>数据目录</b><span>{{ appInfo?.userData || '' }}</span></div>
-            <button class="btn sm ghost" @click="openDataDir"><Icon name="external" :size="14" />打开</button>
+            <div class="label">
+              <b>数据目录</b>
+              <span class="path">{{ dataPath }}</span>
+              <span>数据库、设置、登录态与音源；更改后需重启</span>
+            </div>
+            <div class="inline">
+              <button class="btn sm" :disabled="dataMoving" @click="changeDataDir"><Icon name="folder-open" :size="14" />更改目录</button>
+              <button class="btn sm ghost" @click="openDataDir"><Icon name="external" :size="14" />打开</button>
+              <button class="btn sm ghost" @click="clearDataJunk"><Icon name="trash" :size="14" />清理</button>
+              <button v-if="setting.dataDir" class="btn sm ghost" :disabled="dataMoving" @click="resetDataDir">恢复默认</button>
+            </div>
           </div>
         </section>
 
@@ -723,6 +836,22 @@ h1 {
 .path {
   word-break: break-all;
   font-size: 11px;
+}
+.banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  margin-bottom: 10px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 32%, transparent);
+  font-size: 12px;
+  color: var(--text-2);
+}
+.banner span {
+  flex: 1;
+  word-break: break-all;
 }
 .desc {
   font-size: 11.5px;

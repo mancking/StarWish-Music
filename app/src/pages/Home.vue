@@ -104,7 +104,10 @@ function openMood(m: any): void {
 }
 
 function openPodcast(p: any): void {
-  void call('app:openExternal', { url: `https://podcasts.apple.com/cn/podcast/id${p.id}` })
+  router.push({
+    path: `/podcast/${p.id}`,
+    query: { feed: p.feed || '', name: p.name, pic: p.pic, author: p.author },
+  })
 }
 
 onMounted(() => void load())
@@ -328,7 +331,7 @@ onMounted(() => void load())
           <div class="section-head">
             <div>
               <div class="section-title"><Icon name="microphone" :size="17" />播客精选</div>
-              <div class="section-sub">点击在浏览器中打开</div>
+              <div class="section-sub">点开即可在播放器内收听</div>
             </div>
           </div>
           <div class="podcast-list">
@@ -338,7 +341,7 @@ onMounted(() => void load())
                 <div class="pc-name clamp-2">{{ p.name }}</div>
                 <div class="pc-sub ellipsis">{{ p.author }}</div>
               </div>
-              <Icon name="external" :size="14" class="pc-ext" />
+              <Icon name="play" :size="14" class="pc-ext" />
             </button>
             <div v-if="!podcasts.length" class="empty" style="padding: 24px">
               <div class="empty-desc">播客源暂不可用</div>

@@ -34,9 +34,20 @@ export function ensureDir(dir: string): string {
 }
 
 let cacheRoot = ''
+let coverRoot = ''
+let mediaRoot = ''
 
 export function setCacheRoot(dir: string): void {
   cacheRoot = dir && dir.trim() ? dir : ''
+}
+
+/** 封面 / 媒体缓存可各自指向独立目录，留空则跟随缓存目录 */
+export function setCoverRoot(dir: string): void {
+  coverRoot = dir && dir.trim() ? dir : ''
+}
+
+export function setMediaRoot(dir: string): void {
+  mediaRoot = dir && dir.trim() ? dir : ''
 }
 
 export function cacheRootDir(): string {
@@ -48,11 +59,21 @@ export function cacheDir(): string {
 }
 
 export function coverCacheDir(): string {
-  return ensureDir(path.join(cacheDir(), 'covers'))
+  return ensureDir(coverRoot || path.join(cacheDir(), 'covers'))
 }
 
 export function mediaCacheDir(): string {
-  return ensureDir(path.join(cacheDir(), 'media'))
+  return ensureDir(mediaRoot || path.join(cacheDir(), 'media'))
+}
+
+/** 数据目录指针文件：改过数据目录后写在默认位置，下次启动据此定位 */
+export function dataDirPointerFile(): string {
+  const base =
+    process.env.APPDATA ||
+    (process.platform === 'darwin'
+      ? path.join(os.homedir(), 'Library', 'Application Support')
+      : path.join(os.homedir(), '.config'))
+  return path.join(base, 'StarWish', '.datadir')
 }
 
 export function logDir(): string {

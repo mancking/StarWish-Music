@@ -71,25 +71,42 @@ CREATE INDEX IF NOT EXISTS idx_plsong ON playlist_song(playlist_id, pos);
 CREATE INDEX IF NOT EXISTS idx_songs_name ON songs(name);
 `
 
+let sqlJsLoader: (() => Promise<any>) | undefined
+
+/**
+ * 浏览器/WebView 包无法解析 `require('sql.js')`（CJS + wasm）。
+ * 移动端打包通过注入点提供"已初始化的 sql.js 模块"（即 `initSqlJs(opts)` 的
+ * 返回值），桌面行为不变。
+ */
+export function setSqlJsLoader(fn: () => Promise<any>): void {
+  sqlJsLoader = fn
+}
+
 export async function initDb(): Promise<void> {
-  const initSqlJs = require('sql.js')
-  SQL = await initSqlJs({
-    locateFile: (f: string) => {
-      const candidates = [
-        path.join(__dirname, f),
-        path.join(process.cwd(), 'node_modules', 'sql.js', 'dist', f),
-        path.join(process.resourcesPath || '', 'app.asar.unpacked', 'node_modules', 'sql.js', 'dist', f),
-      ]
-      for (const c of candidates) {
-        try {
-          if (fs.existsSync(c)) return c
-        } catch {
-          /* ignore */
+  // 桌面：`require('sql.js')` 返回 initSqlJs 工厂，需要调用一次拿模块。
+  // 移动端：注入点直接返回已初始化模块，SQL 已就绪，直接取用。
+  if (sqlJsLoader) {
+    SQL = await sqlJsLoader()
+  } else {
+    const initSqlJs: any = require('sql.js')
+    SQL = await initSqlJs({
+      locateFile: (f: string) => {
+        const candidates = [
+          path.join(__dirname, f),
+          path.join(process.cwd(), 'node_modules', 'sql.js', 'dist', f),
+          path.join(process.resourcesPath || '', 'app.asar.unpacked', 'node_modules', 'sql.js', 'dist', f),
+        ]
+        for (const c of candidates) {
+          try {
+            if (fs.existsSync(c)) return c
+          } catch {
+            /* ignore */
+          }
         }
-      }
-      return f
-    },
-  })
+        return f
+      },
+    })
+  }
   ensureDir(path.dirname(dbFile()))
   let data: Buffer | undefined
   try {

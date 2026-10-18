@@ -26,6 +26,7 @@ const pic = ref('')
 const desc = ref('')
 const author = ref('')
 const isLocal = ref(false)
+const isPodcast = ref(false)
 
 const renaming = ref(false)
 const renameValue = ref('')
@@ -52,6 +53,15 @@ async function load(): Promise<void> {
       author.value = String(route.params.platform).toUpperCase()
       isLocal.value = false
       if (!r.songs.length) error.value = '该榜单暂时没有数据'
+    } else if (route.name === 'podcast') {
+      isPodcast.value = true
+      isLocal.value = false
+      name.value = (route.query.name as string) || '播客'
+      pic.value = (route.query.pic as string) || ''
+      author.value = (route.query.author as string) || '播客'
+      desc.value = '单集全部在播放器内播放，不会跳转浏览器'
+      const feed = String(route.query.feed || '')
+      songs.value = await call<Song[]>('podcast:episodes', { feed, limit: 100 })
     } else {
       const id = String(route.params.id)
       const src = (route.query.src as string) || ''
@@ -163,8 +173,8 @@ onMounted(() => void load())
         <Cover :src="pic" :alt="name" :size="180" :radius="16" cover="1" class="hero-cover" />
         <div class="hero-info">
           <div class="kicker">
-            <Icon :name="route.name === 'toplist' ? 'gauge' : isLocal ? 'list' : 'cloud'" :size="12" />
-            {{ route.name === 'toplist' ? '排行榜' : isLocal ? '我的歌单' : '平台歌单' }}
+            <Icon :name="route.name === 'toplist' ? 'gauge' : route.name === 'podcast' ? 'microphone' : isLocal ? 'list' : 'cloud'" :size="12" />
+            {{ route.name === 'toplist' ? '排行榜' : route.name === 'podcast' ? '播客' : isLocal ? '我的歌单' : '平台歌单' }}
           </div>
           <div v-if="renaming" class="rename-row">
             <input v-model="renameValue" class="rename-input" maxlength="30" autofocus @keydown.enter="doRename" @keydown.esc="renaming = false" />

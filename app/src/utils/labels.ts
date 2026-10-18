@@ -1,12 +1,15 @@
 import type { Song } from '@shared/types'
 
-/** 界面中不出现任何官方软件名称，统一以「音源」表述 */
+/**
+ * 各音源的显示别名（对齐参考实现的风格）。
+ * 界面中不出现官方软件名称，只保留这一套别名。
+ */
 export const PLATFORM_LABEL: Record<string, string> = {
-  wy: '音源 A',
-  qq: '音源 B',
-  kg: '音源 C',
-  kw: '音源 D',
-  mg: '音源 E',
+  wy: '小芸音乐',
+  qq: '小秋音乐',
+  kg: '小枸音乐',
+  kw: '小蜗音乐',
+  mg: '小蜜音乐',
   bili: '视频源',
 }
 

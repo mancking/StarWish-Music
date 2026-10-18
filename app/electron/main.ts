@@ -2,7 +2,7 @@ import { app, globalShortcut, Menu, nativeImage, nativeTheme, protocol, Tray, di
 import path from 'node:path'
 import fs from 'node:fs'
 import { createLogger, getErrorCount } from './core/log'
-import { setUserDataDir, resourcesDir, userDataDir, ensureDir } from './core/paths'
+import { setUserDataDir, resourcesDir, userDataDir, ensureDir, dataDirPointerFile } from './core/paths'
 import { initDb, closeDb, dbGetSetting, dbSetSetting, getSong } from './core/db'
 import { loadSettings, getSettings, saveSettings } from './core/settings'
 import { initBiliLogin, biliCookie } from './core/bili'
@@ -25,10 +25,18 @@ import {
 const logger = createLogger('main')
 
 // 用户数据统一放在 %APPDATA%/StarWish，卸载时默认保留；不可写时自动降级到临时目录
+// 若用户在设置里改过数据目录，默认位置留有一行指针文件，下次启动据此定位。
 function resolveDataDir(): string {
   const envDir = process.env.STARWISH_USER_DATA
   if (envDir) return envDir
-  const candidates = [path.join(app.getPath('appData'), 'StarWish'), path.join(app.getPath('temp'), 'StarWish')]
+  const candidates: string[] = []
+  try {
+    const ptr = fs.readFileSync(dataDirPointerFile(), 'utf8').trim()
+    if (ptr) candidates.push(ptr)
+  } catch {
+    /* 没有指针文件，走默认位置 */
+  }
+  candidates.push(path.join(app.getPath('appData'), 'StarWish'), path.join(app.getPath('temp'), 'StarWish'))
   for (const dir of candidates) {
     try {
       fs.mkdirSync(dir, { recursive: true })

@@ -17,14 +17,26 @@
     "icon": "node scripts/make-icon.mjs",
     "dist": "npm run build && electron-builder --win portable nsis",
     "dist:portable": "npm run build && electron-builder --win portable",
-    "test:core": "node scripts/test-core.mjs"
+    "test:core": "node scripts/test-core.mjs",
+    "test:paths": "node scripts/paths-check.mjs",
+    "test:playlists": "node scripts/playlists-check.mjs",
+    "test:podcast": "node scripts/podcast-check.mjs",
+    "test:order": "node scripts/pl-order-check.mjs",
+    "test:pl-source": "node scripts/pl-source-check.mjs",
+    "build:mobile": "vite build --config vite.mobile.config.ts && node scripts/copy-wasm.mjs && node scripts/rename-mobile-html.mjs",
+    "mobile:sync": "npm run build:mobile && cap sync android",
+    "dist:android": "npm run build:mobile && cap sync android && cd android && gradlew.bat assembleRelease assembleDebug",
+    "mobile:smoke": "electron --no-sandbox scripts/mobile-smoke.mjs"
   },
   "dependencies": {
+    "@capacitor/android": "^6.2.2",
+    "@capacitor/core": "^6.2.2",
     "music-metadata": "^10.9.1",
     "qrcode": "^1.5.4",
     "sql.js": "^1.13.0"
   },
   "devDependencies": {
+    "@capacitor/cli": "^6.2.2",
     "@types/node": "^22.10.2",
     "@types/qrcode": "^1.5.6",
     "@vitejs/plugin-vue": "^5.2.1",
@@ -53,7 +65,8 @@
       "node_modules/sql.js/dist/sql-wasm.wasm",
       "node_modules/sql.js/dist/sql-wasm.js",
       "package.json",
-      "!**/*.map"
+      "!**/*.map",
+      "!**/node_modules/@capacitor/**"
     ],
     "extraResources": [
       {

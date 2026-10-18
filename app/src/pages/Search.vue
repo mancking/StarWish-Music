@@ -8,6 +8,7 @@ import { call } from '@/api'
 import { usePlayerStore } from '@/stores/player'
 import { useUiStore } from '@/stores/ui'
 import type { Song } from '@shared/types'
+import { platformLabel } from '@/utils/labels'
 
 const route = useRoute()
 const router = useRouter()
@@ -26,9 +27,11 @@ const HOT = ['周杰伦', '林俊杰', '陈奕迅', '五月天', '邓紫棋', '�
 
 const platforms: PlatformOption[] = [
   { key: '', name: '全部音源' },
-  { key: 'wy', name: '音源 A' },
-  { key: 'qq', name: '音源 B' },
-  { key: 'kg', name: '音源 C' },
+  { key: 'wy', name: platformLabel('wy') },
+  { key: 'qq', name: platformLabel('qq') },
+  { key: 'kg', name: platformLabel('kg') },
+  { key: 'kw', name: platformLabel('kw') },
+  { key: 'mg', name: platformLabel('mg') },
 ]
 
 async function search(): Promise<void> {

@@ -1,4 +1,4 @@
-import type { LyricResult, MvItem, PlaylistMeta, Song, ToplistTree } from '../../shared/types'
+import type { LyricResult, MvItem, PlaylistMeta, PlaylistTagGroup, Song, ToplistTree } from '../../shared/types'
 import { parseLyric } from '../../shared/lrc'
 import { createLogger } from './log'
 import { lxHost } from './lx-host'
@@ -10,10 +10,17 @@ import {
   importPlaylistByLink,
   itunesCover,
   kugouPlaylistDetail,
+  kugouPlaylists,
+  kuwoPlaylists,
+  miguPlaylists,
+  neteaseNewPlaylists,
   neteaseNewSongs,
   neteasePlaylistDetail,
   neteasePlaylists,
+  podcastEpisodes,
   qqPlaylistDetail,
+  qqPlaylistTags,
+  qqPlaylists,
   searchBiliVideo,
   searchKugou,
   searchNetease,
@@ -162,6 +169,13 @@ export async function resolveUrl(
   const chain = QUALITY_CHAIN[quality] || ['128k']
   const errors: string[] = []
   const skipPrimary = avoidSources.includes(song.source)
+
+  // 播客单集：RSS 里的 enclosure 就是音频直链，直接用，不参与换源
+  if (song.source === 'podcast') {
+    const direct = String(song.extra?.url || '')
+    if (!direct) throw new Error('该单集没有可播放的音频地址')
+    return { url: direct, quality: '128k', via: '播客直链' }
+  }
 
   if (song.source === 'bili' && !skipPrimary) {
     try {
@@ -402,8 +416,30 @@ export async function getCover(song: Song): Promise<string> {
   return resolveCoverUrl(song)
 }
 
-export async function getPlaylists(cat: string, order: string, page: number): Promise<PlaylistMeta[]> {
+/**
+ * 各音源推荐的歌单列表。
+ * 目前只有网易云（wy）实现分类标签；其他音源走各自的「推荐/最新」通道。
+ */
+export async function getPlaylists(
+  cat: string,
+  order: string,
+  page: number,
+  source = 'wy'
+): Promise<PlaylistMeta[]> {
+  if (source === 'qq') return qqPlaylists(cat, order, page)
+  if (source === 'kg') return kugouPlaylists(cat, order, page)
+  if (source === 'kw') return kuwoPlaylists(cat, order, page)
+  if (source === 'mg') return miguPlaylists(cat, order, page)
+  // wy：「最新」走精品歌单通道（api/playlist/list 上游已忽略 order，只有
+  // highquality/list 能按 createTime 取到较新的列表，见 providers.ts wyPlaylistPage 注释）
+  if (order === 'new') return neteaseNewPlaylists(cat, page)
   return neteasePlaylists(cat, order, page)
+}
+
+/** 歌单分类标签（按音源）；无标签体系的上游返回空数组，由前端隐藏标签入口 */
+export async function getPlaylistTags(source = 'wy'): Promise<PlaylistTagGroup[]> {
+  if (source === 'qq') return qqPlaylistTags()
+  return []
 }
 
 export async function getPlaylistDetail(
@@ -449,4 +485,9 @@ export async function getMvUrl(bvid: string, cid: string) {
 
 export async function itunesFallbackCover(term: string): Promise<string> {
   return itunesCover(term)
+}
+
+/** 播客单集：把 RSS 解析成可播放的 Song[]，交给现有播放器内置播放 */
+export async function getPodcastEpisodes(feed: string, limit = 100): Promise<Song[]> {
+  return podcastEpisodes(feed, limit)
 }

@@ -12,7 +12,9 @@ import {
   getMvUrl,
   getNewSongs,
   getPlaylistDetail,
+  getPlaylistTags,
   getPlaylists,
+  getPodcastEpisodes,
   getToplist,
   getToplistTree,
   importPlaylist,
@@ -49,9 +51,48 @@ import {
 import { biliLogout, biliQrGenerate, biliQrPoll, biliStatus } from './core/bili'
 import { cancelScan, getScanProgress, scanLibrary } from './core/library'
 import { coverCacheSize, clearCoverCache, coverProtocolUrl } from './core/cover'
-import { cacheRootDir, ensureDir, mediaCacheDir, userDataDir } from './core/paths'
+import {
+  cacheRootDir,
+  coverCacheDir,
+  dataDirPointerFile,
+  ensureDir,
+  logDir,
+  mediaCacheDir,
+  userDataDir,
+} from './core/paths'
 
 const logger = createLogger('ipc')
+
+/** 把 from 里的文件搬进 to（同名跳过），跨盘失败时退化为复制后删除 */
+function moveDirContents(from: string, to: string): void {
+  if (!fs.existsSync(from)) return
+  ensureDir(to)
+  for (const f of fs.readdirSync(from)) {
+    const src = path.join(from, f)
+    const dst = path.join(to, f)
+    if (fs.existsSync(dst)) continue
+    try {
+      fs.renameSync(src, dst)
+    } catch {
+      try {
+        fs.copyFileSync(src, dst)
+        fs.unlinkSync(src)
+      } catch {
+        /* 单个文件迁移失败忽略 */
+      }
+    }
+  }
+}
+
+function statSize(p: string): number {
+  try {
+    const st = fs.statSync(p)
+    if (!st.isDirectory()) return st.size
+    return fs.readdirSync(p).reduce((sum, f) => sum + statSize(path.join(p, f)), 0)
+  } catch {
+    return 0
+  }
+}
 
 /** 把远端封面统一转换为本地协议地址，规避防盗链与跨域问题 */
 function dec(song: Song): Song {
@@ -116,6 +157,11 @@ const handlers: Record<string, Handler> = {
     app.quit()
     return true
   },
+  'app:relaunch': () => {
+    app.relaunch()
+    app.exit(0)
+    return true
+  },
   'app:openExternal': async ({ url }: { url: string }) => {
     if (!/^https?:\/\//i.test(String(url || ''))) throw new Error('仅支持打开 http(s) 链接')
     await shell.openExternal(url)
@@ -123,10 +169,6 @@ const handlers: Record<string, Handler> = {
   },
   'app:showItemInFolder': ({ path: p }: { path: string }) => {
     shell.showItemInFolder(p)
-    return true
-  },
-  'app:openUserData': async () => {
-    await shell.openPath(userDataDir())
     return true
   },
 
@@ -199,9 +241,14 @@ const handlers: Record<string, Handler> = {
     return resolveUrl(song, quality || getSettings().quality, getSettings().autoSwitchSource)
   },
   'music:cover': ({ song }: { song: Song }) => getCover(song),
-  'music:playlists': async ({ cat, order, page }: any) => {
-    const list = await getPlaylists(cat || '全部', order || 'hot', page || 1)
+  'podcast:episodes': async ({ feed, limit }: { feed: string; limit?: number }) =>
+    decList(await getPodcastEpisodes(feed, limit || 100)),
+  'music:playlists': async ({ cat, order, page, source }: any) => {
+    const list = await getPlaylists(cat || '全部', order || 'hot', page || 1, source || 'wy')
     return list.map(p => ({ ...p, pic: decPic(p.pic) }))
+  },
+  'music:playlistTags': async ({ source }: any) => {
+    return getPlaylistTags(source || 'wy')
   },
   'music:playlist': async ({ id, source }: any) => {
     const r = await getPlaylistDetail(id, source || 'wy')
@@ -441,9 +488,10 @@ const handlers: Record<string, Handler> = {
   'cache:size': () => {
     let media = 0
     try {
-      media = fs.readdirSync(mediaCacheDir()).reduce((sum, f) => {
+      const dir = mediaCacheDir()
+      media = fs.readdirSync(dir).reduce((sum, f) => {
         try {
-          return sum + fs.statSync(path.join(mediaCacheDir(), f)).size
+          return sum + fs.statSync(path.join(dir, f)).size
         } catch {
           return sum
         }
@@ -451,64 +499,141 @@ const handlers: Record<string, Handler> = {
     } catch {
       media = 0
     }
-    return { cover: coverCacheSize(), media, total: coverCacheSize() + media }
+    const cover = coverCacheSize()
+    return { cover, media, total: cover + media }
   },
-  'cache:pickDir': async () => {
+  'cache:pickDir': async ({ title }: any = {}) => {
     const r = await dialog.showOpenDialog(wins.main!, {
-      title: '选择缓存目录',
+      title: String(title || '选择缓存目录'),
       properties: ['openDirectory', 'createDirectory'],
     })
     if (r.canceled || !r.filePaths[0]) return ''
     return r.filePaths[0]
   },
-  'cache:setDir': ({ dir }: any) => {
+  // kind: cache | cover | media —— 三类目录各自可改，均把旧内容搬到新位置
+  'cache:setDir': ({ dir, kind = 'cache' }: any) => {
     const target = String(dir || '').trim()
-    const oldRoot = cacheRootDir()
-    const s = saveSettings({ cacheDir: target })
-    const newRoot = cacheRootDir()
-    if (target && oldRoot !== newRoot) {
+    const key = kind === 'cover' ? 'coverDir' : kind === 'media' ? 'mediaDir' : 'cacheDir'
+    const resolve = (): string =>
+      kind === 'cover' ? coverCacheDir() : kind === 'media' ? mediaCacheDir() : cacheRootDir()
+    const oldDir = resolve()
+    const s = saveSettings({ [key]: target } as Partial<AppSettings>)
+    const newDir = resolve()
+    if (target && oldDir !== newDir) {
       try {
-        ensureDir(newRoot)
-        for (const sub of ['covers', 'media']) {
-          const from = path.join(oldRoot, sub)
-          const to = path.join(newRoot, sub)
-          ensureDir(to)
-          if (!fs.existsSync(from)) continue
-          for (const f of fs.readdirSync(from)) {
-            const src = path.join(from, f)
-            const dst = path.join(to, f)
-            if (fs.existsSync(dst)) continue
-            try {
-              fs.renameSync(src, dst)
-            } catch {
-              try {
-                fs.copyFileSync(src, dst)
-                fs.unlinkSync(src)
-              } catch {
-                /* 单个文件迁移失败忽略 */
-              }
-            }
-          }
+        ensureDir(newDir)
+        if (kind === 'cache') {
+          for (const sub of ['covers', 'media']) moveDirContents(path.join(oldDir, sub), path.join(newDir, sub))
+        } else {
+          moveDirContents(oldDir, newDir)
         }
       } catch (e: any) {
         logger.warn('缓存迁移失败', e?.message)
       }
     }
     broadcast('settings:changed', s)
-    return { settings: s, dir: newRoot, size: coverCacheSize() }
+    return { settings: s, dir: newDir, size: coverCacheSize() }
   },
-  'cache:openDir': async () => {
-    await shell.openPath(cacheRootDir())
+  'cache:openDir': async ({ kind }: any = {}) => {
+    await shell.openPath(kind === 'cover' ? coverCacheDir() : kind === 'media' ? mediaCacheDir() : cacheRootDir())
     return true
   },
-  'cache:clear': () => {
-    clearCoverCache()
-    try {
-      for (const f of fs.readdirSync(mediaCacheDir())) fs.unlinkSync(path.join(mediaCacheDir(), f))
-    } catch {
-      /* ignore */
+  // scope: cover | media | all
+  'cache:clear': ({ scope = 'all' }: any = {}) => {
+    if (scope === 'all' || scope === 'cover') clearCoverCache()
+    if (scope === 'all' || scope === 'media') {
+      try {
+        const dir = mediaCacheDir()
+        for (const f of fs.readdirSync(dir)) fs.unlinkSync(path.join(dir, f))
+      } catch {
+        /* ignore */
+      }
     }
-    return { cover: 0, media: 0, total: 0 }
+    let media = 0
+    try {
+      const dir = mediaCacheDir()
+      media = fs.readdirSync(dir).reduce((sum, f) => {
+        try {
+          return sum + fs.statSync(path.join(dir, f)).size
+        } catch {
+          return sum
+        }
+      }, 0)
+    } catch {
+      media = 0
+    }
+    const cover = coverCacheSize()
+    return { cover, media, total: cover + media }
+  },
+
+  /* ---------------- 数据目录 ---------------- */
+  'data:setDir': ({ dir }: any) => {
+    const target = String(dir || '').trim()
+    const oldDir = userDataDir()
+    if (target && path.resolve(target) === path.resolve(oldDir)) {
+      return { dir: oldDir, restart: false }
+    }
+    if (target) {
+      ensureDir(target)
+      // 只搬走不可再生的用户数据；缓存与日志迁移后自动重建，不搬
+      for (const item of ['starwish.db', 'settings.json', 'bili-login.json']) {
+        const from = path.join(oldDir, item)
+        if (!fs.existsSync(from)) continue
+        const to = path.join(target, item)
+        try {
+          fs.copyFileSync(from, to)
+        } catch (e: any) {
+          logger.warn('数据目录迁移失败', item, e?.message)
+          throw new Error(`数据目录迁移失败：${item} 无法写入，请换一个目录`)
+        }
+      }
+      try {
+        fs.cpSync(path.join(oldDir, 'sources'), path.join(target, 'sources'), { recursive: true })
+      } catch {
+        /* 音源目录缺失时忽略 */
+      }
+      saveSettings({ dataDir: target } as Partial<AppSettings>)
+      try {
+        fs.writeFileSync(dataDirPointerFile(), target, 'utf8')
+      } catch (e: any) {
+        logger.warn('数据目录指针写入失败', e?.message)
+        throw new Error('无法记录新的数据目录，请换一个目录重试')
+      }
+    } else {
+      saveSettings({ dataDir: '' } as Partial<AppSettings>)
+      try {
+        fs.unlinkSync(dataDirPointerFile())
+      } catch {
+        /* 指针本就不存在 */
+      }
+    }
+    broadcast('settings:changed', getSettings())
+    return { dir: target || path.join(app.getPath('appData'), 'StarWish'), restart: true }
+  },
+  'data:openDir': async () => {
+    await shell.openPath(userDataDir())
+    return true
+  },
+  // 清理数据目录中可再生部分：缓存、日志、临时文件；数据库 / 设置 / 登录态 / 音源一律不动
+  'data:clear': () => {
+    clearCoverCache()
+    let freed = 0
+    for (const dir of [mediaCacheDir(), logDir(), path.join(userDataDir(), 'temp')]) {
+      try {
+        for (const f of fs.readdirSync(dir)) {
+          const p = path.join(dir, f)
+          try {
+            freed += statSize(p)
+            fs.rmSync(p, { recursive: true, force: true })
+          } catch {
+            /* 文件被占用时跳过 */
+          }
+        }
+      } catch {
+        /* 目录不存在 */
+      }
+    }
+    return { freed }
   },
 }
 

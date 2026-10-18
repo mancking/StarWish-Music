@@ -71,6 +71,10 @@ export async function request(url: string, opts: RequestOptions = {}): Promise<H
       res.headers.forEach((v, k) => {
         h[k.toLowerCase()] = v
       })
+      // fetch 的 Headers.forEach 把多条 Set-Cookie 折叠成一条且会丢掉第一条（实测只剩 DedeUserID，
+      // SESSDATA 消失），导致 B 站扫码登录拿不到登录态。用 getSetCookie() 取全量。
+      const setCookies = typeof (res.headers as any).getSetCookie === 'function' ? (res.headers as any).getSetCookie() : []
+      if (Array.isArray(setCookies) && setCookies.length) h['set-cookie'] = setCookies.join(';;')
       if (opts.binary) {
         const buf = Buffer.from(await res.arrayBuffer())
         return { status: res.status, headers: h, raw: buf.toString('latin1'), body: null, bytes: buf }

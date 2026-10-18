@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import Icon from '@/components/Icon.vue'
 import SongList from '@/components/SongList.vue'
@@ -8,7 +8,7 @@ import PlatformSelect, { type PlatformOption } from '@/components/PlatformSelect
 import { call } from '@/api'
 import { usePlayerStore } from '@/stores/player'
 import { useUiStore } from '@/stores/ui'
-import type { PlaylistMeta, Song, ToplistTree } from '@shared/types'
+import type { PlaylistMeta, PlaylistTagGroup, Song, ToplistTree } from '@shared/types'
 import { platformLabel } from '@/utils/labels'
 
 const route = useRoute()
@@ -23,8 +23,13 @@ const order = ref<'hot' | 'new'>('hot')
 
 const playlists = ref<PlaylistMeta[]>([])
 const plLoading = ref(false)
+/** 当前页；上游接口无总数，故只给「首页/上一页/下一页」，页数由访问过的最大页推导 */
 const plPage = ref(1)
-const plEnd = ref(false)
+const plFurthest = ref(1)
+/** 最大已访问页是否还有下一页（返回满 30 条即认为有） */
+const plHasNext = ref(true)
+const plCanPrev = computed(() => plPage.value > 1)
+const plCanNext = computed(() => plPage.value < plFurthest.value || plHasNext.value)
 
 const tree = ref<ToplistTree | null>(null)
 const treeLoading = ref(true)
@@ -46,38 +51,121 @@ const tlTotalPages = computed(() => Math.max(1, Math.ceil(toplistSongs.value.len
 const newSongs = ref<Song[]>([])
 const newLoading = ref(true)
 
-/** 歌单标签：按分组组织，与参考样式一致 */
-const TAG_GROUPS: { name: string; tags: string[] }[] = [
+/** 歌单标签：按分组组织，与参考样式一致。切换音源后由 music:playlistTags 重新填充 */
+const TAG_GROUPS = ref<PlaylistTagGroup[]>([])
+const DEFAULT_PL_TAGS = [
   { name: '热门标签', tags: ['全部', '流行', '摇滚', '民谣', '电子', '说唱', '轻音乐', '爵士', '古典', '乡村'] },
   { name: '专区', tags: ['影视原声', 'ACG', '怀旧', '儿童', '校园', '游戏', 'KTV', 'DJ', '器乐', '新世纪'] },
   { name: '主题', tags: ['伤感', '治愈', '励志', '甜蜜', '兴奋', '安静', '思念', '怀旧金曲', '翻唱', '现场'] },
   { name: '心情', tags: ['运动', '夜晚', '学习', '浪漫', '减压', '通勤', '派对', '咖啡', '驾车', '午后'] },
 ]
-const TAGS = TAG_GROUPS.flatMap(g => g.tags)
+/** 网易云无标签接口，用内置分组（标签即 name 本身） */
+TAG_GROUPS.value = DEFAULT_PL_TAGS.map(g => ({
+  name: g.name,
+  tags: g.tags.map(t => ({ n: t, id: t })),
+}))
+
+/** 落雪式折叠标签弹层（TagList）：点触发器展开，点外部 / Esc 收起 */
+const tagOpen = ref(false)
+const tagPopupWidth = ref(645)
+/** 该音源是否有标签体系（酷我/酷狗/咪咕无分类标签，隐藏入口） */
+const tagSupported = ref(true)
+
+function toggleTags(): void {
+  tagOpen.value = !tagOpen.value
+}
+
+function closeTags(): void {
+  tagOpen.value = false
+}
+
+function syncTagPopupWidth(): void {
+  const host = document.querySelector('.content') as HTMLElement | null
+  tagPopupWidth.value = (host?.clientWidth || window.innerWidth) * 0.96
+}
+
+function onDocClick(e: MouseEvent): void {
+  if (!tagOpen.value) return
+  const el = e.target as HTMLElement | null
+  if (el?.closest('.tag-select')) return
+  closeTags()
+}
+
+function onDocKey(e: KeyboardEvent): void {
+  if (e.key === 'Escape') closeTags()
+}
 
 const platforms = computed<PlatformOption[]>(() => {
   if (!tree.value) return []
   return Object.keys(tree.value.tree).map(k => ({ key: k, name: platformLabel(k) }))
 })
 
+/** 歌单页的音源下拉：与排行榜同一套别名（小芸/小秋/小枸/小蜗/小蜜） */
+const PL_SOURCES: PlatformOption[] = [
+  { key: 'wy', name: platformLabel('wy') },
+  { key: 'qq', name: platformLabel('qq') },
+  { key: 'kg', name: platformLabel('kg') },
+  { key: 'kw', name: platformLabel('kw') },
+  { key: 'mg', name: platformLabel('mg') },
+]
+const plSource = ref('wy')
+
+/** 切换音源：重置标签与分页，必要时重新拉分类标签 */
+async function changePlSource(s: string): Promise<void> {
+  if (plSource.value === s) return
+  plSource.value = s
+  plPage.value = 1
+  plFurthest.value = 1
+  plHasNext.value = true
+  cat.value = '全部'
+  tagOpen.value = false
+  try {
+    const gs = await call<PlaylistTagGroup[]>('music:playlistTags', { source: s })
+    if (gs.length) {
+      // 新源的标签整体替换（标签名即 id 的场景由后端提供）
+      TAG_GROUPS.value = gs
+      tagSupported.value = true
+    } else {
+      TAG_GROUPS.value = []
+      tagSupported.value = false
+    }
+  } catch {
+    TAG_GROUPS.value = []
+    tagSupported.value = false
+  }
+  void loadPlaylists(1)
+}
+
 const groups = computed(() => tree.value?.tree[platform.value]?.groups || [])
 
-async function loadPlaylists(reset = false): Promise<void> {
+const plError = ref('')
+
+/**
+ * 加载某一页（落雪式真分页，替换原先的「加载更多」无限累加）。
+ * 上游按页返回 30 条，不提供总数，故满页即认为还有下一页。
+ * 「最新」走精品歌单通道（无总数、用 lasttime 游标翻页），冷门标签可能不足 30 条。
+ */
+async function loadPlaylists(page = 1): Promise<void> {
   if (plLoading.value) return
-  if (reset) {
-    plPage.value = 1
-    plEnd.value = false
-    playlists.value = []
-  }
   plLoading.value = true
+  plError.value = ''
   try {
-    const list = await call<PlaylistMeta[]>('music:playlists', { cat: cat.value, order: order.value, page: plPage.value })
-    playlists.value = reset ? list : [...playlists.value, ...list]
-    if (list.length < 30) plEnd.value = true
-    plPage.value++
+    const list = await call<PlaylistMeta[]>('music:playlists', {
+      cat: cat.value,
+      order: order.value,
+      page,
+      source: plSource.value,
+    })
+    playlists.value = list
+    plPage.value = page
+    if (page > plFurthest.value) plFurthest.value = page
+    plHasNext.value = list.length >= 30
+    if (!list.length) plError.value = '该标签暂无歌单，换个标签试试'
+    window.scrollTo({ top: 0, behavior: 'smooth' })
   } catch (e: any) {
+    playlists.value = []
+    plError.value = e?.message || '歌单加载失败'
     ui.toast(`歌单加载失败：${e.message}`, 'error')
-    plEnd.value = true
   } finally {
     plLoading.value = false
   }
@@ -164,9 +252,22 @@ function setTab(t: Tab): void {
 }
 
 function selectCat(c: string): void {
+  closeTags()
+  if (cat.value === c) return
   cat.value = c
   router.replace({ path: '/discover', query: { ...route.query, tab: 'playlists', cat: c } })
-  void loadPlaylists(true)
+  void loadPlaylists(1)
+}
+
+function setOrder(o: 'hot' | 'new'): void {
+  if (order.value === o) return
+  order.value = o
+  void loadPlaylists(1)
+}
+
+function goPage(p: number): void {
+  if (p < 1 || p > plFurthest.value + 1 || p === plPage.value) return
+  void loadPlaylists(p)
 }
 
 watch(
@@ -175,15 +276,25 @@ watch(
     if (q.tab && q.tab !== tab.value) tab.value = q.tab as Tab
     if (typeof q.cat === 'string' && q.cat !== cat.value) {
       cat.value = q.cat
-      if (tab.value === 'playlists') void loadPlaylists(true)
+      if (tab.value === 'playlists') void loadPlaylists(1)
     }
   }
 )
 
 onMounted(() => {
-  void loadPlaylists(true)
+  void loadPlaylists(1)
   void loadTree()
   void loadNew()
+  syncTagPopupWidth()
+  window.addEventListener('resize', syncTagPopupWidth)
+  document.addEventListener('click', onDocClick)
+  document.addEventListener('keydown', onDocKey)
+})
+
+onBeforeUnmount(() => {
+  window.removeEventListener('resize', syncTagPopupWidth)
+  document.removeEventListener('click', onDocClick)
+  document.removeEventListener('keydown', onDocKey)
 })
 </script>
 
@@ -194,7 +305,6 @@ onMounted(() => {
         <h1>发现音乐</h1>
         <p>歌单、榜单、新歌，一站听遍全平台</p>
       </div>
-      <button class="btn" @click="ui.importDialog = true"><Icon name="download" :size="15" />导入平台歌单</button>
     </header>
 
     <div class="tabs">
@@ -211,50 +321,66 @@ onMounted(() => {
 
     <!-- 歌单 -->
     <section v-if="tab === 'playlists'" class="pane">
-      <div class="filter-bar">
-        <div class="tags-scroll">
-          <div v-for="g in TAG_GROUPS" :key="g.name" class="tag-group">
-            <div class="tag-group-name">{{ g.name }}</div>
-            <div class="tags">
-              <button
-                v-for="t in g.tags"
-                :key="t"
-                class="chip"
-                :class="{ active: cat === t }"
-                @click="selectCat(t)"
-              >{{ t }}</button>
+      <!-- 落雪式单行页头：折叠标签 + 音源 + 排序 + 导入 -->
+      <div class="sl-header">
+        <div class="sl-left">
+          <div v-if="tagSupported" class="tag-select" :class="{ active: tagOpen }">
+            <div class="tag-label" @click.stop="toggleTags">
+              <span>{{ cat }}</span>
+              <Icon name="chevron-down" :size="13" class="tag-arrow" />
+            </div>
+            <div class="tag-popup" :style="{ width: tagPopupWidth + 'px' }">
+              <dl v-for="g in TAG_GROUPS" :key="g.name">
+                <dt class="tag-type">{{ g.name }}</dt>
+                <dd>
+                  <span
+                    v-for="t in g.tags"
+                    :key="t.id"
+                    class="tag"
+                    :class="{ active: cat === t.n }"
+                    @click.stop="selectCat(t.n)"
+                  >{{ t.n }}</span>
+                </dd>
+              </dl>
             </div>
           </div>
+          <PlatformSelect v-model="plSource" :options="PL_SOURCES" label="" align="left" @update:model-value="changePlSource" />
+          <div class="sort-tabs">
+            <button class="sort-item" :class="{ active: order === 'hot' }" @click="setOrder('hot')">最热</button>
+            <button class="sort-item" :class="{ active: order === 'new' }" @click="setOrder('new')">最新</button>
+          </div>
         </div>
-        <div class="sorts">
-          <button class="chip" :class="{ active: order === 'hot' }" @click="order = 'hot'; loadPlaylists(true)">最热</button>
-          <button class="chip" :class="{ active: order === 'new' }" @click="order = 'new'; loadPlaylists(true)">最新</button>
-        </div>
+        <button class="btn" @click="ui.importDialog = true"><Icon name="download" :size="15" />导入歌单</button>
       </div>
 
       <div v-if="playlists.length" class="pl-grid">
         <PlaylistCard
           v-for="pl in playlists"
           :key="pl.id"
+          layout="row"
           :playlist="pl"
           @open="openPlaylist(pl)"
           @play="playPlaylist(pl)"
         />
       </div>
       <div v-else-if="plLoading" class="pl-grid">
-        <div v-for="i in 10" :key="i" class="sk" style="aspect-ratio: 1; border-radius: 12px" />
+        <div v-for="i in 9" :key="i" class="sk" style="height: 108px; border-radius: 12px" />
       </div>
       <div v-else class="empty">
         <Icon name="list" :size="32" :stroke="1.3" />
         <div class="empty-title">没有找到歌单</div>
-        <div class="empty-desc">换个标签试试，或检查网络连接</div>
+        <div class="empty-desc">{{ plError || '换个标签试试，或检查网络连接' }}</div>
       </div>
 
-      <div v-if="playlists.length" class="load-more">
-        <button class="btn" :disabled="plEnd || plLoading" @click="loadPlaylists(false)">
-          {{ plEnd ? '已经到底啦' : plLoading ? '加载中…' : '加载更多' }}
+      <nav v-if="playlists.length" class="pagination" aria-label="分页">
+        <button class="pg-btn" :disabled="!plCanPrev || plLoading" @click="goPage(plPage - 1)" title="上一页">
+          <Icon name="chevron-left" :size="13" />上一页
         </button>
-      </div>
+        <span class="pg-num active">第 {{ plPage }} 页</span>
+        <button class="pg-btn" :disabled="!plCanNext || plLoading" @click="goPage(plPage + 1)" title="下一页">
+          下一页<Icon name="chevron-right" :size="13" />
+        </button>
+      </nav>
     </section>
 
     <!-- 榜单 -->
@@ -267,6 +393,7 @@ onMounted(() => {
           v-model="platform"
           :options="platforms"
           align="right"
+          @update:model-value="changePlatform"
         />
       </div>
 
@@ -283,10 +410,17 @@ onMounted(() => {
                 :key="item.n + (item.id || '')"
                 class="tl-item"
                 :class="{ active: currentItem?.id === item.id && currentItem?.name === item.n }"
+                :aria-label="item.n"
                 :disabled="!item.id"
                 @click="item.id && selectToplist(item.n, item.id)"
               >
-                <span class="ellipsis">{{ item.n }}</span>
+                <Icon
+                  v-if="item.id && currentItem?.id === item.id && currentItem?.name === item.n"
+                  name="chevron-right"
+                  :size="12"
+                  class="tl-active-icon"
+                />
+                <span class="ellipsis tl-item-text">{{ item.n }}</span>
                 <Icon v-if="!item.id" name="lock" :size="11" class="lock" />
               </button>
             </div>
@@ -407,57 +541,133 @@ onMounted(() => {
   border-radius: 2px;
   background: var(--accent);
 }
-.filter-bar {
+/* 落雪式单行页头：折叠标签 + 排序 + 导入按钮同排 */
+.sl-header {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
-  gap: 16px;
-  margin-bottom: 16px;
+  gap: 14px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 18px;
 }
-.tags-scroll {
-  flex: 1;
+.sl-left {
   display: flex;
-  flex-direction: column;
-  gap: 8px;
-  max-height: 220px;
-  overflow-y: auto;
-  padding: 4px 4px 4px 0;
-}
-.tag-group {
-  display: flex;
-  align-items: flex-start;
+  align-items: center;
   gap: 10px;
-  min-height: 26px;
+  min-width: 0;
 }
-.tag-group-name {
-  font-size: 10.5px;
+.tag-select {
+  position: relative;
+}
+.tag-label {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  height: 34px;
+  padding: 0 14px;
+  border-radius: 8px;
+  font-size: 13px;
+  color: var(--text-2);
+  cursor: pointer;
+  user-select: none;
+  transition: background 0.18s var(--ease), color 0.18s var(--ease);
+}
+.tag-label:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+.tag-arrow {
+  transition: transform 0.2s var(--ease);
+}
+.tag-select.active .tag-label {
+  color: var(--text);
+  background: var(--hover);
+}
+.tag-select.active .tag-arrow {
+  transform: rotate(180deg);
+}
+.tag-popup {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  margin-top: 10px;
+  max-height: 250px;
+  overflow-y: auto;
+  padding: 10px;
+  border-radius: 8px;
+  /* 浮层要实底：--panel 是半透明色，下层歌单文字会透上来与标签叠在一起 */
+  background: var(--bg-2);
+  border: 1px solid var(--line-2);
+  box-shadow: 0 18px 40px -20px rgba(0, 0, 0, 0.75);
+  opacity: 0;
+  transform: scale(0.95, 0.8);
+  transform-origin: 0 0 0;
+  transition: 0.25s ease;
+  pointer-events: none;
+  z-index: 30;
+}
+.tag-select.active .tag-popup {
+  opacity: 1;
+  transform: scale(1);
+  pointer-events: initial;
+}
+.tag-popup dl {
+  margin: 0;
+}
+.tag-type {
+  padding-top: 10px;
+  padding-bottom: 3px;
+  font-size: 11px;
   color: var(--text-3);
-  letter-spacing: 1px;
-  width: 56px;
-  flex: none;
-  padding-top: 6px;
-  text-transform: uppercase;
+  letter-spacing: 0.5px;
 }
-.tag-group .tags {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  flex: 1;
+.tag {
+  display: inline-block;
+  margin: 5px;
+  padding: 7px 11px;
+  border-radius: 6px;
+  font-size: 12.5px;
+  color: var(--text-2);
+  background: var(--panel-2);
+  cursor: pointer;
+  transition: background 0.15s var(--ease), color 0.15s var(--ease);
 }
-.sorts {
+.tag:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+.tag.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 500;
+}
+.sort-tabs {
   display: flex;
-  gap: 6px;
+  gap: 2px;
   flex: none;
+}
+.sort-item {
+  height: 34px;
+  padding: 0 13px;
+  border-radius: 8px;
+  font-size: 13px;
+  color: var(--text-2);
+  transition: background 0.15s var(--ease), color 0.15s var(--ease);
+}
+.sort-item:hover {
+  color: var(--text);
+  background: var(--hover);
+}
+.sort-item.active {
+  color: var(--accent);
+  background: var(--accent-soft);
+  font-weight: 500;
 }
 .pl-grid {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 20px 18px;
-}
-.load-more {
-  display: flex;
-  justify-content: center;
-  margin-top: 26px;
 }
 .platform-tabs {
   display: flex;
@@ -523,18 +733,23 @@ onMounted(() => {
 .tl-item {
   display: flex;
   align-items: center;
-  justify-content: space-between;
   gap: 6px;
   width: 100%;
-  height: 30px;
-  padding: 0 9px;
+  height: 36px;
+  padding: 0 10px;
   border-radius: 8px;
-  font-size: 12px;
+  font-size: 13px;
   color: var(--text-2);
   text-align: left;
 }
-.tl-item span {
+.tl-item-text {
   flex: 1;
+  min-width: 0;
+}
+.tl-active-icon {
+  flex: none;
+  margin-left: -6px;
+  color: inherit;
 }
 .tl-item:hover:not(:disabled) {
   background: var(--hover);
@@ -573,20 +788,23 @@ onMounted(() => {
   gap: 4px;
   margin: 18px 0 4px;
 }
-.pg-btn,
-.pg-num {
+.pg-btn {
   display: inline-flex;
   align-items: center;
+  gap: 4px;
   justify-content: center;
   min-width: 30px;
   height: 30px;
-  padding: 0 8px;
+  padding: 0 12px;
   border-radius: 7px;
   font-size: 12px;
   color: var(--text-2);
   background: var(--panel);
   border: 1px solid transparent;
   transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+.pg-num {
+  padding: 0 6px;
 }
 .pg-btn:hover:not(:disabled),
 .pg-num:hover:not(.active) {
@@ -606,7 +824,7 @@ onMounted(() => {
 }
 @media (max-width: 1300px) {
   .pl-grid {
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
 </style>

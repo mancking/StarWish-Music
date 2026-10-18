@@ -10,6 +10,8 @@ release/
 !星河音乐-2.0.0-portable.exe
 !星河音乐-2.0.0-Setup.exe
 !星河音乐-2.0.0.exe
+!星河音乐-2.0.0-android.apk
+!星河音乐-2.0.0-android-debug.apk
 
 # 本地数据与测试产物
 .smoke-data/
@@ -77,11 +79,37 @@ app/verify-final-state.json
 # 本地诊断产物
 _probe/
 
+# Android / Capacitor 工程：源码入库，构建产物不入库
+app/android/.gradle/
+app/android/app/build/
+app/android/build/
+app/android/local.properties
+app/android/.idea/
+app/android/captures/
+app/android/app/starwish-release.keystore
+app/android/app/src/main/assets/public/
+
+# 移动 WebView 打包产物（dist/mobile 由 npm run build:mobile 生成）
+app/dist/mobile/
+
+# bili 二维码登录缓存（含 bvid，不入库）
+bili-login.json
+
 # 本地诊断脚本
 app/scripts/cdp-*.mjs
 app/scripts/feature-check.cjs
 app/scripts/mv-*.cjs
 app/scripts/ui-shots.cjs
+app/scripts/browser-bundle-probe.mjs
+
+# 一次性探针与调试输出（点前缀的 .xxx-err/.xxx-log 等）
+app/probe-*
+app/.*-err.txt
+app/.*-out.txt
+app/.*-log*.txt
+app/.qq-portal.html
+app/.plui-log.txt
+gradle-fail.txt
 
 # 本次会话的临时压缩包
 V261017.zip

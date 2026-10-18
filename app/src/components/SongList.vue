@@ -9,6 +9,7 @@ import type { MenuItem } from './menu-types'
 import { usePlayerStore } from '@/stores/player'
 import { useLibraryStore } from '@/stores/library'
 import { useUiStore } from '@/stores/ui'
+import { platformLabel } from '@/utils/labels'
 
 const props = withDefaults(
   defineProps<{
@@ -90,6 +91,13 @@ function qualityTag(s: Song): string {
   return ''
 }
 
+function platformTag(s: Song): string {
+  if (!s.source) return ''
+  if (s.source === 'local') return '本地'
+  if (s.source === 'bili') return '视频'
+  return platformLabel(s.source)
+}
+
 function albumOf(s: Song): string {
   return s.album || (s.localPath ? '本地文件' : '')
 }
@@ -145,6 +153,7 @@ function albumOf(s: Song): string {
           <span class="name-text">
             <span class="title-line">
               <span class="title ellipsis">{{ s.name }}</span>
+              <span v-if="platformTag(s)" class="tag src-tag">{{ platformTag(s) }}</span>
               <span v-if="qualityTag(s)" class="tag" :class="{ quality: qualityTag(s) === '24bit' }">{{ qualityTag(s) }}</span>
             </span>
             <span class="sub ellipsis">{{ s.singer }}</span>
@@ -304,6 +313,11 @@ function albumOf(s: Song): string {
 .tag.quality {
   color: #f0b429;
   border-color: rgba(240, 180, 41, 0.32);
+}
+.src-tag {
+  color: var(--text-2);
+  border-color: var(--line-2);
+  background: var(--bg-2);
 }
 .col-album {
   font-size: 12px;

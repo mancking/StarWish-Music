@@ -29,6 +29,8 @@ export interface PlaylistMeta {
   played?: number
   tags?: string[]
   source?: string
+  /** 创建时间戳（ms）；用于「最新」排序，上游缺失时为 0 */
+  created?: number
   /** 本地歌单为 local */
   kind?: 'local' | 'remote'
 }
@@ -107,6 +109,12 @@ export interface AppSettings {
   cacheLimitMB: number
   /** 自定义缓存目录，空字符串表示使用默认目录 */
   cacheDir: string
+  /** 封面缓存目录，空字符串表示跟随缓存目录 */
+  coverDir: string
+  /** 媒体缓存目录，空字符串表示跟随缓存目录 */
+  mediaDir: string
+  /** 自定义数据目录（数据库/设置/音源），空字符串表示默认 %APPDATA%\StarWish，重启生效 */
+  dataDir: string
   closeToTray: boolean
   minimizeToTray: boolean
   autoPlay: boolean
@@ -137,6 +145,17 @@ export interface ToplistGroup {
 export interface ToplistTree {
   total: number
   tree: Record<string, { name: string; groups: ToplistGroup[] }>
+}
+
+/** 歌单分类标签分组 */
+export interface PlaylistTagItem {
+  n: string
+  id: string
+}
+
+export interface PlaylistTagGroup {
+  name: string
+  tags: PlaylistTagItem[]
 }
 
 export interface MvItem {
