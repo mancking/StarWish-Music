@@ -3,7 +3,8 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
-    <!-- ponytail: 移动端走 VFS/sql.js/IndexedDB + 普通 https 直连，不需要 swcover:/swmedia: -->
+    <!-- 移动媒体走相对路径 /swmedia/（同源 'self'，原生 SwMediaClient 拦截代理），
+         普通 https 数据请求走 CapacitorHttp（原生库，无 CORS）；data:/blob: 覆盖封面与内联媒体 -->
     <meta
       http-equiv="Content-Security-Policy"
       content="default-src 'self'; img-src 'self' data: blob: https:; media-src 'self' data: blob: https:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval'; font-src 'self' data:; connect-src 'self' data: blob: https:"

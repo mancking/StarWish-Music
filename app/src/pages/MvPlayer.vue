@@ -46,7 +46,14 @@ const related = ref<MvItem[]>([])
 const videoEl = ref<HTMLVideoElement | null>(null)
 
 const poster = computed(() => info.value?.pic || '')
-const videoSrc = computed(() => (videoUrl.value ? `swmedia://stream/?u=${encodeURIComponent(videoUrl.value)}` : ''))
+const videoSrc = computed(() => {
+  if (!videoUrl.value) return ''
+  const u = encodeURIComponent(videoUrl.value)
+  // 真机走原生 /swmedia/ 代理（MainActivity 的 SwMediaClient 拦截，注入防盗链头），
+  // 桌面 Electron 走主进程 swmedia:// 协议（media.ts）
+  const native = (globalThis as any).Capacitor?.isNativePlatform?.() === true
+  return native ? `/swmedia/?u=${u}` : `swmedia://stream/?u=${u}`
+})
 const hasParts = computed(() => parts.value.length > 1)
 const forceLoad = ref(false)
 /** 超长分P（整场合集）体积可能数 GB，直接加载会长时间卡住，先提示用户选集 */

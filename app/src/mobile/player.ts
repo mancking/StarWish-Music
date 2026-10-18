@@ -14,6 +14,7 @@ import { resolveUrl } from '../../electron/core/music-service'
 import { getSettings, saveSettings } from '../../electron/core/settings'
 import { addHistory } from '../../electron/core/db'
 import { emit } from './bus'
+import { isNativeWebView } from './shims/util'
 
 const el = new Audio()
 el.preload = 'auto'
@@ -101,7 +102,9 @@ async function load(i: number, autoplay = true): Promise<void> {
   try {
     const r = await resolveUrl(song, getSettings().quality, getSettings().autoSwitchSource)
     if (index !== i) return // 已切歌
-    el.src = r.url
+    // 真机走原生 /swmedia/ 代理（注入 Referer/UA 防盗链，SwMediaClient 拦截），
+    // 否则（Electron smoke / 浏览器）直连；桌面主进程另有 swmedia:// 协议
+    el.src = isNativeWebView() ? `/swmedia/?u=${encodeURIComponent(r.url)}` : r.url
     el.playbackRate = state().rate
     retryCount = 0
     if (autoplay) await el.play()
