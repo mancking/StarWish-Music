@@ -28,11 +28,14 @@ export const net = {
       .replace(/^swmedia:\/\/[^/]+\/stream\/\?u=/, '')
     // 冒烟环境（http://127.0.0.1）浏览器没有 CORS 豁免：上游 API 一律不带
     // Access-Control-Allow-Origin。走 /__cors 代理让断言「控制台无 error」有效；
-    // 真机（Capacitor file:// + 原生 http）与桌面（swmedia）都不受影响。
+    // 真机（native-bridge 原生 fetch 已无 CORS，且静态服务器无 /__cors 代理）
+    // 与桌面（swmedia）都不受影响。
     try {
       if (u.startsWith('http://') || u.startsWith('https://')) {
         const t = new URL(u)
-        return globalThis.fetch(location.origin + '/__cors/' + t.host + t.pathname + t.search, init)
+        if (!(typeof location !== 'undefined' && (globalThis as any).Capacitor?.isNativePlatform?.())) {
+          return globalThis.fetch(location.origin + '/__cors/' + t.host + t.pathname + t.search, init)
+        }
       }
     } catch { /* fallthrough */ }
     return globalThis.fetch(u, init)

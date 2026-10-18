@@ -79,15 +79,30 @@ export function registerBufferGlobal(): void {
 }
 
 /**
+ * 当前是否跑在 Capacitor 真机 WebView（native-bridge 已注入）。
+ * 真机启用 CapacitorHttp 后 native-bridge 已把 window.fetch 换成原生请求
+ * （无 CORS），此时绝不能再改写到 /__cors/——真机静态服务器不提供该代理，
+ * 改写会让接口拿到 index.html 而「响应格式异常」。
+ */
+export function isNativeWebView(): boolean {
+  try {
+    const c = (globalThis as any).Capacitor
+    return !!(c && typeof c.isNativePlatform === 'function' && c.isNativePlatform())
+  } catch { return false }
+}
+
+/**
  * 把全局 fetch 也顺到同源 /__cors 代理上。
  *
  * `electron/core/http.ts` 用的是裸 fetch（桌面主进程无 CORS 概念），浏览器里
  * 这条路径会被上游 CORS 策略全部拦掉。只在 location 是 http(s)（冒烟环境）时
- * 改写；真机（Capacitor file://）与桌面都不受影响。
+ * 改写；真机（native-bridge 原生 fetch）与桌面都不受影响。
  */
 export function patchFetch(): void {
   const orig = (globalThis as any).fetch
   if (!orig || orig.__starwishPatched) return
+  // 真机：native-bridge 的 CapacitorHttp fetch 已无 CORS，直通即可
+  if (isNativeWebView()) return
   const patched = (input: any, init?: RequestInit) => {
     let u = ''
     try {

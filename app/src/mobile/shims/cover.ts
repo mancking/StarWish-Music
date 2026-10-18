@@ -14,12 +14,14 @@
 import type { Song } from '../../../shared/types'
 import { itunesCover } from '../../../electron/core/providers'
 import { lxHost } from '../../../electron/core/lx-host'
+import { isNativeWebView } from './util'
 
-/** http(s) URL → 同源 CORS 代理地址；非 http(s) 原样返回 */
+/** http(s) URL → 同源 CORS 代理地址；非 http(s) 与真机原样返回 */
 function proxied(url: string): string {
   try {
     const t = new URL(url)
-    if ((t.protocol === 'http:' || t.protocol === 'https:') && typeof location !== 'undefined' && location.origin.startsWith('http')) {
+    // 真机静态服务器无 /__cors 代理，且 <img> 跨域不设 CORS，直接用原链
+    if ((t.protocol === 'http:' || t.protocol === 'https:') && typeof location !== 'undefined' && location.origin.startsWith('http') && !isNativeWebView()) {
       return location.origin + '/__cors/' + t.host + t.pathname + t.search
     }
   } catch { /* ignore */ }
