@@ -4,7 +4,10 @@
   "version": "2.0.0",
   "description": "星河音乐 StarWish Music —— 多音源聚合桌面音乐播放器（Electron + Vue3 + TypeScript 新架构）",
   "main": "dist/electron/main.js",
-  "author": "StarWish Music 开发组",
+  "author": {
+    "name": "StarWish Music 开发组",
+    "email": "starwish@users.noreply.github.com"
+  },
   "license": "MIT",
   "private": true,
   "scripts": {
