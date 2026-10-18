@@ -5,7 +5,8 @@ import Icon from '@/components/Icon.vue'
 import Toggle from '@/components/Toggle.vue'
 import Modal from '@/components/Modal.vue'
 import Slider from '@/components/Slider.vue'
-import { call } from '@/api'
+import { call, isDesktop } from '@/api'
+import { checkUpdate, type UpdateInfo } from '@/utils/update-check'
 import { useUiStore } from '@/stores/ui'
 import { useLibraryStore } from '@/stores/library'
 import { usePlayerStore } from '@/stores/player'
@@ -286,6 +287,42 @@ async function clearDataJunk(): Promise<void> {
 
 async function openDataDir(): Promise<void> {
   await call('data:openDir').catch(() => {})
+}
+
+/** 检查更新（桌面/移动共用，见 utils/update-check.ts） */
+const updateChecking = ref(false)
+const updateInfo = ref<UpdateInfo | null>(null)
+async function doCheckUpdate(): Promise<void> {
+  if (updateChecking.value) return
+  updateChecking.value = true
+  try {
+    const cur = String(appInfo.value?.version || '2.0.0')
+    updateInfo.value = await checkUpdate(cur)
+    if (updateInfo.value.hasUpdate) {
+      ui.toast(`发现新版本 v${updateInfo.value.version}`, 'success')
+    } else {
+      ui.toast('当前已是最新版本', 'success')
+    }
+  } catch (e: any) {
+    ui.toast(`检查更新失败：${e.message}`, 'error')
+  } finally {
+    updateChecking.value = false
+  }
+}
+
+async function openUpdatePage(): Promise<void> {
+  const url = updateInfo.value?.url || `https://github.com/${'mancking/StarWish-Music'}/releases/latest`
+  if (isDesktop) {
+    await call('app:openExternal', { url }).catch(() => {})
+    return
+  }
+  // 移动端 WebView 无 window.open 多窗口支持：复制链接给系统浏览器
+  try {
+    await navigator.clipboard.writeText(url)
+    ui.toast('下载页链接已复制，请在浏览器打开', 'success')
+  } catch {
+    ui.toast(url, 'info', 8000)
+  }
 }
 
 async function restartApp(): Promise<void> {
@@ -712,6 +749,21 @@ onBeforeUnmount(stopPoll)
           <div class="row">
             <div class="label"><b>日志目录</b><span>出现问题时可将日志反馈给开发者</span></div>
             <button class="btn sm ghost" @click="openDataDir"><Icon name="folder-open" :size="14" />打开数据目录</button>
+          </div>
+          <div class="row">
+            <div class="label"><b>软件更新</b>
+              <span v-if="updateInfo?.hasUpdate">发现新版本 v{{ updateInfo.version }}（当前 v{{ updateInfo.current }}）</span>
+              <span v-else-if="updateInfo">当前 v{{ updateInfo.current }} 已是最新版本</span>
+              <span v-else>检查是否有新版本可供下载</span>
+            </div>
+            <div style="display:flex;gap:8px;flex:none">
+              <button class="btn sm ghost" :disabled="updateChecking" @click="doCheckUpdate">
+                <Icon name="refresh" :size="14" />{{ updateChecking ? '检查中…' : '检查更新' }}
+              </button>
+              <button v-if="updateInfo?.hasUpdate" class="btn sm" @click="openUpdatePage">
+                <Icon name="external" :size="14" />前往下载
+              </button>
+            </div>
           </div>
         </section>
       </div>

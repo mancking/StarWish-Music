@@ -126,7 +126,8 @@ function srcLabel(s?: string): string {
 .stats {
   display: flex;
   align-items: center;
-  gap: 12px;
+  flex-wrap: wrap;
+  gap: 6px 12px;
   margin-top: 4px;
   font-size: 11px;
   color: var(--text-3);
@@ -136,6 +137,8 @@ function srcLabel(s?: string): string {
   display: inline-flex;
   align-items: center;
   gap: 4px;
+  flex: none;
+  white-space: nowrap;
 }
 .ic {
   color: var(--text-3);

@@ -17,7 +17,8 @@ import { emit } from './bus'
 
 const el = new Audio()
 el.preload = 'auto'
-el.crossOrigin = 'anonymous'
+// ponytail: 不设 crossOrigin——媒体走 <audio> 直载无需 CORS，
+// 设置后真机 CDN 不带 ACAO 会整条拒载（"no supported source" 根因）；Web Audio 未使用
 
 let queue: Song[] = []
 let index = -1
@@ -29,6 +30,16 @@ let buffered = 0
 let sleepUntil = 0
 let retryCount = 0
 const MAX_RETRY = 2
+
+/** HTMLMediaElement 原生错误是英文，统一映射为中文提示 */
+function friendlyPlayError(msg?: string): string | null {
+  if (!msg) return null
+  if (/no supported source|failed to load|unsupported|src/i.test(msg)) return '音频加载失败，可能链接已失效'
+  if (/notallowed|blocked|user didn/i.test(msg)) return '播放被系统阻止，请手动点击播放'
+  if (/aborted|interrupted/i.test(msg)) return '播放被中断，请重试'
+  if (/network|fetch/i.test(msg)) return '网络异常，音频加载失败'
+  return /[一-龥]/.test(msg) ? msg : '播放失败'
+}
 
 function state(): PlayerState {
   return {
@@ -105,7 +116,8 @@ async function load(i: number, autoplay = true): Promise<void> {
     }
     retryCount = 0
     status = 'error'
-    error = e?.message || '播放失败'
+    // 播放原生错误（英文）映射为中文提示，避免 toast 直接透传 HTMLMediaElement 英文消息
+    error = friendlyPlayError(e?.message) || '播放失败'
     emit('player:error', { message: error, song })
     publish()
     if (getSettings().skipOnError) next(false)
