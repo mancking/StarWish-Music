@@ -914,6 +914,8 @@ export async function toplistTree(force = false): Promise<ToplistTree> {
               items: list.slice(0, 8).map(x => ({
                 n: String(x.name || '').replace(/^云音乐/, ''),
                 id: String(x.id),
+                pic: String(x.coverImgUrl || ''),
+                freq: String(x.updateFrequency || ''),
               })),
             },
             ...(list.length > 8
@@ -923,6 +925,8 @@ export async function toplistTree(force = false): Promise<ToplistTree> {
                     items: list.slice(8).map(x => ({
                       n: String(x.name || '').replace(/^云音乐/, ''),
                       id: String(x.id),
+                      pic: String(x.coverImgUrl || ''),
+                      freq: String(x.updateFrequency || ''),
                     })),
                   },
                 ]
@@ -959,6 +963,7 @@ export async function toplistTree(force = false): Promise<ToplistTree> {
         .map((x: any) => ({
           n: stripHtml(x.topTitle || x.ListName || x.topname || ''),
           id: String(x.id ?? x.topID ?? x.topId ?? ''),
+          pic: String(x.picUrl || ''),
         }))
         .filter((x: any) => x.n && x.id)
       if (items.length) {
@@ -1058,7 +1063,7 @@ export async function toplistTree(force = false): Promise<ToplistTree> {
         .map((c: any) => ({
           g: String(c?.style || ''),
           items: (c?.contents || [])
-            .map((x: any) => ({ n: String(x.rankName || ''), id: String(x.rankId || '') }))
+            .map((x: any) => ({ n: String(x.rankName || ''), id: String(x.rankId || ''), pic: String(x.imageUrl || '') }))
             .filter((x: any) => x.n && x.id),
         }))
         .filter((g: any) => g.g && g.items.length)

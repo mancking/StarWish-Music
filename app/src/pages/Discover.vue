@@ -35,6 +35,16 @@ const tree = ref<ToplistTree | null>(null)
 const treeLoading = ref(true)
 const platform = ref('wy')
 const currentItem = ref<{ name: string; id: string } | null>(null)
+/** 当前榜单的更新频率（如「刚刚更新」），从树里反查 */
+const currentFreq = computed(() => {
+  const ci = currentItem.value
+  if (!ci) return ''
+  for (const g of groups.value) {
+    const it = g.items.find(i => i.id === ci.id && i.n === ci.name)
+    if (it?.freq) return it.freq
+  }
+  return ''
+})
 const toplistSongs = ref<Song[]>([])
 const tlLoading = ref(false)
 const tlError = ref('')
@@ -411,6 +421,7 @@ onBeforeUnmount(() => {
                 class="tl-item"
                 :class="{ active: currentItem?.id === item.id && currentItem?.name === item.n }"
                 :aria-label="item.n"
+                :title="item.freq || item.n"
                 :disabled="!item.id"
                 @click="item.id && selectToplist(item.n, item.id)"
               >
@@ -420,6 +431,7 @@ onBeforeUnmount(() => {
                   :size="12"
                   class="tl-active-icon"
                 />
+                <img v-if="item.pic && item.id" class="tl-thumb" :src="item.pic" alt="" loading="lazy" />
                 <span class="ellipsis tl-item-text">{{ item.n }}</span>
                 <Icon v-if="!item.id" name="lock" :size="11" class="lock" />
               </button>
@@ -432,6 +444,7 @@ onBeforeUnmount(() => {
             <div>
               <h2>{{ currentItem?.name || '选择榜单' }}</h2>
               <span class="tl-count">{{ toplistSongs.length }} 首</span>
+              <span v-if="currentFreq" class="tl-count tl-freq">· {{ currentFreq }}</span>
             </div>
             <button class="btn primary sm" :disabled="!toplistSongs.length" @click="playToplist">
               <Icon name="play" :size="13" />播放全部
@@ -746,6 +759,14 @@ onBeforeUnmount(() => {
   flex: 1;
   min-width: 0;
 }
+.tl-thumb {
+  flex: none;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  object-fit: cover;
+  background: var(--panel-2);
+}
 .tl-active-icon {
   flex: none;
   margin-left: -6px;
@@ -780,6 +801,9 @@ onBeforeUnmount(() => {
 .tl-count {
   font-size: 11.5px;
   color: var(--text-3);
+}
+.tl-freq {
+  color: var(--accent);
 }
 .pagination {
   display: flex;

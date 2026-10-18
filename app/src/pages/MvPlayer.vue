@@ -55,9 +55,9 @@ const videoSrc = computed(() => {
   return native ? `/swmedia/?u=${u}` : `swmedia://stream/?u=${u}`
 })
 const hasParts = computed(() => parts.value.length > 1)
-const forceLoad = ref(false)
-/** 超长分P（整场合集）体积可能数 GB，直接加载会长时间卡住，先提示用户选集 */
-const tooLong = computed(() => (current.value?.duration || 0) > 7200 && !forceLoad.value)
+/** 初次自动加载被超长拦截，等用户确认（主动点分集/重试/仍要加载即直接加载） */
+const tooLongBlocked = ref(false)
+const tooLong = computed(() => tooLongBlocked.value)
 
 /** 格式化播放量：B站风格 "277.8万 次播放" */
 function fmtCount(n: number): string {
@@ -81,6 +81,7 @@ async function load(): Promise<void> {
   videoError.value = ''
   listError.value = ''
   videoUrl.value = ''
+  tooLongBlocked.value = false
   parts.value = []
   current.value = null
   try {
@@ -122,17 +123,18 @@ async function load(): Promise<void> {
 }
 
 async function selectPart(p: Part, autoplay = true): Promise<void> {
-  // 只有切换到「另一集」时才清除强制加载标志；
-  // 否则「仍要加载」按钮先置 true、再调本函数，会被这里立刻清掉，导致按钮永久失效。
-  if (current.value?.cid !== p.cid) forceLoad.value = false
   current.value = p
-  if ((p.duration || 0) > 7200 && !forceLoad.value) {
+  // 超长分P（整场合集）体积可能数 GB，只拦「初次自动加载」，先提示用户选集；
+  // 用户主动点分集/重试（autoplay=true）是明确意图，直接加载
+  if (!autoplay && (p.duration || 0) > 7200) {
+    tooLongBlocked.value = true
     loading.value = false
     videoUrl.value = ''
     videoError.value = ''
     router.replace({ path: `/mv/${bvid.value}`, query: p.page > 1 ? { p: String(p.page) } : {} })
     return
   }
+  tooLongBlocked.value = false
   loading.value = true
   videoError.value = ''
   videoUrl.value = ''
@@ -237,7 +239,7 @@ onBeforeUnmount(() => {
             <template v-if="tooLong">
               <span class="state-title">这是一个超长合集（{{ formatTime(current?.duration || 0) }}）</span>
               <span class="state-desc">文件体积较大，建议从右侧「分集」中选择单曲分 P 播放</span>
-              <button class="btn sm" @click="forceLoad = true; current && selectPart(current, true)">仍要加载</button>
+              <button class="btn sm" @click="current && selectPart(current, true)">仍要加载</button>
             </template>
             <template v-else>
               <span>{{ loading ? '正在解析视频流…' : videoError || '暂无可用视频流' }}</span>

@@ -41,6 +41,8 @@ class PlayerService {
   private pendingLoad: any = null
   private loadToken = 0
   private failures = 0
+  /** 连续「换源用尽后跳下一首」仍失败的歌曲数，播放成功即清零 */
+  private consecutiveFails = 0
   private broadcast: Broadcast = () => {}
   private shuffleHistory: number[] = []
   private lastResolved: { url: string; quality: string; matched?: Song } | null = null
@@ -75,6 +77,7 @@ class PlayerService {
         if (st === 'playing' || st === 'paused' || st === 'loading' || st === 'stopped') {
           this.state.status = st as PlayerState['status']
         }
+        if (st === 'playing') this.consecutiveFails = 0
         if (typeof msg.duration === 'number' && msg.duration > 0) this.state.duration = msg.duration
         if (typeof msg.position === 'number') this.state.position = msg.position
         if (typeof msg.buffered === 'number') this.state.buffered = msg.buffered
@@ -282,7 +285,7 @@ class PlayerService {
     const song = this.state.song
     if (!s.skipOnError) return
 
-    // 同一首歌先尝试换源重试（最多 2 次），再跳到下一首
+    // 同一首歌先尝试换源重试（最多 2 次），换源用尽仍失败就跳下一首
     if (song && this.failures <= 2) {
       const avoid = [song.source, this.lastResolved?.matched?.source || ''].filter(Boolean)
       setTimeout(() => {
@@ -293,7 +296,9 @@ class PlayerService {
       }, 500)
       return
     }
-    if (this.failures >= 3) {
+    // 连续多首（换源用尽后逐首跳过仍失败）才判定音源整体故障而暂停
+    this.consecutiveFails++
+    if (this.consecutiveFails >= 3) {
       this.broadcast('toast', { type: 'error', message: '连续多首播放失败，已暂停。请在设置中检查音源' })
       return
     }

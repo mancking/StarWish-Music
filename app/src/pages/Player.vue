@@ -32,6 +32,7 @@ const stages: { key: StageMode; label: string; icon: string }[] = [
 ]
 
 const song = computed(() => player.song)
+const isWin = computed(() => window.sw?.platform === 'win32')
 const liked = computed(() => (song.value ? library.isFavorite(song.value.id) : false))
 const offsetSec = computed(() => (ui.settings.lyricOffset || 0) / 1000)
 const lines = computed<LyricLine[]>(() => player.lyric?.lines || [])
@@ -261,6 +262,8 @@ function back(): void {
           <Icon name="radio" :size="15" /><span>DJ</span>
         </button>
       </div>
+      <!-- Windows 右上角悬浮窗口控制按钮（约 138px），让位避免遮挡 stage 按钮 -->
+      <div v-if="isWin" class="win-ctl-area no-drag" aria-hidden="true" />
     </header>
 
     <!-- 主体 -->
@@ -517,6 +520,11 @@ function back(): void {
   color: #fff;
   background: var(--accent);
   box-shadow: 0 4px 12px -4px var(--accent);
+}
+.win-ctl-area {
+  width: 138px;
+  height: 100%;
+  flex: none;
 }
 
 .p-body {
@@ -915,8 +923,16 @@ function back(): void {
   .stage-wrap {
     width: min(260px, 40vh);
   }
+  /* 歌词区堆叠到唱片/歌名下方，窄屏与移动端才能看到歌词 */
   .right {
-    display: none;
+    display: block;
+    padding: 0;
+  }
+  .lyrics {
+    height: min(460px, 52vh);
+  }
+  .lyric-inner {
+    padding: 20% 8px;
   }
   .p-foot {
     padding: 4px 26px 16px;

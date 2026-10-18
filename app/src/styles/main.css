@@ -378,7 +378,8 @@ img {
   height: 4px;
   width: 100%;
   border-radius: 4px;
-  background: var(--panel-3);
+  /* 固定中性灰而非主题色叠加：浅色主题/封面背景上曾与背景同色，看不清无法准确拖动 */
+  background: rgba(128, 136, 158, 0.55);
   overflow: visible;
 }
 .slider-fill {

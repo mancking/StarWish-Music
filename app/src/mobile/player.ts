@@ -31,6 +31,11 @@ let buffered = 0
 let sleepUntil = 0
 let retryCount = 0
 const MAX_RETRY = 2
+/** 本曲已失败的音源（取链/媒体报错时累计，换源重试时跳过） */
+let failedSources: string[] = []
+let lastSource = ''
+/** 连续「换源用尽后跳下一首」仍失败的歌曲数，播放成功即清零（与桌面一致） */
+let consecutiveFails = 0
 
 /** HTMLMediaElement 原生错误是英文，统一映射为中文提示 */
 function friendlyPlayError(msg?: string): string | null {
@@ -83,7 +88,11 @@ function stopTick(): void {
   tickTimer = 0
 }
 
-async function load(i: number, autoplay = true): Promise<void> {
+/**
+ * @param keepFailures 内部重试链专用：保留 failedSources / retryCount；
+ *   外部点播（换歌、重点当前曲、切下一首）一律 fresh，与桌面 playAt 重置一致
+ */
+async function load(i: number, autoplay = true, keepFailures = false): Promise<void> {
   if (i < 0 || i >= queue.length) {
     status = 'idle'
     error = null
@@ -91,6 +100,10 @@ async function load(i: number, autoplay = true): Promise<void> {
     duration = 0
     publish()
     return
+  }
+  if (!keepFailures) {
+    failedSources = []
+    retryCount = 0
   }
   index = i
   const song = queue[i]
@@ -100,31 +113,56 @@ async function load(i: number, autoplay = true): Promise<void> {
   duration = 0
   publish()
   try {
-    const r = await resolveUrl(song, getSettings().quality, getSettings().autoSwitchSource)
+    const r = await resolveUrl(song, getSettings().quality, getSettings().autoSwitchSource, failedSources)
     if (index !== i) return // 已切歌
+    lastSource = r.matched?.source || song.source
     // 真机走原生 /swmedia/ 代理（注入 Referer/UA 防盗链，SwMediaClient 拦截），
     // 否则（Electron smoke / 浏览器）直连；桌面主进程另有 swmedia:// 协议
     el.src = isNativeWebView() ? `/swmedia/?u=${encodeURIComponent(r.url)}` : r.url
     el.playbackRate = state().rate
-    retryCount = 0
     if (autoplay) await el.play()
     status = el.paused ? 'paused' : 'playing'
   } catch (e: any) {
     if (index !== i) return
-    // 与桌面一致：同曲重试 N 次后跳下一首，连续失败暂停提示
-    if (retryCount < MAX_RETRY) {
-      retryCount++
-      void load(i, autoplay)
+    // 自动播放被系统策略阻止不是音源故障：换源/跳过都无意义，提示手动播放即可
+    if (/notallowed|user didn|blocked/i.test(String(e?.message || ''))) {
+      status = 'error'
+      error = friendlyPlayError(e?.message) || '播放被系统阻止，请手动点击播放'
+      emit('player:error', { message: error, song })
+      publish()
       return
     }
-    retryCount = 0
-    status = 'error'
-    // 播放原生错误（英文）映射为中文提示，避免 toast 直接透传 HTMLMediaElement 英文消息
-    error = friendlyPlayError(e?.message) || '播放失败'
-    emit('player:error', { message: error, song })
-    publish()
-    if (getSettings().skipOnError) next(false)
+    markSourceFailed(song)
+    // 与桌面一致：同曲换源重试 MAX_RETRY 次后跳下一首，连续多首失败暂停提示
+    if (retryCount < MAX_RETRY) {
+      retryCount++
+      void load(i, autoplay, true)
+      return
+    }
+    failCurrent(song, friendlyPlayError(e?.message) || '播放失败')
   }
+}
+
+/** 记下坏链所属音源：重试时 resolveUrl 跳过它，真正换源而非重取同一条 */
+function markSourceFailed(song: Song | null): void {
+  for (const s of [song?.source, lastSource]) {
+    if (s && !failedSources.includes(s)) failedSources.push(s)
+  }
+}
+
+function failCurrent(song: Song | null, msg: string): void {
+  retryCount = 0
+  status = 'error'
+  error = msg
+  if (song) emit('player:error', { message: error, song })
+  publish()
+  if (!getSettings().skipOnError) return
+  consecutiveFails++
+  if (consecutiveFails >= 3) {
+    emit('toast', { type: 'error', message: '连续多首播放失败，已暂停。请在设置中检查音源' })
+    return
+  }
+  next(false)
 }
 
 function next(auto = false): void {
@@ -151,19 +189,28 @@ function prev(): void {
 }
 
 /* ---------------- audio 事件 ---------------- */
-el.addEventListener('playing', () => { status = 'playing'; error = null; startTick(); publish() })
+el.addEventListener('playing', () => {
+  status = 'playing'
+  error = null
+  retryCount = 0
+  consecutiveFails = 0
+  startTick()
+  publish()
+})
 el.addEventListener('pause', () => { status = 'paused'; stopTick(); publish() })
 el.addEventListener('waiting', () => { status = 'loading'; publish() })
 el.addEventListener('ratechange', () => publish())
 el.addEventListener('volumechange', () => publish())
 el.addEventListener('error', () => {
   if (!el.src) return
-  if (retryCount < MAX_RETRY) { retryCount++; void load(index, true); return }
-  status = 'error'
-  error = '音频加载失败，可能链接已失效'
-  emit('player:error', { message: error, song: state().song })
-  publish()
-  if (getSettings().skipOnError) next(false)
+  const song = state().song
+  markSourceFailed(song)
+  if (retryCount < MAX_RETRY) {
+    retryCount++
+    void load(index, true, true)
+    return
+  }
+  failCurrent(song, '音频加载失败，可能链接已失效')
 })
 el.addEventListener('ended', () => {
   const song = state().song

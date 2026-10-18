@@ -8,6 +8,7 @@ import { usePlayerStore } from '@/stores/player'
 withDefaults(defineProps<{ bottom?: number }>(), { bottom: 92 })
 
 const player = usePlayerStore()
+const isWin = window.sw?.platform === 'win32'
 const dragFrom = ref(-1)
 const dragOver = ref(-1)
 
@@ -40,7 +41,8 @@ function onDrop(i: number): void {
     <div v-if="player.queueOpen" class="queue-wrap" :style="{ bottom: bottom + 'px' }">
       <div class="mask" @click="player.queueOpen = false" />
       <aside class="queue">
-        <header>
+        <!-- Windows 右上角悬浮窗口控制按钮（约 138px），header 右让位避免遮挡 -->
+        <header :class="{ win: isWin }">
           <div>
             <h3>播放队列</h3>
             <span class="count">{{ queue.length }} 首</span>
@@ -132,6 +134,9 @@ header h3 {
 .count {
   font-size: 11px;
   color: var(--text-3);
+}
+header.win {
+  padding-right: 156px; /* 18px 原内边距 + 138px 窗口控制按钮 */
 }
 .head-actions {
   display: flex;

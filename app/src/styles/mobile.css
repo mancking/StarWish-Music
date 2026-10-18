@@ -233,19 +233,76 @@
     flex: 1 1 140px;
   }
 
-  /* 发现页·排行榜：208px+1fr 两栏在窄屏把右主区挤成 1 字宽（中文竖排），
-     塌成单栏；榜单侧栏去 sticky、头部允许换行 */
+  /* 发现页·排行榜重设计：桌面是 208px 侧栏纵向列全部榜单，窄屏塌成单栏后
+     整列榜单堆在歌单上方，把歌曲列表挤出首屏。移动端改为：
+     榜单按分组变成横向滑动的胶囊行（组名行内标示），歌曲列表紧随其后。 */
   #app .tl-layout {
     grid-template-columns: 1fr;
+    gap: 12px;
   }
   #app .tl-side {
+    display: flex;
+    align-items: center;
+    gap: 4px;
     max-height: none;
     position: static;
-    overflow: visible;
+    overflow-x: auto;
+    overflow-y: hidden;
+    flex-wrap: nowrap;
+    margin: 0 -14px;
+    padding: 2px 14px 6px;
+    scrollbar-width: none;
+  }
+  #app .tl-side::-webkit-scrollbar {
+    display: none;
+  }
+  #app .tl-group {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex: none;
+    margin-bottom: 0;
+  }
+  #app .tl-group-name {
+    flex: none;
+    padding: 0 2px 0 6px;
+    white-space: nowrap;
+  }
+  /* 榜单项 → 胶囊 chip：nowrap + 自适应宽度，横向滑动浏览 */
+  #app .tl-item {
+    flex: none;
+    width: auto;
+    height: 34px;
+    padding: 0 13px;
+    border-radius: 17px;
+    border: 1px solid var(--line);
+    background: var(--panel);
+    white-space: nowrap;
+    font-size: 13px;
+  }
+  #app .tl-item.active {
+    background: var(--accent-soft);
+    border-color: var(--accent);
+  }
+  #app .tl-item-text {
+    flex: none;
+  }
+  #app .tl-active-icon {
+    display: none;
+  }
+  #app .tl-skeleton {
+    display: flex;
+    gap: 8px;
+  }
+  #app .tl-skeleton .sk {
+    width: 78px;
+    flex: none;
+    margin-bottom: 0;
   }
   #app .tl-head {
     flex-wrap: wrap;
     gap: 8px;
+    margin-bottom: 6px;
   }
 
   /* 首页 hero 统计窄屏换行，避免数字与标签重叠挤压 */

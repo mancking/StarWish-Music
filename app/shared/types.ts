@@ -135,6 +135,10 @@ export interface ScanProgress {
 export interface ToplistItem {
   n: string
   id?: string
+  /** 榜单封面（来自各平台榜单索引接口，非歌曲封面；无则前端用渐变占位） */
+  pic?: string
+  /** 更新频率（如「刚刚更新」「每周四更新」） */
+  freq?: string
 }
 
 export interface ToplistGroup {
