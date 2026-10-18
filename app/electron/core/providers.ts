@@ -243,7 +243,7 @@ export async function neteasePlaylistDetail(id: string): Promise<{ name: string;
         pl = got
         if ((pl.tracks || []).length) break
       } else {
-        lastErr = body?.message || body?.msg || `code ${body?.code}`
+        lastErr = body?.message || body?.msg || (body?.code != null ? `code ${body.code}` : '响应格式异常')
       }
     } catch (e: any) {
       lastErr = e?.message || String(e)

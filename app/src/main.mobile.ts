@@ -18,9 +18,11 @@ import { useLibraryStore } from './stores/library'
 import './styles/main.css'
 import './styles/mobile.css'
 import { installBridge } from './mobile/bridge'
+import { installPullRefresh } from './mobile/pull-refresh'
 
 async function bootstrap(): Promise<void> {
   await installBridge()
+  installPullRefresh()
 
   const app = createApp(App)
   const pinia = createPinia()
