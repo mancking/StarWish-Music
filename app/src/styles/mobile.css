@@ -104,23 +104,15 @@
     overflow-y: hidden;
   }
 
-  /* 展平分组：分组容器不再产生盒子，子项直接成为横向 flex item */
-  #app .sidebar .group {
-    display: contents;
+  /* 移动端侧栏已是 4 tab 的 .mobile-tabs（无 group/foot）：
+     展平与 nth-child 隐藏规则随平铺结构一起移除。 */
+  #app .sidebar .mobile-tabs {
+    display: flex;
+    overflow: visible;
   }
-  #app .sidebar .group-label {
-    display: none;
-  }
-
-  /* 隐藏「我的歌单」整组，以及「本地音乐 / 最近播放」
-     （移动端无本地扫描，且 7 个入口在小屏放不下）
-     子项序号：1=group-label 2=我喜欢的音乐 3=本地音乐 4=最近播放 */
-  #app .sidebar .scroll > .group:nth-child(3) {
-    display: none;
-  }
-  #app .sidebar .scroll > .group:nth-child(2) > .nav-item:nth-child(3),
-  #app .sidebar .scroll > .group:nth-child(2) > .nav-item:nth-child(4) {
-    display: none;
+  #app .sidebar .mobile-tabs .nav-item {
+    flex: 1;
+    min-width: 0;
   }
 
   /* 底部导航项：图标在上、文字在下 */
@@ -138,6 +130,7 @@
     flex: none;
     font-size: 11px;
     line-height: 1.2;
+    white-space: nowrap;
   }
   #app .sidebar .nav-item.active {
     background: none;
@@ -156,20 +149,6 @@
   #app .sidebar .dot-new,
   #app .sidebar .count {
     display: none;
-  }
-
-  #app .sidebar .foot {
-    flex: none;
-    display: flex;
-    align-items: stretch;
-    gap: 0;
-    padding: 0;
-    border-top: none;
-    border-left: 1px solid var(--line);
-  }
-  #app .sidebar .foot .nav-item {
-    flex: none;
-    width: 68px;
   }
 
   /* 顶栏：搜索占满，去掉窗口按钮避让区 */
@@ -273,6 +252,23 @@
   #app .hero-stats {
     flex-wrap: wrap;
     gap: 10px 14px;
+  }
+
+  /* 发现页·歌单筛选行（标签「全部」+ 音源「小芸音乐」+ 排序 + 导入）：
+     单行 flex 在窄屏把各控件压成 1 字宽（中文竖排）。整行换行、
+     控件各自 nowrap 不可压缩 */
+  #app .sl-header,
+  #app .sl-left {
+    flex-wrap: wrap;
+    gap: 8px 10px;
+  }
+  #app .tag-select,
+  #app .tag-label,
+  #app .sort-tabs,
+  #app .sl-header .btn,
+  #app .pl-select {
+    flex: none;
+    white-space: nowrap;
   }
 }
 

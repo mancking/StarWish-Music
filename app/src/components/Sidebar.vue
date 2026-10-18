@@ -25,6 +25,19 @@ const mine = [
   { path: '/history', icon: 'clock', label: '最近播放' },
 ]
 
+// 移动端底栏只留 4 个顶级 tab（借鉴 Material/QQ 音乐：屏幕有限不平铺），
+// 歌单/历史/本地/MV/设置等二级入口收进「我的」页多级跳转。
+// __MOBILE__ 是构建期 define，桌面死分支摇掉。
+const isMobile = __MOBILE__
+const mobileTabs = __MOBILE__
+  ? [
+      { path: '/', icon: 'home', label: '首页' },
+      { path: '/discover', icon: 'compass', label: '发现' },
+      { path: '/search', icon: 'search', label: '搜索' },
+      { path: '/mine', icon: 'user', label: '我的' },
+    ]
+  : []
+
 const activePath = computed(() => route.path)
 
 function go(path: string): void {
@@ -46,6 +59,21 @@ async function submitCreate(): Promise<void> {
 
 <template>
   <aside class="sidebar">
+    <!-- 移动端：4 个顶级 tab 底栏，不平铺（__MOBILE__ 构建期常量，桌面死分支摇掉） -->
+    <div v-if="isMobile" class="scroll mobile-tabs">
+      <button
+        v-for="item in mobileTabs"
+        :key="item.path"
+        class="nav-item"
+        :class="{ active: activePath === item.path }"
+        @click="go(item.path)"
+      >
+        <Icon :name="item.icon" :size="19" />
+        <span>{{ item.label }}</span>
+      </button>
+    </div>
+
+    <template v-else>
     <div class="brand drag">
       <img :src="brand" class="mark" alt="星河音乐" draggable="false" />
       <div class="brand-text">
@@ -130,6 +158,7 @@ async function submitCreate(): Promise<void> {
       </button>
       <div class="version">v2.0.0</div>
     </div>
+    </template>
   </aside>
 </template>
 

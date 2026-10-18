@@ -45,6 +45,7 @@ export default defineConfig({
   define: {
     'process.platform': '"android"',
     'process.env.NODE_ENV': '"production"',
+    __MOBILE__: 'true',
   },
   build: {
     outDir: path.resolve(__dirname, 'dist/mobile'),

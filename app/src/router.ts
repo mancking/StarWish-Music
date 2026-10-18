@@ -12,6 +12,8 @@ const routes = [
   { path: '/favorites', name: 'favorites', component: () => import('@/pages/Favorites.vue'), meta: { title: '我喜欢的音乐' } },
   { path: '/local', name: 'local', component: () => import('@/pages/Local.vue'), meta: { title: '本地音乐' } },
   { path: '/history', name: 'history', component: () => import('@/pages/History.vue'), meta: { title: '最近播放' } },
+  // 移动端「我的」二级中枢（底栏 4 tab 之一），二级入口都从这里跳
+  { path: '/mine', name: 'mine', component: () => import('@/pages/Mine.vue'), meta: { title: '我的' } },
   { path: '/settings', name: 'settings', component: () => import('@/pages/Settings.vue'), meta: { title: '设置' } },
   {
     path: '/player',

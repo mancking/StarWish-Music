@@ -12,6 +12,9 @@ export default defineConfig({
       '@shared': path.resolve(__dirname, 'shared'),
     },
   },
+  define: {
+    __MOBILE__: 'false',
+  },
   build: {
     outDir: path.resolve(__dirname, 'dist/renderer'),
     emptyOutDir: true,

@@ -15,6 +15,14 @@ const config: CapacitorConfig = {
   server: {
     androidScheme: 'https',
   },
+  plugins: {
+    // 移动端 WebView 内 core 的裸 fetch 是跨域请求（歌单/榜单/播客等数据均外域），
+    // 服务端无 CORS 头即被拦 → 首页推荐/歌单全空。启用后 Capacitor 自动 patch
+    // window.fetch/XMLHttpRequest 走原生库，业务代码零改动消除 CORS。
+    CapacitorHttp: {
+      enabled: true,
+    },
+  },
 }
 
 export default config
