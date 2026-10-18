@@ -70,18 +70,35 @@ public class SwMediaClient extends BridgeWebViewClient {
 
     private WebResourceResponse proxy(String target, WebResourceRequest request) {
         try {
-            HttpURLConnection conn = (HttpURLConnection) new URL(target).openConnection();
-            conn.setInstanceFollowRedirects(true);
-            conn.setConnectTimeout(10000);
-            conn.setReadTimeout(20000);
-            conn.setRequestProperty("User-Agent", UA);
-            conn.setRequestProperty("Accept", "*/*");
-            String referer = refererFor(target);
-            if (!referer.isEmpty()) conn.setRequestProperty("Referer", referer);
+            // HttpURLConnection 不跟随跨协议（http↔http s）重定向，各音乐 CDN 常 302 到
+            // http 地址；WebView 也不会跟随 shouldInterceptRequest 返回的 3xx（会把 302 的
+            // 空/HTML 响应体当最终内容喂给 <audio>，导致 ffmpeg demuxer 打不开）。故在此
+            // 手动跟随 Location 直到拿到最终 2xx/4xx 响应，绝不把 3xx 交回 WebView。
             String range = request.getRequestHeaders().get("Range");
-            if (range != null) conn.setRequestProperty("Range", range);
+            HttpURLConnection conn = null;
+            int status = 0;
+            for (int hop = 0; hop <= 5; hop++) {
+                conn = (HttpURLConnection) new URL(target).openConnection();
+                conn.setInstanceFollowRedirects(false); // 手动跟随，覆盖跨协议跳转
+                conn.setConnectTimeout(10000);
+                conn.setReadTimeout(20000);
+                conn.setRequestProperty("User-Agent", UA);
+                conn.setRequestProperty("Accept", "*/*");
+                String referer = refererFor(target);
+                if (!referer.isEmpty()) conn.setRequestProperty("Referer", referer);
+                if (range != null) conn.setRequestProperty("Range", range);
 
-            int status = conn.getResponseCode();
+                status = conn.getResponseCode();
+                if (status == 301 || status == 302 || status == 303
+                        || status == 307 || status == 308) {
+                    String loc = conn.getHeaderField("Location");
+                    if (loc == null || loc.isEmpty()) break;
+                    conn.disconnect();
+                    target = new URL(new URL(target), loc).toString();
+                    continue;
+                }
+                break;
+            }
             InputStream stream = status >= 400 ? conn.getErrorStream() : conn.getInputStream();
             if (stream == null) stream = new ByteArrayInputStream(new byte[0]);
 
