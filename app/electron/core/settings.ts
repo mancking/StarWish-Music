@@ -1,6 +1,6 @@
 import fs from 'node:fs'
 import type { AppSettings } from '../../shared/types'
-import { settingsFile, setCacheRoot, setCoverRoot, setMediaRoot } from './paths'
+import { settingsFile, setCacheRoot, setCoverRoot, setMediaRoot, setLogRoot } from './paths'
 import { createLogger } from './log'
 
 const logger = createLogger('settings')
@@ -26,6 +26,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   cacheDir: '',
   coverDir: '',
   mediaDir: '',
+  logDir: '',
   dataDir: '',
   closeToTray: true,
   minimizeToTray: false,
@@ -51,6 +52,7 @@ export function loadSettings(): AppSettings {
   setCacheRoot(cache.cacheDir || '')
   setCoverRoot(cache.coverDir || '')
   setMediaRoot(cache.mediaDir || '')
+  setLogRoot(cache.logDir || '')
   return cache
 }
 
@@ -63,6 +65,7 @@ export function saveSettings(patch: Partial<AppSettings>): AppSettings {
   if (patch.cacheDir !== undefined) setCacheRoot(cache.cacheDir || '')
   if (patch.coverDir !== undefined) setCoverRoot(cache.coverDir || '')
   if (patch.mediaDir !== undefined) setMediaRoot(cache.mediaDir || '')
+  if (patch.logDir !== undefined) setLogRoot(cache.logDir || '')
   try {
     fs.writeFileSync(settingsFile(), JSON.stringify(cache, null, 2), 'utf8')
   } catch (e: any) {

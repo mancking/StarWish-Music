@@ -59,6 +59,7 @@ import {
   dataDirPointerFile,
   ensureDir,
   logDir,
+  logRootDir,
   mediaCacheDir,
   userDataDir,
 } from './core/paths'
@@ -245,6 +246,7 @@ const handlers: Record<string, Handler> = {
     await mfHost.importSubscription(url, name),
   'plugins:subs:list': () => mfHost.listSubscriptions(),
   'plugins:subs:remove': ({ url }: { url: string }) => mfHost.removeSubscription(url),
+  'plugins:market': async ({ url }: { url: string }) => await mfHost.fetchMarket(url),
   'plugins:search': async ({ file, query, page, type }: any) => await mfHost.search(file, query, page || 1, type || 'music'),
   'plugins:lyric': async ({ file, musicItem }: any) => await mfHost.getLyric(file, musicItem),
   'plugins:url': async ({ file, musicItem, quality }: any) => await mfHost.getMusicUrl(file, musicItem, quality || 'standard'),
@@ -585,6 +587,22 @@ const handlers: Record<string, Handler> = {
   'cache:openDir': async ({ kind }: any = {}) => {
     await shell.openPath(kind === 'cover' ? coverCacheDir() : kind === 'media' ? mediaCacheDir() : cacheRootDir())
     return true
+  },
+  // 日志目录：改后把旧日志搬到新目录，后续写入新目录（log.ts 每次写都重新解析 logDir）
+  'log:setDir': ({ dir }: any) => {
+    const target = String(dir || '').trim()
+    const oldDir = logRootDir()
+    const s = saveSettings({ logDir: target } as Partial<AppSettings>)
+    const newDir = logRootDir()
+    if (oldDir !== newDir) {
+      try {
+        moveDirContents(oldDir, newDir)
+      } catch (e: any) {
+        logger.warn('日志迁移失败', e?.message)
+      }
+    }
+    broadcast('settings:changed', s)
+    return { settings: s, dir: newDir }
   },
   // scope: cover | media | all
   'cache:clear': ({ scope = 'all' }: any = {}) => {

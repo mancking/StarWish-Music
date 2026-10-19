@@ -185,6 +185,7 @@ const handlers: Record<string, Handler> = {
     await mfHost.removeSubscription(url)
     return mfHost.listSubscriptions()
   },
+  'plugins:market': async ({ url }: any) => await mfHost.fetchMarket(url),
   'plugins:search': ({ file, query, page, type }: any) => mfHost.search(file, query, page, type),
   'plugins:lyric': ({ file, musicItem }: any) => mfHost.getLyric(file, musicItem),
   'plugins:url': ({ file, musicItem, quality }: any) => mfHost.getMediaSource(file, musicItem, quality),
@@ -289,6 +290,7 @@ const handlers: Record<string, Handler> = {
   'cache:setDir': ({ dir }: any) => ({ settings: getSettings(), dir: String(dir || ''), size: 0 }),
   'cache:openDir': () => { void 0; return true },
   'cache:clear': () => ({ cover: 0, media: 0, total: 0 }),
+  'log:setDir': ({ dir }: any) => ({ settings: getSettings(), dir: String(dir || userDataDir()) }),
   'data:setDir': ({ dir }: any) => ({ dir: String(dir || userDataDir()), restart: !dir }),
   'data:openDir': () => { void 0; return true },
   'data:clear': () => ({ freed: 0 }),

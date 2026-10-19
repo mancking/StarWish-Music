@@ -36,6 +36,7 @@ export function ensureDir(dir: string): string {
 let cacheRoot = ''
 let coverRoot = ''
 let mediaRoot = ''
+let logRoot = ''
 
 export function setCacheRoot(dir: string): void {
   cacheRoot = dir && dir.trim() ? dir : ''
@@ -48,6 +49,10 @@ export function setCoverRoot(dir: string): void {
 
 export function setMediaRoot(dir: string): void {
   mediaRoot = dir && dir.trim() ? dir : ''
+}
+
+export function setLogRoot(dir: string): void {
+  logRoot = dir && dir.trim() ? dir : ''
 }
 
 export function cacheRootDir(): string {
@@ -76,8 +81,12 @@ export function dataDirPointerFile(): string {
   return path.join(base, 'StarWish', '.datadir')
 }
 
+export function logRootDir(): string {
+  return logRoot || path.join(userDataDir(), 'logs')
+}
+
 export function logDir(): string {
-  return ensureDir(path.join(userDataDir(), 'logs'))
+  return ensureDir(logRootDir())
 }
 
 export function dbFile(): string {

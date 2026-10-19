@@ -6,16 +6,26 @@ import { createLogger } from './log'
 import { request } from './http'
 import { userPluginsDir, pluginsRegistryFile, builtinPluginsDir } from './paths'
 // 静态导入而非 createRequire：桌面（esbuild）与移动端（vite）都能解析同一份依赖。
-// ponytail: 仅覆盖下列 5 个常用依赖；若插件 require 其他模块会抛错——需要时再扩展 DEPS。
+// ponytail: 覆盖下列 7 个常用依赖；若插件 require 其他模块会抛错——需要时再扩展 DEPS。
 import axios from 'axios'
 import * as cheerio from 'cheerio'
 import CryptoJS from 'crypto-js'
 import dayjs from 'dayjs'
 import * as qs from 'qs'
+import he from 'he'
+import BigInteger from 'big-integer'
 
 const logger = createLogger('mf-host')
 
-const DEPS: Record<string, any> = { axios, cheerio, 'crypto-js': CryptoJS, dayjs, qs }
+const DEPS: Record<string, any> = {
+  axios,
+  cheerio,
+  'crypto-js': CryptoJS,
+  dayjs,
+  qs,
+  he,
+  'big-integer': BigInteger,
+}
 
 interface LoadedPlugin {
   file: string
@@ -118,7 +128,8 @@ function loadOne(file: string, dir?: string, builtin = false): LoadedPlugin | nu
       origin: entry.origin || 'local',
       sourceUrl: entry.sourceUrl,
       loadError: null,
-      enabled: entry.enabled !== false,
+      // 插件默认关闭：仅当用户显式开启（enabled===true）才启用，避免新装插件自动参与聚合搜索。
+      enabled: entry.enabled === true,
       builtin,
     }
     return { file, fullPath, meta, info }
@@ -132,7 +143,8 @@ function loadOne(file: string, dir?: string, builtin = false): LoadedPlugin | nu
       origin: entry.origin || 'local',
       sourceUrl: entry.sourceUrl,
       loadError: (e as Error).message,
-      enabled: entry.enabled !== false,
+      // 同上：默认关闭。
+      enabled: entry.enabled === true,
       builtin,
     }
     return { file, fullPath, meta: null, info }
@@ -321,6 +333,25 @@ export function removeSubscription(url: string): PluginSubscription[] {
   reg.subscriptions = reg.subscriptions.filter(s => s.url !== url)
   writeRegistry(reg)
   return reg.subscriptions
+}
+
+export interface MarketEntry {
+  name: string
+  file?: string
+  url: string
+  version?: string
+  author?: string
+  description?: string
+  platform?: string
+  supportedSearchType?: string[]
+}
+
+/** 拉取插件市场目录（走后端 request，规避渲染层直连 raw.githubusercontent 的 fetch failed） */
+export async function fetchMarket(url: string): Promise<MarketEntry[]> {
+  const res = await request(url, { timeout: 20000, headers: { Accept: 'application/json' } })
+  const data: any = res.body
+  const arr: any[] = Array.isArray(data) ? data : Array.isArray(data?.plugins) ? data.plugins : []
+  return arr.map((it: any) => (typeof it === 'string' ? { name: it, url: it } : it)).filter((it: any) => it && /^https?:\/\//i.test(it.url))
 }
 
 /* ---------------- 运行插件能力 ---------------- */

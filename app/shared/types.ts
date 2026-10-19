@@ -113,6 +113,8 @@ export interface LyricResult {
   lines: LyricLine[]
   raw: string
   source?: string
+  /** 本次查询实际尝试并返回候选的来源列表（动态） */
+  sources?: string[]
   offset: number
   hasTrans: boolean
   hasWordByWord: boolean
@@ -142,6 +144,8 @@ export interface AppSettings {
   coverDir: string
   /** 媒体缓存目录，空字符串表示跟随缓存目录 */
   mediaDir: string
+  /** 日志目录，空字符串表示默认 userDataDir\logs */
+  logDir: string
   /** 自定义数据目录（数据库/设置/音源），空字符串表示默认 %APPDATA%\StarWish，重启生效 */
   dataDir: string
   closeToTray: boolean

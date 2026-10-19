@@ -30,6 +30,7 @@ const DEFAULT: AppSettings = {
   cacheDir: '',
   coverDir: '',
   mediaDir: '',
+  logDir: '',
   dataDir: '',
   closeToTray: true,
   minimizeToTray: false,

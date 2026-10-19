@@ -388,9 +388,12 @@ export async function getLyric(song: Song): Promise<LyricResult> {
   }
 
   let best: LyricResult | null = null
+  // 动态来源列表：所有参与过候选的来源（去重、保持顺序）
+  const sources: string[] = []
   for (const c of cands) {
     const parsed = parseLyric(c.raw)
     if (!parsed.lines.length) continue
+    if (!sources.includes(c.source)) sources.push(c.source)
     const res: LyricResult = {
       lines: parsed.lines,
       raw: c.raw,
@@ -403,6 +406,7 @@ export async function getLyric(song: Song): Promise<LyricResult> {
   }
 
   if (!best) return empty
+  best.sources = sources
   if (lyricCache.size > 300) {
     const first = lyricCache.keys().next().value
     if (first) lyricCache.delete(first)

@@ -228,10 +228,8 @@ async function loadMarket(): Promise<void> {
   marketLoading.value = true
   marketError.value = ''
   try {
-    const r = await fetch(OFFICIAL_SUB_URL, { cache: 'no-store' })
-    if (!r.ok) throw new Error(`HTTP ${r.status}`)
-    const j = await r.json()
-    marketEntries.value = Array.isArray(j) ? j : j.plugins || []
+    // 走后端 request（net.fetch + 代理），避免渲染层直连 raw.githubusercontent 触发 fetch failed
+    marketEntries.value = await call<MarketEntry[]>('plugins:market', { url: OFFICIAL_SUB_URL })
     if (!marketEntries.value.length) marketError.value = '目录为空'
   } catch (e: any) {
     marketError.value = `插件市场加载失败：${e.message}`
@@ -366,6 +364,16 @@ async function removeSub(url: string): Promise<void> {
 const cachePath = computed(() => setting.value.cacheDir || `${appInfo.value?.userData || ''}\\cache`)
 const coverPath = computed(() => setting.value.coverDir || `${cachePath.value}\\covers`)
 const mediaPath = computed(() => setting.value.mediaDir || `${cachePath.value}\\media`)
+const logPath = computed(() => setting.value.logDir || `${appInfo.value?.userData || ''}\\logs`)
+// 歌词动态来源：列出本次查询实际尝试并返回候选的来源，优先（source）用「·」高亮标注
+const lyricSourcesText = computed(() => {
+  const l = player.lyric
+  if (!l) return '暂无'
+  const list = l.sources && l.sources.length ? l.sources : l.source ? [l.source] : []
+  if (!list.length) return '暂无'
+  const preferred = l.source
+  return list.map(s => (s === preferred ? `${s}·当前` : s)).join(' / ')
+})
 const dataPath = computed(() => appInfo.value?.userData || '')
 
 type DirKind = 'cache' | 'cover' | 'media'
@@ -395,6 +403,30 @@ async function changeSubDir(kind: Exclude<DirKind, 'cache'>, label: string): Pro
     cache.value = await call('cache:size').catch(() => cache.value)
     ui.toast(`${label}目录已更新，已有缓存已迁移`, 'success')
     await loadMeta()
+  } catch (e: any) {
+    ui.toast(e.message, 'error')
+  }
+}
+
+async function changeLogDir(): Promise<void> {
+  try {
+    const dir = await pickDir('选择日志目录')
+    if (!dir) return
+    if (parseDir(dir) === parseDir(logPath.value)) {
+      ui.toast('新目录与当前日志目录相同', 'info')
+      return
+    }
+    await call('log:setDir', { dir })
+    ui.toast('日志目录已更新，后续日志写入新目录', 'success')
+  } catch (e: any) {
+    ui.toast(e.message, 'error')
+  }
+}
+
+async function resetLogDir(): Promise<void> {
+  try {
+    await call('log:setDir', { dir: '' })
+    ui.toast('已恢复默认日志目录', 'success')
   } catch (e: any) {
     ui.toast(e.message, 'error')
   }
@@ -757,8 +789,8 @@ onBeforeUnmount(stopPoll)
             </div>
           </div>
           <div class="row">
-            <div class="label"><b>当前歌词来源</b><span>来自音源插件或平台官方接口</span></div>
-            <span class="val">{{ player.lyric?.source || '暂无' }}</span>
+            <div class="label"><b>当前歌词来源</b><span>当前歌曲实际使用的歌词来源</span></div>
+            <span class="val">{{ lyricSourcesText }}</span>
           </div>
         </section>
 
@@ -1003,8 +1035,12 @@ onBeforeUnmount(stopPoll)
             <span class="val">{{ appInfo?.db?.songs || 0 }} 首 · {{ fmtBytes(appInfo?.db?.size || 0) }}</span>
           </div>
           <div class="row">
-            <div class="label"><b>日志目录</b><span>出现问题时可将日志反馈给开发者</span></div>
-            <button class="btn sm ghost" @click="openDataDir"><Icon name="folder-open" :size="14" />打开数据目录</button>
+            <div class="label"><b>日志目录</b><span class="path">{{ logPath }}</span></div>
+            <div class="inline">
+              <button class="btn sm" @click="changeLogDir"><Icon name="folder-open" :size="14" />更改目录</button>
+              <button class="btn sm ghost" @click="openDataDir"><Icon name="external" :size="14" />打开数据目录</button>
+              <button v-if="setting.logDir" class="btn sm ghost" @click="resetLogDir">恢复默认</button>
+            </div>
           </div>
           <div class="row">
             <div class="label"><b>软件更新</b>
