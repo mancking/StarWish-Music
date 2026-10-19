@@ -33,13 +33,17 @@ window.addEventListener('unhandledrejection', e => {
 
 async function bootstrap(): Promise<void> {
   const ui = useUiStore(pinia)
-  await ui.init()
   const player = usePlayerStore(pinia)
   const library = useLibraryStore(pinia)
-  await Promise.all([player.init(), library.init()])
+  await Promise.all([ui.init(), player.init(), library.init()])
   // 便于自动化冒烟测试读取状态（不参与业务逻辑）
   ;(window as any).__swStores = { player, library, ui }
   app.mount('#app')
+  const splash = document.getElementById('splash')
+  if (splash) {
+    splash.classList.add('splash-out')
+    setTimeout(() => splash.remove(), 450)
+  }
 }
 
 void bootstrap()

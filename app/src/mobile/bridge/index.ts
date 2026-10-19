@@ -88,7 +88,7 @@ const UNSUPPORTED = (what: string) => () => { throw new Error(`移动端暂不�
 const handlers: Record<string, Handler> = {
   /* ---- 应用 ---- */
   'app:info': () => ({
-    version: '2.0.0',
+    version: '2.0.1',
     name: '星河音乐',
     electron: '',
     chrome: '',

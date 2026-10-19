@@ -49,12 +49,16 @@ async function bootstrap(): Promise<void> {
   })
 
   const ui = useUiStore(pinia)
-  await ui.init()
   const player = usePlayerStore(pinia)
   const library = useLibraryStore(pinia)
-  await Promise.all([player.init(), library.init()])
+  await Promise.all([ui.init(), player.init(), library.init()])
   ;(window as any).__swStores = { player, library, ui }
   app.mount('#app')
+  const splash = document.getElementById('splash')
+  if (splash) {
+    splash.classList.add('splash-out')
+    setTimeout(() => splash.remove(), 450)
+  }
 }
 
 void bootstrap()

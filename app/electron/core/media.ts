@@ -1,10 +1,16 @@
 import fs from 'node:fs'
+import fsp from 'node:fs/promises'
 import path from 'node:path'
+import crypto from 'node:crypto'
 import { Readable } from 'node:stream'
 import { protocol, net } from 'electron'
 import { createLogger } from './log'
+import { ensureDir, mediaCacheDir } from './paths'
 
 const logger = createLogger('media')
+
+const UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
 
 const MIME: Record<string, string> = {
   '.mp3': 'audio/mpeg',
@@ -44,11 +50,118 @@ export function mediaUrl(target: string): string {
   return `swmedia://stream/?u=${encodeURIComponent(target)}`
 }
 
+/** —— 视频边播边存（临时流缓存）——
+ * 只缓存视频流（.mp4/.webm/.m4v）：swmedia 代理时按 offset tee 写入 mediaCacheDir()/stream，
+ * 下完整后改名为 <sha1>.<ext> 即视为完整缓存，后续播放直接本地服务（含 Range）。
+ * 临时性：关闭视频页 / 切分P 由渲染层调 releaseMediaCache 清除，应用启动时整体清空。
+ * ponytail: 不做 LRU/容量上限（临时目录，关页即删）；写冲突（乱序 Range）时放弃该次缓存，播放不受影响。 */
+const VIDEO_EXT = new Set(['.mp4', '.webm', '.m4v'])
+
+function streamDir(): string {
+  return path.join(mediaCacheDir(), 'stream')
+}
+
+function cacheKey(target: string): string {
+  return crypto.createHash('sha1').update(target).digest('hex')
+}
+
+function isVideoUrl(target: string): boolean {
+  try {
+    return VIDEO_EXT.has(path.extname(new URL(target).pathname).toLowerCase())
+  } catch {
+    return false
+  }
+}
+
+/** 完整缓存文件路径（存在才返回） */
+function completeCacheFile(target: string): string | null {
+  const key = cacheKey(target)
+  try {
+    for (const f of fs.readdirSync(streamDir())) {
+      if (f.startsWith(key) && !f.endsWith('.part')) return path.join(streamDir(), f)
+    }
+  } catch {
+    /* 目录不存在 */
+  }
+  return null
+}
+
+interface CacheState {
+  fh: fsp.FileHandle
+  written: number
+  total: number
+  file: string
+  ext: string
+  active: boolean
+}
+const streamStates = new Map<string, CacheState>()
+
+/** 清除视频临时缓存：给定 url 清该视频（含进行中的 .part），不给则整体清空 */
+export async function releaseMediaCache(url?: string): Promise<void> {
+  const drop = (key: string): void => {
+    const st = streamStates.get(key)
+    if (st) {
+      streamStates.delete(key)
+      void st.fh.close().catch(() => {})
+    }
+    try {
+      for (const f of fs.readdirSync(streamDir())) {
+        if (f.startsWith(key)) fs.rmSync(path.join(streamDir(), f), { force: true })
+      }
+    } catch {
+      /* 目录不存在 */
+    }
+  }
+  if (url) {
+    drop(cacheKey(url))
+  } else {
+    for (const key of [...streamStates.keys()]) drop(key)
+    try {
+      fs.rmSync(streamDir(), { recursive: true, force: true })
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+let biliCookieGetter: () => string = () => ''
+
+/**
+ * 把远程媒体整片下载到指定路径（走与代理一致的 Referer / Cookie / 重定向策略）。
+ */
+export async function downloadMediaTo(url: string, dest: string): Promise<void> {
+  const headers: Record<string, string> = { 'User-Agent': UA, Accept: '*/*' }
+  const referer = refererFor(url)
+  if (referer) headers.Referer = referer
+  if (/bilibili|bilivideo|hdslb/i.test(url)) headers.Cookie = biliCookieGetter()
+  let res: Response
+  try {
+    res = await fetch(url, { headers, redirect: 'follow' })
+  } catch {
+    res = await net.fetch(url, { headers, redirect: 'follow' })
+  }
+  if (!res.ok || !res.body) throw new Error(`下载失败（HTTP ${res.status}）`)
+  const fh = await fsp.open(dest, 'w')
+  try {
+    const reader = (res.body as any).getReader()
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      await fh.write(value)
+    }
+  } finally {
+    await fh.close()
+  }
+}
+
 /**
  * 媒体代理协议：统一处理远程防盗链、Range 断点续传与本地文件流。
  * 播放器只认 swmedia://，从而彻底规避 CORS / Referer / file:// 兼容问题。
  */
 export function registerMediaProtocol(getBiliCookie: () => string): void {
+  biliCookieGetter = getBiliCookie
+  // 启动即清空上一次会话残留的视频临时缓存（临时性质）
+  void releaseMediaCache()
   protocol.handle('swmedia', async req => {
     let target = ''
     try {
@@ -58,6 +171,12 @@ export function registerMediaProtocol(getBiliCookie: () => string): void {
       return new Response('bad request', { status: 400 })
     }
     if (!target) return new Response('missing u', { status: 400 })
+
+    // 视频有完整缓存 → 直接当本地文件服务（含 Range，二次播放零流量）
+    if (isVideoUrl(target)) {
+      const cached = completeCacheFile(target)
+      if (cached) target = cached
+    }
 
     // 本地文件
     if (!/^https?:\/\//i.test(target)) {
@@ -135,7 +254,73 @@ export function registerMediaProtocol(getBiliCookie: () => string): void {
       if (!res.ok && res.status !== 206) {
         logger.warn('媒体请求失败', res.status, target.slice(0, 100))
       }
-      return new Response(res.body as any, { status: res.status, headers: outHeaders })
+      // 视频边播边存：按 Range 偏移 tee 写入 .part；整个文件下完整后改名成完整缓存
+      let body: ReadableStream<Uint8Array> | null = res.body
+      if (body && isVideoUrl(target) && (res.status === 200 || res.status === 206)) {
+        const key = cacheKey(target)
+        const m = /bytes=(\d*)-/.exec(range || '')
+        const start = m ? (m[1] ? parseInt(m[1], 10) : 0) : 0
+        const cr = res.headers.get('content-range')
+        const total = cr
+          ? parseInt(cr.split('/')[1] || '0', 10)
+          : res.status === 200
+            ? parseInt(res.headers.get('content-length') || '0', 10)
+            : 0
+        let st = streamStates.get(key)
+        if (start === 0) {
+          await ensureDir(streamDir())
+          const file = path.join(streamDir(), `${key}.part`)
+          if (st) await st.fh.close().catch(() => {})
+          st = {
+            fh: await fsp.open(file, 'w'),
+            written: 0,
+            total,
+            file,
+            ext: path.extname(new URL(target).pathname).toLowerCase() || '.mp4',
+            active: true,
+          }
+          streamStates.set(key, st)
+        } else if (st && st.written === start) {
+          /* 连续续传：复用同一句柄 */
+        } else {
+          // 无起点状态或偏移对不上：放弃本次缓存（播放透传不受影响）
+          if (st) {
+            await st.fh.close().catch(() => {})
+            streamStates.delete(key)
+          }
+          st = undefined
+        }
+        const state = st
+        if (state) {
+          const src = body
+          body = new ReadableStream<Uint8Array>({
+            async pull(controller) {
+              const { done, value } = await src.getReader().read().catch(() => ({ done: true, value: undefined }))
+              if (done) {
+                await state.fh.close().catch(() => {})
+                streamStates.delete(key)
+                if (state.total && state.written >= state.total) {
+                  // 下载完整 → 升格为完整缓存
+                  await fsp.rename(state.file, path.join(streamDir(), `${key}${state.ext}`)).catch(() => {})
+                }
+                controller.close()
+                return
+              }
+              if (value) {
+                await state.fh.write(value, 0, value.length, state.written).catch(() => {})
+                state.written += value.length
+              }
+              controller.enqueue(value!)
+            },
+            async cancel(reason) {
+              await state.fh.close().catch(() => {})
+              streamStates.delete(key)
+              src.cancel(reason).catch(() => {})
+            },
+          })
+        }
+      }
+      return new Response(body as any, { status: res.status, headers: outHeaders })
     } catch (e: any) {
       logger.warn('媒体代理异常', e?.message, target.slice(0, 100))
       return new Response('upstream error', { status: 502 })

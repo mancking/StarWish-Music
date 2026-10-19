@@ -228,10 +228,50 @@ function back(): void {
   if (window.history.length > 1) router.back()
   else router.push('/')
 }
+
+/* 舞台切换手势：右上角按钮在 Windows 上可能被窗口控制区遮挡，
+   左右滑动页面或点击页面左右边缘即可切换（从按钮/滑杆上起手的不触发）。 */
+function cycleStage(dir: 1 | -1): void {
+  const i = stages.findIndex(s => s.key === player.stage)
+  const next = stages[(i + dir + stages.length) % stages.length]
+  player.setStage(next.key)
+  ui.toast(`已切换到${next.label}`, 'info', 1400)
+}
+let gX = 0
+let gY = 0
+let gT = 0
+function onGestureStart(e: PointerEvent): void {
+  if ((e.target as HTMLElement).closest('button, input, a, .slider, canvas')) return
+  gX = e.clientX
+  gY = e.clientY
+  gT = Date.now()
+}
+function onGestureEnd(e: PointerEvent): void {
+  if (!gT) return
+  const dx = e.clientX - gX
+  const dy = e.clientY - gY
+  const dt = Date.now() - gT
+  gT = 0
+  if (dt > 800) return
+  if (Math.abs(dx) > 60 && Math.abs(dx) > Math.abs(dy) * 1.5) {
+    cycleStage(dx < 0 ? 1 : -1)
+    return
+  }
+  if (Math.abs(dx) < 10 && Math.abs(dy) < 10) {
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
+    if (e.clientX - rect.left < 48) cycleStage(-1)
+    else if (rect.right - e.clientX < 48) cycleStage(1)
+  }
+}
 </script>
 
 <template>
-  <div class="player" :class="`stage-${player.stage}`">
+  <div
+    class="player"
+    :class="`stage-${player.stage}`"
+    @pointerdown="onGestureStart"
+    @pointerup="onGestureEnd"
+  >
     <!-- 背景 -->
     <div class="bg-layer">
       <img v-if="player.coverUrl" :src="player.coverUrl" class="bg-img" alt="" />

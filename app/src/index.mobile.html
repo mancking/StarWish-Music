@@ -10,8 +10,28 @@
       content="default-src 'self'; img-src 'self' data: blob: https:; media-src 'self' data: blob: https:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval'; font-src 'self' data:; connect-src 'self' data: blob: https:"
     />
     <title>星河音乐</title>
+    <style>
+      #splash { position: fixed; inset: 0; z-index: 9999; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 18px; background: #0b0f1a; color: #7c9cff; transition: opacity 0.4s ease; -webkit-user-select: none; user-select: none; }
+      #splash.splash-out { opacity: 0; pointer-events: none; }
+      .splash-mark { animation: splash-breathe 1.6s ease-in-out infinite; }
+      .splash-name { font-size: 18px; font-weight: 600; letter-spacing: 2px; color: #e6e9f2; }
+      .splash-dot { width: 6px; height: 6px; border-radius: 50%; background: #7c9cff; animation: splash-blink 1.2s ease-in-out infinite; }
+      @keyframes splash-breathe { 0%, 100% { transform: scale(1); opacity: 0.85; } 50% { transform: scale(1.08); opacity: 1; } }
+      @keyframes splash-blink { 0%, 100% { opacity: 0.3; } 50% { opacity: 1; } }
+      @media (prefers-color-scheme: light) { #splash { background: #f4f6fb; color: #3b5bdb; } .splash-name { color: #1a2033; } }
+    </style>
   </head>
   <body>
+    <div id="splash">
+      <div class="splash-mark">
+        <svg viewBox="0 0 48 48" width="64" height="64" aria-hidden="true">
+          <circle cx="24" cy="24" r="20" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-dasharray="90 40" />
+          <path d="M20 30V18l10 6-10 6z" fill="currentColor" />
+        </svg>
+      </div>
+      <div class="splash-name">星河音乐</div>
+      <div class="splash-dot"></div>
+    </div>
     <div id="app"></div>
     <script type="module" src="/main.mobile.ts"></script>
   </body>

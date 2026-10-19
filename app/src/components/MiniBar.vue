@@ -23,7 +23,7 @@ const qualityLabel = computed(() => {
 const liked = computed(() => (player.song ? library.isFavorite(player.song.id) : false))
 
 function openPlayer(): void {
-  if (player.song) router.push('/player')
+  router.push('/player')
 }
 
 function cycleQuality(): void {

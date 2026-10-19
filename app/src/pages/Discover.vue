@@ -120,7 +120,8 @@ const PL_SOURCES: PlatformOption[] = [
 ]
 const plSource = ref('wy')
 
-/** 切换音源：重置标签与分页，必要时重新拉分类标签 */
+/** 切换音源：重置标签与分页。标签与歌单并行拉取——原先先 await 标签接口再拉歌单，
+ *  切换音源期间界面无任何反馈（这就是「切换有延迟」的主因），现两者同时发出，歌单骨架屏立即出现 */
 async function changePlSource(s: string): Promise<void> {
   if (plSource.value === s) return
   plSource.value = s
@@ -129,20 +130,23 @@ async function changePlSource(s: string): Promise<void> {
   plHasNext.value = true
   cat.value = '全部'
   tagOpen.value = false
-  try {
-    const gs = await call<PlaylistTagGroup[]>('music:playlistTags', { source: s })
-    if (gs.length) {
-      // 新源的标签整体替换（标签名即 id 的场景由后端提供）
-      TAG_GROUPS.value = gs
-      tagSupported.value = true
-    } else {
+  void call<PlaylistTagGroup[]>('music:playlistTags', { source: s })
+    .then(gs => {
+      if (plSource.value !== s) return // 已切到别的源，丢弃过期结果
+      if (gs.length) {
+        // 新源的标签整体替换（标签名即 id 的场景由后端提供）
+        TAG_GROUPS.value = gs
+        tagSupported.value = true
+      } else {
+        TAG_GROUPS.value = []
+        tagSupported.value = false
+      }
+    })
+    .catch(() => {
+      if (plSource.value !== s) return
       TAG_GROUPS.value = []
       tagSupported.value = false
-    }
-  } catch {
-    TAG_GROUPS.value = []
-    tagSupported.value = false
-  }
+    })
   void loadPlaylists(1)
 }
 
@@ -346,7 +350,7 @@ onBeforeUnmount(() => {
                   <span
                     v-for="t in g.tags"
                     :key="t.id"
-                    class="tag"
+                    class="cat-tag"
                     :class="{ active: cat === t.n }"
                     @click.stop="selectCat(t.n)"
                   >{{ t.n }}</span>
@@ -635,22 +639,27 @@ onBeforeUnmount(() => {
   color: var(--text-3);
   letter-spacing: 0.5px;
 }
-.tag {
+/* 类名用 cat-tag 而非 tag：main.css 有全局 .tag（height:16px/border:1px/line-height:1
+   歌曲类型徽标），scoped 只覆盖自声明属性，漏网的 height/border 会把胶囊压成字沉底错位 */
+.cat-tag {
   display: inline-block;
   margin: 5px;
   padding: 7px 11px;
   border-radius: 6px;
   font-size: 12.5px;
+  line-height: normal;
+  height: auto;
+  border: 0;
   color: var(--text-2);
   background: var(--panel-2);
   cursor: pointer;
   transition: background 0.15s var(--ease), color 0.15s var(--ease);
 }
-.tag:hover {
+.cat-tag:hover {
   background: var(--hover);
   color: var(--text);
 }
-.tag.active {
+.cat-tag.active {
   background: var(--accent-soft);
   color: var(--accent);
   font-weight: 500;

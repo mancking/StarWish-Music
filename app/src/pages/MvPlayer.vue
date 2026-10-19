@@ -3,7 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import Icon from '@/components/Icon.vue'
 import Cover from '@/components/Cover.vue'
-import { call } from '@/api'
+import { call, isDesktop } from '@/api'
 import { formatTime } from '@shared/lrc'
 import { usePlayerStore } from '@/stores/player'
 import { useUiStore } from '@/stores/ui'
@@ -55,9 +55,19 @@ const videoSrc = computed(() => {
   return native ? `/swmedia/?u=${u}` : `swmedia://stream/?u=${u}`
 })
 const hasParts = computed(() => parts.value.length > 1)
-/** 初次自动加载被超长拦截，等用户确认（主动点分集/重试/仍要加载即直接加载） */
-const tooLongBlocked = ref(false)
-const tooLong = computed(() => tooLongBlocked.value)
+
+/** 分集分页渲染：合集可能有几百 P，先渲染前 20 条，滚动到底再追加（每批 20） */
+const PART_BATCH = 20
+const partsShown = ref(PART_BATCH)
+const partsMore = computed(() => parts.value.slice(0, partsShown.value))
+const partsPending = computed(() => parts.value.length > partsShown.value)
+
+function onPartsScroll(e: Event): void {
+  const el = e.currentTarget as HTMLElement
+  if (el.scrollTop + el.clientHeight >= el.scrollHeight - 40) {
+    partsShown.value = Math.min(partsShown.value + PART_BATCH, parts.value.length)
+  }
+}
 
 /** 格式化播放量：B站风格 "277.8万 次播放" */
 function fmtCount(n: number): string {
@@ -81,7 +91,6 @@ async function load(): Promise<void> {
   videoError.value = ''
   listError.value = ''
   videoUrl.value = ''
-  tooLongBlocked.value = false
   parts.value = []
   current.value = null
   try {
@@ -123,18 +132,11 @@ async function load(): Promise<void> {
 }
 
 async function selectPart(p: Part, autoplay = true): Promise<void> {
+  releaseCache()
   current.value = p
-  // 超长分P（整场合集）体积可能数 GB，只拦「初次自动加载」，先提示用户选集；
-  // 用户主动点分集/重试（autoplay=true）是明确意图，直接加载
-  if (!autoplay && (p.duration || 0) > 7200) {
-    tooLongBlocked.value = true
-    loading.value = false
-    videoUrl.value = ''
-    videoError.value = ''
-    router.replace({ path: `/mv/${bvid.value}`, query: p.page > 1 ? { p: String(p.page) } : {} })
-    return
-  }
-  tooLongBlocked.value = false
+  // 若目标分P 在未渲染批次内（如带 p= 的深链），扩展渲染范围保证它可见
+  const idx = parts.value.findIndex(x => x.cid === p.cid)
+  if (idx >= partsShown.value) partsShown.value = Math.min(idx + PART_BATCH, parts.value.length)
   loading.value = true
   videoError.value = ''
   videoUrl.value = ''
@@ -201,11 +203,35 @@ function onVideoError(): void {
   videoError.value = err?.message || '视频加载失败，可能受版权或登录限制'
 }
 
+/** 释放当前视频的临时播放缓存（切分P / 关页面时调用） */
+function releaseCache(): void {
+  if (isDesktop && videoUrl.value) void call('video:cache:release', { url: videoUrl.value }).catch(() => {})
+}
+
+/** 保存整片视频到用户选择的位置（桌面端） */
+const savingVideo = ref(false)
+async function saveVideo(): Promise<void> {
+  if (!videoUrl.value) return
+  savingVideo.value = true
+  try {
+    const p = await call<string | null>('video:save', {
+      url: videoUrl.value,
+      title: `${info.value?.title || '视频'}${current.value && current.value.page > 1 ? `-P${current.value.page}` : ''}`,
+    })
+    if (p) ui.toast(`已保存到 ${p}`, 'success')
+  } catch (e: any) {
+    if (e?.message !== 'cancel' && e?.message !== 'canceled') ui.toast(e?.message || '保存失败', 'error')
+  } finally {
+    savingVideo.value = false
+  }
+}
+
 watch(bvid, () => void load())
 
 onMounted(() => void load())
 onBeforeUnmount(() => {
   videoEl.value?.pause()
+  releaseCache()
 })
 </script>
 
@@ -234,17 +260,9 @@ onBeforeUnmount(() => {
           />
           <div v-else class="video-state">
             <Icon v-if="loading" name="loading" :size="26" class="spin" />
-            <Icon v-else-if="tooLong" name="list" :size="28" :stroke="1.4" />
             <Icon v-else name="video" :size="28" :stroke="1.4" />
-            <template v-if="tooLong">
-              <span class="state-title">这是一个超长合集（{{ formatTime(current?.duration || 0) }}）</span>
-              <span class="state-desc">文件体积较大，建议从右侧「分集」中选择单曲分 P 播放</span>
-              <button class="btn sm" @click="current && selectPart(current, true)">仍要加载</button>
-            </template>
-            <template v-else>
-              <span>{{ loading ? '正在解析视频流…' : videoError || '暂无可用视频流' }}</span>
-              <button v-if="!loading && current" class="btn sm" @click="selectPart(current, true)">重试</button>
-            </template>
+            <span>{{ loading ? '正在解析视频流…' : videoError || '暂无可用视频流' }}</span>
+            <button v-if="!loading && current" class="btn sm" @click="selectPart(current, true)">重试</button>
           </div>
           <div v-if="videoError && videoSrc" class="video-overlay">
             <span>{{ videoError }}</span>
@@ -277,6 +295,14 @@ onBeforeUnmount(() => {
             <span v-if="current" class="part-now">P{{ current.page }} · {{ current.part }}</span>
             <div class="meta-actions">
               <button class="btn sm" @click="listenAudio"><Icon name="music" :size="13" />听音频</button>
+              <button
+                v-if="isDesktop && videoUrl"
+                class="btn sm"
+                :disabled="savingVideo"
+                @click="saveVideo"
+              >
+                <Icon name="download" :size="13" />{{ savingVideo ? '保存中…' : '保存视频' }}
+              </button>
               <button class="btn sm ghost" @click="load"><Icon name="refresh" :size="13" />刷新</button>
             </div>
           </div>
@@ -293,9 +319,9 @@ onBeforeUnmount(() => {
           <Icon name="list" :size="15" />
         </div>
 
-        <div v-if="hasParts" class="parts">
+        <div v-if="hasParts" class="parts" @scroll="onPartsScroll">
           <button
-            v-for="p in parts"
+            v-for="p in partsMore"
             :key="p.cid"
             class="part"
             :class="{ active: current?.cid === p.cid }"
@@ -305,6 +331,7 @@ onBeforeUnmount(() => {
             <span class="part-name ellipsis">{{ p.part }}</span>
             <span class="part-dur mono">{{ p.duration ? formatTime(p.duration) : '' }}</span>
           </button>
+          <div v-if="partsPending" class="parts-tip">下滑加载更多分集（{{ partsMore.length }}/{{ parts.length }}）</div>
         </div>
 
         <div v-else class="single-info">
@@ -549,6 +576,12 @@ onBeforeUnmount(() => {
 }
 .part-dur {
   font-size: 10px;
+  color: var(--text-3);
+}
+.parts-tip {
+  padding: 9px 8px 6px;
+  text-align: center;
+  font-size: 10.5px;
   color: var(--text-3);
 }
 .single-info {

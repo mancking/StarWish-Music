@@ -51,6 +51,7 @@ import {
 import { biliLogout, biliQrGenerate, biliQrPoll, biliStatus } from './core/bili'
 import { cancelScan, getScanProgress, scanLibrary } from './core/library'
 import { coverCacheSize, clearCoverCache, coverProtocolUrl } from './core/cover'
+import { downloadMediaTo, releaseMediaCache } from './core/media'
 import {
   cacheRootDir,
   coverCacheDir,
@@ -421,6 +422,23 @@ const handlers: Record<string, Handler> = {
     })
     if (r.canceled) return []
     return r.filePaths
+  },
+  /* 视频：保存整片到用户选择的位置（临时缓存不动） */
+  'video:save': async ({ url, title }: { url: string; title?: string }) => {
+    if (!url) throw new Error('缺少视频地址')
+    const r = await dialog.showSaveDialog(wins.main!, {
+      title: '保存视频',
+      defaultPath: `${(title || '视频').replace(/[\\/:*?"<>|]/g, '_')}.mp4`,
+      filters: [{ name: 'MP4 视频', extensions: ['mp4'] }],
+    })
+    if (r.canceled || !r.filePath) return null
+    await downloadMediaTo(url, r.filePath)
+    return r.filePath
+  },
+  /* 视频：释放某个视频的临时缓存（关闭页面/切分P 时调用；不传 url 整体清空） */
+  'video:cache:release': async ({ url }: { url?: string }) => {
+    await releaseMediaCache(url)
+    return true
   },
   'library:scan': async ({ dirs }: { dirs: string[] }) => {
     const settings = getSettings()

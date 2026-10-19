@@ -85,7 +85,9 @@ onBeforeUnmount(() => {
       <TopBar ref="topbar" />
       <main ref="content" class="content">
         <RouterView v-slot="{ Component, route: r }">
-          <component :is="Component" :key="r.name === 'playlist' || r.name === 'toplist' ? r.fullPath : undefined" />
+          <KeepAlive :include="['Home', 'Discover', 'Mv']">
+            <component :is="Component" :key="r.name === 'playlist' || r.name === 'toplist' ? r.fullPath : undefined" />
+          </KeepAlive>
         </RouterView>
       </main>
       <MiniBar />
