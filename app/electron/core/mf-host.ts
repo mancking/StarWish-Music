@@ -12,10 +12,14 @@ import * as cheerio from 'cheerio'
 import CryptoJS from 'crypto-js'
 import dayjs from 'dayjs'
 import * as qs from 'qs'
-import he from 'he'
+import * as heNS from 'he'
 import BigInteger from 'big-integer'
 
 const logger = createLogger('mf-host')
+
+// he 是纯 ESM（仅具名导出 decode/encode/escape/unescape，无默认导出）；插件 shim 里
+// `require('he')` 期望拿到含 .decode/.encode 的对象，这里手工补一个等价的默认导出。
+const he = { ...(heNS as any) }
 
 const DEPS: Record<string, any> = {
   axios,
