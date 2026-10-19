@@ -23,6 +23,14 @@ const took = ref(0)
 
 const keyword = computed(() => String(route.query.q || '').trim())
 
+// 移动端：顶部搜索框已移除，这里内联一个输入框，让底部「搜索」tab 自成一体（__MOBILE__ 构建期常量，桌面死分支摇掉）
+const isMobile = __MOBILE__
+const draft = ref('')
+function submitDraft(): void {
+  const k = draft.value.trim()
+  if (k) quickSearch(k)
+}
+
 const HOT = ['周杰伦', '林俊杰', '陈奕迅', '五月天', '邓紫棋', '薛之谦', '李荣浩', '毛不易', 'Taylor Swift', '米津玄師']
 
 const platforms: PlatformOption[] = [
@@ -71,6 +79,17 @@ onMounted(() => void search())
         <Icon name="search" :size="26" :stroke="1.5" />
         <h1>搜索音乐</h1>
         <p>输入歌名、歌手或专辑，从多个音源与插件中聚合结果</p>
+      </div>
+      <div v-if="isMobile" class="m-search">
+        <Icon name="search" :size="16" class="m-search-icon" />
+        <input
+          v-model="draft"
+          type="text"
+          placeholder="搜索歌名、歌手、专辑"
+          spellcheck="false"
+          enterkeyhint="search"
+          @keydown.enter="submitDraft"
+        />
       </div>
       <div class="hot">
         <div class="hot-label">试试这些</div>
@@ -152,6 +171,38 @@ onMounted(() => void search())
   font-size: 12.5px;
   max-width: 520px;
   line-height: 1.7;
+}
+.m-search {
+  margin: 22px auto 0;
+  max-width: 520px;
+  height: 44px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 14px;
+  border-radius: 12px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+}
+.m-search:focus-within {
+  border-color: var(--accent);
+  background: var(--panel-2);
+}
+.m-search-icon {
+  color: var(--text-3);
+  flex: none;
+}
+.m-search input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  background: none;
+  outline: none;
+  font-size: 14px;
+  color: var(--text);
+}
+.m-search input::placeholder {
+  color: var(--text-3);
 }
 .hot {
   margin-top: 34px;

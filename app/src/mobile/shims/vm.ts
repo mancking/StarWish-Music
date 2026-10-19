@@ -25,8 +25,14 @@ export function runInContext(code: string, ctx: Ctx, opts?: { filename?: string;
   // 临时全局键传 ctx：避开任何形参/局部名与音源声明撞名（同 EVENT_NAMES 教训）
   const key = '__lx_vm_ctx_' + Math.random().toString(36).slice(2)
   ;(globalThis as any)[key] = ctx
+  // 先用 with(ctx) 复刻对象环境语义；再把每个 sandbox 键显式变成 new Function 形参
+  // 兜底——插件源码若带 "use strict"（strict 模式禁用 with），或在延迟回调里引用
+  // require 时，with 作用域已失效，显式形参保证 require/module/exports 一直是真实
+  // 绑定，移动端不再报 "require is not defined"。
+  const names = Object.keys(ctx).filter((n) => /^[A-Za-z_$][\w$]*$/.test(n))
+  const params = names.map((n) => `var ${n} = ${key}[${JSON.stringify(n)}];`).join('\n')
   try {
-    return new Function(`with (${key}) {\n${code}\n}`)()
+    return new Function(`${params}\nwith (${key}) {\n${code}\n}`)()
   } finally {
     delete (globalThis as any)[key]
   }

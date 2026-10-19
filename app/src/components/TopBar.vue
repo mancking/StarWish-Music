@@ -11,6 +11,8 @@ const ui = useUiStore()
 const input = ref<HTMLInputElement | null>(null)
 const keyword = ref('')
 const isWin = computed(() => window.sw?.platform === 'win32')
+// 移动端：去掉顶部搜索框与前进/后退，搜索统一由「搜索」tab 页内输入框承担（__MOBILE__ 构建期常量，桌面死分支摇掉）
+const isMobile = __MOBILE__
 
 onMounted(() => {
   if (typeof route.query.q === 'string') keyword.value = route.query.q
@@ -47,12 +49,12 @@ defineExpose({ focusSearch })
 
 <template>
   <header class="topbar drag" :class="{ win: isWin }">
-    <div class="nav no-drag">
+    <div v-if="!isMobile" class="nav no-drag">
       <button class="icon-btn" title="后退" @click="router.back()"><Icon name="chevron-left" :size="17" /></button>
       <button class="icon-btn" title="前进" @click="router.forward()"><Icon name="chevron-right" :size="17" /></button>
     </div>
 
-    <div class="search no-drag">
+    <div v-if="!isMobile" class="search no-drag">
       <Icon name="search" :size="14" class="search-icon" />
       <input
         ref="input"
@@ -64,6 +66,11 @@ defineExpose({ focusSearch })
         @keydown.esc="($event.target as HTMLInputElement).blur()"
       />
       <button v-if="keyword" class="clear" title="清空" @click="clear"><Icon name="close" :size="13" /></button>
+    </div>
+
+    <div v-if="isMobile" class="m-brand no-drag">
+      <Icon name="music" :size="16" />
+      <span>星河音乐</span>
     </div>
 
     <div class="spacer no-drag" />
@@ -171,6 +178,18 @@ defineExpose({ focusSearch })
 .spacer {
   flex: 1;
   min-width: 0;
+}
+.m-brand {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 15px;
+  font-weight: 650;
+  color: var(--text);
+  padding-left: 2px;
+}
+.m-brand svg {
+  color: var(--accent);
 }
 .actions {
   display: flex;

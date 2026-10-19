@@ -254,7 +254,7 @@ export function importFromContent(
 /** 从网址导入（下载后按内容导入） */
 export async function importFromUrl(url: string): Promise<ImportResult> {
   if (!/^https?:\/\//i.test(url)) throw new Error('仅支持 http(s) 链接')
-  const res = await request(url, { timeout: 20000 })
+  const res = await requestWithMirror(url, { timeout: 20000 })
   const body: any = res.body
   const content = typeof body === 'string' ? body : res.raw || ''
   if (!content || content.length < 10) throw new Error('下载内容为空或过短，可能不是插件脚本')
@@ -272,7 +272,7 @@ export function listSubscriptions(): PluginSubscription[] {
  */
 export async function importSubscription(url: string, name?: string): Promise<{ added: number; updated: number; subscriptions: PluginSubscription[] }> {
   if (!/^https?:\/\//i.test(url)) throw new Error('仅支持 http(s) 订阅链接')
-  const res = await request(url, { timeout: 20000 })
+  const res = await requestWithMirror(url, { timeout: 20000 })
   const raw: any = res.body
   const text = typeof raw === 'string' ? raw : res.raw || ''
 
@@ -300,7 +300,7 @@ export async function importSubscription(url: string, name?: string): Promise<{ 
   let updated = 0
   for (const item of listItems) {
     try {
-      const dl = await request(item.url, { timeout: 20000 })
+      const dl = await requestWithMirror(item.url, { timeout: 20000 })
       const dlBody: any = dl.body
       const content = typeof dlBody === 'string' ? dlBody : dl.raw || ''
       if (!content || content.length < 10) continue
@@ -348,11 +348,45 @@ export interface MarketEntry {
   description?: string
   platform?: string
   supportedSearchType?: string[]
+  types?: string[]
+}
+
+/**
+ * GitHub raw（raw.githubusercontent.com）在部分网络/地区被阻断或被浏览器 CORS 拦截，
+ * 导致插件市场 manifest 与插件脚本拉取都报 `fetch failed`。这里按仓库结构推导
+ * jsDelivr（cdn.jsdelivr.net/gh/owner/repo@branch/path）镜像做兜底：
+ * 主域名失败自动切换镜像，镜像失败再切回主域名。
+ */
+const GH_RAW_RE = /^https:\/\/raw\.githubusercontent\.com\/([^/]+)\/([^/]+)\/(.+)$/
+
+export function mirrorCandidates(url: string): string[] {
+  const m = GH_RAW_RE.exec(url)
+  if (!m) return [url]
+  const [, owner, repo, rest] = m
+  // rest 形如 "Branch/Path/To/File.js"；jsDelivr 只能带一个 ref，取第一段为分支。
+  const slash = rest.indexOf('/')
+  const ref = slash > 0 ? rest.slice(0, slash) : 'main'
+  const filePath = slash > 0 ? rest.slice(slash + 1) : rest
+  const jsd = `https://cdn.jsdelivr.net/gh/${owner}/${repo}@${ref}/${filePath}`
+  return [url, jsd]
+}
+
+/** 依次尝试主域名与镜像，返回第一个成功的响应；全部失败抛最后一个错误。 */
+async function requestWithMirror(url: string, opts: Parameters<typeof request>[1]): Promise<Awaited<ReturnType<typeof request>>> {
+  let lastErr: unknown = null
+  for (const u of mirrorCandidates(url)) {
+    try {
+      return await request(u, opts)
+    } catch (e) {
+      lastErr = e
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error(String(lastErr))
 }
 
 /** 拉取插件市场目录（走后端 request，规避渲染层直连 raw.githubusercontent 的 fetch failed） */
 export async function fetchMarket(url: string): Promise<MarketEntry[]> {
-  const res = await request(url, { timeout: 20000, headers: { Accept: 'application/json' } })
+  const res = await requestWithMirror(url, { timeout: 20000, headers: { Accept: 'application/json' } })
   const data: any = res.body
   const arr: any[] = Array.isArray(data) ? data : Array.isArray(data?.plugins) ? data.plugins : []
   return arr.map((it: any) => (typeof it === 'string' ? { name: it, url: it } : it)).filter((it: any) => it && /^https?:\/\//i.test(it.url))

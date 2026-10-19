@@ -303,6 +303,18 @@ function pluginTypeLabel(t: string): string {
   return PLUGIN_TYPE_LABEL[t] || t
 }
 
+/** 插件按平台分组（platform 为空归入「未分类」），与音源按平台组织方式保持一致 */
+const pluginGroups = computed<{ label: string; items: PluginInfo[] }[]>(() => {
+  const map = new Map<string, PluginInfo[]>()
+  for (const p of plugins.value) {
+    const key = p.platform || '未分类'
+    const arr = map.get(key)
+    if (arr) arr.push(p)
+    else map.set(key, [p])
+  }
+  return [...map.entries()].map(([label, items]) => ({ label, items }))
+})
+
 async function doImportPlugin(): Promise<void> {
   pluginImportError.value = ''
   if (!pluginImportUrl.value.trim() && !pluginImportText.value.trim()) {
@@ -877,31 +889,37 @@ onBeforeUnmount(stopPoll)
           </div>
 
           <div v-else class="src-list">
-            <div v-for="p in plugins" :key="p.file" class="src" :class="{ off: !p.enabled, bad: p.loadError }">
-              <div class="src-main">
-                <div class="src-title">
-                  <b>{{ p.name }}</b>
-                  <span v-if="p.version" class="src-ver">v{{ p.version }}</span>
-                  <span v-if="p.builtin" class="src-tag">内置</span>
-                  <span v-if="p.loadError" class="src-tag err">加载失败</span>
-                </div>
-                <div class="src-platforms">
-                  <span v-for="t in p.searchTypes.slice(0, 6)" :key="t" class="pf">{{ pluginTypeLabel(t) }}</span>
-                  <span v-if="!p.searchTypes.length" class="pf none">无搜索类型</span>
-                </div>
-                <div v-if="p.author || p.origin !== 'local'" class="src-plat">
-                  <span v-if="p.author">作者 {{ p.author }}</span>
-                  <span v-if="p.origin === 'url'">· 网址导入</span>
-                  <span v-else-if="p.origin === 'subscribe'">· 订阅</span>
-                </div>
-                <div v-if="p.loadError" class="src-err">{{ p.loadError }}</div>
+            <template v-for="group in pluginGroups" :key="group.label">
+              <div class="pf-group-head">
+                <b>{{ group.label }}</b>
+                <span class="src-ver">{{ group.items.length }} 个</span>
               </div>
-              <div class="src-actions">
-                <button class="icon-btn" title="查看源码" @click="viewPluginCode(p)"><Icon name="edit" :size="15" /></button>
-                <button v-if="!p.builtin" class="icon-btn" title="移除" @click="pluginDeleteTarget = p"><Icon name="trash" :size="15" /></button>
-                <Toggle :model-value="p.enabled" @update:model-value="() => togglePlugin(p)" />
+              <div v-for="p in group.items" :key="p.file" class="src" :class="{ off: !p.enabled, bad: p.loadError }">
+                <div class="src-main">
+                  <div class="src-title">
+                    <b>{{ p.name }}</b>
+                    <span v-if="p.version" class="src-ver">v{{ p.version }}</span>
+                    <span v-if="p.builtin" class="src-tag">内置</span>
+                    <span v-if="p.loadError" class="src-tag err">加载失败</span>
+                  </div>
+                  <div class="src-platforms">
+                    <span v-for="t in p.searchTypes.slice(0, 6)" :key="t" class="pf">{{ pluginTypeLabel(t) }}</span>
+                    <span v-if="!p.searchTypes.length" class="pf none">无搜索类型</span>
+                  </div>
+                  <div v-if="p.author || p.origin !== 'local'" class="src-plat">
+                    <span v-if="p.author">作者 {{ p.author }}</span>
+                    <span v-if="p.origin === 'url'">· 网址导入</span>
+                    <span v-else-if="p.origin === 'subscribe'">· 订阅</span>
+                  </div>
+                  <div v-if="p.loadError" class="src-err">{{ p.loadError }}</div>
+                </div>
+                <div class="src-actions">
+                  <button class="icon-btn" title="查看源码" @click="viewPluginCode(p)"><Icon name="edit" :size="15" /></button>
+                  <button v-if="!p.builtin" class="icon-btn" title="移除" @click="pluginDeleteTarget = p"><Icon name="trash" :size="15" /></button>
+                  <Toggle :model-value="p.enabled" @update:model-value="() => togglePlugin(p)" />
+                </div>
               </div>
-            </div>
+            </template>
             <div v-if="!plugins.length" class="empty" style="padding: 30px">
               <div class="empty-desc">暂无插件，可点「导入插件」从本地文件或网址添加，或用「订阅源」批量更新</div>
             </div>
@@ -1477,6 +1495,20 @@ h1 {
 }
 .src-main {
   min-width: 0;
+}
+.pf-group-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 12px 2px 6px;
+  font-size: 11px;
+  color: var(--text-3);
+  letter-spacing: 0.3px;
+}
+.pf-group-head b {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-2);
 }
 .src-title {
   display: flex;
