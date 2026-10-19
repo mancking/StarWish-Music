@@ -16,7 +16,7 @@
         "artist",
         "sheet"
       ],
-      "url": "https://raw.githubusercontent.com/mancking/Star-Wish-Plugin-Library/Star-Wish-Plugin-Library/5s.js"
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/5s.js"
     },
     {
       "name": "bilibili",
@@ -30,7 +30,7 @@
         "album",
         "artist"
       ],
-      "url": "https://raw.githubusercontent.com/mancking/Star-Wish-Plugin-Library/Star-Wish-Plugin-Library/%E5%8E%9F%E5%8A%9B.js"
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E5%8E%9F%E5%8A%9B.js"
     },
     {
       "name": "小芸音乐",
@@ -46,7 +46,7 @@
         "artist",
         "lyric"
       ],
-      "url": "https://raw.githubusercontent.com/mancking/Star-Wish-Plugin-Library/Star-Wish-Plugin-Library/%E5%B0%8F%E4%BA%91.js"
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E5%B0%8F%E4%BA%91.js"
     },
     {
       "name": "歌词千寻",
@@ -58,7 +58,7 @@
       "types": [
         "lyric"
       ],
-      "url": "https://raw.githubusercontent.com/mancking/Star-Wish-Plugin-Library/Star-Wish-Plugin-Library/%E5%B0%8F%E5%8D%83.js"
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E5%B0%8F%E5%8D%83.js"
     },
     {
       "name": "音悦台",
@@ -70,7 +70,7 @@
       "types": [
         "music"
       ],
-      "url": "https://raw.githubusercontent.com/mancking/Star-Wish-Plugin-Library/Star-Wish-Plugin-Library/%E5%B0%8F%E6%9C%88.js"
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E5%B0%8F%E6%9C%88.js"
     },
     {
       "name": "小枸音乐",
@@ -84,7 +84,7 @@
         "album",
         "sheet"
       ],
-      "url": "https://raw.githubusercontent.com/mancking/Star-Wish-Plugin-Library/Star-Wish-Plugin-Library/%E5%B0%8F%E6%9E%B8.js"
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E5%B0%8F%E6%9E%B8.js"
     },
     {
       "name": "小秋音乐",
@@ -100,7 +100,7 @@
         "artist",
         "lyric"
       ],
-      "url": "https://raw.githubusercontent.com/mancking/Star-Wish-Plugin-Library/Star-Wish-Plugin-Library/%E5%B0%8F%E7%A7%8B.js"
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E5%B0%8F%E7%A7%8B.js"
     },
     {
       "name": "小蜗音乐",
@@ -115,7 +115,7 @@
         "sheet",
         "artist"
       ],
-      "url": "https://raw.githubusercontent.com/mancking/Star-Wish-Plugin-Library/Star-Wish-Plugin-Library/%E5%B0%8F%E8%9C%97.js"
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E5%B0%8F%E8%9C%97.js"
     },
     {
       "name": "网易音乐",
@@ -131,7 +131,7 @@
         "artist",
         "lyric"
       ],
-      "url": "https://raw.githubusercontent.com/mancking/Star-Wish-Plugin-Library/Star-Wish-Plugin-Library/%E7%BD%91%E6%98%93%E4%BA%91.js"
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E7%BD%91%E6%98%93%E4%BA%91.js"
     }
   ]
 }
