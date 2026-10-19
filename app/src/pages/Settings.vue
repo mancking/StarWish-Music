@@ -63,10 +63,17 @@ const pluginDeleteTarget = ref<PluginInfo | null>(null)
 const subs = ref<PluginSubscription[]>([])
 const subOpen = ref(false)
 const subUrl = ref('')
-const OFFICIAL_SUB_URL = 'https://raw.githubusercontent.com/mancking/StarWish-Music/main/app/plugins/manifest.json'
+const OFFICIAL_SUB_URL = 'https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/manifest.json'
 const subName = ref('')
 const subError = ref('')
 const subbing = ref(false)
+/** 插件市场：在线目录（浏览 → 一键安装/更新） */
+const marketOpen = ref(false)
+const marketLoading = ref(false)
+const marketError = ref('')
+const marketUpdating = ref('')
+type MarketEntry = { name: string; file: string; version?: string; author?: string; platform?: string; description?: string; types?: string[]; url: string }
+const marketEntries = ref<MarketEntry[]>([])
 /** 数据目录改过之后，存下重启后的目标路径，用于提示横幅 */
 const dataRestart = ref('')
 
@@ -215,6 +222,42 @@ async function togglePlugin(p: PluginInfo): Promise<void> {
   }
 }
 
+/** 打开插件市场：拉取在线目录 manifest */
+async function loadMarket(): Promise<void> {
+  marketOpen.value = true
+  marketLoading.value = true
+  marketError.value = ''
+  try {
+    const r = await fetch(OFFICIAL_SUB_URL, { cache: 'no-store' })
+    if (!r.ok) throw new Error(`HTTP ${r.status}`)
+    const j = await r.json()
+    marketEntries.value = Array.isArray(j) ? j : j.plugins || []
+    if (!marketEntries.value.length) marketError.value = '目录为空'
+  } catch (e: any) {
+    marketError.value = `插件市场加载失败：${e.message}`
+  } finally {
+    marketLoading.value = false
+  }
+}
+
+/** 某个市场条目是否已安装（按 file 名匹配） */
+function isInstalled(file: string): PluginInfo | undefined {
+  return plugins.value.find(p => p.file === file)
+}
+
+/** 从市场安装/更新一个插件 */
+async function installFromMarket(entry: MarketEntry): Promise<void> {
+  marketUpdating.value = entry.file
+  try {
+    await call('plugins:import', { url: entry.url, origin: 'subscribe' })
+    ui.toast(`已安装/更新 ${entry.name}`, 'success')
+    await loadPlugins()
+  } catch (e: any) {
+    ui.toast(`${entry.name}：${e.message}`, 'error')
+  } finally {
+    marketUpdating.value = ''
+  }
+}
 async function viewPluginCode(p: PluginInfo): Promise<void> {
   try {
     codeText.value = await call<string>('plugins:code', { file: p.file })
@@ -791,6 +834,7 @@ onBeforeUnmount(stopPoll)
               </p>
             </div>
             <div class="head-btns">
+              <button class="btn sm ghost" @click="loadMarket"><Icon name="download" :size="14" />插件市场</button>
               <button class="btn sm ghost" @click="subOpen = true"><Icon name="refresh" :size="14" />订阅源</button>
               <button class="btn primary sm" @click="pluginImportOpen = true"><Icon name="plus" :size="14" />导入插件</button>
             </div>
@@ -1038,6 +1082,41 @@ onBeforeUnmount(stopPoll)
         <button class="btn primary" :disabled="pluginImporting" @click="doImportPlugin">
           {{ pluginImporting ? '导入中...' : '导入' }}
         </button>
+      </template>
+    </Modal>
+
+    <!-- 插件市场 -->
+    <Modal v-model="marketOpen" title="插件市场" :width="560">
+      <p class="tip">星河官方插件库 · 在线目录，点击「安装」添加，已安装的可「更新」</p>
+      <div v-if="marketLoading" class="src-list" style="margin-top: 10px">
+        <div v-for="i in 3" :key="i" class="sk" style="height: 58px; border-radius: 10px; margin-bottom: 8px" />
+      </div>
+      <div v-else-if="marketError" class="imp-err">{{ marketError }}</div>
+      <div v-else class="src-list" style="margin-top: 10px; max-height: 46vh; overflow-y: auto">
+        <div v-for="m in marketEntries" :key="m.file" class="src">
+          <div class="src-main">
+            <div class="src-title">
+              <b>{{ m.name }}</b>
+              <span v-if="m.version" class="src-ver">v{{ m.version }}</span>
+            </div>
+            <div class="src-platforms">
+              <span v-for="t in (m.types || []).slice(0, 6)" :key="t" class="pf">{{ pluginTypeLabel(t) }}</span>
+            </div>
+            <div v-if="m.author || m.description" class="src-plat">
+              <span v-if="m.author">{{ m.author }}</span>
+              <span v-if="m.description">· {{ m.description }}</span>
+            </div>
+          </div>
+          <div class="src-actions">
+            <button class="btn sm" :disabled="marketUpdating === m.file" @click="installFromMarket(m)">
+              {{ marketUpdating === m.file ? '处理中…' : isInstalled(m.file) ? '更新' : '安装' }}
+            </button>
+          </div>
+        </div>
+      </div>
+      <template #footer>
+        <button class="btn ghost" @click="marketOpen = false">关闭</button>
+        <button class="btn sm ghost" :disabled="marketLoading" @click="loadMarket"><Icon name="refresh" :size="14" />刷新</button>
       </template>
     </Modal>
 
