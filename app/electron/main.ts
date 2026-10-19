@@ -9,6 +9,7 @@ import { initBiliLogin, biliCookie } from './core/bili'
 import { lxHost } from './core/lx-host'
 import { registerCoverProtocol } from './core/cover'
 import { registerMediaProtocol } from './core/media'
+import * as mfHost from './core/mf-host'
 import { beginWindowInitWatch } from './core/crash-guard'
 import { player } from './core/player-service'
 import { registerIpc, navigateMain } from './ipc'
@@ -248,6 +249,7 @@ async function bootstrap(): Promise<void> {
     await initDb()
     initBiliLogin()
     lxHost.load()
+    mfHost.init()
     registerCoverProtocol()
     registerMediaProtocol(biliCookie)
     registerIpc()

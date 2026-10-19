@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import Icon from '@/components/Icon.vue'
 import Cover from '@/components/Cover.vue'
@@ -39,16 +39,23 @@ const info = ref<{
 const parts = ref<Part[]>([])
 const current = ref<Part | null>(null)
 const videoUrl = ref('')
+/** 已离线缓存的本地文件路径（非空则直接本地播放，零流量秒开） */
+const offlineLocal = ref('')
+/** 当前分P 的远程流 URL（保存 / 离线缓存 / 重新解析用） */
+const remoteUrl = ref('')
 const loading = ref(true)
 const videoError = ref('')
 const listError = ref('')
 const related = ref<MvItem[]>([])
 const videoEl = ref<HTMLVideoElement | null>(null)
+const boxEl = ref<HTMLDivElement | null>(null)
 
 const poster = computed(() => info.value?.pic || '')
 const videoSrc = computed(() => {
-  if (!videoUrl.value) return ''
-  const u = encodeURIComponent(videoUrl.value)
+  // 离线本地文件：走 swmedia 本地文件分支（含 Range，秒开）
+  if (offlineLocal.value) return `swmedia://stream/?u=${encodeURIComponent(offlineLocal.value)}`
+  if (!remoteUrl.value) return ''
+  const u = encodeURIComponent(remoteUrl.value)
   // 真机走原生 /swmedia/ 代理（MainActivity 的 SwMediaClient 拦截，注入防盗链头），
   // 桌面 Electron 走主进程 swmedia:// 协议（media.ts）
   const native = (globalThis as any).Capacitor?.isNativePlatform?.() === true
@@ -56,6 +63,226 @@ const videoSrc = computed(() => {
 })
 const hasParts = computed(() => parts.value.length > 1)
 
+/* ============================ 自定义播放器控制 ============================ */
+const playing = ref(false)
+const curTime = ref(0)
+const duration = ref(0)
+const buffered = ref(0)
+const volume = ref(1)
+const muted = ref(false)
+const rate = ref(1)
+const loop = ref(false)
+const autoNext = ref(true)
+const isFullscreen = ref(false)
+const showControls = ref(true)
+const ready = ref(false)
+
+const RATES = [0.5, 0.75, 1, 1.25, 1.5, 2]
+/** 画面填充模式：contain 适应 / cover 填充 / fill 拉伸 */
+const FILL_MODES = ['contain', 'cover', 'fill'] as const
+type FillMode = (typeof FILL_MODES)[number]
+const FILL_LABEL: Record<FillMode, string> = { contain: '适应', cover: '填充', fill: '拉伸' }
+const fillMode = ref<FillMode>('contain')
+
+/* 画质 */
+const qualities = ref<{ qn: number; label: string }[]>([])
+const curQn = ref(64)
+
+/* 菜单开关 */
+const menu = ref<'' | 'settings' | 'speed' | 'quality'>('')
+
+/* 离线缓存状态 */
+const offlineReady = ref(false)
+const caching = ref(false)
+
+let hideTimer = 0
+function pokeControls(): void {
+  showControls.value = true
+  window.clearTimeout(hideTimer)
+  hideTimer = window.setTimeout(() => {
+    if (playing.value && menu.value === '') showControls.value = false
+  }, 2600)
+}
+
+function fmtTime(s: number): string {
+  if (!isFinite(s) || s < 0) s = 0
+  const h = Math.floor(s / 3600)
+  const m = Math.floor((s % 3600) / 60)
+  const sec = Math.floor(s % 60)
+  const mm = String(m).padStart(2, '0')
+  const ss = String(sec).padStart(2, '0')
+  return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`
+}
+
+function togglePlay(): void {
+  const v = videoEl.value
+  if (!v) return
+  if (v.paused) void v.play().catch(() => {})
+  else v.pause()
+}
+
+function seekTo(t: number): void {
+  const v = videoEl.value
+  if (!v || !isFinite(t)) return
+  v.currentTime = Math.max(0, Math.min(t, duration.value || v.duration || 0))
+}
+
+function nudge(d: number): void {
+  seekTo((videoEl.value?.currentTime || 0) + d)
+}
+
+function setVolume(val: number): void {
+  volume.value = Math.max(0, Math.min(1, val))
+  muted.value = volume.value === 0
+  if (videoEl.value) {
+    videoEl.value.volume = volume.value
+    videoEl.value.muted = muted.value
+  }
+}
+
+function toggleMute(): void {
+  muted.value = !muted.value
+  if (videoEl.value) videoEl.value.muted = muted.value
+}
+
+function setRate(r: number): void {
+  rate.value = r
+  if (videoEl.value) videoEl.value.playbackRate = r
+  menu.value = ''
+}
+
+function toggleLoop(): void {
+  loop.value = !loop.value
+  if (videoEl.value) videoEl.value.loop = loop.value
+}
+
+function cycleFill(): void {
+  const i = FILL_MODES.indexOf(fillMode.value)
+  fillMode.value = FILL_MODES[(i + 1) % FILL_MODES.length]
+}
+
+async function togglePip(): Promise<void> {
+  const v = videoEl.value
+  if (!v) return
+  try {
+    if ((document as any).pictureInPictureElement) await (document as any).exitPictureInPicture()
+    else await v.requestPictureInPicture()
+  } catch {
+    ui.toast('当前环境不支持画中画', 'error', 1600)
+  }
+}
+
+async function toggleFullscreen(): Promise<void> {
+  const box = boxEl.value
+  if (!box) return
+  try {
+    if ((document as any).fullscreenElement) await (document as any).exitFullscreen()
+    else await box.requestFullscreen()
+  } catch {
+    /* ignore */
+  }
+}
+
+function onFsChange(): void {
+  isFullscreen.value = !!(document as any).fullscreenElement
+}
+
+function onKey(e: KeyboardEvent): void {
+  const tag = (e.target as HTMLElement)?.tagName
+  if (tag === 'INPUT' || tag === 'TEXTAREA') return
+  const k = e.key
+  if (k === ' ' || k === 'k') {
+    e.preventDefault()
+    togglePlay()
+  } else if (k === 'ArrowRight' || k === 'l') {
+    e.preventDefault()
+    nudge(5)
+  } else if (k === 'ArrowLeft' || k === 'j') {
+    e.preventDefault()
+    nudge(-5)
+  } else if (k === 'ArrowUp') {
+    e.preventDefault()
+    setVolume(volume.value + 0.1)
+  } else if (k === 'ArrowDown') {
+    e.preventDefault()
+    setVolume(volume.value - 0.1)
+  } else if (k === 'f') {
+    void toggleFullscreen()
+  } else if (k === 'm') {
+    toggleMute()
+  } else if (k === 'p') {
+    void togglePip()
+  } else if (/^[0-9]$/.test(k)) {
+    seekTo((Number(k) / 10) * (duration.value || 0))
+  }
+  pokeControls()
+}
+
+/* 进度条拖动 */
+function onProgressClick(e: MouseEvent): void {
+  const el = e.currentTarget as HTMLElement
+  const rect = el.getBoundingClientRect()
+  const ratio = (e.clientX - rect.left) / rect.width
+  seekTo(ratio * (duration.value || 0))
+}
+
+function onTimeUpdate(): void {
+  const v = videoEl.value
+  if (!v) return
+  curTime.value = v.currentTime
+}
+
+function onLoadedMeta(): void {
+  const v = videoEl.value
+  if (!v) return
+  duration.value = v.duration || current.value?.duration || 0
+  v.volume = volume.value
+  v.playbackRate = rate.value
+  ready.value = true
+}
+
+function onProgressEvt(): void {
+  const v = videoEl.value
+  if (!v || !v.buffered.length) return
+  buffered.value = v.buffered.end(v.buffered.length - 1)
+}
+
+function onPlay(): void {
+  playing.value = true
+  pokeControls()
+}
+function onPause(): void {
+  playing.value = false
+  showControls.value = true
+}
+
+/** 播放结束：循环 or 自动连播下一集 */
+function onEnded(): void {
+  if (loop.value) return
+  if (autoNext.value && hasParts.value && current.value) {
+    const idx = parts.value.findIndex(p => p.cid === current.value!.cid)
+    if (idx >= 0 && idx + 1 < parts.value.length) {
+      void selectPart(parts.value[idx + 1])
+      return
+    }
+  }
+  playing.value = false
+  showControls.value = true
+}
+
+/* ============================ 画质切换 ============================ */
+async function changeQuality(q: number): Promise<void> {
+  if (q === curQn.value) {
+    menu.value = ''
+    return
+  }
+  const keep = videoEl.value?.currentTime || 0
+  curQn.value = q
+  menu.value = ''
+  await resolveStream(q, true, keep)
+}
+
+/* ============================ 分集 / 流解析 ============================ */
 /** 分集分页渲染：合集可能有几百 P，先渲染前 20 条，滚动到底再追加（每批 20） */
 const PART_BATCH = 20
 const partsShown = ref(PART_BATCH)
@@ -96,7 +323,8 @@ async function load(): Promise<void> {
   loading.value = true
   videoError.value = ''
   listError.value = ''
-  videoUrl.value = ''
+  remoteUrl.value = ''
+  offlineLocal.value = ''
   parts.value = []
   current.value = null
   try {
@@ -137,33 +365,75 @@ async function load(): Promise<void> {
   }
 }
 
+/** 拉取某一分P 的视频流并（可选）续播；优先命中离线缓存 */
+async function resolveStream(qn: number | undefined, autoplay: boolean, resumeAt?: number): Promise<void> {
+  const p = current.value
+  if (!p) return
+  loading.value = true
+  videoError.value = ''
+  ready.value = false
+  // 桌面端先查离线缓存
+  if (isDesktop) {
+    try {
+      const local = await call<string | null>('video:offline:file', { bvid: bvid.value, cid: p.cid })
+      if (local) {
+        offlineLocal.value = local
+        offlineReady.value = true
+        remoteUrl.value = ''
+        loading.value = false
+        await play(resumeAt)
+        return
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  offlineReady.value = false
+  try {
+    const r = await call<{ url: string; type: string; qn: number; qualities: { qn: number; label: string }[] }>(
+      'music:mvurl',
+      { bvid: bvid.value, cid: p.cid, qn }
+    )
+    remoteUrl.value = r.url
+    offlineLocal.value = ''
+    if (r.qualities?.length) qualities.value = r.qualities
+    if (r.qn) curQn.value = r.qn
+    if (autoplay) await play(resumeAt)
+  } catch (e: any) {
+    videoError.value = e?.message || '视频流解析失败'
+  } finally {
+    loading.value = false
+  }
+}
+
+async function play(resumeAt?: number): Promise<void> {
+  await nextTick()
+  const v = videoEl.value
+  if (!v) return
+  v.load()
+  if (typeof resumeAt === 'number' && resumeAt > 0) {
+    const resume = (): void => {
+      try {
+        v.currentTime = resumeAt
+      } catch {
+        /* ignore */
+      }
+      v.removeEventListener('loadedmetadata', resume)
+    }
+    v.addEventListener('loadedmetadata', resume)
+  }
+  void v.play().catch(() => {})
+}
+
 async function selectPart(p: Part, autoplay = true): Promise<void> {
   releaseCache()
   current.value = p
   // 若目标分P 在未渲染批次内（如带 p= 的深链），扩展渲染范围保证它可见
   const idx = parts.value.findIndex(x => x.cid === p.cid)
   if (idx >= partsShown.value) partsShown.value = Math.min(idx + PART_BATCH, parts.value.length)
-  loading.value = true
-  videoError.value = ''
-  videoUrl.value = ''
   router.replace({ path: `/mv/${bvid.value}`, query: p.page > 1 ? { p: String(p.page) } : {} })
-  try {
-    const r = await call<{ url: string; type: string }>('music:mvurl', { bvid: bvid.value, cid: p.cid })
-    videoUrl.value = r.url
-    if (autoplay) {
-      requestAnimationFrame(() => {
-        const v = videoEl.value
-        if (v) {
-          v.load()
-          void v.play().catch(() => {})
-        }
-      })
-    }
-  } catch (e: any) {
-    videoError.value = e?.message || '视频流解析失败'
-  } finally {
-    loading.value = false
-  }
+  menu.value = ''
+  await resolveStream(undefined, autoplay)
 }
 
 async function loadRelated(author: string): Promise<void> {
@@ -211,17 +481,17 @@ function onVideoError(): void {
 
 /** 释放当前视频的临时播放缓存（切分P / 关页面时调用） */
 function releaseCache(): void {
-  if (isDesktop && videoUrl.value) void call('video:cache:release', { url: videoUrl.value }).catch(() => {})
+  if (isDesktop && remoteUrl.value) void call('video:cache:release', { url: remoteUrl.value }).catch(() => {})
 }
 
 /** 保存整片视频到用户选择的位置（桌面端） */
 const savingVideo = ref(false)
 async function saveVideo(): Promise<void> {
-  if (!videoUrl.value) return
+  if (!remoteUrl.value) return
   savingVideo.value = true
   try {
     const p = await call<string | null>('video:save', {
-      url: videoUrl.value,
+      url: remoteUrl.value,
       title: `${info.value?.title || '视频'}${current.value && current.value.page > 1 ? `-P${current.value.page}` : ''}`,
     })
     if (p) ui.toast(`已保存到 ${p}`, 'success')
@@ -232,12 +502,116 @@ async function saveVideo(): Promise<void> {
   }
 }
 
+/* ============================ 离线缓存 & 缓存管理 ============================ */
+interface OfflineItem {
+  key: string
+  bvid: string
+  cid: string
+  title: string
+  size: number
+  savedAt: number
+}
+const showCachePanel = ref(false)
+const offlineList = ref<OfflineItem[]>([])
+const offlineTotal = ref(0)
+const loadingCache = ref(false)
+
+function fmtSize(bytes: number): string {
+  if (bytes >= 1 << 30) return `${(bytes / (1 << 30)).toFixed(2)} GB`
+  if (bytes >= 1 << 20) return `${(bytes / (1 << 20)).toFixed(1)} MB`
+  if (bytes >= 1 << 10) return `${(bytes / (1 << 10)).toFixed(0)} KB`
+  return `${bytes} B`
+}
+
+/** 把当前分P 整片下载到离线目录（桌面端） */
+async function cacheCurrent(): Promise<void> {
+  const p = current.value
+  if (!p || !remoteUrl.value || caching.value) return
+  caching.value = true
+  try {
+    await call('video:offline:save', {
+      bvid: bvid.value,
+      cid: p.cid,
+      url: remoteUrl.value,
+      title: `${info.value?.title || '视频'}${p.page > 1 ? `-P${p.page}` : ''}`,
+    })
+    offlineReady.value = true
+    ui.toast('已离线缓存，下次播放免流量秒开', 'success', 1800)
+    if (showCachePanel.value) void loadCachePanel()
+  } catch (e: any) {
+    ui.toast(e?.message || '缓存失败', 'error')
+  } finally {
+    caching.value = false
+  }
+}
+
+async function loadCachePanel(): Promise<void> {
+  loadingCache.value = true
+  try {
+    const r = await call<{ items: OfflineItem[]; total: number }>('video:offline:list')
+    offlineList.value = r.items || []
+    offlineTotal.value = r.total || 0
+  } catch {
+    offlineList.value = []
+    offlineTotal.value = 0
+  } finally {
+    loadingCache.value = false
+  }
+}
+
+async function openCachePanel(): Promise<void> {
+  showCachePanel.value = true
+  void loadCachePanel()
+}
+
+async function removeCacheItem(key: string): Promise<void> {
+  try {
+    await call('video:offline:remove', { key })
+    await loadCachePanel()
+    // 若删的是当前正在离线播放的分P，回退到在线流
+    if (offlineLocal.value) {
+      const p = current.value
+      if (p) {
+        const remain = await call<string | null>('video:offline:file', { bvid: bvid.value, cid: p.cid }).catch(() => null)
+        if (!remain) {
+          offlineLocal.value = ''
+          offlineReady.value = false
+          void resolveStream(undefined, true, videoEl.value?.currentTime || 0)
+        }
+      }
+    }
+  } catch {
+    ui.toast('删除失败', 'error')
+  }
+}
+
+async function clearAllCache(): Promise<void> {
+  try {
+    await call('video:offline:remove', {})
+    await loadCachePanel()
+    if (offlineLocal.value) {
+      offlineLocal.value = ''
+      offlineReady.value = false
+      void resolveStream(undefined, true)
+    }
+  } catch {
+    ui.toast('清空失败', 'error')
+  }
+}
+
 watch(bvid, () => void load())
 
-onMounted(() => void load())
+onMounted(() => {
+  void load()
+  document.addEventListener('fullscreenchange', onFsChange)
+  boxEl.value?.addEventListener('keydown', onKey)
+})
 onBeforeUnmount(() => {
   videoEl.value?.pause()
   releaseCache()
+  window.clearTimeout(hideTimer)
+  document.removeEventListener('fullscreenchange', onFsChange)
+  boxEl.value?.removeEventListener('keydown', onKey)
 })
 </script>
 
@@ -252,17 +626,30 @@ onBeforeUnmount(() => {
 
     <div class="watch">
       <div class="player-col">
-        <div class="video-box">
+        <div
+          ref="boxEl"
+          class="video-box"
+          :class="{ idle: !showControls, fullscreen: isFullscreen }"
+          tabindex="0"
+          @mousemove="pokeControls"
+          @click.self="togglePlay"
+        >
           <video
             v-if="videoSrc"
             ref="videoEl"
             :src="videoSrc"
             :poster="poster"
             class="video"
-            controls
+            :style="{ objectFit: fillMode }"
             autoplay
             playsinline
             @error="onVideoError"
+            @timeupdate="onTimeUpdate"
+            @loadedmetadata="onLoadedMeta"
+            @progress="onProgressEvt"
+            @play="onPlay"
+            @pause="onPause"
+            @ended="onEnded"
           />
           <div v-else class="video-state">
             <Icon v-if="loading" name="loading" :size="26" class="spin" />
@@ -270,9 +657,136 @@ onBeforeUnmount(() => {
             <span>{{ loading ? '正在解析视频流…' : videoError || '暂无可用视频流' }}</span>
             <button v-if="!loading && current" class="btn sm" @click="selectPart(current, true)">重试</button>
           </div>
+
+          <!-- 播放/暂停大按钮 -->
+          <button
+            v-if="videoSrc && ready && !playing"
+            class="big-play"
+            @click.stop="togglePlay"
+          >
+            <Icon name="play" :size="34" />
+          </button>
+
+          <!-- 离线缓存角标 -->
+          <span v-if="offlineReady" class="offline-badge"><Icon name="check" :size="11" />已缓存</span>
+
           <div v-if="videoError && videoSrc" class="video-overlay">
             <span>{{ videoError }}</span>
             <button class="btn sm" @click="current && selectPart(current, true)">重试</button>
+          </div>
+
+          <!-- 底部控制条 -->
+          <div v-if="videoSrc" class="ctrl" :class="{ hidden: !showControls && playing }" @click.stop>
+            <!-- 进度条 -->
+            <div class="bar" @click="onProgressClick">
+              <div class="bar-buffer" :style="{ width: (buffered / (duration || 1)) * 100 + '%' }"></div>
+              <div class="bar-played" :style="{ width: (curTime / (duration || 1)) * 100 + '%' }"></div>
+              <div class="bar-thumb" :style="{ left: (curTime / (duration || 1)) * 100 + '%' }"></div>
+            </div>
+
+            <div class="ctrl-row">
+              <div class="ctrl-left">
+                <button class="cbtn" @click="togglePlay">
+                  <Icon :name="playing ? 'pause' : 'play'" :size="18" />
+                </button>
+                <button class="cbtn" @click="nudge(-5)"><Icon name="prev" :size="16" /></button>
+                <button class="cbtn" @click="nudge(5)"><Icon name="next" :size="16" /></button>
+                <div class="vol">
+                  <button class="cbtn" @click="toggleMute">
+                    <Icon :name="muted || volume === 0 ? 'volume-mute' : volume < 0.5 ? 'volume-low' : 'volume'" :size="17" />
+                  </button>
+                  <input
+                    class="vol-range"
+                    type="range"
+                    min="0"
+                    max="1"
+                    step="0.05"
+                    :value="muted ? 0 : volume"
+                    @input="setVolume(Number(($event.target as HTMLInputElement).value))"
+                  />
+                </div>
+                <span class="time mono">{{ fmtTime(curTime) }} / {{ fmtTime(duration) }}</span>
+              </div>
+
+              <div class="ctrl-right">
+                <!-- 自动连播 -->
+                <button
+                  class="cbtn toggle"
+                  :class="{ on: autoNext }"
+                  title="自动连播"
+                  @click="autoNext = !autoNext"
+                >
+                  <Icon name="repeat" :size="16" /><span class="tlab">连播</span>
+                </button>
+                <!-- 循环 -->
+                <button class="cbtn toggle" :class="{ on: loop }" title="循环播放" @click="toggleLoop">
+                  <Icon name="repeat-one" :size="16" /><span class="tlab">循环</span>
+                </button>
+                <!-- 填充模式 -->
+                <button class="cbtn toggle" title="画面填充模式" @click="cycleFill">
+                  <Icon name="expand" :size="16" /><span class="tlab">{{ FILL_LABEL[fillMode] }}</span>
+                </button>
+                <!-- 离线缓存 -->
+                <button
+                  v-if="isDesktop && remoteUrl"
+                  class="cbtn"
+                  title="离线缓存"
+                  :disabled="caching || offlineReady"
+                  @click="cacheCurrent"
+                >
+                  <Icon :name="offlineReady ? 'check' : 'download'" :size="16" />
+                </button>
+                <!-- 画质 -->
+                <div class="menu-wrap">
+                  <button class="cbtn toggle" :class="{ open: menu === 'quality' }" @click="menu = menu === 'quality' ? '' : 'quality'">
+                    <Icon name="gauge" :size="16" /><span class="tlab">{{ curQn >= 80 ? '高清' : curQn + 'P' }}</span>
+                  </button>
+                  <div v-if="menu === 'quality'" class="menu">
+                    <div class="menu-title">画质</div>
+                    <button
+                      v-for="q in qualities"
+                      :key="q.qn"
+                      class="menu-item"
+                      :class="{ active: q.qn === curQn }"
+                      @click="changeQuality(q.qn)"
+                    >
+                      {{ q.label }}
+                      <Icon v-if="q.qn === curQn" name="check" :size="13" />
+                    </button>
+                    <div v-if="!qualities.length" class="menu-empty">暂无更多画质</div>
+                  </div>
+                </div>
+                <!-- 倍速 -->
+                <div class="menu-wrap">
+                  <button class="cbtn toggle" :class="{ open: menu === 'speed' }" @click="menu = menu === 'speed' ? '' : 'speed'">
+                    <Icon name="gauge" :size="16" /><span class="tlab">{{ rate === 1 ? '倍速' : rate + 'x' }}</span>
+                  </button>
+                  <div v-if="menu === 'speed'" class="menu">
+                    <div class="menu-title">播放速度</div>
+                    <button
+                      v-for="r in RATES"
+                      :key="r"
+                      class="menu-item"
+                      :class="{ active: r === rate }"
+                      @click="setRate(r)"
+                    >
+                      {{ r === 1 ? '正常' : r + 'x' }}
+                      <Icon v-if="r === rate" name="check" :size="13" />
+                    </button>
+                  </div>
+                </div>
+                <!-- 画中画 -->
+                <button class="cbtn" title="画中画 (P)" @click="togglePip"><Icon name="album" :size="16" /></button>
+                <!-- 缓存管理 -->
+                <button v-if="isDesktop" class="cbtn" title="缓存管理" @click="openCachePanel">
+                  <Icon name="hard-drive" :size="16" />
+                </button>
+                <!-- 全屏 -->
+                <button class="cbtn" title="全屏 (F)" @click="toggleFullscreen">
+                  <Icon :name="isFullscreen ? 'shrink' : 'expand'" :size="16" />
+                </button>
+              </div>
+            </div>
           </div>
         </div>
 
@@ -302,12 +816,15 @@ onBeforeUnmount(() => {
             <div class="meta-actions">
               <button class="btn sm" @click="listenAudio"><Icon name="music" :size="13" />听音频</button>
               <button
-                v-if="isDesktop && videoUrl"
+                v-if="isDesktop && remoteUrl"
                 class="btn sm"
                 :disabled="savingVideo"
                 @click="saveVideo"
               >
                 <Icon name="download" :size="13" />{{ savingVideo ? '保存中…' : '保存视频' }}
+              </button>
+              <button v-if="isDesktop && remoteUrl && !offlineReady" class="btn sm" :disabled="caching" @click="cacheCurrent">
+                <Icon name="database" :size="13" />{{ caching ? '缓存中…' : '离线缓存' }}
               </button>
               <button class="btn sm ghost" @click="load"><Icon name="refresh" :size="13" />刷新</button>
             </div>
@@ -367,6 +884,42 @@ onBeforeUnmount(() => {
         </div>
       </div>
     </section>
+
+    <!-- 缓存管理面板 -->
+    <div v-if="showCachePanel" class="cache-mask" @click.self="showCachePanel = false">
+      <div class="cache-panel">
+        <div class="cache-head">
+          <div>
+            <b>离线缓存管理</b>
+            <span class="cache-sub">共 {{ offlineList.length }} 个视频 · 占用 {{ fmtSize(offlineTotal) }}</span>
+          </div>
+          <button class="icon-btn" @click="showCachePanel = false"><Icon name="close" :size="16" /></button>
+        </div>
+        <div class="cache-body">
+          <div v-if="loadingCache" class="cache-empty">加载中…</div>
+          <div v-else-if="!offlineList.length" class="cache-empty">
+            还没有离线缓存，播放视频时点击「离线缓存」即可保存
+          </div>
+          <div v-else class="cache-list">
+            <div v-for="it in offlineList" :key="it.key" class="cache-item">
+              <div class="cache-info">
+                <div class="cache-title ellipsis">{{ it.title || it.bvid }}</div>
+                <div class="cache-meta">{{ fmtSize(it.size) }} · {{ new Date(it.savedAt).toLocaleDateString() }}</div>
+              </div>
+              <button class="icon-btn danger" title="删除" @click="removeCacheItem(it.key)">
+                <Icon name="trash" :size="15" />
+              </button>
+            </div>
+          </div>
+        </div>
+        <div class="cache-foot">
+          <button class="btn sm ghost" :disabled="!offlineList.length" @click="clearAllCache">
+            <Icon name="trash" :size="13" />清空全部
+          </button>
+          <button class="btn sm" @click="showCachePanel = false">关闭</button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -406,6 +959,11 @@ onBeforeUnmount(() => {
   border-radius: 12px;
   overflow: hidden;
   border: 1px solid var(--line);
+  outline: none;
+}
+.video-box.fullscreen {
+  border-radius: 0;
+  border: none;
 }
 .video {
   width: 100%;
@@ -426,16 +984,40 @@ onBeforeUnmount(() => {
   text-align: center;
   padding: 20px;
 }
-.state-title {
-  color: rgba(255, 255, 255, 0.85);
-  font-size: 13.5px;
-  font-weight: 600;
+.big-play {
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  width: 68px;
+  height: 68px;
+  border-radius: 50%;
+  border: none;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  backdrop-filter: blur(4px);
+  transition: background 0.2s, transform 0.2s;
 }
-.state-desc {
-  font-size: 11.5px;
-  color: rgba(255, 255, 255, 0.5);
-  max-width: 380px;
-  line-height: 1.7;
+.big-play:hover {
+  background: rgba(0, 0, 0, 0.75);
+  transform: scale(1.06);
+}
+.offline-badge {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 9px;
+  border-radius: 20px;
+  background: rgba(0, 0, 0, 0.6);
+  color: #8fe3a0;
+  font-size: 10.5px;
+  backdrop-filter: blur(4px);
 }
 .video-overlay {
   position: absolute;
@@ -449,6 +1031,265 @@ onBeforeUnmount(() => {
   justify-content: space-between;
   gap: 10px;
 }
+
+/* ---- 控制条 ---- */
+.ctrl {
+  position: absolute;
+  inset: auto 0 0 0;
+  padding: 22px 12px 8px;
+  background: linear-gradient(180deg, transparent, rgba(0, 0, 0, 0.82));
+  opacity: 1;
+  transition: opacity 0.2s, transform 0.2s;
+  z-index: 3;
+}
+.ctrl.hidden {
+  opacity: 0;
+  transform: translateY(8px);
+  pointer-events: none;
+}
+.bar {
+  position: relative;
+  height: 4px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.22);
+  cursor: pointer;
+  margin-bottom: 6px;
+}
+.bar:hover {
+  height: 6px;
+}
+.bar-buffer,
+.bar-played {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  border-radius: 3px;
+}
+.bar-buffer {
+  background: rgba(255, 255, 255, 0.35);
+}
+.bar-played {
+  background: var(--accent, #7c9cff);
+}
+.bar-thumb {
+  position: absolute;
+  top: 50%;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #fff;
+  transform: translate(-50%, -50%) scale(0);
+  transition: transform 0.15s;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
+}
+.bar:hover .bar-thumb {
+  transform: translate(-50%, -50%) scale(1);
+}
+.ctrl-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.ctrl-left,
+.ctrl-right {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.cbtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  min-width: 30px;
+  height: 30px;
+  padding: 0 5px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.92);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+.cbtn:hover {
+  background: rgba(255, 255, 255, 0.14);
+}
+.cbtn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.cbtn.toggle.on {
+  color: var(--accent, #7c9cff);
+}
+.cbtn.toggle.open {
+  background: rgba(255, 255, 255, 0.16);
+}
+.tlab {
+  font-size: 10.5px;
+}
+.time {
+  margin-left: 8px;
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.8);
+  white-space: nowrap;
+}
+.vol {
+  display: flex;
+  align-items: center;
+}
+.vol-range {
+  width: 0;
+  opacity: 0;
+  transition: width 0.2s, opacity 0.2s;
+  accent-color: var(--accent, #7c9cff);
+  cursor: pointer;
+}
+.vol:hover .vol-range {
+  width: 70px;
+  opacity: 1;
+  margin: 0 6px;
+}
+
+/* ---- 下拉菜单 ---- */
+.menu-wrap {
+  position: relative;
+}
+.menu {
+  position: absolute;
+  bottom: 38px;
+  right: 0;
+  min-width: 120px;
+  padding: 6px;
+  border-radius: 10px;
+  background: rgba(20, 20, 24, 0.96);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  backdrop-filter: blur(8px);
+  z-index: 5;
+}
+.menu-title {
+  padding: 4px 8px 6px;
+  font-size: 10.5px;
+  color: rgba(255, 255, 255, 0.5);
+}
+.menu-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 8px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.9);
+  font-size: 12px;
+  cursor: pointer;
+  text-align: left;
+}
+.menu-item:hover {
+  background: rgba(255, 255, 255, 0.12);
+}
+.menu-item.active {
+  color: var(--accent, #7c9cff);
+}
+.menu-empty {
+  padding: 8px;
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.5);
+}
+
+/* ---- 缓存管理面板 ---- */
+.cache-mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 60;
+}
+.cache-panel {
+  width: 520px;
+  max-width: 92vw;
+  max-height: 76vh;
+  display: flex;
+  flex-direction: column;
+  border-radius: 14px;
+  background: var(--bg, #16161a);
+  border: 1px solid var(--line);
+  box-shadow: 0 24px 60px -20px rgba(0, 0, 0, 0.7);
+  overflow: hidden;
+}
+.cache-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--line);
+}
+.cache-head b {
+  font-size: 15px;
+  font-weight: 650;
+}
+.cache-sub {
+  display: block;
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--text-3);
+}
+.cache-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px;
+}
+.cache-empty {
+  padding: 40px 16px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--text-3);
+}
+.cache-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.cache-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 10px;
+  border-radius: 8px;
+}
+.cache-item:hover {
+  background: var(--hover);
+}
+.cache-info {
+  flex: 1;
+  min-width: 0;
+}
+.cache-title {
+  font-size: 12.5px;
+  color: var(--text);
+}
+.cache-meta {
+  margin-top: 3px;
+  font-size: 10.5px;
+  color: var(--text-3);
+}
+.icon-btn.danger:hover {
+  color: #ff7c8a;
+}
+.cache-foot {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 16px;
+  border-top: 1px solid var(--line);
+}
+
 .meta {
   padding: 12px 2px 0;
 }

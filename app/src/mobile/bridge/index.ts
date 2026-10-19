@@ -17,10 +17,11 @@ import { emit, subscribe } from '../bus'
 import { fail, ok } from './envelope'
 import { player } from '../player'
 import * as vfs from '../shims/vfs'
-import { seedSources } from '../seed'
+import { seedSources, seedPlugins } from '../seed'
 import { registerBufferGlobal, patchFetch } from '../shims/util'
 import { initDb, setSqlJsLoader } from '../../../electron/core/db'
 import { lxHost } from '../../../electron/core/lx-host'
+import * as mfHost from '../../../electron/core/mf-host'
 import { initBiliLogin } from '../../../electron/core/bili'
 import { loadSettings, saveSettings, getSettings } from '../../../electron/core/settings'
 import { userDataDir } from '../../../electron/core/paths'
@@ -44,9 +45,12 @@ async function boot(): Promise<void> {
   patchFetch()
   registerBufferGlobal()
 
-  // 1) 虚拟文件系统：先本地恢复，再用内置音源种子播种
+  // 1) 虚拟文件系统：先本地恢复，再用内置音源/插件种子播种
   await vfs.initFs()
   seedSources()
+  seedPlugins()
+  // 内置 MusicFree 插件预热（init 是同步 void；逐个插件失败不会抛）
+  try { mfHost.init() } catch { /* 预热失败不阻断启动 */ }
 
   // 2) sql.js：浏览器用 wasm 的 ESM 入口。vite 会把 UMD 的 sql-wasm.js
   // 打成 lazy chunk，其默认导出是"已初始化的模块"（db.ts 直接取 Database）。
@@ -88,7 +92,7 @@ const UNSUPPORTED = (what: string) => () => { throw new Error(`移动端暂不�
 const handlers: Record<string, Handler> = {
   /* ---- 应用 ---- */
   'app:info': () => ({
-    version: '2.0.2',
+    version: '2.1.0',
     name: '星河音乐',
     electron: '',
     chrome: '',
@@ -152,6 +156,39 @@ const handlers: Record<string, Handler> = {
     return lxHost.list()
   },
 
+  /* ---- MusicFree 插件 ---- */
+  'plugins:list': () => mfHost.list(),
+  'plugins:code': ({ file }: any) => mfHost.getSourceCode(file),
+  'plugins:toggle': async ({ file, enabled }: any) => {
+    await mfHost.togglePlugin(file, enabled)
+    emit('plugins:changed', mfHost.list())
+    return mfHost.list()
+  },
+  'plugins:delete': async ({ file }: any) => {
+    await mfHost.deletePlugin(file)
+    emit('plugins:changed', mfHost.list())
+    return mfHost.list()
+  },
+  'plugins:import': async ({ url, content, origin }: any) => {
+    if (url) await mfHost.importFromUrl(url)
+    else if (content) await mfHost.importFromContent(content, origin || 'local', url)
+    emit('plugins:changed', mfHost.list())
+    return mfHost.list()
+  },
+  'plugins:subscribe': async ({ url, name }: any) => {
+    const r = await mfHost.importSubscription(url, name)
+    emit('plugins:changed', mfHost.list())
+    return { ...r, list: mfHost.list(), subs: mfHost.listSubscriptions() }
+  },
+  'plugins:subs:list': () => mfHost.listSubscriptions(),
+  'plugins:subs:remove': async ({ url }: any) => {
+    await mfHost.removeSubscription(url)
+    return mfHost.listSubscriptions()
+  },
+  'plugins:search': ({ file, query, page, type }: any) => mfHost.search(file, query, page, type),
+  'plugins:lyric': ({ file, musicItem }: any) => mfHost.getLyric(file, musicItem),
+  'plugins:url': ({ file, musicItem, quality }: any) => mfHost.getMediaSource(file, musicItem, quality),
+
   /* ---- 音乐数据 ---- */
   'music:search': async ({ keyword, page, platform }: any) => searchAll(keyword, page || 1, { platform }),
   'music:url': ({ song, quality }: any) => resolveInline(song, quality),
@@ -169,7 +206,7 @@ const handlers: Record<string, Handler> = {
   'music:importPlaylist': ({ input, platform }: any) => importPlaylist(input, platform),
   'music:mv': ({ keyword, page }: any) => searchMv(keyword || '音乐', page || 1),
   'music:mvinfo': ({ bvid }: any) => getMvInfo(bvid),
-  'music:mvurl': ({ bvid, cid }: any) => getMvUrl(bvid, cid),
+  'music:mvurl': ({ bvid, cid, qn }: any) => getMvUrl(bvid, cid, qn),
   'music:mvparts': ({ bvid }: any) => getMvParts(bvid),
   'home:feed': async ({ force }: any) => buildHomeFeed(!!force),
   'music:memory': () => playStats(),

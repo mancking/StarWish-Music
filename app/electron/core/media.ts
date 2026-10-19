@@ -126,6 +126,103 @@ export async function releaseMediaCache(url?: string): Promise<void> {
 
 let biliCookieGetter: () => string = () => ''
 
+/* ============================ 在线 MV 离线缓存（持久，跨会话） ============================
+ * 与上面的 stream 临时缓存不同：离线缓存存到 mediaCacheDir()/offline，启动/关页不清空，
+ * 下次播放同一 bvid+cid 直接本地服务，零流量、秒开。按 bvid+cid 取键（源流 URL 会过期，不可当键）。
+ * manifest.json 记录标题/大小/时间，供缓存管理面板展示与清理。 */
+interface OfflineEntry {
+  key: string
+  bvid: string
+  cid: string
+  title: string
+  file: string
+  size: number
+  savedAt: number
+}
+
+function offlineDir(): string {
+  return path.join(mediaCacheDir(), 'offline')
+}
+
+function offlineManifestPath(): string {
+  return path.join(offlineDir(), 'manifest.json')
+}
+
+function offlineKey(bvid: string, cid: string): string {
+  return crypto.createHash('sha1').update(`${bvid}:${cid}`).digest('hex')
+}
+
+function readOfflineManifest(): Record<string, OfflineEntry> {
+  try {
+    return JSON.parse(fs.readFileSync(offlineManifestPath(), 'utf8')) || {}
+  } catch {
+    return {}
+  }
+}
+
+function writeOfflineManifest(map: Record<string, OfflineEntry>): void {
+  try {
+    fs.writeFileSync(offlineManifestPath(), JSON.stringify(map))
+  } catch {
+    /* ignore */
+  }
+}
+
+/** 该 bvid+cid 是否已离线缓存，返回本地文件路径（不存在返回 null） */
+export function offlineVideoFile(bvid: string, cid: string): string | null {
+  const key = offlineKey(bvid, cid)
+  const entry = readOfflineManifest()[key]
+  if (entry && fs.existsSync(entry.file)) return entry.file
+  return null
+}
+
+/** 整片下载到离线目录（走 referer/cookie 策略），返回离线文件路径 */
+export async function saveOfflineVideo(
+  bvid: string,
+  cid: string,
+  url: string,
+  title?: string
+): Promise<{ file: string; size: number }> {
+  const key = offlineKey(bvid, cid)
+  await ensureDir(offlineDir())
+  const file = path.join(offlineDir(), `${key}.mp4`)
+  await downloadMediaTo(url, file)
+  const size = fs.statSync(file).size
+  const map = readOfflineManifest()
+  map[key] = { key, bvid, cid, title: title || '', file, size, savedAt: Date.now() }
+  writeOfflineManifest(map)
+  return { file, size }
+}
+
+/** 缓存管理面板：列出所有离线视频 + 总占用 */
+export function listOfflineVideos(): { items: OfflineEntry[]; total: number } {
+  const map = readOfflineManifest()
+  const items = Object.values(map)
+    .filter(e => fs.existsSync(e.file))
+    .sort((a, b) => b.savedAt - a.savedAt)
+  const total = items.reduce((s, e) => s + e.size, 0)
+  return { items, total }
+}
+
+/** 删除单个离线视频；不传 key 则清空全部离线视频 */
+export function removeOfflineVideos(key?: string): boolean {
+  const map = readOfflineManifest()
+  const keys = key ? [key] : Object.keys(map)
+  for (const k of keys) {
+    const e = map[k]
+    if (e) {
+      try {
+        fs.rmSync(e.file, { force: true })
+      } catch {
+        /* ignore */
+      }
+      delete map[k]
+    }
+  }
+  writeOfflineManifest(map)
+  return true
+}
+
 /**
  * 把远程媒体整片下载到指定路径（走与代理一致的 Referer / Cookie / 重定向策略）。
  */

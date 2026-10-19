@@ -54,6 +54,35 @@ export interface SourceInfo {
   platforms: SourcePlatform[]
 }
 
+/** MusicFree 协议插件（歌词/音源），与 lx-music 音源协议不同 */
+export interface PluginInfo {
+  file: string
+  name: string
+  version?: string
+  author?: string
+  platform?: string
+  description?: string
+  /** 支持的搜索类型：music / lyric / album / artist / sheet / comment */
+  searchTypes: string[]
+  /** 导入来源：local=本地文件 / url=网址 / subscribe=订阅 */
+  origin: 'local' | 'url' | 'subscribe'
+  /** 原始导入地址（url/subscribe 时有值），订阅更新用 */
+  sourceUrl?: string
+  loadError: string | null
+  enabled: boolean
+  /** 是否随包内置（内置插件删除需恢复，不写用户目录） */
+  builtin?: boolean
+}
+
+/** 插件订阅源：一个返回插件清单的地址 */
+export interface PluginSubscription {
+  name: string
+  url: string
+  /** 上次更新时间戳 */
+  updatedAt?: number
+  count?: number
+}
+
 export interface PlayerState {
   status: 'idle' | 'loading' | 'playing' | 'paused' | 'stopped' | 'error'
   song: Song | null

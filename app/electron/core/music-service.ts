@@ -479,8 +479,8 @@ export async function getMvParts(bvid: string) {
   return biliParts(bvid)
 }
 
-export async function getMvUrl(bvid: string, cid: string) {
-  return biliPlayUrl(bvid, cid)
+export async function getMvUrl(bvid: string, cid: string, qn?: number) {
+  return biliPlayUrl(bvid, cid, qn)
 }
 
 export async function itunesFallbackCover(term: string): Promise<string> {

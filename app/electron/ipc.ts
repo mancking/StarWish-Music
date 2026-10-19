@@ -4,6 +4,7 @@ import path from 'node:path'
 import type { AppSettings, Song } from '../shared/types'
 import { createLogger } from './core/log'
 import { lxHost } from './core/lx-host'
+import * as mfHost from './core/mf-host'
 import {
   getCover,
   getLyric,
@@ -51,7 +52,7 @@ import {
 import { biliLogout, biliQrGenerate, biliQrPoll, biliStatus } from './core/bili'
 import { cancelScan, getScanProgress, scanLibrary } from './core/library'
 import { coverCacheSize, clearCoverCache, coverProtocolUrl } from './core/cover'
-import { downloadMediaTo, releaseMediaCache } from './core/media'
+import { downloadMediaTo, releaseMediaCache, saveOfflineVideo, listOfflineVideos, removeOfflineVideos, offlineVideoFile } from './core/media'
 import {
   cacheRootDir,
   coverCacheDir,
@@ -230,6 +231,24 @@ const handlers: Record<string, Handler> = {
     return lxHost.list()
   },
 
+  /* ---------------- 插件库（MusicFree 协议） ---------------- */
+  'plugins:list': () => mfHost.list(),
+  'plugins:code': ({ file }: { file: string }) => mfHost.getSourceCode(file),
+  'plugins:toggle': ({ file, enabled }: { file: string; enabled: boolean }) => mfHost.togglePlugin(file, enabled),
+  'plugins:delete': ({ file }: { file: string }) => mfHost.deletePlugin(file),
+  'plugins:import': async ({ url, content }: { url?: string; content?: string }) => {
+    if (url) return await mfHost.importFromUrl(url)
+    if (content) return mfHost.importFromContent(content, 'local')
+    throw new Error('请提供插件链接或内容')
+  },
+  'plugins:subscribe': async ({ url, name }: { url: string; name?: string }) =>
+    await mfHost.importSubscription(url, name),
+  'plugins:subs:list': () => mfHost.listSubscriptions(),
+  'plugins:subs:remove': ({ url }: { url: string }) => mfHost.removeSubscription(url),
+  'plugins:search': async ({ file, query, page, type }: any) => await mfHost.search(file, query, page || 1, type || 'music'),
+  'plugins:lyric': async ({ file, musicItem }: any) => await mfHost.getLyric(file, musicItem),
+  'plugins:url': async ({ file, musicItem, quality }: any) => await mfHost.getMusicUrl(file, musicItem, quality || 'standard'),
+
   /* ---------------- 音乐数据 ---------------- */
   'music:search': async ({ keyword, page, platform }: any) => decList(await searchAll(keyword, page || 1, { platform })),
   'music:url': async ({ song, quality }: { song: Song; quality: string }) => {
@@ -270,7 +289,7 @@ const handlers: Record<string, Handler> = {
     return list.map(v => ({ ...v, pic: v.pic && /^https?:\/\//i.test(v.pic) ? coverProtocolUrl(v.pic) : v.pic }))
   },
   'music:mvinfo': ({ bvid }: any) => getMvInfo(bvid),
-  'music:mvurl': ({ bvid, cid }: any) => getMvUrl(bvid, cid),
+  'music:mvurl': ({ bvid, cid, qn }: any) => getMvUrl(bvid, cid, qn),
   'music:mvparts': ({ bvid }: any) => getMvParts(bvid),
   'home:feed': async ({ force }: any) => decFeed(await buildHomeFeed(!!force)),
 
@@ -440,6 +459,17 @@ const handlers: Record<string, Handler> = {
     await releaseMediaCache(url)
     return true
   },
+  /* 视频：离线缓存 —— 检查某 bvid+cid 是否已离线（返回本地路径，供直接播放） */
+  'video:offline:file': ({ bvid, cid }: { bvid: string; cid: string }) => offlineVideoFile(bvid, cid),
+  /* 视频：离线缓存 —— 整片下载到离线目录 */
+  'video:offline:save': async ({ bvid, cid, url, title }: { bvid: string; cid: string; url: string; title?: string }) => {
+    if (!url) throw new Error('缺少视频地址')
+    return saveOfflineVideo(bvid, cid, url, title)
+  },
+  /* 视频：离线缓存 —— 管理面板：列出离线视频 + 总占用 */
+  'video:offline:list': () => listOfflineVideos(),
+  /* 视频：离线缓存 —— 删除单个（传 key）或清空全部（不传） */
+  'video:offline:remove': ({ key }: { key?: string }) => removeOfflineVideos(key),
   'library:scan': async ({ dirs }: { dirs: string[] }) => {
     const settings = getSettings()
     const list = (dirs && dirs.length ? dirs : settings.localDirs).filter(Boolean)

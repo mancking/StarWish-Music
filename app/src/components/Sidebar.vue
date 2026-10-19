@@ -156,7 +156,6 @@ async function submitCreate(): Promise<void> {
         <Icon name="settings" :size="17" />
         <span>设置</span>
       </button>
-      <div class="version">v2.0.0</div>
     </div>
     </template>
   </aside>
@@ -328,10 +327,5 @@ async function submitCreate(): Promise<void> {
 }
 .foot .nav-item {
   flex: 1;
-}
-.version {
-  font-size: 9.5px;
-  color: var(--text-3);
-  padding-right: 4px;
 }
 </style>

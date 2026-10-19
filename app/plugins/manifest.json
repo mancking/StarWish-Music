@@ -1,0 +1,15 @@
+{
+  "name": "星河音乐官方插件库",
+  "updated": "2025-10-19",
+  "plugins": [
+    { "name": "网易云", "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/main/app/plugins/%E7%BD%91%E6%98%93%E4%BA%91.js" },
+    { "name": "原力", "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/main/app/plugins/%E5%8E%9F%E5%8A%9B.js" },
+    { "name": "小千", "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/main/app/plugins/%E5%B0%8F%E5%8D%83.js" },
+    { "name": "小月", "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/main/app/plugins/%E5%B0%8F%E6%9C%88.js" },
+    { "name": "小云", "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/main/app/plugins/%E5%B0%8F%E4%BA%91.js" },
+    { "name": "小枸", "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/main/app/plugins/%E5%B0%8F%E6%9E%98.js" },
+    { "name": "小秋", "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/main/app/plugins/%E5%B0%8F%E7%A7%8B.js" },
+    { "name": "小蜗", "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/main/app/plugins/%E5%B0%8F%E8%9C%97.js" },
+    { "name": "5s", "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/main/app/plugins/5s.js" }
+  ]
+}

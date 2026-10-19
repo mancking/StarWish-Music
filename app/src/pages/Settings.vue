@@ -11,7 +11,7 @@ import { useUiStore } from '@/stores/ui'
 import { useLibraryStore } from '@/stores/library'
 import { usePlayerStore } from '@/stores/player'
 import { platformLabel } from '@/utils/labels'
-import type { AppSettings, SourceInfo } from '@shared/types'
+import type { AppSettings, SourceInfo, PluginInfo, PluginSubscription } from '@shared/types'
 
 const ui = useUiStore()
 const library = useLibraryStore()
@@ -50,6 +50,23 @@ const codeName = ref('')
 const deleteTarget = ref<SourceInfo | null>(null)
 const restoring = ref(false)
 const dataMoving = ref(false)
+
+// —— MusicFree 插件库 ——
+const plugins = ref<PluginInfo[]>([])
+const pluginsLoading = ref(false)
+const pluginImportOpen = ref(false)
+const pluginImportUrl = ref('')
+const pluginImportText = ref('')
+const pluginImportError = ref('')
+const pluginImporting = ref(false)
+const pluginDeleteTarget = ref<PluginInfo | null>(null)
+const subs = ref<PluginSubscription[]>([])
+const subOpen = ref(false)
+const subUrl = ref('')
+const OFFICIAL_SUB_URL = 'https://raw.githubusercontent.com/mancking/StarWish-Music/main/app/plugins/manifest.json'
+const subName = ref('')
+const subError = ref('')
+const subbing = ref(false)
 /** 数据目录改过之后，存下重启后的目标路径，用于提示横幅 */
 const dataRestart = ref('')
 
@@ -167,6 +184,139 @@ async function doImport(): Promise<void> {
     importError.value = e?.message || '导入失败'
   } finally {
     importing.value = false
+  }
+}
+
+// —— MusicFree 插件库 ——
+async function loadPlugins(): Promise<void> {
+  pluginsLoading.value = true
+  try {
+    plugins.value = await call<PluginInfo[]>('plugins:list')
+  } catch (e: any) {
+    ui.toast(`插件列表加载失败：${e.message}`, 'error')
+  } finally {
+    pluginsLoading.value = false
+  }
+}
+
+async function loadSubs(): Promise<void> {
+  try {
+    subs.value = await call<PluginSubscription[]>('plugins:subs:list')
+  } catch {
+    subs.value = []
+  }
+}
+
+async function togglePlugin(p: PluginInfo): Promise<void> {
+  try {
+    plugins.value = await call<PluginInfo[]>('plugins:toggle', { file: p.file, enabled: !p.enabled })
+  } catch (e: any) {
+    ui.toast(e.message, 'error')
+  }
+}
+
+async function viewPluginCode(p: PluginInfo): Promise<void> {
+  try {
+    codeText.value = await call<string>('plugins:code', { file: p.file })
+    codeName.value = p.name
+    codeOpen.value = true
+  } catch (e: any) {
+    ui.toast(e.message, 'error')
+  }
+}
+
+async function doDeletePlugin(): Promise<void> {
+  const p = pluginDeleteTarget.value
+  if (!p) return
+  try {
+    plugins.value = await call<PluginInfo[]>('plugins:delete', { file: p.file })
+    ui.toast('插件已删除', 'success')
+  } catch (e: any) {
+    ui.toast(e.message, 'error')
+  } finally {
+    pluginDeleteTarget.value = null
+  }
+}
+
+function onPluginFile(e: Event): void {
+  const f = (e.target as HTMLInputElement).files?.[0]
+  if (!f) return
+  const reader = new FileReader()
+  reader.onload = () => {
+    pluginImportText.value = String(reader.result || '')
+    pluginImportUrl.value = ''
+  }
+  reader.readAsText(f, 'utf-8')
+}
+
+const PLUGIN_TYPE_LABEL: Record<string, string> = {
+  music: '歌曲',
+  album: '专辑',
+  artist: '歌手',
+  sheet: '歌单',
+  lyric: '歌词',
+  comment: '评论',
+  mv: '视频',
+}
+function pluginTypeLabel(t: string): string {
+  return PLUGIN_TYPE_LABEL[t] || t
+}
+
+async function doImportPlugin(): Promise<void> {
+  pluginImportError.value = ''
+  if (!pluginImportUrl.value.trim() && !pluginImportText.value.trim()) {
+    pluginImportError.value = '请填写插件链接或选择本地插件文件'
+    return
+  }
+  pluginImporting.value = true
+  try {
+    const r = await call<{ file: string; plugins: PluginInfo[] }>('plugins:import', {
+      url: pluginImportUrl.value.trim() || undefined,
+      content: pluginImportText.value || undefined,
+    })
+    plugins.value = r.plugins
+    pluginImportOpen.value = false
+    pluginImportUrl.value = ''
+    pluginImportText.value = ''
+    ui.toast(`插件「${r.file}」导入成功`, 'success')
+  } catch (e: any) {
+    pluginImportError.value = e?.message || '导入失败'
+  } finally {
+    pluginImporting.value = false
+  }
+}
+
+async function doSubscribe(): Promise<void> {
+  subError.value = ''
+  if (!subUrl.value.trim()) {
+    subError.value = '请填写订阅源链接'
+    return
+  }
+  subbing.value = true
+  try {
+    const r = await call<{ added: number; updated: number; subscriptions: PluginSubscription[] }>('plugins:subscribe', {
+      url: subUrl.value.trim(),
+      name: subName.value.trim() || undefined,
+    })
+    subs.value = r.subscriptions
+    subOpen.value = false
+    subUrl.value = ''
+    subName.value = ''
+    await loadPlugins()
+    ui.toast(`订阅更新完成：新增 ${r.added}，更新 ${r.updated}`, 'success')
+  } catch (e: any) {
+    subError.value = e?.message || '订阅失败'
+  } finally {
+    subbing.value = false
+  }
+}
+
+async function removeSub(url: string): Promise<void> {
+  try {
+    subs.value = await call<PluginSubscription[]>('plugins:subs:remove', { url })
+    ui.toast('订阅已移除', 'success')
+  } catch (e: any) {
+    ui.toast(e.message, 'error')
   }
 }
 
@@ -393,7 +543,7 @@ async function pickDirs(): Promise<void> {
 }
 
 onMounted(async () => {
-  await Promise.all([loadSources(), loadMeta()])
+  await Promise.all([loadSources(), loadMeta(), loadPlugins(), loadSubs()])
 })
 
 watch(qrOpen, v => {
@@ -631,6 +781,68 @@ onBeforeUnmount(stopPoll)
               <div class="empty-desc">没有找到音源脚本，请检查安装目录下的 sources 文件夹</div>
             </div>
           </div>
+
+          <!-- 插件库（MusicFree 协议） -->
+          <div class="sec-head" style="margin-top: 30px">
+            <div>
+              <h2>插件库</h2>
+              <p class="desc">
+                兼容 MusicFree 插件协议 · 当前 {{ plugins.length }} 个 · 可用 {{ plugins.filter(p => !p.loadError && p.enabled).length }} 个
+              </p>
+            </div>
+            <div class="head-btns">
+              <button class="btn sm ghost" @click="subOpen = true"><Icon name="refresh" :size="14" />订阅源</button>
+              <button class="btn primary sm" @click="pluginImportOpen = true"><Icon name="plus" :size="14" />导入插件</button>
+            </div>
+          </div>
+
+          <div v-if="pluginsLoading" class="src-list">
+            <div v-for="i in 3" :key="i" class="sk" style="height: 62px; border-radius: 10px; margin-bottom: 8px" />
+          </div>
+
+          <div v-else class="src-list">
+            <div v-for="p in plugins" :key="p.file" class="src" :class="{ off: !p.enabled, bad: p.loadError }">
+              <div class="src-main">
+                <div class="src-title">
+                  <b>{{ p.name }}</b>
+                  <span v-if="p.version" class="src-ver">v{{ p.version }}</span>
+                  <span v-if="p.builtin" class="src-tag">内置</span>
+                  <span v-if="p.loadError" class="src-tag err">加载失败</span>
+                </div>
+                <div class="src-platforms">
+                  <span v-for="t in p.searchTypes.slice(0, 6)" :key="t" class="pf">{{ pluginTypeLabel(t) }}</span>
+                  <span v-if="!p.searchTypes.length" class="pf none">无搜索类型</span>
+                </div>
+                <div v-if="p.author || p.origin !== 'local'" class="src-plat">
+                  <span v-if="p.author">作者 {{ p.author }}</span>
+                  <span v-if="p.origin === 'url'">· 网址导入</span>
+                  <span v-else-if="p.origin === 'subscribe'">· 订阅</span>
+                </div>
+                <div v-if="p.loadError" class="src-err">{{ p.loadError }}</div>
+              </div>
+              <div class="src-actions">
+                <button class="icon-btn" title="查看源码" @click="viewPluginCode(p)"><Icon name="edit" :size="15" /></button>
+                <button v-if="!p.builtin" class="icon-btn" title="移除" @click="pluginDeleteTarget = p"><Icon name="trash" :size="15" /></button>
+                <Toggle :model-value="p.enabled" @update:model-value="() => togglePlugin(p)" />
+              </div>
+            </div>
+            <div v-if="!plugins.length" class="empty" style="padding: 30px">
+              <div class="empty-desc">暂无插件，可点「导入插件」从本地文件或网址添加，或用「订阅源」批量更新</div>
+            </div>
+          </div>
+
+          <!-- 订阅源列表 -->
+          <div v-if="subs.length" class="src-list" style="margin-top: 16px">
+            <div v-for="s in subs" :key="s.url" class="src">
+              <div class="src-main">
+                <div class="src-title"><b>{{ s.name || s.url }}</b><span class="src-ver">{{ s.count || 0 }} 个</span></div>
+                <div class="src-plat"><span>{{ s.url }}</span></div>
+              </div>
+              <div class="src-actions">
+                <button class="icon-btn" title="移除订阅" @click="removeSub(s.url)"><Icon name="trash" :size="15" /></button>
+              </div>
+            </div>
+          </div>
         </section>
 
         <!-- 本地音乐 -->
@@ -800,6 +1012,67 @@ onBeforeUnmount(stopPoll)
       <template #footer>
         <button class="btn ghost" @click="deleteTarget = null">取消</button>
         <button class="btn primary" @click="doDelete">删除</button>
+      </template>
+    </Modal>
+
+    <!-- 导入插件 -->
+    <Modal v-model="pluginImportOpen" title="导入插件" :width="520">
+      <div class="imp-tabs">
+        <button :class="{ on: !pluginImportUrl }" @click="pluginImportUrl = ''">本地文件</button>
+        <button :class="{ on: !!pluginImportUrl }" @click="pluginImportUrl = pluginImportUrl || 'https://'">网址导入</button>
+      </div>
+      <template v-if="!pluginImportUrl">
+        <input type="file" accept=".js,.cjs,.txt" style="width: 100%; margin: 10px 0" @change="onPluginFile" />
+        <p class="tip">支持 MusicFree 插件协议（.js / .cjs / .txt），本地文件直接读取内容后导入。</p>
+      </template>
+      <template v-else>
+        <div class="field">
+          <label>插件网址（.js 或 .txt）</label>
+          <input v-model="pluginImportUrl" placeholder="https://example.com/plugin.js" style="width: 100%" />
+        </div>
+        <p class="tip">将从该网址下载插件源码并导入，下载失败请检查网络。</p>
+      </template>
+      <div v-if="pluginImportError" class="imp-err">{{ pluginImportError }}</div>
+      <template #footer>
+        <button class="btn ghost" @click="pluginImportOpen = false">取消</button>
+        <button class="btn primary" :disabled="pluginImporting" @click="doImportPlugin">
+          {{ pluginImporting ? '导入中...' : '导入' }}
+        </button>
+      </template>
+    </Modal>
+
+    <!-- 订阅源 -->
+    <Modal v-model="subOpen" title="插件订阅源" :width="520">
+      <button class="btn sm ghost" style="width: 100%; margin-bottom: 10px" @click="subUrl = OFFICIAL_SUB_URL; subName = '星河官方插件库'">
+        <Icon name="download" :size="14" />一键填入官方插件库
+      </button>
+      <div class="field">
+        <label>订阅地址</label>
+        <input v-model="subUrl" placeholder="https://example.com/plugins.json（JSON 数组或每行一个网址）" style="width: 100%" />
+      </div>
+      <div class="field">
+        <label>备注名（可选）</label>
+        <input v-model="subName" placeholder="我的插件源" style="width: 100%" />
+      </div>
+      <div v-if="subError" class="imp-err">{{ subError }}</div>
+      <p class="tip">订阅地址可返回 JSON 数组（每项 { name, url }）或纯文本（每行一个插件网址）。订阅后可一键更新全部插件。</p>
+      <template #footer>
+        <button class="btn ghost" @click="subOpen = false">取消</button>
+        <button class="btn primary" :disabled="subbing" @click="doSubscribe">
+          {{ subbing ? '添加中...' : '添加订阅' }}
+        </button>
+      </template>
+    </Modal>
+
+    <!-- 移除插件确认 -->
+    <Modal :model-value="!!pluginDeleteTarget" title="移除插件" :width="400" @update:model-value="v => !v && (pluginDeleteTarget = null)">
+      <p style="font-size: 13px; line-height: 1.8">
+        确定移除插件「{{ pluginDeleteTarget?.name }}」吗？<br />
+        <span style="color: var(--text-3)">内置插件随应用分发，无法删除，只能停用。用户导入的插件删除后需重新导入。</span>
+      </p>
+      <template #footer>
+        <button class="btn ghost" @click="pluginDeleteTarget = null">取消</button>
+        <button class="btn primary" @click="doDeletePlugin">删除</button>
       </template>
     </Modal>
 
@@ -1135,6 +1408,54 @@ h1 {
   margin-top: 5px;
   font-size: 10.5px;
   color: #ff8b9c;
+}
+.src-plat {
+  margin-top: 4px;
+  font-size: 10px;
+  color: var(--text-3);
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.imp-tabs {
+  display: flex;
+  gap: 6px;
+  margin: 6px 0;
+}
+.imp-tabs button {
+  flex: 1;
+  padding: 6px 0;
+  font-size: 12px;
+  border-radius: 8px;
+  border: 1px solid var(--line-2);
+  background: transparent;
+  color: var(--text-2);
+  cursor: pointer;
+}
+.imp-tabs button.on {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.field {
+  margin: 8px 0;
+}
+.field label {
+  display: block;
+  font-size: 11px;
+  color: var(--text-3);
+  margin-bottom: 4px;
+}
+.tip {
+  font-size: 10.5px;
+  color: var(--text-3);
+  line-height: 1.6;
+  margin-top: 8px;
+}
+.imp-err {
+  margin-top: 8px;
+  font-size: 11px;
+  color: #ff8b9c;
+  word-break: break-all;
 }
 .src-actions {
   display: flex;

@@ -11,18 +11,47 @@ const router = useRouter()
 const keyword = ref('音乐')
 const list = ref<MvItem[]>([])
 const loading = ref(false)
+const loadingMore = ref(false)
 const error = ref('')
+const page = ref(1)
+const hasMore = ref(true)
 
 async function search(): Promise<void> {
   loading.value = true
   error.value = ''
+  page.value = 1
+  hasMore.value = true
   try {
-    list.value = await call<MvItem[]>('music:mv', { keyword: keyword.value.trim() || '音乐', page: 1 })
-    if (!list.value.length) error.value = '没有找到相关视频，换个关键词试试'
+    const res = await call<MvItem[]>('music:mv', { keyword: keyword.value.trim() || '音乐', page: 1 })
+    list.value = res
+    hasMore.value = res.length > 0
+    if (!res.length) error.value = '没有找到相关视频，换个关键词试试'
   } catch (e: any) {
     error.value = e?.message || '视频加载失败'
   } finally {
     loading.value = false
+  }
+}
+
+async function loadMore(): Promise<void> {
+  if (loadingMore.value || !hasMore.value) return
+  loadingMore.value = true
+  try {
+    const next = page.value + 1
+    const res = await call<MvItem[]>('music:mv', { keyword: keyword.value.trim() || '音乐', page: next })
+    const seen = new Set(list.value.map(v => v.bvid))
+    const fresh = res.filter(v => !seen.has(v.bvid))
+    if (!fresh.length && !res.length) {
+      hasMore.value = false
+    } else {
+      list.value = [...list.value, ...fresh]
+      page.value = next
+      if (res.length === 0) hasMore.value = false
+    }
+  } catch {
+    // 分页加载失败静默，保留已有内容
+  } finally {
+    loadingMore.value = false
   }
 }
 
@@ -73,6 +102,13 @@ onMounted(() => void search())
         <div class="mv-title clamp-2">{{ v.title }}</div>
         <div class="mv-author ellipsis">{{ v.author }}</div>
       </div>
+    </div>
+
+    <div v-if="!loading && !error && list.length" class="load-more">
+      <button v-if="hasMore" class="btn" :disabled="loadingMore" @click="loadMore">
+        {{ loadingMore ? '加载中…' : '加载更多' }}
+      </button>
+      <span v-else class="end-hint">已经到底啦</span>
     </div>
   </div>
 </template>
@@ -182,6 +218,16 @@ h1 {
 .mv-author {
   margin-top: 2px;
   font-size: 11px;
+  color: var(--text-3);
+}
+.load-more {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  padding: 26px 0 12px;
+}
+.end-hint {
+  font-size: 12px;
   color: var(--text-3);
 }
 @media (max-width: 1300px) {

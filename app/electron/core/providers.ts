@@ -1320,14 +1320,28 @@ export async function biliParts(bvid: string): Promise<{ cid: string; page: numb
   }))
 }
 
-export async function biliPlayUrl(bvid: string, cid: string): Promise<{ url: string; type: string }> {
+export async function biliPlayUrl(
+  bvid: string,
+  cid: string,
+  qn?: number
+): Promise<{ url: string; type: string; qn: number; qualities: { qn: number; label: string }[] }> {
+  // 从 playurl 响应里抽出可选画质清单（accept_quality + support_formats）
+  const buildQualities = (d: any): { qn: number; label: string }[] => {
+    const accept: number[] = d?.accept_quality || []
+    const fmts: Record<string, { display_desc?: string; new_description?: string }> = d?.support_formats || {}
+    return accept.map(id => ({
+      qn: id,
+      label: fmts[id]?.display_desc || fmts[id]?.new_description || `${id}P`,
+    }))
+  }
+
   // 优先请求 progressive MP4（音视频合一），否则 <video> 只有画面没有声音
   try {
     const res = await request(
       `https://api.bilibili.com/x/player/playurl?${qs({
         bvid,
         cid,
-        qn: 64,
+        qn: String(qn ?? 64),
         fnval: 1,
         fnver: 0,
         fourk: 0,
@@ -1335,25 +1349,43 @@ export async function biliPlayUrl(bvid: string, cid: string): Promise<{ url: str
       })}`,
       { headers: biliHeaders(), timeout: 15000 }
     )
-    const durl = res.body?.data?.durl?.[0]?.url
-    if (durl) return { url: durl, type: 'durl' }
+    const d = res.body?.data
+    const durl = d?.durl?.[0]?.url
+    if (durl)
+      return {
+        url: durl,
+        type: 'durl',
+        qn: Number(d?.quality) || qn || 64,
+        qualities: buildQualities(d),
+      }
   } catch {
     /* 回退 DASH */
   }
 
   const res = await request(
-    `https://api.bilibili.com/x/player/playurl?${qs({ bvid, cid, fnval: 16, fourk: 1, platform: 'html5' })}`,
+    `https://api.bilibili.com/x/player/playurl?${qs({ bvid, cid, qn: String(qn ?? 64), fnval: 16, fourk: 1, platform: 'html5' })}`,
     { headers: biliHeaders(), timeout: 15000 }
   )
   const d = res.body?.data
   const videos: any[] = d?.dash?.video || []
   if (videos.length) {
     const order = [64, 32, 16, 80, 112, 74]
-    const v = order.map(id => videos.find(x => x.id === id)).find(Boolean) || videos[0]
-    return { url: v.baseUrl || v.base_url, type: 'dash-video' }
+    const v = (qn ? videos.find(x => x.id === qn) : null) || order.map(id => videos.find(x => x.id === id)).find(Boolean) || videos[0]
+    return {
+      url: v.baseUrl || v.base_url,
+      type: 'dash-video',
+      qn: Number(v.id) || qn || 64,
+      qualities: buildQualities(d),
+    }
   }
   const fm = d?.durl?.[0]?.url
-  if (fm) return { url: fm, type: 'durl' }
+  if (fm)
+    return {
+      url: fm,
+      type: 'durl',
+      qn: Number(d?.quality) || qn || 64,
+      qualities: buildQualities(d),
+    }
   throw new Error('视频流解析失败（可能需要登录或该视频受限）')
 }
 
