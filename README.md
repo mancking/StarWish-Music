@@ -34,4 +34,88 @@
 
 插件运行时由宿主（星河音乐）注入以下依赖，插件内可直接 `require`：
 
-`axios`、`cheerio`、`crypto-js`、`dayjs`、`qs`
+`axios`、`cheerio`、`crypto-js`、`dayjs`、`qs`、`he`、`big-integer`
+
+## 插件开发指南
+
+星河音乐的插件采用 **MusicFree 插件协议**编写，运行在宿主（`mf-host.ts`）用 `node:vm` 创建的沙箱环境中。插件本质是一个 CommonJS 模块，导出一个对象。
+
+### 基本结构
+
+```js
+// my-plugin.js
+const axios = require('axios')
+
+module.exports = {
+  platform: '我的平台',            // 平台名（唯一标识，用于「当前音源」展示）
+  version: '1.0.0',                // 版本号（semver 建议）
+  srcUrl: 'https://github.com/you/repo',  // 源码地址（可选）
+  author: '你的名字',              // 作者（可选）
+  description: '插件说明',          // 描述（可选）
+  supportedSearchType: ['music', 'album', 'artist', 'sheet', 'lyric'],
+
+  // 搜索。type 取 supportedSearchType 中的值
+  async search(query, page, type) {
+    // 必须返回 { isEnd, data }，data 是数组
+    // 音乐项：{ id, title, artist, album, artwork, url, ... }
+    return { isEnd: true, data: [] }
+  },
+
+  // 歌词。musicItem 是搜索/播放选中的歌曲对象
+  async getLyric(musicItem) {
+    // 返回 { lrc } 或 { rawLrc }
+    return { lrc: '' }
+  },
+
+  // 播放地址（可选 getMusicUrl）
+  async getMusicUrl(musicItem, quality) {
+    return ''  // 返回可直接播放的 URL（http/https）
+  },
+
+  // 其他可选：getAlbum、getArtist、getArtistAlbum、getSheet、getMusicInfo 等
+}
+```
+
+### 可用依赖
+
+插件内可直接 `require`（无需打包），宿主已注入：
+
+- `axios` — HTTP 请求
+- `cheerio` — HTML 解析
+- `crypto-js` — 加密
+- `dayjs` — 时间处理
+- `qs` — 查询串序列化
+- `he` — HTML 实体编解码
+- `big-integer` — 大整数
+
+其余 `require` 一律抛「插件依赖 X 不在支持列表内」，请勿引用其他包。
+
+### manifest.json（市场索引）
+
+每个插件需在 `manifest.json` 中登记，才能在插件市场被列出：
+
+```json
+{
+  "name": "我的插件",
+  "file": "my-plugin.js",
+  "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/my-plugin.js",
+  "version": "1.0.0",
+  "author": "你的名字",
+  "platform": "我的平台",
+  "description": "插件说明",
+  "supportedSearchType": ["music", "album", "artist", "sheet", "lyric"]
+}
+```
+
+`file` 对应分支上的 `.js` 文件名，`url` 指向该文件在本分支的 raw 地址。
+
+### 运行环境与注意事项
+
+- 沙箱超时 20 秒（`timeout: 20000`），单次调用超过会被中断，注意不要阻塞太久。
+- 插件运行在 Electron 主进程，可访问 Node API（但请只用注入的依赖）。
+- **默认关闭**：用户在「设置 → 音源与插件 → 插件库」安装后，需手动启用该插件才会参与搜索/取词。
+- 更新插件时同步更新 `manifest.json` 的 `version`，详见上方「更新方式」。
+
+### 调试
+
+把 `.js` 放到 `manifest.json` 后推送本分支，用户端「插件库 → 检查更新」拉取安装，启用后在搜索/歌词页验证；异常会显示在插件列表的加载错误字段。
