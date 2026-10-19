@@ -272,9 +272,10 @@ function onGestureEnd(e: PointerEvent): void {
     @pointerdown="onGestureStart"
     @pointerup="onGestureEnd"
   >
-    <!-- 背景 -->
+    <!-- 背景：专辑封面大模糊；无封面时兜底氛围渐变（coverUrl 可能为空） -->
     <div class="bg-layer">
       <img v-if="player.coverUrl" :src="player.coverUrl" class="bg-img" alt="" />
+      <div class="bg-fallback" />
       <div class="bg-mask" />
     </div>
 
@@ -484,6 +485,15 @@ function onGestureEnd(e: PointerEvent): void {
   filter: blur(90px) saturate(1.35) brightness(0.55);
   transform: scale(1.25);
   transition: opacity 0.6s;
+}
+/* 无封面兜底：随主题色微调的氛围渐变（盖在纯黑底之上） */
+.bg-fallback {
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(90% 70% at 25% 15%, color-mix(in srgb, var(--accent) 28%, transparent), transparent 60%),
+    radial-gradient(80% 80% at 80% 85%, rgba(124, 108, 255, 0.22), transparent 65%),
+    linear-gradient(160deg, #14162266, #0a0b10);
 }
 .bg-mask {
   position: absolute;

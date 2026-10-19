@@ -1,3 +1,7 @@
+<script lang="ts">
+// 模块级缓存：跨实例存活（KeepAlive 回收后重挂载也能秒开），仅进程内有效
+let feedCache: any = null
+</script>
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
@@ -48,12 +52,27 @@ const memory = ref<any>(null)
 const podcasts = computed<any[]>(() => feed.value?.podcasts || [])
 
 async function load(force = false): Promise<void> {
+  // 后台缓存：有缓存先秒开再静默刷新；下拉刷新（force）直接重拉
+  if (!force && feedCache) {
+    feed.value = feedCache
+    loading.value = false
+    void call('home:feed', { force: false })
+      .then((f: any) => {
+        feedCache = f
+        feed.value = f
+      })
+      .catch(() => {
+        /* 静默刷新失败：保留缓存内容 */
+      })
+    return
+  }
   if (force) refreshing.value = true
   else loading.value = true
   error.value = ''
   try {
     const [f, m] = await Promise.all([call('home:feed', { force }), call('music:memory').catch(() => null)])
     feed.value = f
+    feedCache = f
     memory.value = m
   } catch (e: any) {
     error.value = e?.message || '加载失败'

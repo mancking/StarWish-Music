@@ -65,8 +65,14 @@ const partsPending = computed(() => parts.value.length > partsShown.value)
 function onPartsScroll(e: Event): void {
   const el = e.currentTarget as HTMLElement
   if (el.scrollTop + el.clientHeight >= el.scrollHeight - 40) {
-    partsShown.value = Math.min(partsShown.value + PART_BATCH, parts.value.length)
+    loadMoreParts()
   }
+}
+
+/** 立即加载下一批分集（滚动到底自动触发，也可点击按钮） */
+function loadMoreParts(): void {
+  if (!partsPending.value) return
+  partsShown.value = Math.min(partsShown.value + PART_BATCH, parts.value.length)
 }
 
 /** 格式化播放量：B站风格 "277.8万 次播放" */
@@ -331,7 +337,9 @@ onBeforeUnmount(() => {
             <span class="part-name ellipsis">{{ p.part }}</span>
             <span class="part-dur mono">{{ p.duration ? formatTime(p.duration) : '' }}</span>
           </button>
-          <div v-if="partsPending" class="parts-tip">下滑加载更多分集（{{ partsMore.length }}/{{ parts.length }}）</div>
+          <button v-if="partsPending" class="parts-tip parts-more-btn" @click="loadMoreParts()">
+            加载更多分集（{{ partsMore.length }}/{{ parts.length }}）
+          </button>
         </div>
 
         <div v-else class="single-info">
@@ -539,6 +547,7 @@ onBeforeUnmount(() => {
 }
 .parts {
   overflow-y: auto;
+  max-height: 42vh; /* 不限高则容器随内容撑高、永不触发内部滚动 */
   padding: 6px;
 }
 .part {
@@ -583,6 +592,20 @@ onBeforeUnmount(() => {
   text-align: center;
   font-size: 10.5px;
   color: var(--text-3);
+}
+.parts-more-btn {
+  display: block;
+  width: 100%;
+  border: 1px dashed var(--panel-3);
+  border-radius: 8px;
+  background: transparent;
+  cursor: pointer;
+  font: inherit;
+  color: var(--text-2);
+}
+.parts-more-btn:hover {
+  color: var(--text);
+  border-color: var(--accent, #7c9cff);
 }
 .single-info {
   padding: 12px;

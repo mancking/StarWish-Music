@@ -299,8 +299,9 @@ function albumOf(s: Song): string {
 .tag {
   display: inline-flex;
   align-items: center;
-  height: 15px;
-  padding: 0 4px;
+  /* 用 padding 撑高而非固定 height：固定 15px-边框后内容区仅 13px，字体基线会偏出方框 */
+  padding: 1px 5px;
+  line-height: 1.3;
   border-radius: 3px;
   font-size: 10px;
   font-weight: 500;

@@ -257,67 +257,77 @@ export function registerMediaProtocol(getBiliCookie: () => string): void {
       // 视频边播边存：按 Range 偏移 tee 写入 .part；整个文件下完整后改名成完整缓存
       let body: ReadableStream<Uint8Array> | null = res.body
       if (body && isVideoUrl(target) && (res.status === 200 || res.status === 206)) {
-        const key = cacheKey(target)
-        const m = /bytes=(\d*)-/.exec(range || '')
-        const start = m ? (m[1] ? parseInt(m[1], 10) : 0) : 0
-        const cr = res.headers.get('content-range')
-        const total = cr
-          ? parseInt(cr.split('/')[1] || '0', 10)
-          : res.status === 200
-            ? parseInt(res.headers.get('content-length') || '0', 10)
-            : 0
-        let st = streamStates.get(key)
-        if (start === 0) {
-          await ensureDir(streamDir())
-          const file = path.join(streamDir(), `${key}.part`)
-          if (st) await st.fh.close().catch(() => {})
-          st = {
-            fh: await fsp.open(file, 'w'),
-            written: 0,
-            total,
-            file,
-            ext: path.extname(new URL(target).pathname).toLowerCase() || '.mp4',
-            active: true,
+        try {
+          const key = cacheKey(target)
+          const m = /bytes=(\d*)-/.exec(range || '')
+          const start = m ? (m[1] ? parseInt(m[1], 10) : 0) : 0
+          const cr = res.headers.get('content-range')
+          const total = cr
+            ? parseInt(cr.split('/')[1] || '0', 10)
+            : res.status === 200
+              ? parseInt(res.headers.get('content-length') || '0', 10)
+              : 0
+          let st = streamStates.get(key)
+          if (start === 0) {
+            await ensureDir(streamDir())
+            const file = path.join(streamDir(), `${key}.part`)
+            if (st) await st.fh.close().catch(() => {})
+            st = {
+              fh: await fsp.open(file, 'w'),
+              written: 0,
+              total,
+              file,
+              ext: path.extname(new URL(target).pathname).toLowerCase() || '.mp4',
+              active: true,
+            }
+            streamStates.set(key, st)
+          } else if (st && st.written === start) {
+            /* 连续续传：复用同一句柄 */
+          } else {
+            // 无起点状态或偏移对不上：放弃本次缓存（播放透传不受影响）
+            if (st) {
+              await st.fh.close().catch(() => {})
+              streamStates.delete(key)
+            }
+            st = undefined
           }
-          streamStates.set(key, st)
-        } else if (st && st.written === start) {
-          /* 连续续传：复用同一句柄 */
-        } else {
-          // 无起点状态或偏移对不上：放弃本次缓存（播放透传不受影响）
-          if (st) {
-            await st.fh.close().catch(() => {})
-            streamStates.delete(key)
-          }
-          st = undefined
-        }
-        const state = st
-        if (state) {
-          const src = body
-          body = new ReadableStream<Uint8Array>({
-            async pull(controller) {
-              const { done, value } = await src.getReader().read().catch(() => ({ done: true, value: undefined }))
-              if (done) {
+          const state = st
+          if (state) {
+            const src = body
+            // reader 只能创建一次：ReadableStream 被第二个 getReader() 会抛 locked，
+            // 之前每 pull 新建导致第二块起全被判 done → 视频只剩首块 → Format error
+            const reader = src.getReader()
+            body = new ReadableStream<Uint8Array>({
+              async pull(controller) {
+                const { done, value } = await reader.read().catch(() => ({ done: true, value: undefined }))
+                if (done) {
+                  await state.fh.close().catch(() => {})
+                  streamStates.delete(key)
+                  if (state.total && state.written >= state.total) {
+                    // 下载完整 → 升格为完整缓存
+                    await fsp.rename(state.file, path.join(streamDir(), `${key}${state.ext}`)).catch(() => {})
+                  }
+                  controller.close()
+                  return
+                }
+                if (value) {
+                  await state.fh.write(value, 0, value.length, state.written).catch(() => {})
+                  state.written += value.length
+                }
+                controller.enqueue(value!)
+              },
+              async cancel(reason) {
                 await state.fh.close().catch(() => {})
                 streamStates.delete(key)
-                if (state.total && state.written >= state.total) {
-                  // 下载完整 → 升格为完整缓存
-                  await fsp.rename(state.file, path.join(streamDir(), `${key}${state.ext}`)).catch(() => {})
-                }
-                controller.close()
-                return
-              }
-              if (value) {
-                await state.fh.write(value, 0, value.length, state.written).catch(() => {})
-                state.written += value.length
-              }
-              controller.enqueue(value!)
-            },
-            async cancel(reason) {
-              await state.fh.close().catch(() => {})
-              streamStates.delete(key)
-              src.cancel(reason).catch(() => {})
-            },
-          })
+                reader.cancel(reason).catch(() => {})
+              },
+            })
+          }
+        } catch (e: any) {
+          // 缓存是附加优化：任何缓存侧异常（磁盘满/杀软锁目录/句柄失效）都降级为纯透传，
+          // 绝不能让整条媒体请求 502（那会让所有视频 Format error）
+          logger.warn('视频缓存写入异常，降级为透传', e?.message)
+          body = res.body
         }
       }
       return new Response(body as any, { status: res.status, headers: outHeaders })

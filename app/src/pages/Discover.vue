@@ -154,12 +154,26 @@ const groups = computed(() => tree.value?.tree[platform.value]?.groups || [])
 
 const plError = ref('')
 
+/** SWR 后台缓存：切标签/音源/最新最热/榜单时先用缓存秒开，再 30s 防抖后台静默刷新 */
+const SWR_BG_MS = 30_000
+const plCache = new Map<string, { list: PlaylistMeta[]; ts: number }>()
+const tlCache = new Map<string, { r: { name: string; songs: Song[] }; ts: number }>()
+
 /**
  * 加载某一页（落雪式真分页，替换原先的「加载更多」无限累加）。
  * 上游按页返回 30 条，不提供总数，故满页即认为还有下一页。
  * 「最新」走精品歌单通道（无总数、用 lasttime 游标翻页），冷门标签可能不足 30 条。
  */
 async function loadPlaylists(page = 1): Promise<void> {
+  const key = `pl|${plSource.value}|${cat.value}|${order.value}|${page}`
+  const hit = plCache.get(key)
+  if (hit) {
+    // 命中缓存：立即渲染（无骨架等待），再后台刷新
+    applyPlaylists(hit.list, page)
+    window.scrollTo({ top: 0 })
+    void revalidatePlaylists(key, page)
+    return
+  }
   if (plLoading.value) return
   plLoading.value = true
   plError.value = ''
@@ -170,11 +184,8 @@ async function loadPlaylists(page = 1): Promise<void> {
       page,
       source: plSource.value,
     })
-    playlists.value = list
-    plPage.value = page
-    if (page > plFurthest.value) plFurthest.value = page
-    plHasNext.value = list.length >= 30
-    if (!list.length) plError.value = '该标签暂无歌单，换个标签试试'
+    plCache.set(key, { list, ts: Date.now() })
+    applyPlaylists(list, page)
     window.scrollTo({ top: 0, behavior: 'smooth' })
   } catch (e: any) {
     playlists.value = []
@@ -182,6 +193,35 @@ async function loadPlaylists(page = 1): Promise<void> {
     ui.toast(`歌单加载失败：${e.message}`, 'error')
   } finally {
     plLoading.value = false
+  }
+}
+
+function applyPlaylists(list: PlaylistMeta[], page: number): void {
+  playlists.value = list
+  plPage.value = page
+  if (page > plFurthest.value) plFurthest.value = page
+  plHasNext.value = list.length >= 30
+  if (!list.length) plError.value = '该标签暂无歌单，换个标签试试'
+  else plError.value = ''
+}
+
+/** 后台静默刷新缓存数据；仅当该 key 仍是当前视图时替换界面 */
+async function revalidatePlaylists(key: string, page: number): Promise<void> {
+  const hit = plCache.get(key)
+  if (!hit || Date.now() - hit.ts < SWR_BG_MS) return
+  try {
+    const list = await call<PlaylistMeta[]>('music:playlists', {
+      cat: cat.value,
+      order: order.value,
+      page,
+      source: plSource.value,
+    })
+    plCache.set(key, { list, ts: Date.now() })
+    if (`pl|${plSource.value}|${cat.value}|${order.value}|${plPage.value}` === key) {
+      applyPlaylists(list, page)
+    }
+  } catch {
+    /* 后台刷新失败：保留缓存内容 */
   }
 }
 
@@ -204,17 +244,44 @@ async function loadTree(): Promise<void> {
 async function selectToplist(name: string, id: string): Promise<void> {
   currentItem.value = { name, id }
   tlPage.value = 1
+  const key = `tl|${platform.value}|${id}`
+  const hit = tlCache.get(key)
+  if (hit) {
+    // 命中缓存：榜单秒开，后台刷新
+    toplistSongs.value = hit.r.songs
+    tlLoading.value = false
+    tlError.value = hit.r.songs.length ? '' : '该榜单暂时没有返回数据'
+    void revalidateToplist(key, name, id)
+    return
+  }
   tlLoading.value = true
   tlError.value = ''
   toplistSongs.value = []
   try {
     const r = await call<{ name: string; songs: Song[] }>('music:toplist', { platform: platform.value, id })
+    tlCache.set(key, { r, ts: Date.now() })
     toplistSongs.value = r.songs
     if (!r.songs.length) tlError.value = '该榜单暂时没有返回数据'
   } catch (e: any) {
     tlError.value = e?.message || '榜单加载失败'
   } finally {
     tlLoading.value = false
+  }
+}
+
+/** 榜单后台静默刷新；仅当 key 仍是当前榜单时替换 */
+async function revalidateToplist(key: string, name: string, id: string): Promise<void> {
+  const hit = tlCache.get(key)
+  if (!hit || Date.now() - hit.ts < SWR_BG_MS) return
+  try {
+    const r = await call<{ name: string; songs: Song[] }>('music:toplist', { platform: platform.value, id })
+    tlCache.set(key, { r, ts: Date.now() })
+    if (`tl|${platform.value}|${id}` === key) {
+      toplistSongs.value = r.songs
+      tlError.value = r.songs.length ? '' : '该榜单暂时没有返回数据'
+    }
+  } catch {
+    /* 后台刷新失败保留缓存 */
   }
 }
 
