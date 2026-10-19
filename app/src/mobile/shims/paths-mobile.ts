@@ -47,6 +47,8 @@ export const setMediaRoot = base.setMediaRoot
 export const coverCacheDir = base.coverCacheDir
 export const mediaCacheDir = base.mediaCacheDir
 export const dataDirPointerFile = base.dataDirPointerFile
+export const setLogRoot = base.setLogRoot
+export const logRootDir = base.logRootDir
 export const logDir = base.logDir
 export const dbFile = base.dbFile
 export const settingsFile = base.settingsFile
@@ -58,5 +60,5 @@ export default {
   setUserDataDir, userDataDir, ensureDir,
   setCacheRoot, cacheRootDir, cacheDir,
   setCoverRoot, setMediaRoot, coverCacheDir, mediaCacheDir,
-  dataDirPointerFile, logDir, dbFile, settingsFile, biliLoginFile,
+  dataDirPointerFile, setLogRoot, logRootDir, logDir, dbFile, settingsFile, biliLoginFile,
 }
