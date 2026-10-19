@@ -4,7 +4,7 @@
 
 **把每一次聆听，都汇成一条星河。**
 
-Windows 桌面音乐播放器 · 多音源聚合 · 本地曲库 · 内置视频播放器
+Windows 桌面音乐播放器 · 多音源聚合 · 插件市场 · 本地曲库 · 内置视频播放器
 
 </div>
 
@@ -84,6 +84,39 @@ npm run dist:portable
 ## 音源
 
 仓库内仅包含自研音源（聚合音源、视频音源）作为示例与开箱即用方案；第三方社区音源请自行获取后通过「设置 → 音源与插件 → 导入音源」加载。音源脚本格式与完整示例见[音源开发指南](docs/音源开发指南.md)。
+
+## 插件库 / 插件市场
+
+v2.1.0 起新增**插件库（插件市场）**，用于管理跨平台的 **MusicFree 协议插件**（支持歌曲 / 专辑 / 歌手 / 歌单 / 歌词等多类型检索），与内置的 lx-music 音源并行工作、互不影响——内置音源保持原样，插件库是可在线安装的额外音源扩展。
+
+### 在哪里用
+
+「设置 → 音源与插件 → 插件库」。支持三种方式获取插件：
+
+- **插件市场**：浏览在线目录、查看版本与支持类型，一键安装 / 更新 / 卸载
+- **订阅源**：填入订阅地址后自动同步目录，插件更新只需刷新订阅
+- **本地导入**：从本地文件或直接粘贴 / 填写插件网址导入
+
+### 插件库地址（GitHub 独立分支存储库）
+
+官方插件库托管在本仓库的独立分支 **`Star-Wish-Plugin-Library`**，与主分支代码隔离，便于独立迭代与版本更新：
+
+- **仓库**：https://github.com/mancking/StarWish-Music
+- **插件库分支**：https://github.com/mancking/StarWish-Music/tree/Star-Wish-Plugin-Library
+- **目录索引（manifest.json）**：https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/manifest.json
+
+`manifest.json` 是插件市场的目录索引，每条记录包含插件名、文件名、版本、作者、支持的检索类型（types）以及插件源码的 raw 下载地址。客户端（设置页）拉取该索引即可展示可安装列表；订阅源也复用同一格式，因此可指向该分支或任意自建镜像。
+
+### 插件来源与参考源码
+
+- **内置插件**：随应用分发，位于 [`app/plugins/`](app/plugins)，首次安装即可在插件库中看到（标记「内置」），可停用但不可删除。
+- **官方在线插件**：托管于上述 `Star-Wish-Plugin-Library` 分支，共 9 个：网易云、B站、5sing、音悦台、歌词千寻、小枸、小秋、小蜗、小云。
+- **插件协议**：采用 MusicFree 插件协议（`search` / `getLyric` / `getMusicUrl` 等导出方法），运行在主进程的 `vm` 沙箱内，仅通过宿主注入的依赖（`axios` / `cheerio` / `crypto-js` / `dayjs` / `qs`）发起网络请求。
+- **插件宿主实现**：[`app/electron/core/mf-host.ts`](app/electron/core/mf-host.ts)（加载 / 求值 / 调用 / 订阅解析）。插件运行时依赖与 IPC 通道见 [`app/electron/ipc.ts`](app/electron/ipc.ts)（`plugins:*`）。
+- **插件市场 / 导入 UI**：[`app/src/pages/Settings.vue`](app/src/pages/Settings.vue) 的「插件库」区块。
+- **插件开发**：插件本质是一个导出若干方法的 JS 文件，可直接参考 `Star-Wish-Plugin-Library` 分支中的任意插件源码；本地调试时把文件放入插件目录或用「本地导入」加载即可。
+
+> 说明：插件库与音源是两套并列机制。音源走 lx-music v2 协议（`app/sources/*.js`），插件走 MusicFree 协议（`app/plugins/*.js` 与在线插件），两者可在聚合搜索中共同参与，也可各自单独启停。
 
 ## 说明
 
