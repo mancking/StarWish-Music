@@ -1,5 +1,6 @@
 import type { MvItem, PlaylistMeta, Song, ToplistItem, ToplistTree } from '../../shared/types'
 import { getJson, hostOf, limited, qs, request, sleep, stripHtml, UA } from './http'
+import { followRedirect } from './redirect'
 import { createLogger } from './log'
 import { biliCookie, biliHeaders, biliStatus } from './bili'
 import * as nodeCrypto from 'node:crypto'
@@ -1584,35 +1585,12 @@ async function kgChainToSpecialid(chain: string): Promise<string> {
   }
 }
 
-/** 跟随一次 HTTP 跳转，取 location（落雪 handleParseId 的做法） */
-async function followRedirect(url: string): Promise<string> {
-  try {
-    const res = await request(url, { redirect: 'manual', timeout: 10000, retry: 0 })
-    const loc = res.headers['location']
-    if (!loc) return url
-    return /^https?:\/\//i.test(loc) ? loc : new URL(loc, url).toString()
-  } catch {
-    return url
-  }
-}
-
 /**
  * QQ 官方分享短链：c6.y.qq.com/base/fcgi-bin/u?__=XXXX
  * 短码是 QQ 服务端的一张映射表，没有客户端解码算法 —— 只能靠 302 的 Location 拿真链接
- * （落雪 v2 同样只做跟跳转）。Location 形态随内容类型变化，这里只取歌单那种。
+ * （落雪 v2 同样只做跟跳转）。Location 里就带 id=，
+ * 所以下面通用的「跟跳转 + 套正则」分支即可解析，无需额外规则。
  */
-async function qqShortLinkTarget(url: string): Promise<string> {
-  const loc = await followRedirect(url)
-  if (loc === url) return ''
-  let u: URL
-  try {
-    u = new URL(loc)
-  } catch {
-    return ''
-  }
-  if (!/\/details\/playlist\.html/i.test(u.pathname)) return ''
-  return u.searchParams.get('id') || ''
-}
 
 /**
  * 把用户输入解析成「平台 + 歌单 ID」。
@@ -1640,10 +1618,6 @@ export async function resolvePlaylistTarget(
     return ''
   }
   let id = pick(s)
-  // QQ 官方分享短链：短码是服务端映射，只能跟 302 拿 Location
-  if (!id && p === 'qq' && /\/base\/fcgi-bin\/u\?__=/i.test(s)) {
-    id = await qqShortLinkTarget(s)
-  }
   // 酷狗分享短链：chain → specialid
   if (!id && p === 'kg') {
     const chain = s.match(/[?&#]chain=([A-Za-z0-9]+)/)

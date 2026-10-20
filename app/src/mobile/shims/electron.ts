@@ -1,7 +1,7 @@
 /** `electron` 模块的浏览器垫片：app/shell/... 一律 no-op，net.fetch 退回全局 fetch。 */
 export const app = {
   getPath: (_name: string) => '/home/user/.starwish',
-  getVersion: () => '2.1.0',
+  getVersion: () => __APP_VERSION__,
   getName: () => '星河音乐',
   on: () => undefined,
   whenReady: () => Promise.resolve(),

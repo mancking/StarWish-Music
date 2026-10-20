@@ -2,6 +2,7 @@ import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import pkg from './package.json'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
@@ -38,6 +39,8 @@ export default defineConfig({
       './bili': path.resolve(__dirname, 'src/mobile/shims/bili-bridge.ts'),
       // paths.ts 的 sourcesDir 指向虚拟 fs 种子目录
       './paths': path.resolve(__dirname, 'src/mobile/shims/paths-mobile.ts'),
+      // 跟跳转：移动端走原生 CapacitorHttp（拿得到 302 的 Location）
+      './redirect': path.resolve(__dirname, 'src/mobile/shims/redirect-mobile.ts'),
       // db.ts 里 require('sql.js')
       'sql.js': path.resolve(__dirname, 'node_modules/sql.js/dist/sql-wasm.js'),
     },
@@ -46,6 +49,7 @@ export default defineConfig({
     'process.platform': '"android"',
     'process.env.NODE_ENV': '"production"',
     __MOBILE__: 'true',
+    __APP_VERSION__: JSON.stringify(pkg.version),
   },
   build: {
     outDir: path.resolve(__dirname, 'dist/mobile'),

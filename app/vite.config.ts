@@ -1,6 +1,7 @@
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 import path from 'node:path'
+import pkg from './package.json'
 
 export default defineConfig({
   root: path.resolve(__dirname, 'src'),
@@ -14,6 +15,7 @@ export default defineConfig({
   },
   define: {
     __MOBILE__: 'false',
+    __APP_VERSION__: JSON.stringify(pkg.version),
   },
   build: {
     outDir: path.resolve(__dirname, 'dist/renderer'),

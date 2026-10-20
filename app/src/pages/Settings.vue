@@ -103,6 +103,8 @@ async function patch(p: Partial<AppSettings>): Promise<void> {
 /* ---------------- 播放页背景（封面模糊 / 动态渐变 / 壁纸 / 纯色） ---------------- */
 
 const isMobile = __MOBILE__
+/** 应用版本号：构建期注入，与 app/package.json 一致 */
+const appVersion = __APP_VERSION__
 const wallpaperInput = ref<HTMLInputElement | null>(null)
 /** 当前播放页背景模式 */
 const bgMode = computed<AppSettings['playerBg']>(() => setting.value.playerBg || 'cover')
@@ -615,7 +617,7 @@ async function doCheckUpdate(): Promise<void> {
   if (updateChecking.value) return
   updateChecking.value = true
   try {
-    const cur = String(appInfo.value?.version || '2.0.0')
+    const cur = String(appInfo.value?.version || appVersion)
     updateInfo.value = await checkUpdate(cur)
     if (updateInfo.value.hasUpdate) {
       ui.toast(`发现新版本 v${updateInfo.value.version}`, 'success')
@@ -1156,7 +1158,7 @@ onBeforeUnmount(stopPoll)
             <div class="about-mark">星</div>
             <div>
               <h3>星河音乐 <span>StarWish Music</span></h3>
-              <p>版本 {{ appInfo?.version || '2.0.0' }} · Electron {{ appInfo?.electron || '-' }}</p>
+              <p>版本 {{ appInfo?.version || appVersion }} · Electron {{ appInfo?.electron || '-' }}</p>
               <p>Chrome {{ appInfo?.chrome || '-' }} · Node {{ appInfo?.node || '-' }}</p>
               <p class="muted">多音源聚合播放器，音源脚本可自由导入替换。所有音乐版权归各平台与版权方所有，仅供个人学习与试听。</p>
             </div>

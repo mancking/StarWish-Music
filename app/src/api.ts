@@ -41,4 +41,8 @@ export function on(channel: string, cb: (payload: any) => void): () => void {
   return window.sw.on(channel, cb)
 }
 
-export const isDesktop = typeof window !== 'undefined' && !!window.sw
+/**
+ * 是否桌面端。必须用构建期旗标：`window.sw` 在移动端也注入了（WebView bridge），
+ * 用它判桌面会让移动端误调桌面专属 IPC（视频缓存、打开外部浏览器…）。
+ */
+export const isDesktop = !__MOBILE__
