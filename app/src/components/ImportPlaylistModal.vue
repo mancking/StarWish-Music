@@ -29,6 +29,21 @@ const PLATFORMS: { key: string; name: string; hint: string }[] = [
   { key: 'bili', name: '视频源', hint: 'B 站合集 / 收藏夹' },
 ]
 
+/** 域名 → 音源 key。粘贴链接后自动切到对应音源（与落雪 deeplink 同思路） */
+const HOST_PLATFORM: [RegExp, string][] = [
+  [/bilibili\.com|b23\.tv/i, 'bili'],
+  [/y\.qq\.com|qq\.com|c\.y\.qq/i, 'qq'],
+  [/kugou\.com/i, 'kg'],
+  [/kuwo\.cn/i, 'kw'],
+  [/migu\.cn/i, 'mg'],
+  [/music\.163\.com|163cn\.tv/i, 'wy'],
+]
+
+function detectPlatform(text: string): string {
+  for (const [re, key] of HOST_PLATFORM) if (re.test(text)) return key
+  return ''
+}
+
 const platform = ref<string>(PLATFORMS[0].key)
 const input = ref('')
 const busy = ref(false)
@@ -39,7 +54,23 @@ watch(open, v => {
   if (v) {
     error.value = ''
     input.value = ''
+    platform.value = PLATFORMS[0].key
   }
+})
+
+// 粘贴链接后自动切到对应音源：不同平台的分享链接不互通，切对了才解析得动
+const detectedPlatform = ref('')
+watch(input, v => {
+  const key = detectPlatform(v)
+  detectedPlatform.value = key
+  if (key && key !== platform.value) platform.value = key
+  if (error.value) error.value = ''
+})
+
+/** 选中的音源与链接所属平台不一致时先提醒，省得白等一次请求 */
+const platformMismatch = computed(() => {
+  const d = detectedPlatform.value
+  return !!(d && d !== platform.value)
 })
 
 const current = computed(() => PLATFORMS.find(p => p.key === platform.value) || PLATFORMS[0])
@@ -121,8 +152,13 @@ async function submit(): Promise<void> {
           <Icon name="info" :size="14" />{{ error }}
         </div>
 
+        <div v-else-if="platformMismatch" class="error warn">
+          <Icon name="info" :size="14" />
+          该链接属于「{{ PLATFORMS.find(p => p.key === detectedPlatform)?.name }}」，当前选的是「{{ current.name }}」
+        </div>
+
         <div class="tip">
-          <p>请确认要打开的歌单与左侧选择的音源是否对应；不同音源的分享链接不互通。</p>
+          <p>粘贴链接后会自动切换到对应音源；不同音源的分享链接不互通。</p>
           <p>支持用歌单 ID 或概念版链接打开；部分平台（如 B 站合集）需登录态或 Cookie 才能解析。</p>
         </div>
       </div>
@@ -309,6 +345,11 @@ async function submit(): Promise<void> {
   padding: 6px 8px;
   border-radius: 6px;
   background: rgba(255, 122, 140, 0.08);
+}
+/* 只是提醒（选了别的音源），不当作错误 */
+.error.warn {
+  color: var(--text-2);
+  background: var(--hover);
 }
 .tip {
   margin-top: auto;

@@ -17,7 +17,7 @@ import { emit, subscribe } from '../bus'
 import { fail, ok } from './envelope'
 import { player } from '../player'
 import * as vfs from '../shims/vfs'
-import { seedSources, seedPlugins } from '../seed'
+import { seedSources } from '../seed'
 import { registerBufferGlobal, patchFetch } from '../shims/util'
 import { initDb, setSqlJsLoader } from '../../../electron/core/db'
 import { lxHost } from '../../../electron/core/lx-host'
@@ -45,10 +45,10 @@ async function boot(): Promise<void> {
   patchFetch()
   registerBufferGlobal()
 
-  // 1) 虚拟文件系统：先本地恢复，再用内置音源/插件种子播种
+  // 1) 虚拟文件系统：先本地恢复，再用内置音源种子播种
   await vfs.initFs()
   seedSources()
-  seedPlugins()
+  // 插件不再内置：用户从「插件市场」/订阅/本地导入安装后落进用户插件目录
   // 内置 MusicFree 插件预热（init 是同步 void；逐个插件失败不会抛）
   try { mfHost.init() } catch { /* 预热失败不阻断启动 */ }
 
@@ -135,8 +135,8 @@ const handlers: Record<string, Handler> = {
     emit('sources:changed', lxHost.list())
     return lxHost.list()
   },
-  'sources:import': async ({ url, content }: any) => {
-    const r = await lxHost.importSource({ url, content })
+  'sources:import': async ({ url, content, file }: any) => {
+    const r = await lxHost.importSource({ url, content, file })
     emit('sources:changed', lxHost.list())
     return { file: r.file, sources: lxHost.list() }
   },
@@ -169,9 +169,9 @@ const handlers: Record<string, Handler> = {
     emit('plugins:changed', mfHost.list())
     return mfHost.list()
   },
-  'plugins:import': async ({ url, content, origin }: any) => {
-    if (url) await mfHost.importFromUrl(url)
-    else if (content) await mfHost.importFromContent(content, origin || 'local', url)
+  'plugins:import': async ({ url, content, origin, file }: any) => {
+    if (url) await mfHost.importFromUrl(url, file)
+    else if (content) await mfHost.importFromContent(content, origin || 'local', url, file)
     emit('plugins:changed', mfHost.list())
     return mfHost.list()
   },

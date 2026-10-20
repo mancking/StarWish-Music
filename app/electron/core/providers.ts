@@ -469,15 +469,26 @@ export async function kuwoPlaylistDetail(pid: string): Promise<{ name: string; p
 }
 
 export async function miguPlaylistDetail(id: string): Promise<{ name: string; pic: string; description: string; songs: Song[] }> {
-  const url = `https://music.migu.cn/v3/api/playlist/song?playlistId=${encodeURIComponent(id)}&pageNo=1&pageSize=200`
+  // 落雪 v1.22.3 用的就是这个端点；music.migu.cn/v3/api/playlist/song 已改成 SPA 只返回 HTML
+  const url = `https://app.c.nf.migu.cn/MIGUM2.0/v1.0/user/queryMusicListSongs.do?${qs({
+    musicListId: id,
+    pageNo: 1,
+    pageSize: 200,
+  })}`
   const res = await request(url, {
-    headers: { 'User-Agent': UA, Referer: 'https://music.migu.cn/', Accept: 'application/json' },
+    headers: {
+      'User-Agent':
+        'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
+      Referer: 'https://m.music.migu.cn/',
+      Accept: 'application/json',
+    },
     timeout: 15000,
   })
-  if (typeof res.body === 'string' || !res.body) {
+  const body: any = res.body
+  if (!body || typeof body === 'string' || body.code !== '000000') {
     throw new Error('该音源的歌单接口暂不可用，请改用其他音源的分享链接')
   }
-  const list = res.body?.data?.content || res.body?.data?.list || []
+  const list = body.list || []
   const songs = list
     .map(
       (s: any): Song => ({
@@ -485,15 +496,15 @@ export async function miguPlaylistDetail(id: string): Promise<{ name: string; pi
         source: 'mg',
         songId: String(s.songId || s.contentId || ''),
         name: s.songName || s.name || '',
-        singer: s.singerName || s.singer || '未知歌手',
-        album: s.albumName || s.album || '',
-        duration: num(s.duration),
-        pic: https(s.albumPic || s.pic || ''),
+        singer: s.singer || (s.artists || []).map((a: any) => a.name).filter(Boolean).join('/') || '未知歌手',
+        album: s.album || s.albumName || '',
+        duration: parseDuration(s.length || s.duration),
+        pic: https(s.landscapImg || s.albumPic || s.pic || ''),
         qualitys: ['128k'],
       })
     )
     .filter(s => s.name)
-  return { name: `咪咕歌单 ${id}`, pic: '', description: '', songs }
+  return { name: `咪咕歌单 ${id}`, pic: songs[0]?.pic || '', description: '', songs }
 }
 
 /**
@@ -528,7 +539,9 @@ export async function qqPlaylistTags(): Promise<{ name: string; tags: { n: strin
  * 「最新」改为对当页结果按 create_time 降序重排。
  */
 export async function qqPlaylists(cat: string, order: string, page = 1): Promise<PlaylistMeta[]> {
-  const titleid = cat === '全部' ? 3317 : cat
+  // 分类必须是**数字**：titleid/category_id 传字符串会返回空列表（实测）。
+  // 标签 id 来自 qqPlaylistTags（如 流行=3152），「全部」= 3317。
+  const titleid = cat === '全部' ? 3317 : Number(cat) || 3317
   const param = {
     comm: { cv: 1602, ct: 20 },
     playlist: {
@@ -1499,30 +1512,163 @@ export function detectPlatform(input: string): string {
   return ''
 }
 
-export function extractPlaylistId(input: string, platform?: string): { platform: string; id: string } {
+/** 平台中文名，报错时提示用户该切到哪个音源 */
+const PLATFORM_NAMES: Record<string, string> = {
+  wy: '小芸音乐',
+  qq: '小秋音乐',
+  kg: '小枸音乐',
+  kw: '小蜗音乐',
+  mg: '小蜜音乐',
+  bili: '视频源',
+}
+
+/**
+ * 各平台歌单链接 → 歌单 ID 的正则，取自落雪 lx-music v1.22.3 的 regExps
+ * （src/renderer/utils/music/{wy,tx,kg,kw,mg}/songList.js）。
+ * 匹配顺序即优先级：先命中「带参数的分享链接」，再命中「路径里的纯数字」。
+ */
+const PLAYLIST_ID_RULES: Record<string, RegExp[]> = {
+  wy: [/^.+(?:\?|&)id=(\d+)(?:&.*$|#.*$|$)/, /^.+\/playlist\/(\d+)(?:\/\d+)?\/?.*$/, /^(\d+)$/],
+  qq: [
+    /[?&]id=(\d+)/,
+    /\/playlist\/(\d+)/,
+    /\/(\d+)\.html/,
+    /^(\d+)$/,
+  ],
+  kg: [
+    /^.+\/special\/single\/(\d+).*$/,
+    /^.+\/(\d+)\.html(?:\?.*|&.*$|#.*$|$)/,
+    /^.+\/plist\/list_(\d+).*$/,
+    /[?&#]specialid=(\d+)/,
+    /^(\d+)$/,
+  ],
+  kw: [
+    /^.+\/playlist(?:_detail)?\/(\d+)(?:\?.*|&.*$|#.*$|$)/,
+    /[?&#]pid=(\d+)/,
+    /^(\d+)$/,
+  ],
+  mg: [
+    /^.+\/playlist\/index\.html\?.*[?&#]id=(\d+)/,
+    /^.+\/playlist\/(\d+)(?:\?.*|&.*$|#.*$|$)/,
+    /[?&#]id=(\d+)/,
+    /^(\d+)$/,
+  ],
+  bili: [/[?&#]sid=(\d+)/, /[?&#]season_id=(\d+)/, /^(\d+)$/],
+}
+
+/** 解析失败时按平台给出可操作的中文提示 */
+const PLATFORM_HINTS: Record<string, string> = {
+  wy: '无法识别该网易云歌单链接，请检查后重试',
+  qq: '无法识别该 QQ 音乐歌单链接。官方短链接（c6.y.qq.com/base/fcgi-bin/u?__=…）需要跟跳转解析，若提示失效说明该短码已过期，请复制完整歌单链接（i.y.qq.com/n2/m/share/details/taoge.html?id=…）或直接输入歌单 ID',
+  kg: '无法识别该酷狗歌单链接，请检查后重试',
+  kw: '无法识别该酷我歌单链接，请检查后重试',
+  mg: '无法识别该咪咕歌单链接，请检查后重试',
+  bili: '无法识别该 B 站合集链接（链接需含 sid= 或 season_id=）',
+}
+
+/** 酷狗分享短链：m.kugou.com/schain/transfer 能把 chain 换成 specialid */
+const KG_MOBILE_UA =
+  'Mozilla/5.0 (iPhone; CPU iPhone OS 13_2_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/13.0.3 Mobile/15E148 Safari/604.1'
+
+async function kgChainToSpecialid(chain: string): Promise<string> {
+  try {
+    const res = await request(
+      `https://m.kugou.com/schain/transfer?pagesize=100&chain=${encodeURIComponent(chain)}&su=1&page=1&n=0.7928855356604456`,
+      { headers: { 'User-Agent': KG_MOBILE_UA, Referer: 'https://m3ws.kugou.com/share/index.php' }, timeout: 12000, retry: 0 }
+    )
+    const b: any = res.body
+    const id = b?.info?.id || b?.global_collection_id
+    return id ? String(id) : ''
+  } catch {
+    return ''
+  }
+}
+
+/** 跟随一次 HTTP 跳转，取 location（落雪 handleParseId 的做法） */
+async function followRedirect(url: string): Promise<string> {
+  try {
+    const res = await request(url, { redirect: 'manual', timeout: 10000, retry: 0 })
+    const loc = res.headers['location']
+    if (!loc) return url
+    return /^https?:\/\//i.test(loc) ? loc : new URL(loc, url).toString()
+  } catch {
+    return url
+  }
+}
+
+/**
+ * QQ 官方分享短链：c6.y.qq.com/base/fcgi-bin/u?__=XXXX
+ * 短码是 QQ 服务端的一张映射表，没有客户端解码算法 —— 只能靠 302 的 Location 拿真链接
+ * （落雪 v2 同样只做跟跳转）。Location 形态随内容类型变化，这里只取歌单那种。
+ */
+async function qqShortLinkTarget(url: string): Promise<string> {
+  const loc = await followRedirect(url)
+  if (loc === url) return ''
+  let u: URL
+  try {
+    u = new URL(loc)
+  } catch {
+    return ''
+  }
+  if (!/\/details\/playlist\.html/i.test(u.pathname)) return ''
+  return u.searchParams.get('id') || ''
+}
+
+/**
+ * 把用户输入解析成「平台 + 歌单 ID」。
+ * 规则照落雪：先用平台正则取 id；取不到就跟一次跳转再套正则（落雪 handleParseId）。
+ * platform 传了就以它为准（左侧切换音源后按所选音源解析），并校验链接归属。
+ */
+export async function resolvePlaylistTarget(
+  input: string,
+  platform?: string
+): Promise<{ platform: string; id: string }> {
   const s = String(input || '').trim()
   if (!s) throw new Error('请输入歌单链接或 ID')
-  const p = platform || detectPlatform(s) || 'wy'
-  const rules: Record<string, RegExp[]> = {
-    wy: [/[?&#]id=(\d+)/, /playlist\/(\d+)/, /^(\d+)$/],
-    qq: [/[?&#]id=([A-Za-z0-9]+)/, /taoge\/([A-Za-z0-9]+)/, /playlist\/([A-Za-z0-9]+)/, /^([A-Za-z0-9]+)$/],
-    kw: [/[?&#]pid=(\d+)/, /playlist_detail\/(\d+)/, /^(\d+)$/],
-    kg: [/[?&#]specialid=(\d+)/, /special\/single\/(\d+)/, /plist\/list_(\d+)/, /^(\d+)$/],
-    mg: [/[?&#]id=(\d+)/, /playlist\/(\d+)/, /^(\d+)$/],
-    bili: [/[?&#]sid=(\d+)/, /season_id=(\d+)/, /^(\d+)$/],
+  const detected = detectPlatform(s)
+  const p = platform || detected || 'wy'
+  if (platform && detected && detected !== platform) {
+    const name = PLATFORM_NAMES[detected] || detected
+    throw new Error(`该链接属于「${name}」，请在左侧切换到「${name}」后再导入`)
   }
-  for (const re of rules[p] || []) {
-    const m = s.match(re)
-    if (m) return { platform: p, id: m[1] }
+  const rules = PLAYLIST_ID_RULES[p] || []
+  const pick = (text: string): string => {
+    for (const re of rules) {
+      const m = text.match(re)
+      if (m) return m[1]
+    }
+    return ''
   }
-  throw new Error('无法识别该歌单链接，请检查后重试')
+  let id = pick(s)
+  // QQ 官方分享短链：短码是服务端映射，只能跟 302 拿 Location
+  if (!id && p === 'qq' && /\/base\/fcgi-bin\/u\?__=/i.test(s)) {
+    id = await qqShortLinkTarget(s)
+  }
+  // 酷狗分享短链：chain → specialid
+  if (!id && p === 'kg') {
+    const chain = s.match(/[?&#]chain=([A-Za-z0-9]+)/)
+    if (chain) id = await kgChainToSpecialid(chain[1])
+  }
+  // 落雪 handleParseId：正则没命中就跟一次跳转，用跳转后的地址再套正则
+  if (!id && /[?&:/]/.test(s)) {
+    let url = s
+    for (let i = 0; i < 2; i++) {
+      const next = await followRedirect(url)
+      if (next === url) break
+      url = next
+      id = pick(url)
+      if (id) break
+    }
+  }
+  if (!id) throw new Error(PLATFORM_HINTS[p] || '无法识别该歌单链接，请检查后重试')
+  return { platform: p, id }
 }
 
 export async function importPlaylistByLink(
   input: string,
   platform?: string
 ): Promise<{ name: string; pic: string; description: string; songs: Song[]; platform: string }> {
-  const t = extractPlaylistId(input, platform)
+  const t = await resolvePlaylistTarget(input, platform)
   let r: { name: string; pic: string; description: string; songs: Song[] }
   if (t.platform === 'wy') r = await neteasePlaylistDetail(t.id)
   else if (t.platform === 'qq') r = await qqPlaylistDetail(t.id)

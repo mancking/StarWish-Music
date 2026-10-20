@@ -4,7 +4,7 @@ import vm from 'node:vm'
 import type { PluginInfo, PluginSubscription } from '../../shared/types'
 import { createLogger } from './log'
 import { request } from './http'
-import { userPluginsDir, pluginsRegistryFile, builtinPluginsDir } from './paths'
+import { userPluginsDir, pluginsRegistryFile } from './paths'
 // 静态导入而非 createRequire：桌面（esbuild）与移动端（vite）都能解析同一份依赖。
 // ponytail: 覆盖下列 7 个常用依赖；若插件 require 其他模块会抛错——需要时再扩展 DEPS。
 import axios from 'axios'
@@ -166,12 +166,7 @@ function listDir(dir: string | null): string[] {
 
 function loadAll(): void {
   plugins.clear()
-  // 内置插件优先（随包只读），再叠加用户目录（同名用户插件覆盖内置）
-  const builtinDir = builtinPluginsDir()
-  for (const f of listDir(builtinDir)) {
-    const p = loadOne(f, builtinDir!, true)
-    if (p) plugins.set(f, p)
-  }
+  // 不再加载随包分发的内置插件：插件一律由用户从「插件市场」/订阅/本地导入安装。
   const userDir = userPluginsDir()
   for (const f of listDir(userDir)) {
     const p = loadOne(f, userDir, false)
@@ -205,7 +200,7 @@ export function togglePlugin(file: string, enabled: boolean): PluginInfo[] {
 export function deletePlugin(file: string): PluginInfo[] {
   if (!plugins.size) loadAll()
   const p = plugins.get(file)
-  if (p?.info.builtin) throw new Error('内置插件随应用分发，无法删除（可停用）')
+  if (!p) throw new Error(`插件不存在：${file}`)
   try {
     fs.unlinkSync(path.join(userPluginsDir(), file))
   } catch (e) {
@@ -223,42 +218,55 @@ export interface ImportResult {
   plugins: PluginInfo[]
 }
 
-/** 从内容导入（本地文件读取后传入） */
+/** 从内容导入（本地文件读取后传入）；传 replaceFile 表示原地替换该插件 */
 export function importFromContent(
   content: string,
   origin: PluginInfo['origin'] = 'local',
-  sourceUrl?: string
+  sourceUrl?: string,
+  replaceFile?: string
 ): ImportResult {
   const dir = userPluginsDir()
-  // 尝试解析出平台名做文件名
-  let base = 'plugin'
-  try {
-    const probe = evalPlugin(content, 'probe.js')
-    if (probe?.platform) base = safeFileName(String(probe.platform))
-  } catch {
-    /* 解析失败则用通用名 */
-  }
-  let file = `${base}.js`
-  let i = 1
-  while (fs.existsSync(path.join(dir, file))) {
-    file = `${base}-${i++}.js`
+  let file = ''
+  if (replaceFile) {
+    // 更新已有插件：保留原文件名与启用状态，只换内容
+    file = path.basename(replaceFile)
+    if (!fs.existsSync(path.join(dir, file))) throw new Error('插件不存在，无法更新')
+  } else {
+    // 尝试解析出平台名做文件名
+    let base = 'plugin'
+    try {
+      const probe = evalPlugin(content, 'probe.js')
+      if (probe?.platform) base = safeFileName(String(probe.platform))
+    } catch {
+      /* 解析失败则用通用名 */
+    }
+    file = `${base}.js`
+    let i = 1
+    while (fs.existsSync(path.join(dir, file))) {
+      file = `${base}-${i++}.js`
+    }
   }
   fs.writeFileSync(path.join(dir, file), content, 'utf8')
   const reg = readRegistry()
-  reg.entries[file] = { origin, sourceUrl }
+  // 原地替换时保留原启用状态，避免更新后插件被意外停用
+  reg.entries[file] = {
+    ...(reg.entries[file] || {}),
+    origin,
+    sourceUrl: sourceUrl || reg.entries[file]?.sourceUrl,
+  }
   writeRegistry(reg)
   loadAll()
   return { file, plugins: list() }
 }
 
 /** 从网址导入（下载后按内容导入） */
-export async function importFromUrl(url: string): Promise<ImportResult> {
+export async function importFromUrl(url: string, replaceFile?: string): Promise<ImportResult> {
   if (!/^https?:\/\//i.test(url)) throw new Error('仅支持 http(s) 链接')
   const res = await requestWithMirror(url, { timeout: 20000 })
   const body: any = res.body
   const content = typeof body === 'string' ? body : res.raw || ''
   if (!content || content.length < 10) throw new Error('下载内容为空或过短，可能不是插件脚本')
-  return importFromContent(content, 'url', url)
+  return importFromContent(content, 'url', url, replaceFile)
 }
 
 export function listSubscriptions(): PluginSubscription[] {

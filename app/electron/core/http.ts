@@ -20,6 +20,8 @@ export interface RequestOptions {
   retry?: number
   /** 期望二进制时传 true，返回 raw 为 latin1 字符串，bytes 为 Buffer */
   binary?: boolean
+  /** 'manual' 时不自动跟随跳转，302 的 location 留在 headers.location（解析分享链接用） */
+  redirect?: 'follow' | 'manual'
 }
 
 export class HttpError extends Error {
@@ -66,7 +68,7 @@ export async function request(url: string, opts: RequestOptions = {}): Promise<H
           body = JSON.stringify(opts.body)
         }
       }
-      const res = await fetch(url, { method, headers, body, signal, redirect: 'follow' })
+      const res = await fetch(url, { method, headers, body, signal, redirect: opts.redirect || 'follow' })
       const h: Record<string, string> = {}
       res.headers.forEach((v, k) => {
         h[k.toLowerCase()] = v

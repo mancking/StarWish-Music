@@ -382,6 +382,18 @@ img {
   background: rgba(128, 136, 158, 0.55);
   overflow: visible;
 }
+/* 底栏「音量」细轨：主界面底栏本身就是深色，灰轨在深底上几乎消失，改用亮色轨道 */
+.minibar .vol-slider .slider-track {
+  height: 5px;
+  background: rgba(214, 220, 236, 0.42);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.14);
+}
+.minibar .vol-slider .slider-thumb {
+  width: 12px;
+  height: 12px;
+  margin-left: -6px;
+  transform: translateY(-50%) scale(1);
+}
 .slider-fill {
   position: absolute;
   inset: 0 auto 0 0;

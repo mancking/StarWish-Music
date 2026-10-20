@@ -109,14 +109,14 @@ v2.1.0 起新增**插件库（插件市场）**，用于管理跨平台的 **Mus
 
 ### 插件来源与参考源码
 
-- **内置插件**：随应用分发，位于 [`app/plugins/`](app/plugins)，首次安装即可在插件库中看到（标记「内置」），可停用但不可删除。
+- **插件不内置**：安装后插件库为空，插件一律由用户从「插件市场」/「订阅源」/「本地导入」安装，安装后存放于用户插件目录，可随时更新替换与卸载。
 - **官方在线插件**：托管于上述 `Star-Wish-Plugin-Library` 分支，共 9 个：网易云、B站、5sing、音悦台、歌词千寻、小枸、小秋、小蜗、小云。
 - **插件协议**：采用 MusicFree 插件协议（`search` / `getLyric` / `getMusicUrl` 等导出方法），运行在主进程的 `vm` 沙箱内，仅通过宿主注入的依赖（`axios` / `cheerio` / `crypto-js` / `dayjs` / `qs`）发起网络请求。
 - **插件宿主实现**：[`app/electron/core/mf-host.ts`](app/electron/core/mf-host.ts)（加载 / 求值 / 调用 / 订阅解析）。插件运行时依赖与 IPC 通道见 [`app/electron/ipc.ts`](app/electron/ipc.ts)（`plugins:*`）。
 - **插件市场 / 导入 UI**：[`app/src/pages/Settings.vue`](app/src/pages/Settings.vue) 的「插件库」区块。
-- **插件开发**：插件本质是一个导出若干方法的 JS 文件，可直接参考 `Star-Wish-Plugin-Library` 分支中的任意插件源码；本地调试时把文件放入插件目录或用「本地导入」加载即可。
+- **插件开发**：插件本质是一个导出若干方法的 JS 文件，可直接参考 `Star-Wish-Plugin-Library` 分支中的任意插件源码；本地调试时用「本地导入」加载即可。
 
-> 说明：插件库与音源是两套并列机制。音源走 lx-music v2 协议（`app/sources/*.js`），插件走 MusicFree 协议（`app/plugins/*.js` 与在线插件），两者可在聚合搜索中共同参与，也可各自单独启停。
+> 说明：插件库与音源是两套并列机制。音源走 lx-music v2 协议（`app/sources/*.js`），插件走 MusicFree 协议（在线插件），两者可在聚合搜索中共同参与，也可各自单独启停。
 
 ## 说明
 

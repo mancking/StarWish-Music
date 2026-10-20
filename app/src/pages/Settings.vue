@@ -48,6 +48,8 @@ const codeText = ref('')
 const codeName = ref('')
 
 const deleteTarget = ref<SourceInfo | null>(null)
+/** 非空表示导入弹窗处于「更新替换」模式，导入的内容将原地覆盖该音源 */
+const replaceTarget = ref<SourceInfo | null>(null)
 const restoring = ref(false)
 const dataMoving = ref(false)
 
@@ -96,6 +98,71 @@ const setting = computed(() => ui.settings)
 
 async function patch(p: Partial<AppSettings>): Promise<void> {
   await ui.patch(p)
+}
+
+/* ---------------- 播放页背景（封面模糊 / 动态渐变 / 壁纸 / 纯色） ---------------- */
+
+const isMobile = __MOBILE__
+const wallpaperInput = ref<HTMLInputElement | null>(null)
+/** 当前播放页背景模式 */
+const bgMode = computed<AppSettings['playerBg']>(() => setting.value.playerBg || 'cover')
+/** 壁纸的可显示地址：桌面是本地文件路径，移动端是 data URL */
+const wallpaperSrc = computed(() => {
+  const p = (setting.value.playerWallpaper || '').trim()
+  if (!p) return ''
+  if (/^(https?|data|file):/i.test(p)) return p
+  return 'file:///' + p.replace(/\\/g, '/').replace(/^\/+/, '')
+})
+
+/** 选壁纸：桌面走系统文件对话框，移动端走系统相册（<input type=file>） */
+async function pickWallpaper(): Promise<void> {
+  if (isMobile) {
+    wallpaperInput.value?.click()
+    return
+  }
+  try {
+    const p = await call<string>('wallpaper:pick')
+    if (!p) return
+    await patch({ playerWallpaper: p, playerBg: 'wallpaper' })
+    ui.toast('壁纸已更新', 'success')
+  } catch (e: any) {
+    ui.toast(e.message, 'error')
+  }
+}
+
+/** 移动端选图：压到长边 1920 的 JPEG 再存，避免把几 MB 原图写进设置文件 */
+function onWallpaperFile(e: Event): void {
+  const input = e.target as HTMLInputElement
+  const f = input.files?.[0]
+  input.value = ''
+  if (!f) return
+  const reader = new FileReader()
+  reader.onload = () => {
+    const img = new Image()
+    img.onload = () => {
+      const scale = Math.min(1, 1920 / Math.max(img.width, img.height))
+      const cv = document.createElement('canvas')
+      cv.width = Math.max(1, Math.round(img.width * scale))
+      cv.height = Math.max(1, Math.round(img.height * scale))
+      const ctx = cv.getContext('2d')
+      if (!ctx) {
+        ui.toast('图片处理失败', 'error')
+        return
+      }
+      ctx.drawImage(img, 0, 0, cv.width, cv.height)
+      void patch({ playerWallpaper: cv.toDataURL('image/jpeg', 0.85), playerBg: 'wallpaper' })
+        .then(() => ui.toast('壁纸已更新', 'success'))
+        .catch((err: any) => ui.toast(err?.message || '设置失败', 'error'))
+    }
+    img.onerror = () => ui.toast('图片读取失败', 'error')
+    img.src = String(reader.result || '')
+  }
+  reader.readAsDataURL(f)
+}
+
+async function clearWallpaper(): Promise<void> {
+  await patch({ playerWallpaper: '' })
+  ui.toast('已清除壁纸', 'info')
 }
 
 function fmtBytes(n: number): string {
@@ -178,20 +245,30 @@ async function doImport(): Promise<void> {
   }
   importing.value = true
   try {
+    // replaceFile 非空＝更新替换该音源（原地覆盖，保留启用状态）
     const r = await call<{ file: string; sources: SourceInfo[] }>('sources:import', {
       url: importUrl.value.trim() || undefined,
       content: importText.value || undefined,
+      file: replaceTarget.value?.file,
     })
     sources.value = r.sources
+    const wasUpdate = !!replaceTarget.value
     importOpen.value = false
+    replaceTarget.value = null
     importUrl.value = ''
     importText.value = ''
-    ui.toast(`音源「${r.file}」导入成功`, 'success')
+    ui.toast(wasUpdate ? `音源「${r.file}」已更新` : `音源「${r.file}」导入成功`, 'success')
   } catch (e: any) {
     importError.value = e?.message || '导入失败'
   } finally {
     importing.value = false
   }
+}
+
+/** 打开「更新替换」弹窗：按当前音源重新下载或改用本地文件覆盖 */
+function updateSource(s: SourceInfo): void {
+  replaceTarget.value = s
+  importOpen.value = true
 }
 
 // —— MusicFree 插件库 ——
@@ -256,6 +333,21 @@ async function installFromMarket(entry: MarketEntry): Promise<void> {
     marketUpdating.value = ''
   }
 }
+
+/** 已安装插件原地更新：按保存的来源地址重新下载并覆盖同名文件（需求 7 插件替换） */
+async function updatePlugin(p: PluginInfo): Promise<void> {
+  if (!p.sourceUrl) return
+  marketUpdating.value = p.file
+  try {
+    await call('plugins:import', { url: p.sourceUrl, file: p.file, origin: p.origin })
+    ui.toast(`${p.name} 已更新到最新版本`, 'success')
+    await loadPlugins()
+  } catch (e: any) {
+    ui.toast(`${p.name} 更新失败：${e.message}`, 'error')
+  } finally {
+    marketUpdating.value = ''
+  }
+}
 async function viewPluginCode(p: PluginInfo): Promise<void> {
   try {
     codeText.value = await call<string>('plugins:code', { file: p.file })
@@ -303,17 +395,7 @@ function pluginTypeLabel(t: string): string {
   return PLUGIN_TYPE_LABEL[t] || t
 }
 
-/** 插件按平台分组（platform 为空归入「未分类」），与音源按平台组织方式保持一致 */
-const pluginGroups = computed<{ label: string; items: PluginInfo[] }[]>(() => {
-  const map = new Map<string, PluginInfo[]>()
-  for (const p of plugins.value) {
-    const key = p.platform || '未分类'
-    const arr = map.get(key)
-    if (arr) arr.push(p)
-    else map.set(key, [p])
-  }
-  return [...map.entries()].map(([label, items]) => ({ label, items }))
-})
+/** 插件不再分组：插件库就是用户安装的扁平列表（来源统一为插件市场/订阅/本地导入） */
 
 async function doImportPlugin(): Promise<void> {
   pluginImportError.value = ''
@@ -703,6 +785,32 @@ onBeforeUnmount(stopPoll)
             <div class="label"><b>粒子舞台</b><span>播放页粒子特效，低配设备建议关闭</span></div>
             <Toggle :model-value="setting.particle" @update:model-value="v => patch({ particle: v })" />
           </div>
+
+          <div class="row">
+            <div class="label"><b>播放页背景</b><span>封面模糊、动态渐变、自定义壁纸或纯色</span></div>
+            <div class="seg">
+              <button :class="{ on: bgMode === 'cover' }" @click="patch({ playerBg: 'cover' })">封面模糊</button>
+              <button :class="{ on: bgMode === 'gradient' }" @click="patch({ playerBg: 'gradient' })">动态渐变</button>
+              <button :class="{ on: bgMode === 'wallpaper' }" @click="patch({ playerBg: 'wallpaper' })">壁纸</button>
+              <button :class="{ on: bgMode === 'solid' }" @click="patch({ playerBg: 'solid' })">纯色</button>
+            </div>
+          </div>
+
+          <div v-if="bgMode === 'wallpaper'" class="row">
+            <div class="label"><b>壁纸图片</b><span>{{ wallpaperSrc ? '已设置自定义壁纸' : '还没有选择壁纸' }}</span></div>
+            <div class="inline">
+              <button class="btn sm" @click="pickWallpaper"><Icon name="folder-open" :size="14" />选择图片</button>
+              <button v-if="wallpaperSrc" class="btn sm ghost" @click="clearWallpaper">清除</button>
+              <img v-if="wallpaperSrc" class="wall-thumb" :src="wallpaperSrc" alt="壁纸预览" />
+            </div>
+          </div>
+          <input
+            ref="wallpaperInput"
+            type="file"
+            accept="image/*"
+            class="hidden-file"
+            @change="onWallpaperFile"
+          />
         </section>
 
         <!-- 播放 -->
@@ -820,7 +928,7 @@ onBeforeUnmount(stopPoll)
               <button class="btn sm ghost" :disabled="restoring" @click="restoreSources">
                 <Icon name="refresh" :size="14" />恢复内置音源
               </button>
-              <button class="btn primary sm" @click="importOpen = true"><Icon name="plus" :size="14" />导入音源</button>
+              <button class="btn primary sm" @click="replaceTarget = null; importOpen = true"><Icon name="plus" :size="14" />导入音源</button>
             </div>
           </div>
 
@@ -859,6 +967,9 @@ onBeforeUnmount(stopPoll)
                 <div v-if="s.loadError" class="src-err">{{ s.loadError }}</div>
               </div>
               <div class="src-actions">
+                <button v-if="!s.builtin" class="icon-btn" title="更新替换" @click="updateSource(s)">
+                  <Icon name="refresh" :size="15" />
+                </button>
                 <button class="icon-btn" title="查看源码" @click="viewCode(s)"><Icon name="edit" :size="15" /></button>
                 <button class="icon-btn" title="移除" @click="deleteTarget = s"><Icon name="trash" :size="15" /></button>
                 <Toggle :model-value="s.enabled" @update:model-value="() => toggleSource(s)" />
@@ -889,39 +1000,41 @@ onBeforeUnmount(stopPoll)
           </div>
 
           <div v-else class="src-list">
-            <template v-for="group in pluginGroups" :key="group.label">
-              <div class="pf-group-head">
-                <b>{{ group.label }}</b>
-                <span class="src-ver">{{ group.items.length }} 个</span>
-              </div>
-              <div v-for="p in group.items" :key="p.file" class="src" :class="{ off: !p.enabled, bad: p.loadError }">
-                <div class="src-main">
-                  <div class="src-title">
-                    <b>{{ p.name }}</b>
-                    <span v-if="p.version" class="src-ver">v{{ p.version }}</span>
-                    <span v-if="p.builtin" class="src-tag">内置</span>
-                    <span v-if="p.loadError" class="src-tag err">加载失败</span>
-                  </div>
-                  <div class="src-platforms">
-                    <span v-for="t in p.searchTypes.slice(0, 6)" :key="t" class="pf">{{ pluginTypeLabel(t) }}</span>
-                    <span v-if="!p.searchTypes.length" class="pf none">无搜索类型</span>
-                  </div>
-                  <div v-if="p.author || p.origin !== 'local'" class="src-plat">
-                    <span v-if="p.author">作者 {{ p.author }}</span>
-                    <span v-if="p.origin === 'url'">· 网址导入</span>
-                    <span v-else-if="p.origin === 'subscribe'">· 订阅</span>
-                  </div>
-                  <div v-if="p.loadError" class="src-err">{{ p.loadError }}</div>
+            <div v-for="p in plugins" :key="p.file" class="src" :class="{ off: !p.enabled, bad: p.loadError }">
+              <div class="src-main">
+                <div class="src-title">
+                  <b>{{ p.name }}</b>
+                  <span v-if="p.version" class="src-ver">v{{ p.version }}</span>
+                  <span v-if="p.loadError" class="src-tag err">加载失败</span>
                 </div>
-                <div class="src-actions">
-                  <button class="icon-btn" title="查看源码" @click="viewPluginCode(p)"><Icon name="edit" :size="15" /></button>
-                  <button v-if="!p.builtin" class="icon-btn" title="移除" @click="pluginDeleteTarget = p"><Icon name="trash" :size="15" /></button>
-                  <Toggle :model-value="p.enabled" @update:model-value="() => togglePlugin(p)" />
+                <div class="src-platforms">
+                  <span v-for="t in p.searchTypes.slice(0, 6)" :key="t" class="pf">{{ pluginTypeLabel(t) }}</span>
+                  <span v-if="!p.searchTypes.length" class="pf none">无搜索类型</span>
                 </div>
+                <div v-if="p.author || p.origin !== 'local'" class="src-plat">
+                  <span v-if="p.author">作者 {{ p.author }}</span>
+                  <span v-if="p.origin === 'url'">· 网址导入</span>
+                  <span v-else-if="p.origin === 'subscribe'">· 订阅</span>
+                </div>
+                <div v-if="p.loadError" class="src-err">{{ p.loadError }}</div>
               </div>
-            </template>
+              <div class="src-actions">
+                <button
+                  v-if="p.sourceUrl"
+                  class="icon-btn"
+                  title="重新下载并替换为最新版本"
+                  :disabled="marketUpdating === p.file"
+                  @click="updatePlugin(p)"
+                >
+                  <Icon name="refresh" :size="15" />
+                </button>
+                <button class="icon-btn" title="查看源码" @click="viewPluginCode(p)"><Icon name="edit" :size="15" /></button>
+                <button class="icon-btn" title="移除" @click="pluginDeleteTarget = p"><Icon name="trash" :size="15" /></button>
+                <Toggle :model-value="p.enabled" @update:model-value="() => togglePlugin(p)" />
+              </div>
+            </div>
             <div v-if="!plugins.length" class="empty" style="padding: 30px">
-              <div class="empty-desc">暂无插件，可点「导入插件」从本地文件或网址添加，或用「订阅源」批量更新</div>
+              <div class="empty-desc">暂无插件，点「插件市场」安装；也可从本地文件/网址导入，或用「订阅源」批量安装</div>
             </div>
           </div>
 
@@ -1080,8 +1193,19 @@ onBeforeUnmount(stopPoll)
     </div>
 
     <!-- 导入音源 -->
-    <Modal v-model="importOpen" title="导入音源" :width="520">
-      <p class="modal-tip">支持 lx-music 协议 JS 音源，可从在线链接导入或选择本地文件。</p>
+    <Modal
+      v-model="importOpen"
+      :title="replaceTarget ? `更新音源 · ${replaceTarget.name}` : '导入音源'"
+      :width="520"
+      @update:model-value="v => !v && (replaceTarget = null)"
+    >
+      <p class="modal-tip">
+        {{
+          replaceTarget
+            ? '填入新版本链接或选择本地文件，将原地覆盖该音源（保留文件名与启用状态）。'
+            : '支持 lx-music 协议 JS 音源，可从在线链接导入或选择本地文件。'
+        }}
+      </p>
       <label class="field-label">音源链接</label>
       <input v-model="importUrl" class="input" placeholder="https://example.com/source.js" spellcheck="false" @input="importText = ''" />
       <label class="field-label">或选择本地 JS 文件</label>
@@ -1090,7 +1214,9 @@ onBeforeUnmount(stopPoll)
       <div v-if="importError" class="err"><Icon name="info" :size="13" />{{ importError }}</div>
       <template #footer>
         <button class="btn ghost" @click="importOpen = false">取消</button>
-        <button class="btn primary" :disabled="importing" @click="doImport">{{ importing ? '导入中…' : '导入' }}</button>
+        <button class="btn primary" :disabled="importing" @click="doImport">
+          {{ importing ? '处理中…' : replaceTarget ? '更新替换' : '导入' }}
+        </button>
       </template>
     </Modal>
 
@@ -1201,7 +1327,7 @@ onBeforeUnmount(stopPoll)
     <Modal :model-value="!!pluginDeleteTarget" title="移除插件" :width="400" @update:model-value="v => !v && (pluginDeleteTarget = null)">
       <p style="font-size: 13px; line-height: 1.8">
         确定移除插件「{{ pluginDeleteTarget?.name }}」吗？<br />
-        <span style="color: var(--text-3)">内置插件随应用分发，无法删除，只能停用。用户导入的插件删除后需重新导入。</span>
+        <span style="color: var(--text-3)">插件由你从插件市场 / 订阅源 / 本地导入安装，移除后需重新安装。</span>
       </p>
       <template #footer>
         <button class="btn ghost" @click="pluginDeleteTarget = null">取消</button>
@@ -1428,6 +1554,16 @@ h1 {
   gap: 12px;
   flex: none;
 }
+.hidden-file {
+  display: none;
+}
+.wall-thumb {
+  width: 64px;
+  height: 40px;
+  object-fit: cover;
+  border-radius: 8px;
+  border: 1px solid var(--line-2);
+}
 .row-slider {
   width: 200px;
 }
@@ -1495,20 +1631,6 @@ h1 {
 }
 .src-main {
   min-width: 0;
-}
-.pf-group-head {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  padding: 12px 2px 6px;
-  font-size: 11px;
-  color: var(--text-3);
-  letter-spacing: 0.3px;
-}
-.pf-group-head b {
-  font-size: 11.5px;
-  font-weight: 600;
-  color: var(--text-2);
 }
 .src-title {
   display: flex;

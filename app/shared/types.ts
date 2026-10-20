@@ -155,6 +155,12 @@ export interface AppSettings {
   animations: boolean
   particle: boolean
   skipOnError: boolean
+  /** 播放页背景：模糊专辑封面 / 动态渐变 / 自定义壁纸 / 纯色 */
+  playerBg: 'cover' | 'gradient' | 'wallpaper' | 'solid'
+  /** 壁纸图片路径（playerBg === 'wallpaper' 时生效） */
+  playerWallpaper: string
+  /** MV 播放器音量（独立记忆，0-1） */
+  mvVolume: number
 }
 
 export interface ScanProgress {

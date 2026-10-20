@@ -120,6 +120,7 @@ const volIcon = computed(() => {
             thin
             @change="onVolume"
           />
+          <span class="vol-num">{{ Math.round((player.state.muted ? 0 : player.state.volume) * 100) }}</span>
         </div>
       </div>
 
@@ -261,6 +262,7 @@ const volIcon = computed(() => {
   display: flex;
   align-items: center;
 }
+/* 音量条悬停面板：底栏背景与滑轨同为深色时，细轨几乎不可见，故加浮层底板 + 百分比读数 */
 .vol-slider {
   width: 0;
   overflow: hidden;
@@ -269,8 +271,24 @@ const volIcon = computed(() => {
   align-items: center;
 }
 .vol-slider.open {
-  width: 78px;
+  width: auto;
   margin-right: 4px;
+  padding: 4px 9px 4px 9px;
+  gap: 8px;
+  background: var(--panel-2);
+  border: 1px solid var(--line-2);
+  border-radius: 8px;
+  box-shadow: 0 6px 18px -8px rgba(0, 0, 0, 0.55);
+}
+.vol-slider .slider {
+  width: 78px;
+}
+.vol-num {
+  min-width: 26px;
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--text-2);
+  text-align: right;
 }
 @media (max-width: 1200px) {
   .minibar {

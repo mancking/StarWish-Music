@@ -16,12 +16,7 @@ export function userSourcesDir(): string {
   return '/starwish/sources'
 }
 
-/** 内置插件目录：移动端种子写进虚拟 fs 的 /starwish/plugins */
-export function builtinPluginsDir(): string {
-  return '/starwish/plugins'
-}
-
-/** 用户插件目录：与内置同目录（种子只读，用户导入同名覆盖） */
+/** 用户插件目录：插件不再内置，一律由用户从市场/订阅/本地导入安装后落在这里 */
 export function userPluginsDir(): string {
   return '/starwish/plugins'
 }
@@ -56,7 +51,7 @@ export const biliLoginFile = base.biliLoginFile
 
 export default {
   sourcesDir, userSourcesDir, resourcesDir, rendererDir,
-  builtinPluginsDir, userPluginsDir, pluginsRegistryFile,
+  userPluginsDir, pluginsRegistryFile,
   setUserDataDir, userDataDir, ensureDir,
   setCacheRoot, cacheRootDir, cacheDir,
   setCoverRoot, setMediaRoot, coverCacheDir, mediaCacheDir,

@@ -35,6 +35,9 @@ export const DEFAULT_SETTINGS: AppSettings = {
   animations: true,
   particle: true,
   skipOnError: true,
+  playerBg: 'cover',
+  playerWallpaper: '',
+  mvVolume: 0.8,
 }
 
 let cache: AppSettings = { ...DEFAULT_SETTINGS }

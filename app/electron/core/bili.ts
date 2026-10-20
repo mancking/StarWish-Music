@@ -128,6 +128,49 @@ export function biliLogout() {
   return biliStatus()
 }
 
+/** JSON 字幕（B 站 subtitle_url 返回 {body:[{from,to,content}]}）转标准 LRC 文本 */
+function jsonToLrc(raw: string): string {
+  try {
+    const body: any[] = JSON.parse(raw)?.body || []
+    const stamp = (s: number): string => {
+      const t = Math.max(0, Number(s) || 0)
+      const m = Math.floor(t / 60)
+      const sec = (t % 60).toFixed(2).padStart(5, '0')
+      return `[${String(m).padStart(2, '0')}:${sec}]`
+    }
+    return body
+      .filter(x => String(x?.content || '').trim())
+      .map(x => `${stamp(x.from)}${String(x.content).replace(/\r?\n/g, ' ')}`)
+      .join('\n')
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * B 站自带字幕（视频「听音频」后播放页的歌词来源之一）。
+ * 字幕需要登录态；未登录时接口不返回字幕列表，交给名字匹配兜底。
+ */
+export async function biliSubtitleLrc(bvid: string, cid: string): Promise<string> {
+  if (!bvid || !cid) return ''
+  const h = biliHeaders()
+  const meta = await request(`https://api.bilibili.com/x/player/v2?${qs({ bvid, cid })}`, {
+    headers: h,
+    timeout: 12000,
+  })
+  const list: any[] = meta.body?.data?.subtitle?.subtitles || []
+  if (!list.length) return ''
+  // 优先中文，其次第一条
+  const pick = list.find(s => /^zh|ai-zh/i.test(String(s.lan || ''))) || list[0]
+  const url = String(pick?.subtitle_url || '')
+  if (!url) return ''
+  const res = await request(url.startsWith('//') ? `https:${url}` : url, {
+    headers: { 'User-Agent': UA, Referer: 'https://www.bilibili.com/' },
+    timeout: 15000,
+  })
+  return jsonToLrc(res.raw)
+}
+
 export async function importBiliSeason(sid: string): Promise<{
   name: string
   pic: string

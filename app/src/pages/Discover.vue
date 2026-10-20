@@ -81,6 +81,20 @@ const tagPopupWidth = ref(645)
 /** 该音源是否有标签体系（酷我/酷狗/咪咕无分类标签，隐藏入口） */
 const tagSupported = ref(true)
 
+/**
+ * 传给上游的分类参数。
+ * QQ（小秋）接口要的是标签 id（流行=3152），直接传名称会返回空列表；
+ * 网易云等以名称为 id 的音源两者一致，故取「当前分类名在标签表里对应的 id」。
+ */
+const catId = computed(() => {
+  for (const g of TAG_GROUPS.value) {
+    for (const t of g.tags) {
+      if (t.n === cat.value) return t.id || t.n
+    }
+  }
+  return cat.value
+})
+
 function toggleTags(): void {
   tagOpen.value = !tagOpen.value
 }
@@ -157,6 +171,8 @@ const plError = ref('')
 /** SWR 后台缓存：切标签/音源/最新最热/榜单时先用缓存秒开，再 30s 防抖后台静默刷新 */
 const SWR_BG_MS = 30_000
 const plCache = new Map<string, { list: PlaylistMeta[]; ts: number }>()
+/** 请求序号：只让最后一次歌单请求的结果落到界面，避免快速切标签时旧结果覆盖新结果 */
+let plReqSeq = 0
 const tlCache = new Map<string, { r: { name: string; songs: Song[] }; ts: number }>()
 
 /**
@@ -165,7 +181,10 @@ const tlCache = new Map<string, { r: { name: string; songs: Song[] }; ts: number
  * 「最新」走精品歌单通道（无总数、用 lasttime 游标翻页），冷门标签可能不足 30 条。
  */
 async function loadPlaylists(page = 1): Promise<void> {
-  const key = `pl|${plSource.value}|${cat.value}|${order.value}|${page}`
+  // 请求序号：无论命中缓存还是走网络，本次请求都占用一个序号，
+  // 让仍在飞的旧请求结果作废（否则快速切标签时旧结果会盖掉新内容）
+  const seq = ++plReqSeq
+  const key = `pl|${plSource.value}|${catId.value}|${order.value}|${page}`
   const hit = plCache.get(key)
   if (hit) {
     // 命中缓存：立即渲染（无骨架等待），再后台刷新
@@ -174,25 +193,27 @@ async function loadPlaylists(page = 1): Promise<void> {
     void revalidatePlaylists(key, page)
     return
   }
-  if (plLoading.value) return
   plLoading.value = true
   plError.value = ''
   try {
     const list = await call<PlaylistMeta[]>('music:playlists', {
-      cat: cat.value,
+      cat: catId.value,
       order: order.value,
       page,
       source: plSource.value,
     })
-    plCache.set(key, { list, ts: Date.now() })
+    // 空结果不入缓存：上游偶发返回空（风控/限流）时不应把「没有歌单」粘住
+    if (list.length) plCache.set(key, { list, ts: Date.now() })
+    if (seq !== plReqSeq) return
     applyPlaylists(list, page)
     window.scrollTo({ top: 0, behavior: 'smooth' })
   } catch (e: any) {
+    if (seq !== plReqSeq) return
     playlists.value = []
     plError.value = e?.message || '歌单加载失败'
     ui.toast(`歌单加载失败：${e.message}`, 'error')
   } finally {
-    plLoading.value = false
+    if (seq === plReqSeq) plLoading.value = false
   }
 }
 
@@ -211,13 +232,13 @@ async function revalidatePlaylists(key: string, page: number): Promise<void> {
   if (!hit || Date.now() - hit.ts < SWR_BG_MS) return
   try {
     const list = await call<PlaylistMeta[]>('music:playlists', {
-      cat: cat.value,
+      cat: catId.value,
       order: order.value,
       page,
       source: plSource.value,
     })
-    plCache.set(key, { list, ts: Date.now() })
-    if (`pl|${plSource.value}|${cat.value}|${order.value}|${plPage.value}` === key) {
+    if (list.length) plCache.set(key, { list, ts: Date.now() })
+    if (`pl|${plSource.value}|${catId.value}|${order.value}|${plPage.value}` === key) {
       applyPlaylists(list, page)
     }
   } catch {

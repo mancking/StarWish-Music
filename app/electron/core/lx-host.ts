@@ -522,7 +522,8 @@ class LxHost {
     return ''
   }
 
-  async importSource(payload: { url?: string; content?: string }): Promise<{ file: string }> {
+  /** 导入音源；传 file 表示原地替换该文件（更新已有音源），否则新建 */
+  async importSource(payload: { url?: string; content?: string; file?: string }): Promise<{ file: string }> {
     let content = payload.content || ''
     if (payload.url) {
       if (!/^https?:\/\//i.test(payload.url)) throw new Error('仅支持 http(s) 链接')
@@ -542,9 +543,17 @@ class LxHost {
     const safe = base.replace(/[\\/:*?"<>|]/g, '_').slice(0, 60)
     let file = `${safe}.js`
     const dir = userSourcesDir()
-    let i = 1
-    while (fs.existsSync(path.join(dir, file))) {
-      file = `${safe}-${i++}.js`
+    const target = String(payload.file || '').trim()
+    if (target) {
+      // 原地替换：保留原文件名，用户不必重新启用/排序
+      const old = this.sources.find(s => s.file === target)
+      if (!old || old.builtin) throw new Error('只能更新用户导入的音源')
+      file = path.basename(target)
+    } else {
+      let i = 1
+      while (fs.existsSync(path.join(dir, file))) {
+        file = `${safe}-${i++}.js`
+      }
     }
     fs.writeFileSync(path.join(dir, file), content, 'utf8')
     this.load()

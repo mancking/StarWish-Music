@@ -33,6 +33,15 @@ const stages: { key: StageMode; label: string; icon: string }[] = [
 
 const song = computed(() => player.song)
 const isWin = computed(() => window.sw?.platform === 'win32')
+/** 播放页背景模式（设置 → 播放） */
+const bgMode = computed(() => ui.settings.playerBg || 'cover')
+/** 本地壁纸需要转成 file:// 才能被 <img> 加载（Windows 路径直接拼会失效） */
+const wallpaperSrc = computed(() => {
+  const p = (ui.settings.playerWallpaper || '').trim()
+  if (!p) return ''
+  if (/^(https?|data|file):/i.test(p)) return p
+  return 'file:///' + p.replace(/\\/g, '/').replace(/^\/+/, '')
+})
 const liked = computed(() => (song.value ? library.isFavorite(song.value.id) : false))
 const offsetSec = computed(() => (ui.settings.lyricOffset || 0) / 1000)
 const lines = computed<LyricLine[]>(() => player.lyric?.lines || [])
@@ -272,10 +281,15 @@ function onGestureEnd(e: PointerEvent): void {
     @pointerdown="onGestureStart"
     @pointerup="onGestureEnd"
   >
-    <!-- 背景：专辑封面大模糊；无封面时兜底氛围渐变（coverUrl 可能为空） -->
-    <div class="bg-layer">
-      <img v-if="player.coverUrl" :src="player.coverUrl" class="bg-img" alt="" />
-      <div class="bg-fallback" />
+    <!-- 背景：模糊封面 / 动态渐变 / 壁纸 / 纯色（设置 → 播放页背景） -->
+    <div class="bg-layer" :class="`bg-${bgMode}`">
+      <!-- 兜底氛围层在图片之下，图片才不会被盖住 -->
+      <div v-if="bgMode !== 'solid'" class="bg-fallback" />
+      <img v-if="bgMode === 'cover' && player.coverUrl" :src="player.coverUrl" class="bg-img" alt="" />
+      <img v-else-if="bgMode === 'wallpaper' && wallpaperSrc" :src="wallpaperSrc" class="bg-img bg-wall" alt="" />
+      <div v-if="bgMode === 'gradient'" class="bg-flow">
+        <span /><span /><span /><span />
+      </div>
       <div class="bg-mask" />
     </div>
 
@@ -478,30 +492,95 @@ function onGestureEnd(e: PointerEvent): void {
   inset: 0;
   z-index: 0;
 }
+/* 注意分层：bg-img 必须显式定位并给 z-index，否则会被后面的 absolute 层（兜底/遮罩）盖住 */
 .bg-img {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
   width: 100%;
   height: 100%;
   object-fit: cover;
-  filter: blur(90px) saturate(1.35) brightness(0.55);
-  transform: scale(1.25);
+  filter: blur(60px) saturate(1.6) brightness(1);
+  transform: scale(1.2);
   transition: opacity 0.6s;
 }
-/* 无封面兜底：随主题色微调的氛围渐变（盖在纯黑底之上） */
+/* 壁纸：保留图片可辨识度，只轻度压暗，避免糊成一片 */
+.bg-wall {
+  filter: brightness(0.85) saturate(1.1);
+  transform: scale(1.06);
+}
+/* 动态渐变：四个色团缓慢漂移，纯 CSS 不占主线程 */
+.bg-flow {
+  position: absolute;
+  inset: -20%;
+  z-index: 1;
+  filter: blur(60px);
+}
+.bg-flow span {
+  position: absolute;
+  width: 55%;
+  height: 55%;
+  border-radius: 50%;
+  opacity: 0.85;
+  mix-blend-mode: screen;
+  animation: bgDrift 22s ease-in-out infinite alternate;
+}
+.bg-flow span:nth-child(1) {
+  top: 0;
+  left: 0;
+  background: color-mix(in srgb, var(--accent) 70%, transparent);
+}
+.bg-flow span:nth-child(2) {
+  top: 10%;
+  right: 0;
+  background: #5a3cff;
+  animation-duration: 27s;
+  animation-delay: -6s;
+}
+.bg-flow span:nth-child(3) {
+  bottom: 0;
+  left: 15%;
+  background: #00b7c7;
+  animation-duration: 31s;
+  animation-delay: -13s;
+}
+.bg-flow span:nth-child(4) {
+  bottom: 5%;
+  right: 10%;
+  background: color-mix(in srgb, var(--accent) 45%, #ffb347);
+  animation-duration: 19s;
+  animation-delay: -3s;
+}
+@keyframes bgDrift {
+  0% {
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+  50% {
+    transform: translate3d(8%, 12%, 0) scale(1.18);
+  }
+  100% {
+    transform: translate3d(-10%, -8%, 0) scale(0.92);
+  }
+}
+/* 无封面兜底：随主题色微调的氛围渐变（垫底，被封面盖住才对） */
 .bg-fallback {
   position: absolute;
   inset: 0;
+  z-index: 0;
   background:
     radial-gradient(90% 70% at 25% 15%, color-mix(in srgb, var(--accent) 28%, transparent), transparent 60%),
     radial-gradient(80% 80% at 80% 85%, rgba(124, 108, 255, 0.22), transparent 65%),
     linear-gradient(160deg, #14162266, #0a0b10);
 }
+/* 遮罩只做压暗，保证封面颜色透出来 */
 .bg-mask {
   position: absolute;
   inset: 0;
+  z-index: 2;
   background:
-    radial-gradient(120% 80% at 18% 20%, rgba(255, 77, 109, 0.16), transparent 55%),
-    radial-gradient(100% 90% at 85% 80%, rgba(120, 80, 255, 0.18), transparent 60%),
-    linear-gradient(180deg, rgba(6, 8, 14, 0.55), rgba(6, 8, 14, 0.88));
+    radial-gradient(120% 80% at 18% 20%, rgba(255, 77, 109, 0.12), transparent 55%),
+    radial-gradient(100% 90% at 85% 80%, rgba(120, 80, 255, 0.14), transparent 60%),
+    linear-gradient(180deg, rgba(6, 8, 14, 0.12), rgba(6, 8, 14, 0.55));
 }
 
 .p-head {
@@ -962,6 +1041,18 @@ function onGestureEnd(e: PointerEvent): void {
 }
 .vol-slider {
   width: 76px;
+}
+/* 播放页浮在封面/壁纸之上：滑轨加亮 + 描边，避免与背景同色看不清 */
+.vol-slider :deep(.slider-track) {
+  height: 5px;
+  background: rgba(200, 208, 226, 0.62);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.45), 0 1px 4px rgba(0, 0, 0, 0.5);
+}
+.vol-slider :deep(.slider-fill) {
+  background: linear-gradient(90deg, #ffffff, var(--accent));
+}
+.vol-slider:hover :deep(.slider-track) {
+  background: rgba(226, 232, 245, 0.8);
 }
 @media (max-width: 1120px) {
   .p-body {

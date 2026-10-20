@@ -125,23 +125,6 @@ export function userSourcesDir(): string {
   return ensureDir(path.join(userDataDir(), 'sources'))
 }
 
-/** 内置插件目录（随包分发的 MusicFree 插件，只读） */
-export function builtinPluginsDir(): string | null {
-  const candidates = [
-    path.join(process.resourcesPath || '', 'plugins'),
-    path.join(__dirname, '..', '..', 'plugins'),
-    path.join(process.cwd(), 'plugins'),
-  ]
-  for (const c of candidates) {
-    try {
-      if (c && fs.existsSync(c)) return c
-    } catch {
-      /* ignore */
-    }
-  }
-  return null
-}
-
 /** 用户插件库目录（MusicFree 协议插件，可写） */
 export function userPluginsDir(): string {
   return ensureDir(path.join(userDataDir(), 'plugins'))

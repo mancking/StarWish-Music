@@ -30,7 +30,7 @@ import {
 } from './providers'
 import { getJson, qs, request, UA } from './http'
 import { resolveCoverUrl } from './cover'
-import { biliHeaders } from './bili'
+import { biliHeaders, biliSubtitleLrc } from './bili'
 
 const logger = createLogger('music')
 
@@ -59,6 +59,18 @@ function baseName(s: string): string {
 
 function mainSinger(s: string): string {
   return normName(String(s || '').split(/[\/、,;&]/)[0])
+}
+
+/** 洗掉 B 站分P标题里的「MV」「官方」「高清」「4K」「1080P」等噪声，只留歌名主体 */
+function cleanBiliTitle(s: string): string {
+  return String(s || '')
+    .replace(/[（(\[【][^)）\]】]*[)）\]】]/g, ' ')
+    .replace(/【[^】]*】/g, ' ')
+    .replace(/\b(mv|m\/v|official|offical|lyric(s)?|video|hd|hq|4k|8k|1080p|720p|hi-?res|live|ver\.?|remix|cover)\b/gi, ' ')
+    .replace(/(高音质|高清|无损|完整版|官方版|官方|原版|超清|付费|纯享版|纯享|字幕版|带歌词|歌词版|动态歌词|一首歌|神仙|宝藏)/g, ' ')
+    .replace(/[-–—_~|/·]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
 }
 
 /** 按关键词相关度排序：原名优先、歌手命中优先，翻唱/DJ 版本降权 */
@@ -371,15 +383,24 @@ export async function getLyric(song: Song): Promise<LyricResult> {
     } catch {
       /* ignore */
     }
+  } else if (song.source === 'bili') {
+    // 视频源：先用 B 站自带字幕（CC 字幕/UP 主上传），未登录或无字幕时退回名字匹配
+    try {
+      push(await biliSubtitleLrc(String(song.extra?.bvid || ''), String(song.extra?.cid || '')), '视频字幕')
+    } catch {
+      /* ignore */
+    }
   }
 
-  if (song.source !== 'wy' && cands.every(c => c.source === '音源插件')) {
+  if (song.source !== 'wy' && cands.every(c => c.source === '音源插件' || c.source === '视频字幕')) {
     try {
-      const list = await searchNetease(`${song.name} ${String(song.singer).split('/')[0]}`, 1, 6)
+      // 视频分P标题常带「MV」「官方」「4K」等噪声，先洗一遍再拿去匹配，命中率明显更高
+      const key = song.source === 'bili' ? cleanBiliTitle(song.name) : song.name
+      const list = await searchNetease(`${key} ${String(song.singer).split('/')[0]}`, 1, 6)
       const cand =
         list.find(x => song.duration > 30 && Math.abs(x.duration - song.duration) < 12) ||
         list.find(
-          x => normName(x.name) === normName(song.name) && normName(x.singer).includes(mainSinger(song.singer))
+          x => normName(x.name) === normName(key) && normName(x.singer).includes(mainSinger(song.singer))
         )
       if (cand) push(await wyLyric(cand.songId), '在线音源')
     } catch {
@@ -423,13 +444,42 @@ export async function getCover(song: Song): Promise<string> {
 /**
  * 各音源推荐的歌单列表。
  * 目前只有网易云（wy）实现分类标签；其他音源走各自的「推荐/最新」通道。
+ * 带进程内缓存：发现页切换标签/音源时命中缓存直接返回，避免每次都打上游（首屏延迟主要来源）。
  */
+const PL_TTL = 10 * 60 * 1000
+/** 空结果只缓存很短时间：上游可能只是临时风控/限流，过期后重试 */
+const PL_EMPTY_TTL = 60 * 1000
+const plCache = new Map<string, { at: number; list: PlaylistMeta[] }>()
+/** 在飞请求去重：快速来回切标签时同一 key 只打一次上游 */
+const plInflight = new Map<string, Promise<PlaylistMeta[]>>()
+
 export async function getPlaylists(
   cat: string,
   order: string,
   page: number,
   source = 'wy'
 ): Promise<PlaylistMeta[]> {
+  const key = `${source}|${cat}|${order}|${page}`
+  const hit = plCache.get(key)
+  if (hit && Date.now() - hit.at < (hit.list.length ? PL_TTL : PL_EMPTY_TTL)) return hit.list
+  const inflight = plInflight.get(key)
+  if (inflight) return inflight
+  const task = fetchPlaylists(cat, order, page, source)
+    .then(list => {
+      plCache.set(key, { at: Date.now(), list })
+      // 简单的容量保护：条目过多时清掉最早的
+      if (plCache.size > 120) {
+        const oldest = [...plCache.entries()].sort((a, b) => a[1].at - b[1].at)[0]
+        if (oldest) plCache.delete(oldest[0])
+      }
+      return list
+    })
+    .finally(() => plInflight.delete(key))
+  plInflight.set(key, task)
+  return task
+}
+
+async function fetchPlaylists(cat: string, order: string, page: number, source: string): Promise<PlaylistMeta[]> {
   if (source === 'qq') return qqPlaylists(cat, order, page)
   if (source === 'kg') return kugouPlaylists(cat, order, page)
   if (source === 'kw') return kuwoPlaylists(cat, order, page)

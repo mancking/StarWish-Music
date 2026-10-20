@@ -68,9 +68,10 @@ const playing = ref(false)
 const curTime = ref(0)
 const duration = ref(0)
 const buffered = ref(0)
-const volume = ref(1)
+const volume = ref(Math.max(0, Math.min(1, ui.settings.mvVolume ?? 0.8)))
 const muted = ref(false)
 const rate = ref(1)
+/** 传给 <video loop>：仅单集循环时为 true（列表循环交给 onEnded 处理） */
 const loop = ref(false)
 const autoNext = ref(true)
 const isFullscreen = ref(false)
@@ -89,7 +90,13 @@ const qualities = ref<{ qn: number; label: string }[]>([])
 const curQn = ref(64)
 
 /* 菜单开关 */
-const menu = ref<'' | 'settings' | 'speed' | 'quality'>('')
+const menu = ref<'' | 'settings' | 'speed' | 'quality' | 'loop' | 'fill'>('')
+
+/** 循环模式：off 不循环 / one 单集循环 / list 列表循环 */
+type LoopMode = 'off' | 'one' | 'list'
+const LOOP_MODES: LoopMode[] = ['off', 'one', 'list']
+const LOOP_LABEL: Record<LoopMode, string> = { off: '不循环', one: '单集循环', list: '列表循环' }
+const loopMode = ref<LoopMode>('off')
 
 /* 离线缓存状态 */
 const offlineReady = ref(false)
@@ -138,6 +145,8 @@ function setVolume(val: number): void {
     videoEl.value.volume = volume.value
     videoEl.value.muted = muted.value
   }
+  // 记忆音量：下次进 MV 播放器沿用上次的值
+  if (Math.abs((ui.settings.mvVolume ?? -1) - volume.value) > 0.001) void ui.patch({ mvVolume: volume.value })
 }
 
 function toggleMute(): void {
@@ -151,14 +160,33 @@ function setRate(r: number): void {
   menu.value = ''
 }
 
-function toggleLoop(): void {
-  loop.value = !loop.value
+function setLoop(m: LoopMode): void {
+  loopMode.value = m
+  // 只有「单集循环」交给 <video loop>；列表循环由 ended 事件切下一集
+  loop.value = m === 'one'
   if (videoEl.value) videoEl.value.loop = loop.value
+  menu.value = ''
 }
 
-function cycleFill(): void {
-  const i = FILL_MODES.indexOf(fillMode.value)
-  fillMode.value = FILL_MODES[(i + 1) % FILL_MODES.length]
+/**
+ * 切换控制条菜单。按钮已在 open 态时再点一次是「关闭」而不是重新打开——
+ * 否则菜单层的点击被按钮先吞掉又立刻重开，看起来像点了没反应。
+ */
+function toggleMenu(name: Exclude<typeof menu.value, ''>): void {
+  menu.value = menu.value === name ? '' : name
+}
+
+/** 点击菜单/按钮之外的区域时收起菜单（捕获阶段判定，故用 closest） */
+function onBoxDown(e: MouseEvent): void {
+  if (!menu.value) return
+  const t = e.target as HTMLElement | null
+  if (t?.closest('.menu-wrap')) return
+  menu.value = ''
+}
+
+function setFill(m: FillMode): void {
+  fillMode.value = m
+  menu.value = ''
 }
 
 async function togglePip(): Promise<void> {
@@ -237,6 +265,7 @@ function onLoadedMeta(): void {
   if (!v) return
   duration.value = v.duration || current.value?.duration || 0
   v.volume = volume.value
+  v.muted = muted.value
   v.playbackRate = rate.value
   ready.value = true
 }
@@ -256,14 +285,22 @@ function onPause(): void {
   showControls.value = true
 }
 
-/** 播放结束：循环 or 自动连播下一集 */
+/** 播放结束：单集循环由 <video loop> 处理；列表循环/自动连播切下一集，末尾回到第一集 */
 function onEnded(): void {
-  if (loop.value) return
-  if (autoNext.value && hasParts.value && current.value) {
-    const idx = parts.value.findIndex(p => p.cid === current.value!.cid)
-    if (idx >= 0 && idx + 1 < parts.value.length) {
-      void selectPart(parts.value[idx + 1])
-      return
+  const list = parts.value
+  const cur = current.value
+  if (cur && list.length > 1) {
+    const idx = list.findIndex(p => p.cid === cur.cid)
+    if (idx >= 0) {
+      if (loopMode.value === 'list') {
+        // 列表循环：最后一集结束后回到第一集，循环不中断
+        void selectPart(list[(idx + 1) % list.length])
+        return
+      }
+      if (autoNext.value && idx + 1 < list.length) {
+        void selectPart(list[idx + 1])
+        return
+      }
     }
   }
   playing.value = false
@@ -605,6 +642,8 @@ onMounted(() => {
   void load()
   document.addEventListener('fullscreenchange', onFsChange)
   boxEl.value?.addEventListener('keydown', onKey)
+  // 点空白处（video-box 自身，非控制条）关掉展开的菜单
+  boxEl.value?.addEventListener('mousedown', onBoxDown, true)
 })
 onBeforeUnmount(() => {
   videoEl.value?.pause()
@@ -612,6 +651,7 @@ onBeforeUnmount(() => {
   window.clearTimeout(hideTimer)
   document.removeEventListener('fullscreenchange', onFsChange)
   boxEl.value?.removeEventListener('keydown', onKey)
+  boxEl.value?.removeEventListener('mousedown', onBoxDown, true)
 })
 </script>
 
@@ -718,14 +758,49 @@ onBeforeUnmount(() => {
                 >
                   <Icon name="repeat" :size="16" /><span class="tlab">连播</span>
                 </button>
-                <!-- 循环 -->
-                <button class="cbtn toggle" :class="{ on: loop }" title="循环播放" @click="toggleLoop">
-                  <Icon name="repeat-one" :size="16" /><span class="tlab">循环</span>
-                </button>
-                <!-- 填充模式 -->
-                <button class="cbtn toggle" title="画面填充模式" @click="cycleFill">
-                  <Icon name="expand" :size="16" /><span class="tlab">{{ FILL_LABEL[fillMode] }}</span>
-                </button>
+                <!-- 循环：点击展开列表选择（与倍速一致） -->
+                <div class="menu-wrap">
+                  <button
+                    class="cbtn toggle"
+                    :class="{ on: loopMode !== 'off', open: menu === 'loop' }"
+                    @click="toggleMenu('loop')"
+                  >
+                    <Icon :name="loopMode === 'one' ? 'repeat-one' : 'repeat'" :size="16" />
+                    <span class="tlab">{{ LOOP_LABEL[loopMode] }}</span>
+                  </button>
+                  <div v-if="menu === 'loop'" class="menu">
+                    <div class="menu-title">循环</div>
+                    <button
+                      v-for="m in LOOP_MODES"
+                      :key="m"
+                      class="menu-item"
+                      :class="{ active: m === loopMode }"
+                      @click="setLoop(m)"
+                    >
+                      {{ LOOP_LABEL[m] }}
+                      <Icon v-if="m === loopMode" name="check" :size="13" />
+                    </button>
+                  </div>
+                </div>
+                <!-- 画面填充模式：点击展开列表选择（与倍速一致） -->
+                <div class="menu-wrap">
+                  <button class="cbtn toggle" :class="{ open: menu === 'fill' }" @click="toggleMenu('fill')">
+                    <Icon name="expand" :size="16" /><span class="tlab">{{ FILL_LABEL[fillMode] }}</span>
+                  </button>
+                  <div v-if="menu === 'fill'" class="menu">
+                    <div class="menu-title">画面模式</div>
+                    <button
+                      v-for="m in FILL_MODES"
+                      :key="m"
+                      class="menu-item"
+                      :class="{ active: m === fillMode }"
+                      @click="setFill(m)"
+                    >
+                      {{ FILL_LABEL[m] }}
+                      <Icon v-if="m === fillMode" name="check" :size="13" />
+                    </button>
+                  </div>
+                </div>
                 <!-- 离线缓存 -->
                 <button
                   v-if="isDesktop && remoteUrl"
@@ -738,7 +813,7 @@ onBeforeUnmount(() => {
                 </button>
                 <!-- 画质 -->
                 <div class="menu-wrap">
-                  <button class="cbtn toggle" :class="{ open: menu === 'quality' }" @click="menu = menu === 'quality' ? '' : 'quality'">
+                  <button class="cbtn toggle" :class="{ open: menu === 'quality' }" @click="toggleMenu('quality')">
                     <Icon name="gauge" :size="16" /><span class="tlab">{{ curQn >= 80 ? '高清' : curQn + 'P' }}</span>
                   </button>
                   <div v-if="menu === 'quality'" class="menu">
@@ -758,7 +833,7 @@ onBeforeUnmount(() => {
                 </div>
                 <!-- 倍速 -->
                 <div class="menu-wrap">
-                  <button class="cbtn toggle" :class="{ open: menu === 'speed' }" @click="menu = menu === 'speed' ? '' : 'speed'">
+                  <button class="cbtn toggle" :class="{ open: menu === 'speed' }" @click="toggleMenu('speed')">
                     <Icon name="gauge" :size="16" /><span class="tlab">{{ rate === 1 ? '倍速' : rate + 'x' }}</span>
                   </button>
                   <div v-if="menu === 'speed'" class="menu">

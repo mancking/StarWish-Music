@@ -211,8 +211,8 @@ const handlers: Record<string, Handler> = {
     broadcast('sources:changed', lxHost.list())
     return lxHost.list()
   },
-  'sources:import': async ({ url, content }: { url?: string; content?: string }) => {
-    const r = await lxHost.importSource({ url, content })
+  'sources:import': async ({ url, content, file }: { url?: string; content?: string; file?: string }) => {
+    const r = await lxHost.importSource({ url, content, file })
     broadcast('sources:changed', lxHost.list())
     return { file: r.file, sources: lxHost.list() }
   },
@@ -237,9 +237,9 @@ const handlers: Record<string, Handler> = {
   'plugins:code': ({ file }: { file: string }) => mfHost.getSourceCode(file),
   'plugins:toggle': ({ file, enabled }: { file: string; enabled: boolean }) => mfHost.togglePlugin(file, enabled),
   'plugins:delete': ({ file }: { file: string }) => mfHost.deletePlugin(file),
-  'plugins:import': async ({ url, content }: { url?: string; content?: string }) => {
-    if (url) return await mfHost.importFromUrl(url)
-    if (content) return mfHost.importFromContent(content, 'local')
+  'plugins:import': async ({ url, content, file }: { url?: string; content?: string; file?: string }) => {
+    if (url) return await mfHost.importFromUrl(url, file)
+    if (content) return mfHost.importFromContent(content, 'local', undefined, file)
     throw new Error('请提供插件链接或内容')
   },
   'plugins:subscribe': async ({ url, name }: { url: string; name?: string }) =>
@@ -559,6 +559,14 @@ const handlers: Record<string, Handler> = {
     })
     if (r.canceled || !r.filePaths[0]) return ''
     return r.filePaths[0]
+  },
+  'wallpaper:pick': async () => {
+    const r = await dialog.showOpenDialog(wins.main!, {
+      title: '选择播放页壁纸',
+      properties: ['openFile'],
+      filters: [{ name: '图片', extensions: ['jpg', 'jpeg', 'png', 'webp', 'bmp', 'gif', 'avif'] }],
+    })
+    return r.canceled || !r.filePaths[0] ? '' : r.filePaths[0]
   },
   // kind: cache | cover | media —— 三类目录各自可改，均把旧内容搬到新位置
   'cache:setDir': ({ dir, kind = 'cache' }: any) => {
