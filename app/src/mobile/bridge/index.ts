@@ -371,6 +371,14 @@ const handlers: Record<string, Handler> = {
     return true
   },
 
+  /* ---- 视频离线缓存：移动端暂无视频离线能力，管理器诚实返回空列表 ---- */
+  'video:offline:list': () => ({ items: [], total: 0 }),
+  'video:offline:file': () => null,
+  'video:offline:save': async () => {
+    throw new Error('移动端暂不支持视频离线缓存')
+  },
+  'video:offline:remove': () => true,
+
   /* ---- B 站 ---- */
   'bili:status': () => biliStatus(),
   'bili:qr': () => biliQrGenerate(),

@@ -32,6 +32,7 @@ const mine = [
   { path: '/favorites', icon: 'heart', label: '我喜欢的音乐' },
   { path: '/downloads', icon: 'download', label: '下载' },
   { path: '/local', icon: 'folder', label: '本地音乐' },
+  { path: '/offline', icon: 'hard-drive', label: '离线缓存' },
   { path: '/history', icon: 'clock', label: '最近播放' },
 ]
 

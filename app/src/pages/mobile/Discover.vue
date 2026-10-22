@@ -5,7 +5,6 @@ import Icon from '@/components/Icon.vue'
 import Cover from '@/components/Cover.vue'
 import { call } from '@/api'
 import { usePlayerStore } from '@/stores/player'
-import { useUiStore } from '@/stores/ui'
 import type { Song } from '@shared/types'
 import { platformLabel } from '@/utils/labels'
 
@@ -22,7 +21,6 @@ type Tab = 'playlists' | 'toplists' | 'new'
 const route = useRoute()
 const router = useRouter()
 const player = usePlayerStore()
-const ui = useUiStore()
 
 const tab = ref<Tab>(((route.query.tab as string) || 'playlists') as Tab)
 const cat = ref((route.query.cat as string) || '全部')
@@ -105,15 +103,10 @@ async function loadTree(): Promise<void> {
   }
 }
 
-async function playToplist(item: any): Promise<void> {
-  try {
-    const r = await call<{ name: string; songs: Song[] }>('music:toplist', { platform: tlPlatform.value, id: item.id })
-    if (!r.songs?.length) throw new Error('该榜单暂无数据')
-    await player.playSongs(r.songs, 0)
-    ui.toast(`正在播放：${r.name}`, 'success', 1600)
-  } catch (e: any) {
-    ui.toast(e.message, 'error')
-  }
+/** 打开榜单详情页（不再直接播放）：详情页可看完整曲目并可整体播放，
+ *  同时把「榜单无法打开」的报错可视化到详情页里 */
+function openToplist(item: any): void {
+  router.push(`/toplist/${tlPlatform.value}/${item.id}`)
 }
 
 /* ---- 新歌 ---- */
@@ -152,7 +145,7 @@ onMounted(() => {
     <!-- 分段 tab：吸顶 -->
     <nav class="d-seg">
       <button class="d-seg-item" :class="{ on: tab === 'playlists' }" @click="setTab('playlists')">歌单</button>
-      <button class="d-seg-item" :class="{ on: tab === 'toplists' }" @click="setTab('toplists')">排行</button>
+      <button class="d-seg-item" :class="{ on: tab === 'toplists' }" @click="setTab('toplists')">排行榜</button>
       <button class="d-seg-item" :class="{ on: tab === 'new' }" @click="setTab('new')">新歌</button>
     </nav>
 
@@ -219,7 +212,7 @@ onMounted(() => {
         <div class="empty-title">榜单加载中…</div>
       </div>
       <div class="d-tl-list">
-        <button v-for="(t, i) in tlItems" :key="t.platform + t.id" class="d-tl" @click="playToplist(t)">
+        <button v-for="(t, i) in tlItems" :key="t.platform + t.id" class="d-tl" @click="openToplist(t)">
           <span class="d-tl-rank" :class="{ top: i < 3 }">{{ i + 1 }}</span>
           <span class="d-tl-meta">
             <span class="d-tl-name">{{ t.n }}</span>

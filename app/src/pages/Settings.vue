@@ -24,6 +24,8 @@ const router = useRouter()
 
 type Cat = 'appearance' | 'wallpaper' | 'playback' | 'lyric' | 'video' | 'download' | 'sources' | 'local' | 'cache' | 'shortcuts' | 'about'
 const cat = ref<Cat>('appearance')
+/** 移动端设置页为「单页滚动 + 分区标题」结构，一次渲染全部分区；桌面保持单面板切换 */
+const isMobileSettings = __MOBILE__
 
 const cats: { key: Cat; label: string; icon: string }[] = [
   { key: 'appearance', label: '外观主题', icon: 'palette' },
@@ -991,7 +993,7 @@ onBeforeUnmount(stopPoll)
     </header>
 
     <div class="layout">
-      <aside class="cats">
+      <aside v-if="!isMobileSettings" class="cats">
         <button v-for="c in cats" :key="c.key" class="cat" :class="{ active: cat === c.key }" @click="cat = c.key">
           <Icon :name="c.icon" :size="16" />
           <span>{{ c.label }}</span>
@@ -1000,7 +1002,7 @@ onBeforeUnmount(stopPoll)
 
       <div class="panel">
         <!-- 外观 -->
-        <section v-if="cat === 'appearance'">
+        <section v-if="cat === 'appearance' || isMobileSettings">
           <h2>外观主题</h2>
           <div class="row">
             <div class="label"><b>主题模式</b><span>深色适合夜间长时间听歌</span></div>
@@ -1082,7 +1084,7 @@ onBeforeUnmount(stopPoll)
         </section>
 
         <!-- 壁纸引擎 -->
-        <section v-else-if="cat === 'wallpaper'">
+        <section v-else-if="cat === 'wallpaper' || isMobileSettings">
           <h2>壁纸引擎</h2>
           <p class="hint">图片壁纸库：导入多张图片、轮播、调节显示属性。壁纸只作用于应用内播放页，不修改系统桌面。</p>
 
@@ -1214,7 +1216,7 @@ onBeforeUnmount(stopPoll)
         </section>
 
         <!-- 视频与弹幕 -->
-        <section v-else-if="cat === 'video'">
+        <section v-else-if="cat === 'video' || isMobileSettings">
           <h2>视频与弹幕</h2>
           <p class="hint">MV / 视频播放器的默认行为。弹幕来自视频源，关闭后不影响视频播放。</p>
 
@@ -1303,7 +1305,7 @@ onBeforeUnmount(stopPoll)
         </section>
 
         <!-- 下载 -->
-        <section v-else-if="cat === 'download'">
+        <section v-else-if="cat === 'download' || isMobileSettings">
           <h2>下载</h2>
           <p class="hint">在歌曲列表右键选择「下载」，文件保存到下方目录，不参与缓存清理。</p>
 
@@ -1354,7 +1356,7 @@ onBeforeUnmount(stopPoll)
         </section>
 
         <!-- 播放 -->
-        <section v-else-if="cat === 'playback'">
+        <section v-else-if="cat === 'playback' || isMobileSettings">
           <h2>播放</h2>
           <div class="row">
             <div class="label"><b>播放倍速</b><span>变速时保留音调，不产生「花栗鼠」效果</span></div>
@@ -1456,7 +1458,7 @@ onBeforeUnmount(stopPoll)
         </section>
 
         <!-- 歌词 -->
-        <section v-else-if="cat === 'lyric'">
+        <section v-else-if="cat === 'lyric' || isMobileSettings">
           <h2>歌词</h2>
           <div class="row">
             <div class="label"><b>桌面歌词</b><span>悬浮在桌面最上层，快捷键 Ctrl+Alt+L</span></div>
@@ -1487,7 +1489,7 @@ onBeforeUnmount(stopPoll)
         </section>
 
         <!-- 音源 -->
-        <section v-else-if="cat === 'sources'">
+        <section v-else-if="cat === 'sources' || isMobileSettings">
           <div class="sec-head">
             <div>
               <h2>音源与插件</h2>
@@ -1625,7 +1627,7 @@ onBeforeUnmount(stopPoll)
         </section>
 
         <!-- 本地音乐 -->
-        <section v-else-if="cat === 'local'">
+        <section v-else-if="cat === 'local' || isMobileSettings">
           <h2>本地音乐</h2>
           <div class="row">
             <div class="label"><b>音乐文件夹</b><span>支持 MP3 / FLAC / M4A / OGG / WAV / APE</span></div>
@@ -1649,7 +1651,7 @@ onBeforeUnmount(stopPoll)
         </section>
 
         <!-- 缓存 -->
-        <section v-else-if="cat === 'cache'">
+        <section v-else-if="cat === 'cache' || isMobileSettings">
           <h2>网络与缓存</h2>
           <div v-if="dataRestart" class="banner">
             <Icon name="info" :size="15" />
@@ -1797,7 +1799,7 @@ onBeforeUnmount(stopPoll)
         </section>
 
         <!-- 快捷键 -->
-        <section v-else-if="cat === 'shortcuts'">
+        <section v-else-if="cat === 'shortcuts' || isMobileSettings">
           <h2>快捷键与系统</h2>
           <div class="row">
             <div class="label"><b>任务栏歌词</b><span>在任务栏上方显示当前一句歌词（macOS 为菜单栏）</span></div>

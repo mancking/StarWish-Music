@@ -12,6 +12,9 @@ import { useUiStore } from '@/stores/ui'
 import type { Song } from '@shared/types'
 import { platformLabel } from '@/utils/labels'
 
+/** 移动端与桌面各用一套头部模板（同一份状态与处理器） */
+const isMobile = __MOBILE__
+
 const route = useRoute()
 const router = useRouter()
 const player = usePlayerStore()
@@ -169,7 +172,42 @@ onMounted(() => void load())
     </div>
 
     <template v-else>
-      <header class="hero">
+      <!-- 移动端头部：上下两段布局，描述独占整行不与按钮重叠，按钮为大触控目标 -->
+      <header v-if="isMobile" class="hero m-hero">
+        <div class="m-top">
+          <Cover :src="pic" :alt="name" :size="104" :radius="12" cover="1" class="m-cover" />
+          <div class="m-info">
+            <div class="kicker">
+              <Icon :name="route.name === 'toplist' ? 'gauge' : route.name === 'podcast' ? 'microphone' : isLocal ? 'list' : 'cloud'" :size="12" />
+              {{ route.name === 'toplist' ? '排行榜' : route.name === 'podcast' ? '播客' : isLocal ? '我的歌单' : '平台歌单' }}
+            </div>
+            <div v-if="renaming" class="rename-row">
+              <input v-model="renameValue" class="rename-input" maxlength="30" autofocus @keydown.enter="doRename" @keydown.esc="renaming = false" />
+              <button class="btn primary sm" @click="doRename">保存</button>
+            </div>
+            <h1 v-else @dblclick="isLocal && startRename()">{{ name }}</h1>
+            <div class="meta">
+              <span>{{ author }}</span>
+              <span class="dot">·</span>
+              <span>{{ count }} 首</span>
+            </div>
+          </div>
+          <div v-if="isLocal" class="m-side-acts">
+            <button class="m-icon" aria-label="重命名" @click="startRename"><Icon name="edit" :size="16" /></button>
+            <button class="m-icon danger" aria-label="删除歌单" @click="confirmDelete = true"><Icon name="trash" :size="16" /></button>
+          </div>
+        </div>
+        <p v-if="desc" class="m-desc">{{ desc }}</p>
+        <div class="m-acts">
+          <button class="btn primary m-play" :disabled="!count" @click="playAll"><Icon name="play" :size="15" />播放全部</button>
+          <button class="btn" :disabled="!count" @click="addAllToQueue"><Icon name="queue" :size="15" />加入队列</button>
+          <button v-if="!isLocal && count" class="btn" :disabled="importing" @click="importToMine">
+            <Icon name="plus" :size="15" />{{ importing ? '收藏中…' : '收藏' }}
+          </button>
+        </div>
+      </header>
+
+      <header v-else class="hero">
         <Cover :src="pic" :alt="name" :size="180" :radius="16" cover="1" class="hero-cover" />
         <div class="hero-info">
           <div class="kicker">
@@ -325,5 +363,71 @@ h1 {
 .hs-right {
   flex: 1;
   padding-top: 20px;
+}
+
+/* ---- 移动端头部：上下两段，描述独占整行，操作按钮大目标 ---- */
+.m-hero {
+  flex-direction: column;
+  gap: 12px;
+  align-items: stretch;
+}
+.m-hero .m-top {
+  display: flex;
+  gap: 14px;
+  align-items: flex-start;
+}
+.m-hero .m-cover {
+  flex: none;
+  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.32);
+}
+.m-hero .m-info {
+  flex: 1;
+  min-width: 0;
+}
+.m-hero .m-info h1 {
+  font-size: 19px;
+  line-height: 1.4;
+  margin: 6px 0 0;
+  word-break: break-all;
+}
+.m-hero .m-side-acts {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.m-hero .m-icon {
+  width: 42px;
+  height: 42px;
+  border-radius: 50%;
+  border: 1px solid var(--line);
+  background: var(--bg-2);
+  color: var(--text-2);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  -webkit-tap-highlight-color: transparent;
+}
+.m-hero .m-icon.danger {
+  color: #ff5d5d;
+}
+.m-hero .m-desc {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.7;
+  color: var(--text-2);
+  white-space: normal;
+  overflow: visible;
+}
+.m-hero .m-acts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.m-hero .m-play {
+  flex: 1;
+  min-height: 46px;
+}
+.m-hero .m-acts .btn {
+  min-height: 46px;
 }
 </style>

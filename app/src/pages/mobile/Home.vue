@@ -58,11 +58,17 @@ const memorySingers = computed<string[]>(() => memory.value?.topSingers?.slice(0
 
 const quickActions = computed(() => [
   { icon: 'sparkles', label: '每日推荐', run: playDaily },
-  { icon: 'heart', label: '我喜欢的', run: () => router.push('/favorites') },
   { icon: 'trophy', label: '排行榜', run: () => router.push('/discover') },
-  { icon: 'compass', label: '发现音乐', run: () => router.push('/discover') },
-  { icon: 'video', label: '视频 MV', run: () => router.push('/mv') },
 ])
+
+/** 首页搜索：输入即跳搜索页（与底栏搜索同一去向） */
+const searchText = ref('')
+function submitSearch(): void {
+  const k = searchText.value.trim()
+  if (!k) return
+  router.push({ path: '/search', query: { q: k } })
+  searchText.value = ''
+}
 
 async function load(force = false): Promise<void> {
   if (!force && feedCache) {
@@ -136,15 +142,27 @@ defineExpose({ refresh: () => load(true) })
     </div>
 
     <template v-else>
-      <!-- 问候头：三行短文案，永不截断 -->
+      <!-- 问候头 + 搜索框：三行短文案，永不截断 -->
       <header class="m-head">
         <div class="m-kicker">{{ dateText }}</div>
         <h1 class="m-greet">{{ greeting }}，欢迎回来</h1>
         <p class="m-sub">从星河里捞一首歌，陪你度过此刻</p>
+        <div class="m-search">
+          <Icon name="search" :size="17" class="m-search-icon" />
+          <input
+            v-model="searchText"
+            type="search"
+            placeholder="搜索歌曲、歌手、歌单"
+            enterkeyhint="search"
+            @keydown.enter="submitSearch"
+          />
+          <button class="m-search-go" @click="submitSearch">搜索</button>
+        </div>
       </header>
 
-      <!-- 快捷入口：横滑胶囊 -->
-      <nav class="m-quick">
+      <!-- 快捷入口：仅保留有实际动作的项（每日推荐直达播放 / 排行榜直达榜单），
+           其余去重——底栏已有「发现/视频/我的」，我喜欢的在「我的」页 -->
+      <nav v-if="quickActions.length" class="m-quick">
         <button v-for="q in quickActions" :key="q.label" class="m-quick-item" @click="q.run()">
           <Icon :name="q.icon" :size="16" />
           <span>{{ q.label }}</span>
@@ -265,6 +283,43 @@ defineExpose({ refresh: () => load(true) })
   font-size: 13px;
   color: var(--text-3);
   line-height: 1.5;
+}
+
+/* 搜索框 */
+.m-search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 46px;
+  margin-top: 12px;
+  padding: 0 6px 0 14px;
+  border-radius: 14px;
+  border: 1px solid var(--line);
+  background: var(--bg-2);
+}
+.m-search-icon {
+  color: var(--text-3);
+}
+.m-search input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  background: none;
+  color: var(--text);
+  font-size: 14px;
+  outline: none;
+}
+.m-search-go {
+  flex: none;
+  height: 34px;
+  padding: 0 16px;
+  border: 0;
+  border-radius: 10px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+  -webkit-tap-highlight-color: transparent;
 }
 
 /* 快捷入口：横滑胶囊 */

@@ -29,6 +29,8 @@ const routes = [
   { path: '/toplist/:platform/:id', name: 'toplist', component: () => import('@/pages/Playlist.vue'), meta: { title: '排行榜' } },
   { path: '/favorites', name: 'favorites', component: () => import('@/pages/Favorites.vue'), meta: { title: '我喜欢的音乐' } },
   { path: '/local', name: 'local', component: () => import('@/pages/Local.vue'), meta: { title: '本地音乐' } },
+  // 离线缓存管理器（视频 MV）：桌面「我的音乐→本地音乐」下方，移动端在「我的」
+  { path: '/offline', name: 'offline', component: () => import('@/pages/OfflineCache.vue'), meta: { title: '离线缓存' } },
   { path: '/history', name: 'history', component: () => import('@/pages/History.vue'), meta: { title: '最近播放' } },
   {
     path: '/downloads',

@@ -32,6 +32,7 @@ const quickEntries = computed(() => [
   { path: '/local', icon: 'folder', label: '本地音乐', meta: library.localCount ? `${library.localCount}` : '' },
   { path: '/history', icon: 'clock', label: '最近播放', meta: library.history.length ? `${library.history.length}` : '' },
   { path: '/downloads', icon: 'download', label: '下载管理', meta: download.runningCount ? `${download.runningCount}` : '' },
+  { path: '/offline', icon: 'hard-drive', label: '离线缓存', meta: '' },
 ])
 
 const go = (path: string) => {
@@ -100,31 +101,6 @@ async function createPlaylist(): Promise<void> {
       </div>
     </section>
 
-    <!-- ④ 内容模块（视频，独立） -->
-    <section class="mod">
-      <header class="mod-head"><h2>视频内容</h2></header>
-      <div class="mod-card">
-        <button class="row" @click="go('/mv')">
-          <span class="row-icon tint-video"><Icon name="video" :size="16" /></span>
-          <span class="row-label">视频 / MV</span>
-          <span class="row-meta">B 站曲库</span>
-          <Icon name="chevron-right" :size="14" class="row-arrow" />
-        </button>
-      </div>
-    </section>
-
-    <!-- ⑤ 系统模块（设置，独立） -->
-    <section class="mod">
-      <header class="mod-head"><h2>应用</h2></header>
-      <div class="mod-card">
-        <button class="row" @click="go('/settings')">
-          <span class="row-icon tint-gear"><Icon name="settings" :size="16" /></span>
-          <span class="row-label">设置</span>
-          <span class="row-meta">音源 / 播放 / 通用</span>
-          <Icon name="chevron-right" :size="14" class="row-arrow" />
-        </button>
-      </div>
-    </section>
   </div>
 </template>
 
@@ -332,14 +308,6 @@ async function createPlaylist(): Promise<void> {
 .tint-list {
   background: color-mix(in srgb, #7c9cff 16%, transparent);
   color: #7c9cff;
-}
-.tint-video {
-  background: color-mix(in srgb, #ff4d6d 15%, transparent);
-  color: #ff4d6d;
-}
-.tint-gear {
-  background: color-mix(in srgb, #a855f7 15%, transparent);
-  color: #a855f7;
 }
 .row-label {
   flex: 1;

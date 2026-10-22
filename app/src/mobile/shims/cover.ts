@@ -16,12 +16,18 @@ import { itunesCover } from '../../../electron/core/providers'
 import { lxHost } from '../../../electron/core/lx-host'
 import { isNativeWebView } from './util'
 
-/** http(s) URL → 同源 CORS 代理地址；非 http(s) 与真机原样返回 */
+/** http(s) URL → 展示用地址。
+ * 真机：走同源 /swmedia/ 原生代理（SwMediaClient 按 CDN 注入 Referer/UA）——
+ * B 站 hdslb、酷我等图片 CDN 有防盗链，WebView 直连会带 https://localhost
+ * 的 Referer 被 403 拒图（v2.3.4「MV 封面获取不到」的根因）。
+ * 冒烟 http(s)：走 /__cors 代理；桌面不用本 shim。 */
 function proxied(url: string): string {
   try {
     const t = new URL(url)
-    // 真机静态服务器无 /__cors 代理，且 <img> 跨域不设 CORS，直接用原链
-    if ((t.protocol === 'http:' || t.protocol === 'https:') && typeof location !== 'undefined' && location.origin.startsWith('http') && !isNativeWebView()) {
+    if ((t.protocol === 'http:' || t.protocol === 'https:') && isNativeWebView()) {
+      return `/swmedia/?u=${encodeURIComponent(url)}`
+    }
+    if ((t.protocol === 'http:' || t.protocol === 'https:') && typeof location !== 'undefined' && location.origin.startsWith('http')) {
       return location.origin + '/__cors/' + t.host + t.pathname + t.search
     }
   } catch { /* ignore */ }

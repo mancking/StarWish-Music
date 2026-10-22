@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, defineOptions, onMounted, ref } from 'vue'
+import { computed, defineOptions, nextTick, onMounted, onBeforeUnmount, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import Icon from '@/components/Icon.vue'
 import Cover from '@/components/Cover.vue'
@@ -62,6 +62,25 @@ function fmtPlay(n: number): string {
   return String(n)
 }
 
+/** 真机封面走 /swmedia/ 原生代理（B 站图片 CDN 有 Referer 防盗链，直连 403） */
+function picUrl(u?: string): string {
+  const s = String(u || '')
+  if (!/^https?:\/\//i.test(s)) return s
+  const cap: any = (globalThis as any).Capacitor
+  if (cap?.isNativePlatform?.()) return `/swmedia/?u=${encodeURIComponent(s)}`
+  return s
+}
+
+/** 滚动容器触底自动加载更多（观察哨兵元素） */
+function watchSentinel(): void {
+  const el = sentinel.value
+  if (!el || observer) return
+  observer = new IntersectionObserver(entries => {
+    if (entries.some(e => e.isIntersecting)) void loadMore()
+  }, { rootMargin: '600px 0px' })
+  observer.observe(el)
+}
+
 async function loadMore(): Promise<void> {
   if (loadingMore.value || !hasMore.value || loading.value) return
   loadingMore.value = true
@@ -81,15 +100,17 @@ async function loadMore(): Promise<void> {
   }
 }
 
-function onScroll(e: Event): void {
-  const el = e.target as HTMLElement
-  if (el.scrollTop + el.clientHeight >= el.scrollHeight - 400) void loadMore()
-}
-
+const sentinel = ref<HTMLElement | null>(null)
+let observer: IntersectionObserver | null = null
 const PLACEHOLDER = computed(() => (keyword.value ? keyword.value : '搜索视频 / MV'))
 const HOT_SUGGESTIONS = HOT
 
-onMounted(() => void search())
+onMounted(() => {
+  void search()
+  watchSentinel()
+})
+watch(list, () => void nextTick(watchSentinel))
+onBeforeUnmount(() => observer?.disconnect())
 </script>
 
 <template>
@@ -128,7 +149,7 @@ onMounted(() => void search())
       <div class="mv-grid">
         <button v-for="v in list" :key="v.bvid" class="mv-card" @click="router.push(`/mv/${v.bvid}`)">
           <div class="mv-cover-wrap">
-            <Cover :src="v.pic || ''" :size="180" radius="12" class="mv-cover" />
+            <Cover :src="picUrl(v.pic)" :size="180" radius="12" class="mv-cover" />
             <span v-if="v.duration" class="mv-badge">{{ v.duration }}</span>
             <span v-if="v.play" class="mv-badge play"><Icon name="play" :size="10" />{{ fmtPlay(v.play) }}</span>
           </div>

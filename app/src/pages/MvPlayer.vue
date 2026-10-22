@@ -51,7 +51,14 @@ const related = ref<MvItem[]>([])
 const videoEl = ref<HTMLVideoElement | null>(null)
 const boxEl = ref<HTMLDivElement | null>(null)
 
-const poster = computed(() => info.value?.pic || '')
+const isMobileMv = __MOBILE__
+/** 真机封面/海报走 /swmedia/ 代理：B 站图片 CDN 防盗链，直连 403 */
+const poster = computed(() => {
+  const u = String(info.value?.pic || '')
+  if (!/^https?:\/\//i.test(u) || !isMobileMv) return u
+  const cap: any = (globalThis as any).Capacitor
+  return cap?.isNativePlatform?.() ? `/swmedia/?u=${encodeURIComponent(u)}` : u
+})
 const videoSrc = computed(() => {
   // 离线本地文件：走 swmedia 本地文件分支（含 Range，秒开）
   if (offlineLocal.value) return `swmedia://stream/?u=${encodeURIComponent(offlineLocal.value)}`
@@ -91,7 +98,7 @@ const qualities = ref<{ qn: number; label: string }[]>([])
 const curQn = ref(64)
 
 /* 菜单开关 */
-const menu = ref<'' | 'settings' | 'speed' | 'quality' | 'loop' | 'fill'>('')
+const menu = ref<'' | 'settings' | 'speed' | 'quality' | 'loop' | 'fill' | 'more'>('')
 
 /** 循环模式：off 不循环 / one 单集循环 / list 列表循环 */
 type LoopMode = 'off' | 'one' | 'list'
@@ -167,6 +174,12 @@ function setVolume(val: number): void {
   }
   // 记忆音量：下次进 MV 播放器沿用上次的值
   if (Math.abs((ui.settings.mvVolume ?? -1) - volume.value) > 0.001) void ui.patch({ mvVolume: volume.value })
+}
+
+function toggleDanmaku(): void {
+  const v = !ui.settings.danmakuEnabled
+  ;(ui.settings as any).danmakuEnabled = v
+  void call('settings:set', { danmakuEnabled: v })
 }
 
 function toggleMute(): void {
@@ -274,10 +287,32 @@ function onProgressClick(e: MouseEvent): void {
   seekTo(ratio * (duration.value || 0))
 }
 
+let lastProgSave = 0
 function onTimeUpdate(): void {
   const v = videoEl.value
   if (!v) return
   curTime.value = v.currentTime
+  // 进度记忆：每 3s 落一次 localStorage（按 bvid+cid），临近结尾不记
+  const now = Date.now()
+  if (now - lastProgSave < 3000) return
+  lastProgSave = now
+  if (v.currentTime > 5 && (duration.value || 0) - v.currentTime > 10 && bvid.value && current.value) {
+    try {
+      localStorage.setItem(progKey(bvid.value, current.value.cid), String(v.currentTime))
+    } catch { /* 隐私模式等忽略 */ }
+  }
+}
+
+/** 视频进度记忆：按 bvid+cid 存取（双端通用，localStorage） */
+function progKey(bv: string, cid: string): string {
+  return `sw.mvprog:${bv}:${cid}`
+}
+function lastProgressOf(bv: string, cid: string): number {
+  try {
+    return Number(localStorage.getItem(progKey(bv, cid)) || 0)
+  } catch {
+    return 0
+  }
 }
 
 function onLoadedMeta(): void {
@@ -492,7 +527,9 @@ async function selectPart(p: Part, autoplay = true): Promise<void> {
   if (idx >= partsShown.value) partsShown.value = Math.min(idx + PART_BATCH, parts.value.length)
   router.replace({ path: `/mv/${bvid.value}`, query: p.page > 1 ? { p: String(p.page) } : {} })
   menu.value = ''
-  await resolveStream(undefined, autoplay)
+  const saved = autoplay ? lastProgressOf(bvid.value, p.cid) : 0
+  if (saved > 15) ui.toast('已恢复到上次播放进度', 'info', 1800)
+  await resolveStream(undefined, autoplay, saved > 15 ? saved : undefined)
 }
 
 async function loadRelated(author: string): Promise<void> {
@@ -759,97 +796,19 @@ onBeforeUnmount(() => {
               <div class="bar-thumb" :style="{ left: (curTime / (duration || 1)) * 100 + '%' }"></div>
             </div>
 
-            <div class="ctrl-row">
-              <div class="ctrl-left">
+            <!-- 移动端控制条：两行大目标，功能收进图标 chips，无音量滑杆（用系统音量） -->
+            <div v-if="isMobileMv" class="ctrl-row m-ctrl">
+              <div class="m-row">
                 <button class="cbtn" @click="togglePlay">
-                  <Icon :name="playing ? 'pause' : 'play'" :size="18" />
+                  <Icon :name="playing ? 'pause' : 'play'" :size="20" />
                 </button>
-                <button class="cbtn" @click="nudge(-5)"><Icon name="prev" :size="16" /></button>
-                <button class="cbtn" @click="nudge(5)"><Icon name="next" :size="16" /></button>
-                <div class="vol">
-                  <button class="cbtn" @click="toggleMute">
-                    <Icon :name="muted || volume === 0 ? 'volume-mute' : volume < 0.5 ? 'volume-low' : 'volume'" :size="17" />
-                  </button>
-                  <input
-                    class="vol-range"
-                    type="range"
-                    min="0"
-                    max="1"
-                    step="0.05"
-                    :value="muted ? 0 : volume"
-                    @input="setVolume(Number(($event.target as HTMLInputElement).value))"
-                  />
-                </div>
+                <button class="cbtn" @click="nudge(-5)"><Icon name="prev" :size="17" /></button>
+                <button class="cbtn" @click="nudge(5)"><Icon name="next" :size="17" /></button>
                 <span class="time mono">{{ fmtTime(curTime) }} / {{ fmtTime(duration) }}</span>
-              </div>
-
-              <div class="ctrl-right">
-                <!-- 自动连播 -->
-                <button
-                  class="cbtn toggle"
-                  :class="{ on: autoNext }"
-                  title="自动连播"
-                  @click="autoNext = !autoNext"
-                >
-                  <Icon name="repeat" :size="16" /><span class="tlab">连播</span>
-                </button>
-                <!-- 循环：点击展开列表选择（与倍速一致） -->
-                <div class="menu-wrap">
-                  <button
-                    class="cbtn toggle"
-                    :class="{ on: loopMode !== 'off', open: menu === 'loop' }"
-                    @click="toggleMenu('loop')"
-                  >
-                    <Icon :name="loopMode === 'one' ? 'repeat-one' : 'repeat'" :size="16" />
-                    <span class="tlab">{{ LOOP_LABEL[loopMode] }}</span>
-                  </button>
-                  <div v-if="menu === 'loop'" class="menu">
-                    <div class="menu-title">循环</div>
-                    <button
-                      v-for="m in LOOP_MODES"
-                      :key="m"
-                      class="menu-item"
-                      :class="{ active: m === loopMode }"
-                      @click="setLoop(m)"
-                    >
-                      {{ LOOP_LABEL[m] }}
-                      <Icon v-if="m === loopMode" name="check" :size="13" />
-                    </button>
-                  </div>
-                </div>
-                <!-- 画面填充模式：点击展开列表选择（与倍速一致） -->
-                <div class="menu-wrap">
-                  <button class="cbtn toggle" :class="{ open: menu === 'fill' }" @click="toggleMenu('fill')">
-                    <Icon name="expand" :size="16" /><span class="tlab">{{ FILL_LABEL[fillMode] }}</span>
-                  </button>
-                  <div v-if="menu === 'fill'" class="menu">
-                    <div class="menu-title">画面模式</div>
-                    <button
-                      v-for="m in FILL_MODES"
-                      :key="m"
-                      class="menu-item"
-                      :class="{ active: m === fillMode }"
-                      @click="setFill(m)"
-                    >
-                      {{ FILL_LABEL[m] }}
-                      <Icon v-if="m === fillMode" name="check" :size="13" />
-                    </button>
-                  </div>
-                </div>
-                <!-- 离线缓存 -->
-                <button
-                  v-if="isDesktop && remoteUrl"
-                  class="cbtn"
-                  title="离线缓存"
-                  :disabled="caching || offlineReady"
-                  @click="cacheCurrent"
-                >
-                  <Icon :name="offlineReady ? 'check' : 'download'" :size="16" />
-                </button>
-                <!-- 画质 -->
+                <span class="m-gap" />
                 <div class="menu-wrap">
                   <button class="cbtn toggle" :class="{ open: menu === 'quality' }" @click="toggleMenu('quality')">
-                    <Icon name="gauge" :size="16" /><span class="tlab">{{ curQn >= 80 ? '高清' : curQn + 'P' }}</span>
+                    <Icon name="gauge" :size="17" />
                   </button>
                   <div v-if="menu === 'quality'" class="menu">
                     <div class="menu-title">画质</div>
@@ -866,10 +825,9 @@ onBeforeUnmount(() => {
                     <div v-if="!qualities.length" class="menu-empty">暂无更多画质</div>
                   </div>
                 </div>
-                <!-- 倍速 -->
                 <div class="menu-wrap">
                   <button class="cbtn toggle" :class="{ open: menu === 'speed' }" @click="toggleMenu('speed')">
-                    <Icon name="gauge" :size="16" /><span class="tlab">{{ rate === 1 ? '倍速' : rate + 'x' }}</span>
+                    <Icon name="gauge" :size="17" />
                   </button>
                   <div v-if="menu === 'speed'" class="menu">
                     <div class="menu-title">播放速度</div>
@@ -885,16 +843,49 @@ onBeforeUnmount(() => {
                     </button>
                   </div>
                 </div>
-                <!-- 画中画 -->
-                <button class="cbtn" title="画中画 (P)" @click="togglePip"><Icon name="album" :size="16" /></button>
-                <!-- 缓存管理 -->
-                <button v-if="isDesktop" class="cbtn" title="缓存管理" @click="openCachePanel">
-                  <Icon name="hard-drive" :size="16" />
+                <button class="cbtn" title="画中画" @click="togglePip"><Icon name="album" :size="17" /></button>
+                <button class="cbtn" title="全屏" @click="toggleFullscreen">
+                  <Icon :name="isFullscreen ? 'shrink' : 'expand'" :size="17" />
                 </button>
-                <!-- 全屏 -->
-                <button class="cbtn" title="全屏 (F)" @click="toggleFullscreen">
-                  <Icon :name="isFullscreen ? 'shrink' : 'expand'" :size="16" />
+              </div>
+              <div class="menu-wrap">
+                <button class="m-chip" :class="{ open: menu === 'more' }" @click="toggleMenu('more')">
+                  <Icon name="more" :size="15" />更多
                 </button>
+                <div v-if="menu === 'more'" class="menu">
+                  <div class="menu-title">播放选项</div>
+                  <button class="menu-item" :class="{ active: autoNext }" @click="autoNext = !autoNext">
+                    自动连播<Icon v-if="autoNext" name="check" :size="13" />
+                  </button>
+                  <button
+                    v-for="m in LOOP_MODES"
+                    :key="m"
+                    class="menu-item"
+                    :class="{ active: m === loopMode }"
+                    @click="setLoop(m)"
+                  >
+                    {{ LOOP_LABEL[m] }}
+                    <Icon v-if="m === loopMode" name="check" :size="13" />
+                  </button>
+                  <div class="menu-title">画面模式</div>
+                  <button
+                    v-for="m in FILL_MODES"
+                    :key="m"
+                    class="menu-item"
+                    :class="{ active: m === fillMode }"
+                    @click="setFill(m)"
+                  >
+                    {{ FILL_LABEL[m] }}
+                    <Icon v-if="m === fillMode" name="check" :size="13" />
+                  </button>
+                  <div class="menu-title">其他</div>
+                  <button class="menu-item" :class="{ active: ui.settings.danmakuEnabled }" @click="toggleDanmaku">
+                    弹幕{{ ui.settings.danmakuEnabled ? '（开）' : '（关）' }}
+                  </button>
+                  <button class="menu-item" @click="toggleMute">
+                    {{ muted || volume === 0 ? '开启声音' : '静音' }}
+                  </button>
+                </div>
               </div>
             </div>
           </div>
@@ -1622,5 +1613,51 @@ onBeforeUnmount(() => {
   .rel-grid {
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
+}
+
+/* ---- 移动端控制条：两行布局，chips 横滑 ---- */
+.m-ctrl {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 6px 10px calc(8px + env(safe-area-inset-bottom, 0px));
+}
+.m-ctrl .m-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.m-ctrl .m-row.chips {
+  gap: 7px;
+  overflow-x: auto;
+  scrollbar-width: none;
+  padding: 2px 0;
+}
+.m-ctrl .m-row.chips::-webkit-scrollbar {
+  display: none;
+}
+.m-ctrl .m-gap {
+  flex: 1;
+}
+.m-ctrl .m-chip {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 34px;
+  padding: 0 13px;
+  border-radius: 17px;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  background: rgba(255, 255, 255, 0.1);
+  color: #fff;
+  font-size: 12.5px;
+  -webkit-tap-highlight-color: transparent;
+}
+.m-ctrl .m-chip.on {
+  background: var(--accent);
+  border-color: transparent;
+}
+.m-ctrl .menu {
+  bottom: 44px;
 }
 </style>
