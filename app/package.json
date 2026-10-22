@@ -115,7 +115,7 @@
       ],
       "icon": "resources/icon.ico",
       "requestedExecutionLevel": "asInvoker",
-      "artifactName": "星河音乐-${version}-${arch}.${ext}"
+      "artifactName": "StarWish-${version}-win-${arch}.${ext}"
     },
     "nsis": {
       "oneClick": false,
@@ -128,7 +128,7 @@
       "deleteAppDataOnUninstall": false
     },
     "portable": {
-      "artifactName": "星河音乐-${version}-便携版.${ext}"
+      "artifactName": "StarWish-${version}-win-portable.${ext}"
     },
     "mac": {
       "target": [

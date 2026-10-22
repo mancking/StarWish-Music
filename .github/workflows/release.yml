@@ -122,6 +122,14 @@ jobs:
         run: |
           mkdir -p dist/final
           find dist/assets -type f | while read -r f; do cp "$f" dist/final/; done
+          # 资产名一律 ASCII + 带版本号：中文名在跨 runner 的 zip/unzip 之间会被
+          # 解成乱码（历史上出现过 "-2.3.4-.exe"），且 GitHub 资产 URL 也拒绝中文。
+          VER="${GITHUB_REF_NAME#v}"
+          cd dist/final
+          [ -f app-debug.apk ] && mv app-debug.apk "StarWish-${VER}-android-debug.apk"
+          [ -f app-release.apk ] && mv app-release.apk "StarWish-${VER}-android.apk"
+          [ -f StarWish-unsigned.ipa ] && mv StarWish-unsigned.ipa "StarWish-${VER}-ios-unsigned.ipa"
+          cd -
           ls -la dist/final
 
       - name: Create GitHub Release
@@ -130,7 +138,15 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           NOTES=$(ls docs/StarWish-Music-v*-发布说明.md 2>/dev/null | sort | tail -1)
-          gh release create "$TAG" dist/final/* \
-            --title "星河音乐 ${TAG}" \
-            --notes-file "$NOTES" \
-            --latest || gh release upload "$TAG" dist/final/* --clobber
+          # Release 已存在时 gh release create 会失败，回退分支不仅要上传资产，
+          # 还要 gh release edit 把标题与说明刷新（否则说明永远是首次发布的旧版）。
+          if gh release create "$TAG" dist/final/* \
+              --title "星河音乐 ${TAG}" \
+              --notes-file "$NOTES" \
+              --latest; then
+            echo "release created"
+          else
+            echo "release exists -> upload + refresh notes"
+            gh release upload "$TAG" dist/final/* --clobber
+            gh release edit "$TAG" --title "星河音乐 ${TAG}" --notes-file "$NOTES" --latest
+          fi
