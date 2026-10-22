@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { useRouter } from 'vue-router'
 import QRCode from 'qrcode'
 import Icon from '@/components/Icon.vue'
 import Toggle from '@/components/Toggle.vue'
@@ -11,14 +12,17 @@ import { searchSettings } from '@/settings/schema'
 import { useUiStore } from '@/stores/ui'
 import { useLibraryStore } from '@/stores/library'
 import { usePlayerStore } from '@/stores/player'
+import { useDownloadStore } from '@/stores/download'
 import { platformLabel } from '@/utils/labels'
 import type { AppSettings, SourceInfo, PluginInfo, PluginSubscription, WallpaperItem } from '@shared/types'
 
 const ui = useUiStore()
 const library = useLibraryStore()
 const player = usePlayerStore()
+const download = useDownloadStore()
+const router = useRouter()
 
-type Cat = 'appearance' | 'wallpaper' | 'playback' | 'lyric' | 'video' | 'sources' | 'local' | 'cache' | 'shortcuts' | 'about'
+type Cat = 'appearance' | 'wallpaper' | 'playback' | 'lyric' | 'video' | 'download' | 'sources' | 'local' | 'cache' | 'shortcuts' | 'about'
 const cat = ref<Cat>('appearance')
 
 const cats: { key: Cat; label: string; icon: string }[] = [
@@ -27,6 +31,7 @@ const cats: { key: Cat; label: string; icon: string }[] = [
   { key: 'playback', label: '播放', icon: 'play-circle' },
   { key: 'lyric', label: '歌词', icon: 'lyric' },
   { key: 'video', label: '视频与弹幕', icon: 'video' },
+  { key: 'download', label: '下载', icon: 'download' },
   { key: 'sources', label: '音源与插件', icon: 'plug' },
   { key: 'local', label: '本地音乐', icon: 'folder' },
   { key: 'cache', label: '网络与缓存', icon: 'database' },
@@ -103,6 +108,16 @@ const qrImg = ref('')
 const qrStatus = ref('')
 const qrKey = ref('')
 let qrTimer: number | null = null
+const loginTab = ref<'qr' | 'pwd' | 'cookie'>('qr')
+const isMobileApp = __MOBILE__
+const biliQrUrl = ref('')
+const pwdUser = ref('')
+const pwdPass = ref('')
+const pwdBusy = ref(false)
+const pwdErr = ref('')
+const ckText = ref('')
+const ckBusy = ref(false)
+const ckErr = ref('')
 
 const ACCENTS = ['#ff4d6d', '#a855f7', '#3cb371', '#4f9cf9', '#f0b429', '#ff7a45', '#22d3ee', '#e879f9']
 
@@ -621,8 +636,37 @@ async function changeSubDir(kind: Exclude<DirKind, 'cache'>, label: string): Pro
   }
 }
 
-async function changeLogDir(): Promise<void> {
+/** 下载目录：走 download:pickDir（主进程选目录后直接写设置），与缓存目录迁移是两套逻辑 */
+async function changeDownloadDir(): Promise<void> {
   try {
+    const dir = await call<string>('download:pickDir')
+    if (!dir) return
+    download.dir = dir
+    ui.toast('下载目录已更新', 'success')
+  } catch (e: any) {
+    ui.toast(e.message, 'error')
+  }
+}
+
+async function resetDownloadDir(): Promise<void> {
+  try {
+    await patch({ downloadDir: '' })
+    download.dir = await call<string>('download:dir')
+    ui.toast('已恢复默认下载目录', 'success')
+  } catch (e: any) {
+    ui.toast(e.message, 'error')
+  }
+}
+
+async function openDownloadDir(): Promise<void> {
+  try {
+    await call('download:openDir')
+  } catch (e: any) {
+    ui.toast(e.message, 'error')
+  }
+}
+
+async function changeLogDir(): Promise<void> {  try {
     const dir = await pickDir('选择日志目录')
     if (!dir) return
     if (parseDir(dir) === parseDir(logPath.value)) {
@@ -782,17 +826,84 @@ async function restoreSources(): Promise<void> {
 
 async function startBiliLogin(): Promise<void> {
   qrOpen.value = true
+  loginTab.value = 'qr'
+  pwdErr.value = ''
+  ckErr.value = ''
   qrStatus.value = '正在获取二维码…'
   qrImg.value = ''
   stopPoll()
   try {
     const r = await call<{ url: string; key: string }>('bili:qr')
     qrKey.value = r.key
+    biliQrUrl.value = r.url
     qrImg.value = await QRCode.toDataURL(r.url, { margin: 1, width: 220, color: { dark: '#111827', light: '#ffffff' } })
-    qrStatus.value = '请使用视频源账号扫码登录'
+    qrStatus.value = '请使用哔哩哔哩 App 扫码，或点下方按钮拉起客户端'
     qrTimer = window.setInterval(poll, 2000)
   } catch (e: any) {
     qrStatus.value = e?.message || '二维码获取失败'
+  }
+}
+
+function switchLoginTab(t: 'qr' | 'pwd' | 'cookie'): void {
+  loginTab.value = t
+  pwdErr.value = ''
+  ckErr.value = ''
+  // 二维码过期/出错后切回扫码页时自动重新生成
+  if (t === 'qr' && !qrImg.value) void startBiliLogin()
+}
+
+/** 拉起哔哩哔哩客户端确认登录（手机上点开即弹确认，无需第二台设备扫码） */
+function openBiliApp(): void {
+  if (!biliQrUrl.value) {
+    ui.toast('二维码尚未生成', 'info')
+    return
+  }
+  // bilibili:// scheme 打开 B 站 App 内置浏览器并载入确认页；
+  // Android 11+ 需要 AndroidManifest 里 <queries> 声明该 scheme
+  window.location.href = 'bilibili://browser?url=' + encodeURIComponent(biliQrUrl.value)
+  qrStatus.value = '已尝试拉起哔哩哔哩，请在 App 中点击「确认登录」'
+}
+
+async function biliPwdLogin(): Promise<void> {
+  if (pwdBusy.value) return
+  pwdErr.value = ''
+  if (!pwdUser.value.trim() || !pwdPass.value) {
+    pwdErr.value = '请输入账号与密码'
+    return
+  }
+  pwdBusy.value = true
+  try {
+    await call('bili:passwordLogin', { username: pwdUser.value.trim(), password: pwdPass.value })
+    bili.value = await call('bili:status')
+    ui.toast('视频源账号登录成功', 'success')
+    pwdUser.value = ''
+    pwdPass.value = ''
+    qrOpen.value = false
+  } catch (e: any) {
+    pwdErr.value = e?.message || '登录失败'
+  } finally {
+    pwdBusy.value = false
+  }
+}
+
+async function biliCkLogin(): Promise<void> {
+  if (ckBusy.value) return
+  ckErr.value = ''
+  if (!ckText.value.trim()) {
+    ckErr.value = '请粘贴 Cookie 内容'
+    return
+  }
+  ckBusy.value = true
+  try {
+    await call('bili:cookieLogin', { cookie: ckText.value.trim() })
+    bili.value = await call('bili:status')
+    ui.toast('视频源账号登录成功', 'success')
+    ckText.value = ''
+    qrOpen.value = false
+  } catch (e: any) {
+    ckErr.value = e?.message || '登录失败'
+  } finally {
+    ckBusy.value = false
   }
 }
 
@@ -1173,6 +1284,57 @@ onBeforeUnmount(stopPoll)
               placeholder="例如：\n前排\n签到"
               @change="patch({ danmakuBlockWords: ($event.target as HTMLTextAreaElement).value })"
             />
+          </div>
+        </section>
+
+        <!-- 下载 -->
+        <section v-else-if="cat === 'download'">
+          <h2>下载</h2>
+          <p class="hint">在歌曲列表右键选择「下载」，文件保存到下方目录，不参与缓存清理。</p>
+
+          <div class="row">
+            <div class="label"><b>下载目录</b><span class="path">{{ download.dir || '默认目录（下载/StarWish）' }}</span></div>
+            <div class="inline">
+              <button class="btn sm" @click="changeDownloadDir"><Icon name="folder-open" :size="14" />更改目录</button>
+              <button class="btn sm ghost" @click="openDownloadDir"><Icon name="external" :size="14" />打开</button>
+              <button v-if="setting.downloadDir" class="btn sm ghost" @click="resetDownloadDir">恢复默认</button>
+            </div>
+          </div>
+
+          <div class="row">
+            <div class="label"><b>下载音质</b><span>跟随音质则与播放音质一致</span></div>
+            <select
+              class="select"
+              :value="String(setting.downloadQuality)"
+              @change="patch({ downloadQuality: ($event.target as HTMLSelectElement).value })"
+            >
+              <option value="">跟随全局音质</option>
+              <option value="128k">标准 128K</option>
+              <option value="320k">高品质 320K</option>
+              <option value="flac">无损 FLAC</option>
+              <option value="flac24bit">Hi-Res 24bit</option>
+            </select>
+          </div>
+
+          <div class="row">
+            <div class="label"><b>同时下载歌词</b><span>保存与歌曲同名的 .lrc 文件</span></div>
+            <Toggle :model-value="setting.downloadLrc" @update:model-value="v => patch({ downloadLrc: v })" />
+          </div>
+
+          <div class="row">
+            <div class="label"><b>同时下载任务数</b><span>{{ setting.downloadConcurrency }} 个 · 音源多为第三方，并发过高可能被限流</span></div>
+            <Slider
+              :model-value="setting.downloadConcurrency"
+              :min="1"
+              :max="4"
+              :step="1"
+              @update:model-value="v => patch({ downloadConcurrency: v })"
+            />
+          </div>
+
+          <div class="row">
+            <div class="label"><b>下载管理</b><span>{{ download.tasks.length ? `${download.tasks.length} 条记录 · ${download.runningCount} 个进行中` : '暂无下载记录' }}</span></div>
+            <button class="btn sm" @click="router.push('/downloads')"><Icon name="download" :size="14" />打开下载管理</button>
           </div>
         </section>
 
@@ -1831,13 +1993,66 @@ onBeforeUnmount(stopPoll)
       </template>
     </Modal>
 
-    <!-- 视频源登录 -->
-    <Modal v-model="qrOpen" title="视频源扫码登录" :width="380">
-      <div class="qr-box">
+    <!-- 视频源登录：扫码 / 账号密码 / Cookie 三种方式 -->
+    <Modal v-model="qrOpen" title="视频源账号登录" :width="400">
+      <div class="login-tabs">
+        <button class="login-tab" :class="{ on: loginTab === 'qr' }" @click="switchLoginTab('qr')">
+          <Icon name="qr" :size="14" />扫码登录
+        </button>
+        <button class="login-tab" :class="{ on: loginTab === 'pwd' }" @click="switchLoginTab('pwd')">
+          <Icon name="lock" :size="14" />账号密码
+        </button>
+        <button class="login-tab" :class="{ on: loginTab === 'cookie' }" @click="switchLoginTab('cookie')">
+          <Icon name="edit" :size="14" />Cookie
+        </button>
+      </div>
+
+      <!-- 扫码 -->
+      <div v-if="loginTab === 'qr'" class="qr-box">
         <img v-if="qrImg" :src="qrImg" class="qr" alt="视频源登录二维码" />
         <div v-else class="qr-placeholder"><Icon name="qr" :size="40" :stroke="1.2" /></div>
         <p class="qr-status">{{ qrStatus }}</p>
+        <div class="qr-actions">
+          <button v-if="isMobileApp" class="btn sm primary" @click="openBiliApp">
+            <Icon name="external" :size="14" />拉起哔哩哔哩确认登录
+          </button>
+          <button class="btn sm ghost" @click="startBiliLogin"><Icon name="refresh" :size="14" />刷新二维码</button>
+        </div>
         <p class="qr-tip">登录态仅保存在本机，用于获取更高清晰度的视频与音频流。</p>
+      </div>
+
+      <!-- 账号密码 -->
+      <div v-else-if="loginTab === 'pwd'" class="login-form">
+        <label class="lf-field">
+          <span>账号（手机号 / 邮箱）</span>
+          <input v-model="pwdUser" type="text" autocomplete="username" placeholder="B 站账号" />
+        </label>
+        <label class="lf-field">
+          <span>密码</span>
+          <input v-model="pwdPass" type="password" autocomplete="current-password" placeholder="密码" @keyup.enter="biliPwdLogin" />
+        </label>
+        <p v-if="pwdErr" class="login-err">{{ pwdErr }}</p>
+        <button class="btn primary wide" :disabled="pwdBusy" @click="biliPwdLogin">
+          {{ pwdBusy ? '正在登录…' : '登录' }}
+        </button>
+        <p class="lf-tip">若 B 站触发风控验证，会提示改用扫码或 Cookie 登录。</p>
+      </div>
+
+      <!-- Cookie -->
+      <div v-else class="login-form">
+        <label class="lf-field">
+          <span>粘贴整串 Cookie 或仅 SESSDATA 值</span>
+          <textarea
+            v-model="ckText"
+            rows="5"
+            placeholder="SESSDATA=xxx; buvid3=xxx; …（或只粘贴 SESSDATA 的值）"
+          ></textarea>
+        </label>
+        <p v-if="ckErr" class="login-err">{{ ckErr }}</p>
+        <button class="btn primary wide" :disabled="ckBusy" @click="biliCkLogin">
+          {{ ckBusy ? '正在校验…' : '校验并登录' }}
+        </button>
+        <p class="lf-tip">获取方式：浏览器登录 B 站 → F12 → 应用/存储 → Cookies → 复制 bilibili.com 的 Cookie。</p>
       </div>
     </Modal>
   </div>
@@ -2610,6 +2825,97 @@ kbd {
   align-items: center;
   gap: 10px;
   padding: 6px 0 10px;
+}
+/* ---- 登录弹窗：三方式页签 ---- */
+.login-tabs {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 14px;
+  padding: 4px;
+  border-radius: 12px;
+  background: var(--bg-3);
+}
+.login-tab {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: 8px 0;
+  border: none;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 12.5px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.login-tab.on {
+  background: var(--panel);
+  color: var(--text);
+  font-weight: 600;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.18);
+}
+.qr-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: center;
+}
+.login-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 6px 0 10px;
+}
+.lf-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.lf-field span {
+  font-size: 12px;
+  color: var(--text-2);
+}
+.lf-field input,
+.lf-field textarea {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-3);
+  color: var(--text);
+  font-size: 13px;
+  outline: none;
+  resize: vertical;
+  box-sizing: border-box;
+}
+.lf-field input:focus,
+.lf-field textarea:focus {
+  border-color: var(--accent);
+}
+.login-err {
+  margin: 0;
+  font-size: 12px;
+  color: #ff8b9c;
+  word-break: break-all;
+}
+.lf-tip {
+  margin: 0;
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--text-2);
+  opacity: 0.85;
+}
+.btn.wide {
+  width: 100%;
+  justify-content: center;
+}
+@media (max-width: 460px) {
+  .qr-box :deep(.qr) {
+    width: 180px;
+    height: 180px;
+  }
 }
 .qr {
   width: 220px;

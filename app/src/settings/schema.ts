@@ -19,6 +19,7 @@ export type SettingCat =
   | 'playback'
   | 'lyric'
   | 'video'
+  | 'download'
   | 'sources'
   | 'local'
   | 'cache'
@@ -370,6 +371,17 @@ export const SETTING_SCHEMA: SettingDef[] = [
   },
   { key: 'danmakuAntiSubtitle', cat: 'video', label: '防挡字幕', desc: '底部区域不投放滚动弹幕', kw: 'subtitle 字幕 遮挡', type: 'toggle' },
   { key: 'danmakuBlockWords', cat: 'video', label: '屏蔽词', desc: '每行一个，包含该词的弹幕不显示', kw: 'block 屏蔽 过滤 关键词', type: 'textarea' },
+
+  /* ---------------- 下载 ---------------- */
+  { key: 'downloadQuality', cat: 'download', label: '下载音质', desc: '跟随音质则与播放音质一致', kw: 'download quality 音质 下载 无损 flac 320', type: 'select', options: [
+    { value: '', label: '跟随全局音质' },
+    { value: '128k', label: '标准 128K' },
+    { value: '320k', label: '高品质 320K' },
+    { value: 'flac', label: '无损 FLAC' },
+    { value: 'flac24bit', label: 'Hi-Res 24bit' },
+  ] },
+  { key: 'downloadLrc', cat: 'download', label: '同时下载歌词', desc: '保存与歌曲同名的 .lrc 文件', kw: 'lrc lyric 歌词 下载', type: 'toggle' },
+  { key: 'downloadConcurrency', cat: 'download', label: '同时下载任务数', desc: '音源多为第三方，并发过高可能被限流', kw: 'concurrent 并发 任务 下载', type: 'slider', min: 1, max: 4, step: 1 },
 
   /* ---------------- 本地音乐 ---------------- */
   { key: 'scanOnStart', cat: 'local', label: '启动时扫描', desc: '每次启动自动扫描本地音乐目录', kw: 'scan 扫描 启动 本地', type: 'toggle' },

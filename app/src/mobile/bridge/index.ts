@@ -13,16 +13,16 @@
  *   - 播放器换成 src/mobile/player.ts（<audio>）
  */
 import type { Song } from '@shared/types'
+import axios from 'axios'
 import { emit, subscribe } from '../bus'
 import { fail, ok } from './envelope'
 import { player } from '../player'
 import * as vfs from '../shims/vfs'
 import { seedSources } from '../seed'
-import { registerBufferGlobal, patchFetch } from '../shims/util'
+import { registerBufferGlobal, patchFetch, patchNativeFetch, isNativeWebView } from '../shims/util'
 import { initDb, setSqlJsLoader } from '../../../electron/core/db'
 import { lxHost } from '../../../electron/core/lx-host'
 import * as mfHost from '../../../electron/core/mf-host'
-import { initBiliLogin } from '../../../electron/core/bili'
 import { loadSettings, saveSettings, getSettings } from '../../../electron/core/settings'
 import { userDataDir } from '../../../electron/core/paths'
 import { dbStats, playStats, favoriteIds, favoriteSongs, toggleFavorite, historySongs, addHistory, clearHistory, listPlaylists, createPlaylist, updatePlaylist, deletePlaylist, playlistSongs, addSongsToPlaylist, removeSongFromPlaylist, reorderPlaylist, getSongs, localSongs, localCount, removeLocalSongs, dbGetSetting, dbSetSetting, isFavorite } from '../../../electron/core/db'
@@ -31,7 +31,13 @@ import {
   getNewSongs, importPlaylist, searchMv, getMvInfo, getMvParts, getMvUrl, getPodcastEpisodes,
 } from '../../../electron/core/music-service'
 import { buildHomeFeed } from '../../../electron/core/recommend'
-import { biliStatus, biliQrGenerate, biliQrPoll, biliLogout } from '../../../electron/core/bili'
+// 注意：必须走 shims 版（localStorage 登录态）。providers/music-service 通过 vite
+// 别名 './bili' 也解析到同一份 shim——若这里直连 electron/core/bili 会出现两份
+// 各自独立的登录态（设置页显示已登录、实际取流却未登录）。
+import {
+  initBiliLogin, biliStatus, biliQrGenerate, biliQrPoll, biliLogout,
+  biliCookieLogin, biliPasswordLogin,
+} from '../shims/bili-bridge'
 
 let started = false
 
@@ -41,9 +47,14 @@ async function boot(): Promise<void> {
 
   // 0) 全局 Buffer + fetch 代理：electron/core/lx-host.ts 的音源沙箱直接注入
   //    全局 Buffer，electron/core/http.ts 用裸 fetch——两者在浏览器里都不可用。
-  //    顺序：先 patchFetch（让 http.ts 的 fetch 走同源代理），再 registerBufferGlobal。
+  //    顺序：先 patchFetch（冒烟环境改走同源 /__cors 代理），再 registerBufferGlobal。
   patchFetch()
   registerBufferGlobal()
+  // 真机：跨域 fetch 走 Capacitor 原生 HTTP（无 CORS）——二维码/推荐/歌单等全靠它
+  await patchNativeFetch()
+  // 插件沙箱里的 axios 默认用 XHR（同样受 CORS 限制），真机切到 fetch adapter
+  //（已被上面的原生 fetch 兜住）
+  if (isNativeWebView()) (axios as any).defaults.adapter = 'fetch'
 
   // 1) 虚拟文件系统：先本地恢复，再用内置音源种子播种
   await vfs.initFs()
@@ -270,11 +281,23 @@ const handlers: Record<string, Handler> = {
   'library:count': () => localCount(),
   'library:remove': ({ paths }: any) => { removeLocalSongs(paths || []); return localSongs() },
 
+  /* ---- 下载：WebView 沙盒没有对外文件系统写权限，诚实返回 ---- */
+  'download:list': () => [],
+  'download:dir': () => '',
+  'download:pickDir': async () => '',
+  'download:openDir': NOP_OK,
+  'download:add': UNSUPPORTED('下载到本地文件（请使用桌面版）'),
+  'download:cancel': NOP_OK,
+  'download:remove': NOP_OK,
+  'download:clear': NOP_OK,
+
   /* ---- B 站 ---- */
   'bili:status': () => biliStatus(),
   'bili:qr': () => biliQrGenerate(),
   'bili:poll': ({ key }: any) => biliQrPoll(key),
   'bili:logout': () => biliLogout(),
+  'bili:cookieLogin': ({ cookie }: any) => biliCookieLogin(String(cookie || '')),
+  'bili:passwordLogin': ({ username, password }: any) => biliPasswordLogin(String(username || ''), String(password || '')),
 
   /* ---- 窗口 / 歌词：移动端 no-op ---- */
   'win:minimize': NOP_OK,

@@ -32,6 +32,7 @@
     "mobile:smoke": "electron --no-sandbox scripts/mobile-smoke.mjs"
   },
   "dependencies": {
+    "@capacitor-community/http": "^1.4.1",
     "@capacitor/android": "^6.2.2",
     "@capacitor/core": "^6.2.2",
     "axios": "^1.20.0",

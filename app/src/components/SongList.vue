@@ -9,6 +9,7 @@ import type { MenuItem } from './menu-types'
 import { usePlayerStore } from '@/stores/player'
 import { useLibraryStore } from '@/stores/library'
 import { useUiStore } from '@/stores/ui'
+import { useDownloadStore } from '@/stores/download'
 import { platformLabel } from '@/utils/labels'
 
 const props = withDefaults(
@@ -40,6 +41,7 @@ const emit = defineEmits<{ (e: 'remove', index: number): void }>()
 const player = usePlayerStore()
 const library = useLibraryStore()
 const ui = useUiStore()
+const download = useDownloadStore()
 
 const menu = ref<{ x: number; y: number; index: number } | null>(null)
 
@@ -58,11 +60,13 @@ function menuItems(index: number): MenuItem[] {
   const s = props.songs[index]
   if (!s) return []
   const fav = library.isFavorite(s.id)
+  const downloadable = s.source !== 'local' && !s.localPath
   return [
     { label: '立即播放', icon: 'play' },
     { label: '下一首播放', icon: 'arrow-down' },
     { label: '添加到歌单', icon: 'plus' },
     { label: fav ? '取消喜欢' : '喜欢', icon: fav ? 'heart-filled' : 'heart' },
+    ...(downloadable ? [{ label: '下载', icon: 'download' }] : []),
     ...(props.playlistId ? [{ divider: true, label: '' }, { label: '从歌单移除', icon: 'trash', danger: true }] : []),
   ]
 }
@@ -73,11 +77,19 @@ async function onMenuSelect(i: number): Promise<void> {
   const s = props.songs[m.index]
   menu.value = null
   if (!s) return
-  if (i === 0) play(m.index)
-  else if (i === 1) await player.addNext(s)
-  else if (i === 2) ui.playlistPickerSong = s
-  else if (i === 3) await library.toggleFavorite(s)
-  else if (i === 4 && props.playlistId) {
+  // 按 label 匹配而不是按下标：菜单项会随「是否本地歌曲 / 是否歌单内」增减，
+  // 写死下标在本地歌曲场景会把「从歌单移除」错位到下载上。
+  const items = menuItems(m.index)
+  const label = items[i]?.label
+  if (label === '立即播放') play(m.index)
+  else if (label === '下一首播放') await player.addNext(s)
+  else if (label === '添加到歌单') ui.playlistPickerSong = s
+  else if (label === '喜欢' || label === '取消喜欢') await library.toggleFavorite(s)
+  else if (label === '下载') {
+    const n = await download.add([s])
+    ui.toast(n ? '已加入下载队列' : '该歌曲已在下载记录中', n ? 'success' : 'info', 1800)
+  }
+  else if (label === '从歌单移除' && props.playlistId) {
     await library.removeSong(props.playlistId, s.id)
     emit('remove', m.index)
   }

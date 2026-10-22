@@ -76,6 +76,10 @@ const DEFAULT: AppSettings = {
   proxyEnabled: false,
   proxyUrl: '',
   listDensity: 'standard',
+  downloadDir: '',
+  downloadQuality: '',
+  downloadLrc: true,
+  downloadConcurrency: 2,
 }
 
 let toastSeq = 1

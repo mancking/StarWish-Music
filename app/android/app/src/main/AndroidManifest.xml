@@ -43,6 +43,17 @@
     <uses-permission android:name="android.permission.INTERNET" />
 
     <!--
+      B 站扫码登录「拉起客户端」：Android 11+ 的包可见性过滤要求显式声明
+      要跳转的 scheme，否则 bilibili:// 链接无法解析到哔哩哔哩 App。
+    -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="bilibili" />
+        </intent>
+    </queries>
+
+    <!--
       车机端（Android Automotive OS 及国内 Android 车机）兼容声明。
       这两条 required=false 是「允许安装」而非「要求能力」：
       · type.automotive —— 让 AAOS 车机允许安装本应用；

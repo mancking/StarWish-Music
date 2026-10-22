@@ -240,6 +240,16 @@ export interface AppSettings {
   /* ---------------- 列表密度 ---------------- */
   /** 列表行高：紧凑 / 标准 / 宽松 */
   listDensity: 'compact' | 'standard' | 'relaxed'
+
+  /* ---------------- 下载 ---------------- */
+  /** 下载目录，空字符串表示系统「下载/StarWish」 */
+  downloadDir: string
+  /** 下载音质，空字符串跟随全局音质 */
+  downloadQuality: string
+  /** 下载时同时保存同名 .lrc */
+  downloadLrc: boolean
+  /** 下载并发数 1-4 */
+  downloadConcurrency: number
 }
 
 /** 壁纸条目（图片壁纸库） */

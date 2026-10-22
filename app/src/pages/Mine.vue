@@ -3,14 +3,17 @@ import { computed } from 'vue'
 import { useRouter } from 'vue-router'
 import Icon from '@/components/Icon.vue'
 import { useLibraryStore } from '@/stores/library'
+import { useDownloadStore } from '@/stores/download'
 
 /** 「我的」二级中枢页（移动端多级跳转）：底栏不平铺，
  *  歌单/历史/本地/MV/设置等二级入口集中在这里，点入后走正常路由栈、返回键回退。 */
 const router = useRouter()
 const library = useLibraryStore()
+const download = useDownloadStore()
 
 const quick = computed(() => [
   { path: '/favorites', icon: 'heart', label: '我喜欢的音乐', meta: library.favoriteCount ? `${library.favoriteCount} 首` : '' },
+  { path: '/downloads', icon: 'download', label: '下载管理', meta: download.runningCount ? `${download.runningCount} 个进行中` : download.tasks.length ? `${download.tasks.length} 条记录` : '' },
   { path: '/history', icon: 'clock', label: '最近播放', meta: library.history.length ? `${library.history.length} 首` : '' },
   { path: '/local', icon: 'folder', label: '本地音乐', meta: library.localCount ? `${library.localCount} 首` : '' },
   { path: '/mv', icon: 'video', label: '视频 / MV', meta: '' },
@@ -25,7 +28,7 @@ const go = (path: string) => void router.push(path)
     <header class="head">
       <div>
         <h1>我的</h1>
-        <p>收藏、歌单与本地内容</p>
+        <p>收藏、下载、歌单与本地内容</p>
       </div>
     </header>
 

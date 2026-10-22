@@ -124,6 +124,80 @@ export function patchFetch(): void {
   ;(globalThis as any).fetch = patched
 }
 
+/**
+ * 真机原生 fetch：把全局 fetch 的**跨域 http(s) 请求**改走 Capacitor 原生
+ * HTTP 插件（@capacitor-community/http，无 CORS 概念），返回真实 Response
+ * 对象（.json()/.text()/.headers 照常用）。
+ *
+ * `electron/core/http.ts` 的 request() 已在内部走原生通道；这里再兜一层是给
+ * 直接用裸 fetch 的消费者（MusicFree 插件沙箱里 axios 的 fetch adapter 等）。
+ * 同源（https://localhost 的静态资源）与 blob:/data: 一律透传原生 fetch。
+ */
+export async function patchNativeFetch(): Promise<void> {
+  if (!isNativeWebView()) return
+  const orig = (globalThis as any).fetch
+  if (!orig || orig.__starwishNative) return
+  let httpMod: any = null
+  const getHttp = async (): Promise<any> => {
+    if (!httpMod) httpMod = await import('@capacitor-community/http')
+    return httpMod.Http
+  }
+  const nativeFetch = async (input: any, init?: any) => {
+    let url = ''
+    try {
+      url = typeof input === 'string' ? input : String(input?.url ?? input ?? '')
+    } catch {
+      url = ''
+    }
+    let external = false
+    try {
+      const t = new URL(url, location.origin)
+      external = /^https?:$/.test(t.protocol) && t.origin !== location.origin
+    } catch {
+      external = false
+    }
+    if (!external) return orig(input, init)
+    const Http = await getHttp()
+    const method = String(init?.method || (typeof input === 'object' && input?.method) || 'GET').toUpperCase()
+    const headers: Record<string, string> = {}
+    const src = init?.headers ?? (typeof input === 'object' ? input?.headers : null)
+    if (src) {
+      if (typeof src.forEach === 'function') src.forEach((v: any, k: string) => { headers[k] = String(v) })
+      else if (Array.isArray(src)) src.forEach(([k, v]: any) => { headers[k] = String(v) })
+      else Object.keys(src).forEach(k => { headers[k] = String(src[k]) })
+    }
+    let data: string | undefined
+    if (init?.body && method !== 'GET' && method !== 'HEAD') {
+      data = typeof init.body === 'string' ? init.body : String(init.body)
+      if (!Object.keys(headers).some(k => k.toLowerCase() === 'content-type')) {
+        headers['Content-Type'] = 'application/json'
+      }
+    }
+    const res = await Http.request({
+      url,
+      method,
+      headers,
+      data,
+      responseType: 'text',
+      connectTimeout: 15000,
+      readTimeout: 30000,
+    })
+    const hs = new Headers()
+    for (const k of Object.keys(res.headers || {})) {
+      const v = (res.headers as any)[k]
+      if (Array.isArray(v)) v.forEach((x: any) => hs.append(k, String(x)))
+      else hs.append(k, String(v))
+    }
+    const bodyText = res.data !== null && typeof res.data === 'object' ? JSON.stringify(res.data) : String(res.data ?? '')
+    const status = Number(res.status) || 200
+    // 101/204/205/304 不允许带 body
+    const nullBody = status === 101 || status === 204 || status === 205 || status === 304
+    return new Response(nullBody ? null : bodyText, { status, headers: hs })
+  }
+  ;(nativeFetch as any).__starwishNative = true
+  ;(globalThis as any).fetch = nativeFetch
+}
+
 export function format(fmt: string, ...args: any[]): string {
   let i = 0
   return String(fmt).replace(/%[sdifjoO%]/g, (s: string) => {

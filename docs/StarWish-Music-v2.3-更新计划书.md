@@ -13,6 +13,7 @@
 | R1 | 2026-10-22 | 初稿：三端范围、四类壁纸引擎 |
 | R2 | 2026-10-22 | 按决策修订：范围扩至五端（新增 macOS / Linux / iOS）；壁纸引擎收窄为**仅图片**；WebDAV 纳入本版；新增「设置中心重构」专章；新增「播放页透明叠字」缺陷；补充源码级设置体系对标 |
 | R3 | 2026-10-22 | 确认构建环境走 GitHub Actions / 云构建；iOS 不上架 App Store；WebDAV 首版仅「歌单 + 收藏」单向同步；新增「视频播放器调研与改进」专章（弹幕引擎、手势、进度记忆） |
+| R4 | 2026-10-22 | v2.3.0 发布收口：B 站登录修复与三方式增强（扫码 / 拉起客户端 / 账号密码 / Cookie）、真机跨域根因修复、下载功能多端接线；§3.4 / §9 构建矩阵纳入 **xtool**（无 Mac 构建 iOS），五端产物按最终代码重新产出并随 Release 发布 |
 
 ---
 
@@ -230,9 +231,9 @@ sources/   13 个音源脚本
 | macOS | electron-builder | dmg 需在 macOS 上构建；分发需 Apple Developer 证书 + 公证，否则用户需手动绕过 Gatekeeper |
 | Linux | electron-builder | AppImage / deb；AppImage 免安装最贴合「便携」定位 |
 | Android | Capacitor + Gradle | 需 JDK + Android SDK；APK 可直接侧载 |
-| iOS | Capacitor + Xcode | **必须 macOS + Xcode**；需 Apple Developer 账号、.p12 证书、provisioning profile；CI 可用 GitHub Actions `macos-14` |
+| iOS | Capacitor + Xcode / **xtool** | 传统路径必须 macOS + Xcode；**xtool（https://github.com/xtool-org/xtool）可在 Linux / Windows(WSL) / macOS 上构建、签名（支持免费与付费开发者团队）并直装真机**，摆脱「必须有 Mac」的硬约束；CI 可用 GitHub Actions `macos-14`（未签名 ipa） |
 
-这意味着：**当前开发机（Windows）无法直接产出 mac 与 iOS 包**。按已确认的决策，mac/iOS 统一走 **GitHub Actions（`macos-14` runner）或云构建服务**，本地只负责 Windows 与 Android。
+这意味着：**mac 包仍只能在 macOS 上构建**（CI `macos-14`）；iOS 则有两条路——CI 未签名 ipa（用户自签 / AltStore 安装），以及 **xtool 本机（WSL/Linux）构建 + 免费/付费证书签名 + `xtool install` 直装真机**。本地只负责 Windows 与 Android。
 
 ### 3.5 视频播放器
 
@@ -763,7 +764,8 @@ export interface MvProgress {
 | macOS dmg | `--mac dmg` | macOS 或 CI `macos-14` |
 | Linux AppImage / deb | `--linux AppImage deb` | Linux 或 CI `ubuntu-22.04` |
 | Android APK | `cap sync android && gradlew assembleRelease` | Windows + JDK17 + SDK |
-| iOS ipa | `cap sync ios && xcodebuild archive` | macOS + Xcode + 证书 |
+| iOS ipa（CI 默认） | `cap sync ios && xcodebuild archive`（未签名） | CI `macos-14` |
+| iOS ipa（xtool，可选） | `xtool dev`（SwiftPM 构建）→ `xtool install`（签名 + 直装真机） | Linux / Windows(WSL) / macOS，无需 Xcode；支持免费与付费开发者团队签名 |
 
 ### 9.2 平台适配点
 
@@ -782,7 +784,7 @@ GitHub Actions 三作业：
 - `build-mac`（macos-14）：dmg（无证书时产出未签名包，标注仅测试）
 - `build-linux`（ubuntu-22.04）：AppImage + deb
 - `build-android`（ubuntu + JDK17）：APK
-- `build-ios`（macos-14，需 secrets）：仅在配置了证书时运行，否则跳过并说明
+- `build-ios`（macos-14）：未签名 ipa（用户自签 / AltStore 安装）；需要签名分发时可改走 xtool（免费/付费团队证书）或自备 secrets
 
 ---
 

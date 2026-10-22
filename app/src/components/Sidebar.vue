@@ -4,12 +4,14 @@ import { useRoute, useRouter } from 'vue-router'
 import Icon from './Icon.vue'
 import { useLibraryStore } from '@/stores/library'
 import { useUiStore } from '@/stores/ui'
+import { useDownloadStore } from '@/stores/download'
 import brand from '@/assets/brand-icon.png'
 
 const route = useRoute()
 const router = useRouter()
 const library = useLibraryStore()
 const ui = useUiStore()
+const download = useDownloadStore()
 
 const creating = ref(false)
 const newName = ref('')
@@ -28,6 +30,7 @@ const online = [
 ]
 const mine = [
   { path: '/favorites', icon: 'heart', label: '我喜欢的音乐' },
+  { path: '/downloads', icon: 'download', label: '下载' },
   { path: '/local', icon: 'folder', label: '本地音乐' },
   { path: '/history', icon: 'clock', label: '最近播放' },
 ]
@@ -120,6 +123,7 @@ async function submitCreate(): Promise<void> {
           <Icon :name="item.icon" :size="17" />
           <span>{{ item.label }}</span>
           <span v-if="item.path === '/favorites' && library.favoriteCount" class="count">{{ library.favoriteCount }}</span>
+          <span v-if="item.path === '/downloads' && download.runningCount" class="count">{{ download.runningCount }}</span>
           <span v-if="item.path === '/local' && library.localCount" class="count">{{ library.localCount }}</span>
         </button>
       </div>

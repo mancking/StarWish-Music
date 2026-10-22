@@ -9,6 +9,7 @@
  */
 import type { Song } from '../../../shared/types'
 import { request, qs, UA } from '../../../electron/core/http'
+import { rsaEncryptB64 } from '../../../electron/core/bili-rsa'
 
 const KEY = 'starwish.bili-login'
 const BUV_KEY = 'starwish.buvid'
@@ -20,9 +21,11 @@ interface LoginState {
   avatar: string
   at: number
   buvid: string
+  buvid3: string
+  buvid4: string
 }
 
-let state: LoginState = { sessdata: '', mid: '', uname: '', avatar: '', at: 0, buvid: '' }
+let state: LoginState = { sessdata: '', mid: '', uname: '', avatar: '', at: 0, buvid: '', buvid3: '', buvid4: '' }
 
 function load(): void {
   let raw: any = null
@@ -33,30 +36,60 @@ function load(): void {
     uname: String(raw?.uname || ''),
     avatar: String(raw?.avatar || ''),
     at: Number(raw?.at || 0),
-    buvid: String(raw?.buvid || localStorage.getItem(BUV_KEY) || ''),
+    buvid: String(raw?.buvid || ''),
+    buvid3: String(raw?.buvid3 || ''),
+    buvid4: String(raw?.buvid4 || ''),
   }
+  // 兼容旧版只存 buvid 的登录态
+  if (!state.buvid3 && state.buvid) state.buvid3 = state.buvid
 }
 
 function save(): void {
   try {
     localStorage.setItem(KEY, JSON.stringify(state))
-    if (state.buvid) localStorage.setItem(BUV_KEY, state.buvid)
+    if (state.buvid3) localStorage.setItem(BUV_KEY, state.buvid3)
   } catch { /* 隐私模式：忽略 */ }
 }
 
 export function initBiliLogin(): void {
   load()
-  if (!state.buvid) {
+  if (!state.buvid3) {
     const b = new Uint8Array(8)
     crypto.getRandomValues(b)
-    state.buvid = 'BUV3' + Array.from(b).map(x => x.toString(16).padStart(2, '0')).join('').toUpperCase()
+    state.buvid3 = 'BUV3' + Array.from(b).map(x => x.toString(16).padStart(2, '0')).join('').toUpperCase()
+    state.buvid = state.buvid3
     save()
   }
+  void ensureBuvid()
+}
+
+/**
+ * 取真实 buvid3/buvid4（finger/spi）。B 站对假 buvid 的 passport 请求有风控
+ * （-352 / 二维码获取失败），generate/poll 前确保带真实 buvid。
+ */
+async function ensureBuvid(): Promise<void> {
+  if (state.buvid3 && state.buvid4) return
+  try {
+    const res = await request('https://api.bilibili.com/x/frontend/finger/spi', {
+      headers: { 'User-Agent': UA, Referer: 'https://www.bilibili.com/' },
+      timeout: 12000,
+    })
+    const d = res.body?.data
+    if (d?.b_3 && d?.b_4) {
+      state.buvid3 = String(d.b_3)
+      state.buvid4 = String(d.b_4)
+      state.buvid = state.buvid3
+      save()
+    }
+  } catch { /* 网络不佳时保留本地生成的 buvid3 */ }
 }
 
 export function biliCookie(): string {
-  const base = `buvid3=${state.buvid}`
-  return state.sessdata ? `${base}; SESSDATA=${state.sessdata}` : base
+  const parts: string[] = []
+  if (state.buvid3) parts.push(`buvid3=${state.buvid3}`)
+  if (state.buvid4) parts.push(`buvid4=${state.buvid4}`)
+  if (state.sessdata) parts.push(`SESSDATA=${state.sessdata}`)
+  return parts.join('; ') || 'buvid3=none'
 }
 
 export function biliHeaders(): Record<string, string> {
@@ -79,19 +112,23 @@ export function biliStatus() {
 }
 
 export async function biliQrGenerate(): Promise<{ url: string; key: string }> {
+  await ensureBuvid()
   const res = await request(
     `https://passport.bilibili.com/x/passport-login/web/qrcode/generate?${qs({ source: 'main-fe-header' })}`,
-    { headers: { 'User-Agent': UA, Referer: 'https://www.bilibili.com/' }, timeout: 15000 }
+    { headers: biliHeaders(), timeout: 15000 }
   )
   const d = res.body?.data
-  if (!d?.qrcode_key) throw new Error('二维码获取失败，请检查网络')
+  if (!d?.qrcode_key) {
+    const msg = res.body?.message ? `二维码获取失败：${res.body.message}` : '二维码获取失败，请检查网络'
+    throw new Error(msg)
+  }
   return { url: d.url || '', key: d.qrcode_key }
 }
 
 export async function biliQrPoll(key: string): Promise<{ ok: boolean; status: string; message?: string }> {
   const res = await request(
     `https://passport.bilibili.com/x/passport-login/web/qrcode/poll?${qs({ qrcode_key: key, source: 'main-fe-header' })}`,
-    { headers: { 'User-Agent': UA, Referer: 'https://www.bilibili.com/' }, timeout: 15000 }
+    { headers: biliHeaders(), timeout: 15000 }
   )
   const d = res.body?.data || {}
   const code = Number(d.code)
@@ -124,6 +161,112 @@ export async function biliQrPoll(key: string): Promise<{ ok: boolean; status: st
 export function biliLogout() {
   state = { ...state, sessdata: '', mid: '', uname: '', avatar: '', at: 0 }
   save()
+  return biliStatus()
+}
+
+/** 用登录态调 nav 校验并回填用户信息；返回是否有效登录 */
+async function verifyAndSave(): Promise<boolean> {
+  try {
+    const nav = await request('https://api.bilibili.com/x/web-interface/nav', {
+      headers: biliHeaders(),
+      timeout: 12000,
+    })
+    const nd = nav.body?.data || {}
+    if (nav.body?.code === -101 || !nd.isLogin) return false
+    if (nd.uname) state.uname = nd.uname
+    if (nd.face) state.avatar = nd.face
+    if (nd.mid) state.mid = String(nd.mid)
+    state.at = Date.now()
+    save()
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** 从粘贴内容里提取 SESSDATA（支持整串 Cookie / 裸值 / URL 编码值） */
+function extractSessdata(input: string): string {
+  const text = String(input || '').trim()
+  if (!text) return ''
+  const m = text.match(/SESSDATA=([^;\s]+)/i)
+  if (m) return decodeURIComponent(m[1])
+  if (/^[A-Za-z0-9%,*-]+$/.test(text)) return decodeURIComponent(text)
+  return ''
+}
+
+/** Cookie 登录：粘贴浏览器复制的整串 Cookie 或仅 SESSDATA，nav 校验通过即登录 */
+export async function biliCookieLogin(input: string) {
+  const sessdata = extractSessdata(input)
+  if (!sessdata) throw new Error('未识别到 SESSDATA，请粘贴完整 Cookie 或仅 SESSDATA 值')
+  state.sessdata = sessdata
+  const ok = await verifyAndSave()
+  if (!ok) {
+    state.sessdata = ''
+    save()
+    throw new Error('Cookie 无效或已过期，请重新复制')
+  }
+  return biliStatus()
+}
+
+/** 密码登录错误码 → 友好提示 */
+function pwdErrHint(code: number, msg: string): string {
+  if (code === -105) return '本次登录触发了风控验证（极验），请改用扫码登录或 Cookie 登录'
+  if (code === -629) return '账号或密码错误'
+  if (code === -619) return '账号不存在'
+  if (code === -610) return '手机号格式不正确'
+  if (code === -611 || code === -612) return '验证码错误，请重试'
+  return msg || `登录失败（${code}）`
+}
+
+/** 账号密码登录：web/key 取公钥 → RSA/PKCS1 加密(hash+password) → web/login */
+export async function biliPasswordLogin(username: string, password: string) {
+  const user = String(username || '').trim()
+  const pwd = String(password || '')
+  if (!user || !pwd) throw new Error('请输入账号与密码')
+  await ensureBuvid()
+
+  const keyRes = await request('https://passport.bilibili.com/x/passport-login/web/key', {
+    headers: biliHeaders(),
+    timeout: 15000,
+  })
+  const kd = keyRes.body?.data
+  if (keyRes.body?.code !== 0 || !kd?.key || !kd?.hash) {
+    throw new Error(keyRes.body?.message || '获取登录公钥失败，请重试')
+  }
+
+  let encrypted: string
+  try {
+    encrypted = rsaEncryptB64(String(kd.key), `${kd.hash}${pwd}`)
+  } catch {
+    throw new Error('密码加密失败，请重试')
+  }
+
+  const res = await request('https://passport.bilibili.com/x/passport-login/web/login', {
+    method: 'POST',
+    headers: {
+      ...biliHeaders(),
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: qs({
+      username: user,
+      password: encrypted,
+      keep_me: 'true',
+      source: 'main-fe-header',
+    }),
+    timeout: 15000,
+  })
+
+  const code = Number(res.body?.code)
+  if (code !== 0) {
+    throw new Error(pwdErrHint(code, String(res.body?.message || '')))
+  }
+  const raw = res.headers['set-cookie'] || ''
+  const jar = Array.isArray(raw) ? raw.join(';;') : String(raw)
+  const sessMatch = jar.match(/SESSDATA=([^;]+)/)
+  if (!sessMatch) throw new Error('登录成功但未获取到凭证，请重试')
+  state.sessdata = decodeURIComponent(sessMatch[1])
+  const ok = await verifyAndSave()
+  if (!ok) throw new Error('登录态校验失败，请重试')
   return biliStatus()
 }
 
@@ -221,5 +364,7 @@ export async function importBiliSeason(sid: string): Promise<{
 
 export default {
   initBiliLogin, biliCookie, biliHeaders, biliStatus,
-  biliQrGenerate, biliQrPoll, biliLogout, importBiliSeason, biliSubtitleLrc,
+  biliQrGenerate, biliQrPoll, biliLogout,
+  biliCookieLogin, biliPasswordLogin,
+  importBiliSeason, biliSubtitleLrc,
 }

@@ -77,6 +77,10 @@ export const DEFAULT_SETTINGS: AppSettings = {
   proxyEnabled: false,
   proxyUrl: '',
   listDensity: 'standard',
+  downloadDir: '',
+  downloadQuality: '',
+  downloadLrc: true,
+  downloadConcurrency: 2,
 }
 
 let cache: AppSettings = { ...DEFAULT_SETTINGS }

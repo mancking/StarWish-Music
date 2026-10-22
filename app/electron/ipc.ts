@@ -27,6 +27,16 @@ import { player } from './core/player-service'
 import { listWallpapers, saveWallpaper, removeWallpaper, renameWallpaper, importWallpaperFromPath } from './core/wallpaper'
 import { getDanmaku } from './core/danmaku'
 import { testConnection, uploadBackup } from './core/webdav'
+import {
+  addDownloads,
+  cancelDownload,
+  clearDownloads,
+  downloadDir,
+  listDownloads,
+  removeDownload,
+  restoreDownloads,
+  setDownloadEmitter,
+} from './core/download'
 import { getSettings, saveSettings } from './core/settings'
 import { applyTitleBarTheme, broadcast, sendToMain, setLyricLock, showLyricWindow, showTaskbarLyric, wins } from './windows'
 import {
@@ -52,7 +62,7 @@ import {
   toggleFavorite,
   updatePlaylist,
 } from './core/db'
-import { biliLogout, biliQrGenerate, biliQrPoll, biliStatus } from './core/bili'
+import { biliLogout, biliQrGenerate, biliQrPoll, biliStatus, biliCookieLogin, biliPasswordLogin } from './core/bili'
 import { cancelScan, getScanProgress, scanLibrary } from './core/library'
 import { coverCacheSize, clearCoverCache, coverProtocolUrl } from './core/cover'
 import { downloadMediaTo, releaseMediaCache, saveOfflineVideo, listOfflineVideos, removeOfflineVideos, offlineVideoFile } from './core/media'
@@ -536,6 +546,8 @@ const handlers: Record<string, Handler> = {
   'bili:qr': () => biliQrGenerate(),
   'bili:poll': ({ key }: any) => biliQrPoll(key),
   'bili:logout': () => biliLogout(),
+  'bili:cookieLogin': ({ cookie }: any) => biliCookieLogin(String(cookie || '')),
+  'bili:passwordLogin': ({ username, password }: any) => biliPasswordLogin(String(username || ''), String(password || '')),
 
   /* ---------------- 窗口 ---------------- */
   'win:minimize': () => {
@@ -608,6 +620,28 @@ const handlers: Record<string, Handler> = {
   // ---------------- WebDAV 备份（单向） ----------------
   'webdav:test': () => testConnection(),
   'webdav:upload': () => uploadBackup(),
+
+  // ---------------- 下载 ----------------
+  'download:add': ({ songs, quality }: any) => addDownloads(songs || [], quality),
+  'download:list': () => listDownloads(),
+  'download:cancel': ({ id }: any) => ({ ok: cancelDownload(String(id || '')) }),
+  'download:remove': ({ id, deleteFile }: any) => ({ ok: removeDownload(String(id || ''), !!deleteFile) }),
+  'download:clear': ({ onlyFinished }: any) => ({ count: clearDownloads(onlyFinished !== false) }),
+  'download:dir': () => downloadDir(),
+  'download:openDir': async () => {
+    await shell.openPath(downloadDir())
+    return true
+  },
+  'download:pickDir': async () => {
+    const r = await dialog.showOpenDialog(wins.main!, {
+      title: '选择下载目录',
+      properties: ['openDirectory', 'createDirectory'],
+    })
+    if (r.canceled || !r.filePaths[0]) return ''
+    saveSettings({ downloadDir: r.filePaths[0] })
+    broadcast('settings:changed', getSettings())
+    return r.filePaths[0]
+  },
   // kind: cache | cover | media —— 三类目录各自可改，均把旧内容搬到新位置
   'cache:setDir': ({ dir, kind = 'cache' }: any) => {
     const target = String(dir || '').trim()
@@ -752,6 +786,8 @@ const handlers: Record<string, Handler> = {
 }
 
 export function registerIpc(): void {
+  restoreDownloads()
+  setDownloadEmitter(t => broadcast('download:progress', t))
   ipcMain.handle('sw:invoke', async (event, channel: string, payload: any) => {
     const fn = handlers[channel]
     if (!fn) {

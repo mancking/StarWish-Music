@@ -12,12 +12,33 @@ import AddToPlaylistModal from '@/components/AddToPlaylistModal.vue'
 import ImportPlaylistModal from '@/components/ImportPlaylistModal.vue'
 import { usePlayerStore } from '@/stores/player'
 import { useUiStore } from '@/stores/ui'
+import { useDownloadStore } from '@/stores/download'
 import { on } from '@/api'
 
 const route = useRoute()
 const router = useRouter()
 const player = usePlayerStore()
 const ui = useUiStore()
+const download = useDownloadStore()
+
+/** 下载完成/失败时轻提示一次（按 id 去重，进度事件不会重复弹） */
+const dlNotified = new Set<string>()
+watch(
+  () => download.tasks,
+  list => {
+    for (const t of list) {
+      if (dlNotified.has(t.id)) continue
+      if (t.status === 'done') {
+        dlNotified.add(t.id)
+        ui.toast(`已下载《${t.song?.name || ''}》`, 'success', 2200)
+      } else if (t.status === 'error') {
+        dlNotified.add(t.id)
+        ui.toast(`下载失败：${t.song?.name || ''}`, 'error', 2600)
+      }
+    }
+  },
+  { deep: true }
+)
 
 const content = ref<HTMLElement | null>(null)
 const topbar = ref<InstanceType<typeof TopBar> | null>(null)
@@ -67,6 +88,8 @@ let offNavigate: (() => void) | null = null
 
 onMounted(() => {
   window.addEventListener('keydown', onKey)
+  // 下载队列全局初始化：侧栏计数、进度事件从启动就生效，不必等进入下载页
+  void download.init()
   offNavigate = on('app:navigate', (p: any) => {
     if (p?.route) router.push(p.route)
   })
