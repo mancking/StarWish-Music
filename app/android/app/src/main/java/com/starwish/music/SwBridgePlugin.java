@@ -157,6 +157,13 @@ public class SwBridgePlugin extends Plugin {
     }
 
     @PluginMethod
+    public void moveTaskToBack(PluginCall call) {
+        // 「退出」= 退到后台（保留播放），符合国内音乐 App 惯例；不杀进程
+        getActivity().moveTaskToBack(true);
+        call.resolve();
+    }
+
+    @PluginMethod
     public void deleteMedia(PluginCall call) {
         String uri = call.getString("uri");
         if (uri == null || uri.isEmpty()) {

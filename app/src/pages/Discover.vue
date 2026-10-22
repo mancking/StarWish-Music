@@ -187,10 +187,12 @@ async function loadPlaylists(page = 1): Promise<void> {
   const key = `pl|${plSource.value}|${catId.value}|${order.value}|${page}`
   const hit = plCache.get(key)
   if (hit) {
-    // 命中缓存：立即渲染（无骨架等待），再后台刷新
+    // 命中缓存：立即渲染（无骨架等待），**无论缓存多新都后台刷新**——
+    // v2.3.2 修复「切换歌单没反馈、要手动刷新」：原先 30s 防抖会吞掉切换后的
+    // 后台刷新，用户看到的永远是旧列表且无任何更新迹象
     applyPlaylists(hit.list, page)
     window.scrollTo({ top: 0 })
-    void revalidatePlaylists(key, page)
+    void revalidatePlaylists(key, page, true)
     return
   }
   plLoading.value = true
@@ -226,10 +228,12 @@ function applyPlaylists(list: PlaylistMeta[], page: number): void {
   else plError.value = ''
 }
 
-/** 后台静默刷新缓存数据；仅当该 key 仍是当前视图时替换界面 */
-async function revalidatePlaylists(key: string, page: number): Promise<void> {
+/** 后台静默刷新缓存数据；仅当该 key 仍是当前视图时替换界面。
+ *  force=true：用户主动切换触发的刷新，绕过 30s 防抖（保证切了就有新数据） */
+async function revalidatePlaylists(key: string, page: number, force = false): Promise<void> {
   const hit = plCache.get(key)
-  if (!hit || Date.now() - hit.ts < SWR_BG_MS) return
+  if (!hit) return
+  if (!force && Date.now() - hit.ts < SWR_BG_MS) return
   try {
     const list = await call<PlaylistMeta[]>('music:playlists', {
       cat: catId.value,

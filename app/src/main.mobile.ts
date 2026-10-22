@@ -19,6 +19,7 @@ import './styles/main.css'
 import './styles/mobile.css'
 import { installBridge } from './mobile/bridge'
 import { installPullRefresh } from './mobile/pull-refresh'
+import { installBackHandler } from './mobile/back-handler'
 
 async function bootstrap(): Promise<void> {
   // 平台感知：android / ios 分别注入（styles/platform.css 按此适配 HIG 细节，
@@ -61,6 +62,9 @@ async function bootstrap(): Promise<void> {
   // 不再让用户盯着 splash 等数据库/收藏/播放队列全部就绪。
   ;(window as any).__swStores = { player, library, ui }
   app.mount('#app')
+  // 系统返回（含手势）：MainActivity 统一转 backButton 事件，这里接管
+  // ——关弹层 → 回退 → 根页双击退后台，不再直接退出应用
+  installBackHandler(router)
   void Promise.all([ui.init(), player.init(), library.init()])
     .catch(err => console.error('[renderer] 启动初始化失败', err))
     .finally(() => {

@@ -3,17 +3,19 @@
  *
  * Android 用户的肌肉记忆是「边缘右滑 = 返回」（系统返回手势同向），桌面移植壳
  * 一直缺这一层，子页面只能靠顶栏返回键。这里在 document 上统一接管：
- *  - 起点在左缘 28px 内、横向位移 >72px 且明显大于纵向 → router.back()
+ *  - 起点在左缘 28px 内、横向位移 >72px 且明显大于纵向 → 触发统一返回处理
  *  - 跟手视觉：左缘出现一条高亮竖条，随手指下移/淡出
  *  - 排除 button/input/a/.slider 等交互元素，避免误伤横滑组件与滑杆
- *
- * 播放页有自己的整套手势（上/下滑、左右切歌），且它不是栈顶弹层，
- * 边缘返回同样适用（等价收起播放页）。
+ *  - v2.3.2：返回行为汇入 handleBack（关弹层 → 回退 → 根页双击退后台），
+ *    修复「根页边缘右滑直接退出应用」
  */
+import { handleBack } from './back-handler'
+import type { Router } from 'vue-router'
+
 const EDGE = 28
 const DIST = 72
 
-export function installEdgeBack(router: { back(): void }): void {
+export function installEdgeBack(router: Router): void {
   let startX = 0
   let startY = 0
   let tracking = false
@@ -65,7 +67,7 @@ export function installEdgeBack(router: { back(): void }): void {
         done = true
         tracking = false
         setBar(0, 0)
-        router.back()
+        handleBack(router)
       }
     },
     { passive: true },

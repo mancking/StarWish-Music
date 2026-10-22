@@ -207,14 +207,14 @@ async function main() {
       const want = '#/discover'
       for (let i = 0; i < 20; i++) {
         const txt = document.body.innerText
-        if (location.hash === want && /推荐歌单|榜单|标签/.test(txt)) {
+        if (location.hash === want && /歌单|排行|新歌|全部/.test(txt)) {
           return { hash: location.hash, hasTag: true, tries: i }
         }
         location.hash = want
         await new Promise(r => setTimeout(r, 300))
       }
       const txt = document.body.innerText
-      return { hash: location.hash, hasTag: /推荐歌单|榜单|标签/.test(txt), tried: 20 }
+      return { hash: location.hash, hasTag: /歌单|排行|新歌|全部/.test(txt), tried: 20 }
     })()
   `).catch((e) => ({ err: String(e && e.message) }))
   check('发现页路由可进入', !!(discover && discover.hasTag), discover)

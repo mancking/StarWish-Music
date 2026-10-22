@@ -785,3 +785,64 @@
 #app .m-shell .sk {
   border-radius: 10px;
 }
+
+/* ==================================================================
+   v2.3.2 真机显示问题修复层
+   ================================================================== */
+
+/* ---- 歌曲行：隐藏列不再占轨道，歌名单列吃满宽度、不再显示不全 ---- */
+#app .m-shell .song-list .list-head,
+#app .m-shell .song-list .row {
+  grid-template-columns: 34px minmax(0, 1fr) 46px !important;
+  gap: 10px;
+}
+#app .m-shell .song-list .row .col-idx {
+  width: 34px;
+}
+
+/* ---- 桌面 Home/Discover 的 hero 兜底（万一模板未切：按钮换行、标题完整） ---- */
+#app .m-shell .hero-actions {
+  flex-wrap: wrap;
+  gap: 10px;
+}
+#app .m-shell .hero-content h1 {
+  white-space: normal;
+  word-break: break-all;
+}
+#app .m-shell .hero-stats {
+  flex-wrap: wrap;
+}
+#app .m-shell .hero-content,
+#app .m-shell .crumb-title {
+  max-width: 100%;
+}
+#app .m-shell .ellipsis,
+#app .m-shell .clamp-2 {
+  /* 允许完整换行的容器内不再被父级裁切 */
+  max-width: 100%;
+}
+
+/* ---- MV 播放页：桌面双栏（视频+300px 侧栏）→ 移动单栏，视频满宽 ---- */
+#app .m-shell .mv-detail .watch {
+  grid-template-columns: minmax(0, 1fr);
+  gap: 14px;
+}
+#app .m-shell .mv-detail .side {
+  width: 100%;
+  max-width: none;
+  position: static;
+  max-height: none;
+  overflow: visible;
+}
+#app .m-shell .mv-detail .video-box {
+  border-radius: 14px;
+}
+
+/* ---- 歌单页 hero：描述与标题完整显示 ---- */
+#app .m-shell .hero-info .desc,
+#app .m-shell .hero-info p {
+  white-space: normal;
+  overflow: visible;
+  text-overflow: unset;
+  line-height: 1.6;
+}

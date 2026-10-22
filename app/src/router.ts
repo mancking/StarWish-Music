@@ -1,9 +1,27 @@
 import { createRouter, createWebHashHistory } from 'vue-router'
 
 const routes = [
-  { path: '/', name: 'home', component: () => import('@/pages/Home.vue'), meta: { title: '个性推荐' } },
-  { path: '/discover', name: 'discover', component: () => import('@/pages/Discover.vue'), meta: { title: '发现音乐' } },
-  { path: '/mv', name: 'mv', component: () => import('@/pages/Mv.vue'), meta: { title: '视频 / MV' } },
+  {
+    path: '/',
+    name: 'home',
+    // 移动端首页是全新模板（横滑卡片流），与桌面页头网格完全异构
+    component: () => (__MOBILE__ ? import('@/pages/mobile/Home.vue') : import('@/pages/Home.vue')),
+    meta: { title: '个性推荐' },
+  },
+  {
+    path: '/discover',
+    name: 'discover',
+    // 移动端发现页为模板级独立实现（分段 tab + 2 列大卡），与桌面三栏布局异构
+    component: () => (__MOBILE__ ? import('@/pages/mobile/Discover.vue') : import('@/pages/Discover.vue')),
+    meta: { title: '发现音乐' },
+  },
+  {
+    path: '/mv',
+    name: 'mv',
+    // 移动端视频页为模板级独立实现（大搜索框 + 2 列封面卡 + 滚动加载）
+    component: () => (__MOBILE__ ? import('@/pages/mobile/Mv.vue') : import('@/pages/Mv.vue')),
+    meta: { title: '视频 / MV' },
+  },
   { path: '/mv/:bvid', name: 'mv-player', component: () => import('@/pages/MvPlayer.vue'), meta: { title: '视频播放' } },
   { path: '/search', name: 'search', component: () => import('@/pages/Search.vue'), meta: { title: '搜索' } },
   { path: '/playlist/:id', name: 'playlist', component: () => import('@/pages/Playlist.vue'), meta: { title: '歌单' } },
@@ -20,7 +38,8 @@ const routes = [
     meta: { title: '下载管理' },
   },
   // 移动端「我的」二级中枢（底栏 4 tab 之一），二级入口都从这里跳
-  { path: '/mine', name: 'mine', component: () => import('@/pages/Mine.vue'), meta: { title: '我的' } },
+  // 移动端「我的」二级中枢（底栏 4 tab 之一）：模板级独立实现（资料卡 + 分组条目）
+  { path: '/mine', name: 'mine', component: () => (__MOBILE__ ? import('@/pages/mobile/Mine.vue') : import('@/pages/Mine.vue')), meta: { title: '我的' } },
   { path: '/settings', name: 'settings', component: () => import('@/pages/Settings.vue'), meta: { title: '设置' } },
   {
     path: '/player',
