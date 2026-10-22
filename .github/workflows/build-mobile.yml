@@ -50,11 +50,19 @@ jobs:
         working-directory: app
         run: npm ci
 
-      - name: Build web bundle for mobile
+      - name: Build web bundle for mobile (vite)
         working-directory: app
         env:
           NODE_OPTIONS: '--max-old-space-size=4096'
-        run: npm run build:mobile
+        run: npx vite build --config vite.mobile.config.ts
+
+      - name: Copy sql-wasm
+        working-directory: app
+        run: node scripts/copy-wasm.mjs
+
+      - name: Normalize mobile entry html
+        working-directory: app
+        run: node scripts/rename-mobile-html.mjs
 
       - name: Capacitor sync
         working-directory: app
