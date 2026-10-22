@@ -107,7 +107,6 @@ jobs:
   ios:
     name: ios-unsigned-ipa
     # 首次运行会用 `cap add ios` 生成 ios/ 工程；后续建议把 ios/ 提交进仓库以保证可复现。
-    if: vars.ENABLE_IOS == 'true'
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
