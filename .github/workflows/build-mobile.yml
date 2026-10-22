@@ -54,7 +54,18 @@ jobs:
         working-directory: app
         env:
           NODE_OPTIONS: '--max-old-space-size=4096'
-        run: npx vite build --config vite.mobile.config.ts
+        run: |
+          set +e
+          npx vite build --config vite.mobile.config.ts > /tmp/vite.log 2>&1
+          code=$?
+          if [ $code -ne 0 ]; then
+            # 把最后 20 行以 ::error:: 注解输出，便于在 run 页面直接看到原因
+            tail -20 /tmp/vite.log | while IFS= read -r line; do
+              echo "::error::$line"
+            done
+            exit $code
+          fi
+          tail -5 /tmp/vite.log
 
       - name: Copy sql-wasm
         working-directory: app
