@@ -79,6 +79,15 @@ jobs:
         working-directory: app
         run: npx cap sync android
 
+      - name: Assert web assets integrity after sync
+        # v2.3.2 事故：本地 cap sync 曾在删除旧 assets 后中断，APK 缺 index.html
+        # 导致真机「网页无法打开」。CI 上同样加断言，缺文件直接失败。
+        working-directory: app
+        run: |
+          test -f android/app/src/main/assets/public/index.html || { echo "::error::missing assets/public/index.html (cap sync incomplete)"; exit 1; }
+          test -f android/app/src/main/assets/capacitor.config.json || { echo "::error::missing assets/capacitor.config.json"; exit 1; }
+          grep -q "assets/index" android/app/src/main/assets/public/index.html && echo "index.html references ok"
+
       - name: Gradle assembleDebug
         working-directory: app/android
         run: |
@@ -95,6 +104,12 @@ jobs:
             exit $code
           fi
           tail -5 /tmp/gradle.log
+
+      - name: Assert APK contains entry page
+        working-directory: app/android
+        run: |
+          unzip -l app/build/outputs/apk/debug/app-debug.apk | grep -q "assets/public/index.html" || { echo "::error::APK missing assets/public/index.html"; exit 1; }
+          echo "APK integrity ok"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4

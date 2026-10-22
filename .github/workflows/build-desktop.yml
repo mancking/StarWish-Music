@@ -82,6 +82,13 @@ jobs:
         working-directory: app
         run: npm run build
 
+      - name: Assert renderer entry integrity
+        # 同 build-mobile：cap/vite 产物缺 index.html 会产出「能装但白屏」的包
+        working-directory: app
+        run: |
+          test -f dist/renderer/index.html || { echo "::error::missing dist/renderer/index.html"; exit 1; }
+          echo "renderer entry ok"
+
       - name: Package
         working-directory: app
         run: ${{ matrix.build }}

@@ -41,6 +41,12 @@ jobs:
         working-directory: app
         run: npm run build
 
+      - name: Assert renderer entry integrity
+        working-directory: app
+        run: |
+          test -f dist/renderer/index.html || { echo "::error::missing dist/renderer/index.html"; exit 1; }
+          echo "renderer entry ok"
+
       - name: Package portable + zip
         working-directory: app
         run: npx electron-builder --win portable zip --x64 --publish never
