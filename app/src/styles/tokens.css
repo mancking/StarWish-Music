@@ -1,0 +1,107 @@
+/* ============================================================
+   星河音乐 · 设计 token
+   ------------------------------------------------------------
+   所有颜色、圆角、间距、动效时长都从这里出，组件不写死数值。
+   分端覆盖只改尺寸类 token（圆角/行高/字号），颜色保持一致。
+   ============================================================ */
+
+:root {
+  --font: 'Segoe UI', 'Microsoft YaHei', 'PingFang SC', 'Hiragino Sans GB', system-ui, sans-serif;
+
+  /* 圆角 */
+  --radius-sm: 8px;
+  --radius: 12px;
+  --radius-lg: 18px;
+  --radius-xl: 26px;
+
+  /* 结构尺寸（分端覆盖） */
+  --titlebar-h: 44px;
+  --sidebar-w: 232px;
+  --minibar-h: 92px;
+  --row-h: 52px;
+  --font-base: 13.5px;
+
+  /* 品牌色（运行时由强调色覆盖） */
+  --accent: #ff4d6d;
+  --accent-2: #a855f7;
+  --accent-soft: rgba(255, 77, 109, 0.14);
+
+  /* 动效 */
+  --ease: cubic-bezier(0.22, 0.61, 0.36, 1);
+  --ease-out: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --dur-fast: 120ms;
+  --dur-base: 220ms;
+  --dur-slow: 420ms;
+
+  /* 层级 */
+  --z-bg: 0;
+  --z-content: 2;
+  --z-sticky: 20;
+  --z-overlay: 40;
+  --z-modal: 60;
+}
+
+:root[data-theme='dark'] {
+  --bg: #0b0d12;
+  --bg-2: #10131a;
+  --bg-3: #161a23;
+  --panel: rgba(255, 255, 255, 0.045);
+  --panel-2: rgba(255, 255, 255, 0.075);
+  --panel-3: rgba(255, 255, 255, 0.11);
+  --text: #eef1f8;
+  --text-2: #9ba4b8;
+  --text-3: #6d7688;
+  --line: rgba(255, 255, 255, 0.075);
+  --line-2: rgba(255, 255, 255, 0.14);
+  --glass: rgba(20, 24, 33, 0.72);
+  --hover: rgba(255, 255, 255, 0.055);
+  --skeleton: rgba(255, 255, 255, 0.06);
+  --skeleton-2: rgba(255, 255, 255, 0.12);
+  --shadow: 0 18px 50px rgba(0, 0, 0, 0.42);
+  --shadow-sm: 0 6px 18px rgba(0, 0, 0, 0.24);
+}
+
+:root[data-theme='light'] {
+  --bg: #f4f5f9;
+  --bg-2: #ffffff;
+  --bg-3: #eef0f6;
+  --panel: rgba(16, 20, 32, 0.035);
+  --panel-2: rgba(16, 20, 32, 0.06);
+  --panel-3: rgba(16, 20, 32, 0.09);
+  --text: #171b26;
+  --text-2: #5d6577;
+  --text-3: #8a91a3;
+  --line: rgba(16, 20, 32, 0.08);
+  --line-2: rgba(16, 20, 32, 0.14);
+  --glass: rgba(255, 255, 255, 0.78);
+  --hover: rgba(16, 20, 32, 0.045);
+  --skeleton: rgba(16, 20, 32, 0.06);
+  --skeleton-2: rgba(16, 20, 32, 0.11);
+  --shadow: 0 18px 50px rgba(30, 40, 70, 0.14);
+  --shadow-sm: 0 6px 30px rgba(30, 40, 70, 0.1);
+}
+
+/* ---------------- 分端覆盖 ---------------- */
+:root[data-platform='desktop'] {
+  --radius-card: 12px;
+  --row-h: 52px;
+  --font-base: 13.5px;
+  --page-pad: 26px;
+}
+
+:root[data-platform='mobile'] {
+  --radius-card: 20px;
+  --radius: 16px;
+  --row-h: 64px;
+  --font-base: 15px;
+  --page-pad: 16px;
+}
+
+/* 车机 / 横屏：压缩纵向节奏，放大点击热区 */
+@media (max-height: 620px) {
+  :root {
+    --row-h: 48px;
+    --titlebar-h: 38px;
+    --minibar-h: 72px;
+  }
+}

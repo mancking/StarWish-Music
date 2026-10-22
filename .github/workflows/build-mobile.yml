@@ -87,7 +87,7 @@ jobs:
           ./gradlew assembleDebug --no-daemon > /tmp/gradle.log 2>&1
           code=$?
           if [ $code -ne 0 ]; then
-            grep -E "FAILURE|What went wrong|Caused by|error:|Could not|SDK|license" /tmp/gradle.log | tail -25 | while IFS= read -r line; do
+            tail -45 /tmp/gradle.log | while IFS= read -r line; do
               echo "::error::$line"
             done
             exit $code

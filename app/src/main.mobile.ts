@@ -21,6 +21,7 @@ import { installBridge } from './mobile/bridge'
 import { installPullRefresh } from './mobile/pull-refresh'
 
 async function bootstrap(): Promise<void> {
+  document.documentElement.dataset.platform = 'mobile'
   await installBridge()
   installPullRefresh()
 

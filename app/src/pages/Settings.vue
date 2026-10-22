@@ -7,6 +7,7 @@ import Modal from '@/components/Modal.vue'
 import Slider from '@/components/Slider.vue'
 import { call, isDesktop } from '@/api'
 import { checkUpdate, type UpdateInfo } from '@/utils/update-check'
+import { searchSettings } from '@/settings/schema'
 import { useUiStore } from '@/stores/ui'
 import { useLibraryStore } from '@/stores/library'
 import { usePlayerStore } from '@/stores/player'
@@ -34,71 +35,18 @@ const cats: { key: Cat; label: string; icon: string }[] = [
 ]
 
 /**
- * 设置项索引：跨分区搜索用。
- * 不解析 DOM（脆弱），而是维护一份「分区 + 标题 + 关键词」的静态索引，
- * 命中后直接跳到对应分区。新增设置项时补一行即可。
+ * 设置项索引来自 schema（单一数据源），跨分区搜索直接查 schema。
+ * 新增设置项只需在 schema 里补一条，搜索自动覆盖。
  */
-const SETTING_INDEX: { cat: Cat; title: string; kw: string }[] = [
-  { cat: 'appearance', title: '主题模式', kw: '深色 浅色 跟随系统 夜间 dark light' },
-  { cat: 'appearance', title: '强调色', kw: '主色 取色 accent 封面' },
-  { cat: 'appearance', title: '界面动画', kw: '动效 过渡 性能' },
-  { cat: 'appearance', title: '粒子舞台', kw: '粒子 特效 低配' },
-  { cat: 'appearance', title: '播放页背景', kw: '背景 封面 渐变 壁纸 纯色' },
-  { cat: 'wallpaper', title: '启用壁纸', kw: '壁纸 背景 开关' },
-  { cat: 'wallpaper', title: '壁纸库', kw: '导入 图片 添加 删除 库' },
-  { cat: 'wallpaper', title: '轮播方式', kw: '轮播 按歌 定时 随机' },
-  { cat: 'wallpaper', title: '模糊与遮罩', kw: '模糊 遮罩 亮度 可读性' },
-  { cat: 'wallpaper', title: '填充方式', kw: '填充 适应 拉伸 缩放' },
-  { cat: 'playback', title: '播放倍速', kw: '倍速 变速 rate' },
-  { cat: 'playback', title: '睡眠定时', kw: '定时 关闭 睡眠 sleep' },
-  { cat: 'playback', title: '默认音质', kw: '音质 128k 320k 无损 flac' },
-  { cat: 'playback', title: '交叉淡入', kw: '淡入 淡出 无缝 crossfade' },
-  { cat: 'playback', title: '自动换源', kw: '换源 失败 跳过' },
-  { cat: 'playback', title: '输出设备', kw: '声卡 设备 音频输出' },
-  { cat: 'lyric', title: '歌词字号', kw: '歌词 字号 大小' },
-  { cat: 'lyric', title: '歌词偏移', kw: '偏移 校准 延迟' },
-  { cat: 'lyric', title: '桌面歌词', kw: '桌面歌词 悬浮 锁定 穿透' },
-  { cat: 'lyric', title: '歌词翻译', kw: '翻译 罗马音 繁简' },
-  { cat: 'video', title: '默认画质', kw: '画质 1080 720 480' },
-  { cat: 'video', title: '记忆播放进度', kw: '进度 续播 断点' },
-  { cat: 'video', title: '弹幕开关', kw: '弹幕 danmaku' },
-  { cat: 'video', title: '弹幕透明度', kw: '透明度 字号 速度 区域' },
-  { cat: 'video', title: '防挡字幕', kw: '字幕 遮挡 底部' },
-  { cat: 'video', title: '屏蔽词', kw: '屏蔽 过滤 关键词' },
-  { cat: 'sources', title: '音源管理', kw: '音源 导入 启用 移除' },
-  { cat: 'sources', title: '插件库', kw: '插件 订阅 市场 musicfree' },
-  { cat: 'sources', title: '音源健康检查', kw: '健康 失效 检测' },
-  { cat: 'local', title: '本地目录', kw: '扫描 本地 文件夹 目录' },
-  { cat: 'local', title: '启动时扫描', kw: '扫描 启动 自动' },
-  { cat: 'cache', title: '缓存上限', kw: '缓存 大小 限制' },
-  { cat: 'cache', title: '缓存目录', kw: '目录 位置 迁移' },
-  { cat: 'cache', title: '数据目录', kw: '数据 迁移 备份' },
-  { cat: 'cache', title: '网络代理', kw: '代理 proxy 端口' },
-  { cat: 'cache', title: 'WebDAV 备份', kw: 'webdav 备份 同步 坚果云 nextcloud' },
-  { cat: 'shortcuts', title: '任务栏歌词', kw: '任务栏 菜单栏 歌词' },
-  { cat: 'shortcuts', title: '开机自启动', kw: '开机 启动 自启' },
-  { cat: 'shortcuts', title: '关闭到托盘', kw: '托盘 最小化 后台' },
-  { cat: 'shortcuts', title: '全局快捷键', kw: '快捷键 热键 键盘' },
-  { cat: 'about', title: '版本与更新', kw: '版本 更新 日志 检查' },
-  { cat: 'about', title: '诊断信息', kw: '诊断 日志 导出 boot-trace' },
-]
-
 const q = ref('')
-const searchResults = computed(() => {
-  const key = q.value.trim().toLowerCase()
-  if (!key) return []
-  return SETTING_INDEX.filter(it => {
-    const hay = `${it.title} ${it.kw}`.toLowerCase()
-    return hay.includes(key)
-  }).slice(0, 8)
-})
+const searchResults = computed(() => searchSettings(q.value, isMobile))
 
-function catLabel(key: Cat): string {
+function catLabel(key: string): string {
   return cats.find(c => c.key === key)?.label || ''
 }
 
-function jumpTo(r: { cat: Cat; title: string }): void {
-  cat.value = r.cat
+function jumpTo(r: { cat: string; label: string }): void {
+  cat.value = r.cat as Cat
   q.value = ''
 }
 
@@ -907,8 +855,8 @@ onBeforeUnmount(stopPoll)
           <button v-if="q" class="search-clear" @click="q = ''"><Icon name="close" :size="13" /></button>
         </div>
         <div v-if="q" class="search-pop">
-          <button v-for="r in searchResults" :key="r.cat + r.title" class="search-item" @click="jumpTo(r)">
-            <b>{{ r.title }}</b>
+          <button v-for="r in searchResults" :key="r.key as string" class="search-item" @click="jumpTo(r)">
+            <b>{{ r.label }}</b>
             <span>{{ catLabel(r.cat) }}</span>
           </button>
           <div v-if="!searchResults.length" class="search-empty">没有匹配的设置项</div>
