@@ -31,6 +31,7 @@ import {
   getNewSongs, importPlaylist, searchMv, getMvInfo, getMvParts, getMvUrl, getPodcastEpisodes,
 } from '../../../electron/core/music-service'
 import { buildHomeFeed } from '../../../electron/core/recommend'
+import { buildRadio } from '../../../electron/core/radio'
 // 注意：必须走 shims 版（localStorage 登录态）。providers/music-service 通过 vite
 // 别名 './bili' 也解析到同一份 shim——若这里直连 electron/core/bili 会出现两份
 // 各自独立的登录态（设置页显示已登录、实际取流却未登录）。
@@ -92,7 +93,23 @@ async function boot(): Promise<void> {
   // 4) 播放器
   player.init()
 
-  // 5) 睡眠关机轮询（桌面由 player-service 内部定时器做）
+  // 5) 升级包下载进度：原生 SwBridgePlugin 的 notifyListeners 事件
+  //    → 转成渲染层 update:progress，前端才能显示下载百分比
+  try {
+    const cap: any = (globalThis as any).Capacitor
+    if (cap && typeof cap.addListener === 'function' && cap.isNativePlatform?.()) {
+      await cap.addListener('SwBridge', 'swUpdateProgress', (p: any) => {
+        emit('update:progress', {
+          received: Number(p?.received || 0),
+          total: Number(p?.total || 0),
+          percent: Number(p?.percent || 0),
+          phase: String(p?.phase || 'downloading'),
+        })
+      })
+    }
+  } catch { /* 真机外环境无原生事件，忽略 */ }
+
+  // 6) 睡眠关机轮询（桌面由 player-service 内部定时器做）
   window.setInterval(() => player.checkSleep(), 20000)
 }
 
@@ -143,16 +160,38 @@ const handlers: Record<string, Handler> = {
   },
   'app:showItemInFolder': UNSUPPORTED('在文件夹中显示'),
   /**
-   * 应用内下载安装包（APK）：原生 SwUpdate 插件下载到应用私有目录，
+   * 应用内下载安装包（APK）：原生 SwBridge 插件下载到应用私有目录，
    * 完成后拉起系统安装器——不再跳浏览器手动下载。
+   *
+   * 注意：v2.3.4 之前这里调的是 'SwUpdate'，而原生只注册了 'SwBridge'
+   * （MainActivity.registerPlugin(SwBridgePlugin.class)），插件名不匹配导致
+   * 调用必然 reject——这正是「移动端无法应用内更新」的直接根因。
    */
   'app:downloadAndInstall': async ({ url }: any) => {
     const cap: any = (globalThis as any).Capacitor
     if (cap && typeof cap.nativePromise === 'function' && cap.isNativePlatform?.()) {
-      await cap.nativePromise('SwUpdate', 'downloadAndInstall', { url: String(url) })
+      await cap.nativePromise('SwBridge', 'downloadAndInstall', { url: String(url) })
       return true
     }
     throw new Error('当前环境不支持应用内安装')
+  },
+  /** 是否已授权「安装未知应用」（Android 8+ 必需） */
+  'app:canInstallPackages': async () => {
+    const cap: any = (globalThis as any).Capacitor
+    if (cap && typeof cap.nativePromise === 'function' && cap.isNativePlatform?.()) {
+      const r: any = await cap.nativePromise('SwBridge', 'canInstallPackages', {})
+      return !!r?.allowed
+    }
+    return false
+  },
+  /** 拉起系统「允许安装未知应用」设置页 */
+  'app:openInstallPermission': async () => {
+    const cap: any = (globalThis as any).Capacitor
+    if (cap && typeof cap.nativePromise === 'function' && cap.isNativePlatform?.()) {
+      await cap.nativePromise('SwBridge', 'openInstallPermissionSettings', {})
+      return true
+    }
+    return false
   },
 
   /* ---- 设置 ---- */
@@ -256,6 +295,11 @@ const handlers: Record<string, Handler> = {
   'music:mvurl': ({ bvid, cid, qn }: any) => getMvUrl(bvid, cid, qn),
   'music:mvparts': ({ bvid }: any) => getMvParts(bvid),
   'home:feed': async ({ force }: any) => buildHomeFeed(!!force),
+  /** 私人电台：按口味生成可连续播放的新歌队列（换一批时 force=true） */
+  'radio:build': async ({ force, size }: any) => {
+    const r = await buildRadio(!!force, Number(size) || 60)
+    return { songs: r.songs, seeds: r.seeds, generatedAt: r.generatedAt }
+  },
   'music:memory': () => playStats(),
 
   /* ---- 播放器 ---- */

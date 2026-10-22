@@ -3,6 +3,7 @@ import { computed, defineOptions, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import Icon from '@/components/Icon.vue'
 import Cover from '@/components/Cover.vue'
+import SongRows from '@/components/mobile/SongRows.vue'
 import { call } from '@/api'
 import { usePlayerStore } from '@/stores/player'
 import type { Song } from '@shared/types'
@@ -113,6 +114,7 @@ function openToplist(item: any): void {
 const newSongs = ref<Song[]>([])
 const newLoading = ref(false)
 async function loadNew(): Promise<void> {
+  if (newLoading.value || newSongs.value.length) return
   newLoading.value = true
   try {
     newSongs.value = await call<Song[]>('music:new')
@@ -130,13 +132,39 @@ function setTab(t: Tab): void {
 }
 
 watch(tab, t => {
-  if (t === 'new' && !newSongs.value.length && !newLoading.value) void loadNew()
+  if (t === 'new') void loadNew()
   if (t === 'toplists' && !tree.value) void loadTree()
+  if (t === 'playlists' && !playlists.value.length) void loadPlaylists()
 })
+
+/**
+ * 外部入口（首页「全部新歌」「全部榜单」「按心情听」）会带 query 进来，
+ * 而本页被 KeepAlive 缓存 —— 只靠 watch(tab) 不会响应，
+ * 必须同步 route.query 并按需补数据，否则表现为「点进去是空白页」。
+ */
+watch(
+  () => route.query.tab,
+  v => {
+    const t = (v as string) as Tab
+    if (!t || t === tab.value) return
+    tab.value = t
+  }
+)
+watch(
+  () => route.query.cat,
+  v => {
+    const c = (v as string) || '全部'
+    if (c !== cat.value) {
+      cat.value = c
+      void loadPlaylists()
+    }
+  }
+)
 
 onMounted(() => {
   void loadPlaylists()
   void loadTree()
+  if (tab.value === 'new') void loadNew()
 })
 </script>
 
@@ -212,32 +240,29 @@ onMounted(() => {
         <div class="empty-title">榜单加载中…</div>
       </div>
       <div class="d-tl-list">
-        <button v-for="(t, i) in tlItems" :key="t.platform + t.id" class="d-tl" @click="openToplist(t)">
+        <button v-for="(t, i) in tlItems" :key="tlPlatform + t.id" class="d-tl" @click="openToplist(t)">
           <span class="d-tl-rank" :class="{ top: i < 3 }">{{ i + 1 }}</span>
           <span class="d-tl-meta">
             <span class="d-tl-name">{{ t.n }}</span>
             <span class="d-tl-sub">{{ t.group }}<template v-if="t.freq"> · {{ t.freq }}</template></span>
           </span>
-          <Icon name="play" :size="16" class="d-tl-play" />
+          <Icon name="chevron-right" :size="16" class="d-tl-play" />
         </button>
       </div>
     </template>
 
     <!-- ============ 新歌 ============ -->
     <template v-else>
-      <div v-if="newLoading" class="d-list-sk">
-        <div v-for="i in 6" :key="i" class="sk" style="height: 56px; border-radius: 12px" />
-      </div>
-      <div v-else class="m-song-list">
-        <button v-for="(s, i) in newSongs" :key="s.id" class="d-new" @click="player.playSongs(newSongs, i)">
-          <Cover :src="s.pic || ''" :size="46" radius="9" />
-          <span class="d-new-meta">
-            <span class="d-new-name">{{ s.name }}</span>
-            <span class="d-new-sub">{{ s.singer }}</span>
-          </span>
-          <Icon name="play" :size="16" class="d-tl-play" />
+      <div class="d-sec-head">
+        <span class="d-sec-title"><Icon name="music" :size="16" />新歌速递</span>
+        <button class="d-sec-all" @click="router.push('/new')">
+          全部<Icon name="chevron-right" :size="13" />
         </button>
       </div>
+      <div v-if="newLoading" class="d-list-sk">
+        <div v-for="i in 6" :key="i" class="sk" style="height: 58px; border-radius: 12px" />
+      </div>
+      <SongRows v-else :songs="newSongs" show-index empty-text="暂无新歌" empty-desc="稍后再来看看" />
     </template>
   </div>
 </template>
@@ -463,5 +488,34 @@ onMounted(() => {
   display: flex;
   flex-direction: column;
   gap: 8px;
+}
+
+/* 分区头（标题 + 全部入口） */
+.d-sec-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin: 2px 0 10px;
+}
+.d-sec-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--text);
+}
+.d-sec-all {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  height: 30px;
+  padding: 0 11px;
+  border: 1px solid var(--line);
+  border-radius: 15px;
+  background: var(--bg-2);
+  color: var(--text-2);
+  font-size: 12px;
+  -webkit-tap-highlight-color: transparent;
 }
 </style>

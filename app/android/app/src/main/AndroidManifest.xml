@@ -41,6 +41,15 @@
     <!-- Permissions -->
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <!--
+      应用内更新：Android 8.0+ 拉起系统安装器必须声明此权限，
+      否则安装器会直接拒绝（这是「移动端无法应用内更新」的主因之一）。
+    -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <!-- 读取系统下载目录里的升级包（部分 ROM 的安装器需要） -->
+    <uses-permission
+        android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
 
     <!--
       B 站扫码登录「拉起客户端」：Android 11+ 的包可见性过滤要求显式声明

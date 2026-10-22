@@ -9,7 +9,7 @@ import Icon from '@/components/Icon.vue'
 import Cover from '@/components/Cover.vue'
 import SongList from '@/components/SongList.vue'
 import PlaylistCard from '@/components/PlaylistCard.vue'
-import { call } from '@/api'
+import { call, isDesktop } from '@/api'
 import { usePlayerStore } from '@/stores/player'
 import { useLibraryStore } from '@/stores/library'
 import { useUiStore } from '@/stores/ui'
@@ -50,6 +50,43 @@ const newSongs = computed<Song[]>(() => feed.value?.newSongs || [])
 const onRepeat = computed<Song[]>(() => feed.value?.onRepeat || [])
 const memory = ref<any>(null)
 const podcasts = computed<any[]>(() => feed.value?.podcasts || [])
+
+/* ---------------- 私人电台 ---------------- */
+const radio = ref<{ songs: Song[]; seeds: string[] }>({ songs: [], seeds: [] })
+const radioLoading = ref(false)
+
+async function loadRadio(force = false): Promise<void> {
+  if (radioLoading.value) return
+  radioLoading.value = true
+  try {
+    const r = await call<{ songs: Song[]; seeds: string[] }>('radio:build', { force, size: 60 })
+    radio.value = { songs: r.songs || [], seeds: r.seeds || [] }
+  } catch (e: any) {
+    // 电台失败时退回「你在循环」，保证区块不至于空白
+    if (!radio.value.songs.length) radio.value = { songs: onRepeat.value, seeds: [] }
+  } finally {
+    radioLoading.value = false
+  }
+}
+
+function playRadio(): void {
+  if (!radio.value.songs.length) {
+    void loadRadio(true).then(() => {
+      if (radio.value.songs.length) player.playSongs(radio.value.songs, 0)
+    })
+    return
+  }
+  void player.playSongs(radio.value.songs, 0)
+}
+
+function shuffleRadio(): void {
+  void loadRadio(true).then(() => {
+    if (radio.value.songs.length) {
+      player.playSongs(radio.value.songs, 0)
+      ui.toast('已换一批电台', 'success', 1600)
+    }
+  })
+}
 
 async function load(force = false): Promise<void> {
   // 后台缓存：有缓存先秒开再静默刷新；下拉刷新（force）直接重拉
@@ -113,6 +150,11 @@ async function playToplist(card: any): Promise<void> {
   }
 }
 
+function openToplist(card: any): void {
+  if (!card?.platform || !card?.id) return
+  router.push({ path: `/toplist/${card.platform}/${card.id}` })
+}
+
 function playFrom(card: any, index: number): void {
   if (!card.songs?.length) return
   void player.playSongs(card.songs, index)
@@ -129,7 +171,10 @@ function openPodcast(p: any): void {
   })
 }
 
-onMounted(() => void load())
+onMounted(() => {
+  void load()
+  void loadRadio()
+})
 </script>
 
 <template>
@@ -250,15 +295,22 @@ onMounted(() => void load())
       </section>
 
       <!-- 私人电台 -->
-      <section v-if="onRepeat.length" class="section">
+      <section v-if="radio.songs.length" class="section">
         <div class="section-head">
           <div>
             <div class="section-title"><Icon name="radio" :size="17" />私人电台</div>
-            <div class="section-sub">最近最常听的歌，持续为你播放</div>
+            <div class="section-sub">
+              {{ radio.seeds.length ? `根据 ${radio.seeds.join('、')} 的口味，持续为你播放` : '按你的收听口味，持续为你播放' }}
+            </div>
           </div>
-          <button class="btn sm" @click="player.playSongs(onRepeat, 0)"><Icon name="play" :size="13" />开始收听</button>
+          <div style="display:flex;gap:8px;flex:none">
+            <button class="btn sm ghost" :disabled="radioLoading" @click="shuffleRadio">
+              <Icon name="refresh" :size="13" />{{ radioLoading ? '生成中…' : '换一批' }}
+            </button>
+            <button class="btn sm" @click="playRadio"><Icon name="play" :size="13" />开始收听</button>
+          </div>
         </div>
-        <SongList :songs="onRepeat.slice(0, 8)" :show-album="false" empty-text="多听几首歌，这里会出现你的私人电台" />
+        <SongList :songs="radio.songs.slice(0, 8)" :show-album="false" empty-text="多听几首歌，这里会出现你的私人电台" />
       </section>
 
       <!-- 音乐回忆 -->
@@ -294,10 +346,11 @@ onMounted(() => void load())
         <div class="toplist-grid">
           <div v-for="card in toplists" :key="card.id" class="top-card">
             <div class="tc-head">
-              <div class="tc-title">
+              <button class="tc-title tc-title-btn" :title="`打开榜单：${card.name}`" @click="openToplist(card)">
                 <span class="tc-badge"><Icon name="zap" :size="12" /></span>
                 <span class="ellipsis">{{ card.name }}</span>
-              </div>
+                <Icon name="chevron-right" :size="12" class="tc-more" />
+              </button>
               <button class="icon-btn tiny" title="播放全部" @click="playToplist(card)"><Icon name="play" :size="13" /></button>
             </div>
             <div
@@ -343,8 +396,11 @@ onMounted(() => void load())
               <div class="section-title"><Icon name="music" :size="17" />新歌速递</div>
               <div class="section-sub">刚刚上架的新声音</div>
             </div>
+            <span class="section-more" @click="router.push(isDesktop ? { path: '/discover', query: { tab: 'new' } } : { path: '/new' })">
+              全部新歌<Icon name="chevron-right" :size="13" />
+            </span>
           </div>
-          <SongList :songs="newSongs" :show-album="false" :show-cover="true" empty-text="暂无新歌" />
+          <SongList :songs="newSongs.slice(0, 12)" :show-album="false" :show-cover="true" empty-text="暂无新歌" />
         </div>
         <div class="col-side">
           <div class="section-head">
@@ -574,6 +630,25 @@ onMounted(() => void load())
   font-size: 13px;
   font-weight: 600;
   min-width: 0;
+}
+.tc-title-btn {
+  flex: 1;
+  padding: 0;
+  border: none;
+  background: none;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  text-align: left;
+  border-radius: 7px;
+  transition: color 0.15s;
+}
+.tc-title-btn:hover {
+  color: var(--accent);
+}
+.tc-more {
+  flex: none;
+  color: var(--text-3);
 }
 .tc-badge {
   display: inline-flex;

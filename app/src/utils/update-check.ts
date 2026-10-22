@@ -14,6 +14,8 @@ export interface UpdateInfo {
   notes: string
   /** 最新 Release 里的 Android APK 直链（无则为空）；移动端应用内下载安装用 */
   apkUrl: string
+  /** 桌面端安装包直链（Windows 便携 exe / macOS zip）；桌面端应用内下载更新用 */
+  desktopUrl: string
 }
 
 /** 语义化版本比较：a > b 返回 1，= 0，< -1（忽略 v 前缀与预发布后缀） */
@@ -38,6 +40,12 @@ export async function checkUpdate(currentVersion: string): Promise<UpdateInfo> {
   // Android 安装包直链：优先 debug APK 之外命名规范的 release 产物
   const assets: Array<{ name?: string; browser_download_url?: string }> = Array.isArray(data.assets) ? data.assets : []
   const apk = assets.find(a => /\.(apk)$/i.test(String(a.name || ''))) || null
+  // 桌面端安装包：Windows 便携 exe / macOS zip（产物名含中文时会被打包器净化，按后缀匹配更稳）
+  const isMac = /mac/i.test(String((navigator as any)?.userAgent || '')) || /Mac/.test(String((navigator as any)?.platform || ''))
+  const desktop =
+    (isMac
+      ? assets.find(a => /mac/i.test(String(a.name || '')) && /\.zip$/i.test(String(a.name || '')))
+      : assets.find(a => /\.exe$/i.test(String(a.name || '')))) || null
   return {
     hasUpdate: cmp(version, currentVersion) > 0,
     version,
@@ -45,5 +53,6 @@ export async function checkUpdate(currentVersion: string): Promise<UpdateInfo> {
     url: data.html_url || `https://github.com/${REPO}/releases/latest`,
     notes: String(data.body || '').slice(0, 2000),
     apkUrl: apk?.browser_download_url || '',
+    desktopUrl: desktop?.browser_download_url || '',
   }
 }

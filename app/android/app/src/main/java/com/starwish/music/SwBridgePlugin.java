@@ -79,7 +79,7 @@ public class SwBridgePlugin extends Plugin {
                 File dir = new File(ctx.getFilesDir(), "update");
                 if (!dir.exists()) dir.mkdirs();
                 File apk = new File(dir, "starwish-update.apk");
-                downloadToFile(url, apk);
+                downloadToFile(url, apk, getActivity());
                 Intent it = new Intent(Intent.ACTION_VIEW);
                 Uri uri;
                 if (Build.VERSION.SDK_INT >= 24) {
@@ -92,11 +92,52 @@ public class SwBridgePlugin extends Plugin {
                 it.setDataAndType(uri, "application/vnd.android.package-archive");
                 it.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
                 getActivity().startActivity(it);
-                call.resolve();
+                JSObject ret = new JSObject();
+                ret.put("path", apk.getAbsolutePath());
+                call.resolve(ret);
             } catch (Exception e) {
                 call.reject("下载安装包失败：" + e.getMessage());
             }
         }, "sw-update-dl").start();
+    }
+
+    /**
+     * 是否已获得「安装未知应用」授权（Android 8+ 必需）。
+     * 未授权时前端应引导用户到系统设置开启，否则安装器会直接失败。
+     */
+    @PluginMethod
+    public void canInstallPackages(PluginCall call) {
+        JSObject ret = new JSObject();
+        boolean ok = true;
+        if (Build.VERSION.SDK_INT >= 26) {
+            try {
+                ok = getContext().getPackageManager().canRequestPackageInstalls();
+            } catch (Exception e) {
+                ok = false;
+            }
+        }
+        ret.put("allowed", ok);
+        call.resolve(ret);
+    }
+
+    /** 拉起「允许安装未知应用」的系统设置页 */
+    @PluginMethod
+    public void openInstallPermissionSettings(PluginCall call) {
+        try {
+            Intent it = new Intent();
+            if (Build.VERSION.SDK_INT >= 26) {
+                it.setAction("android.settings.MANAGE_UNKNOWN_APP_SOURCES");
+                it.setData(Uri.parse("package:" + getContext().getPackageName()));
+            } else {
+                it.setAction(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS);
+                it.setData(Uri.parse("package:" + getContext().getPackageName()));
+            }
+            it.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            getActivity().startActivity(it);
+            call.resolve();
+        } catch (Exception e) {
+            call.reject("无法打开系统设置：" + e.getMessage());
+        }
     }
 
     @PluginMethod
@@ -184,9 +225,10 @@ public class SwBridgePlugin extends Plugin {
         }
     }
 
-    /** HttpURLConnection 下载（跟随同协议跳转），用于升级包 */
-    private static void downloadToFile(String url, File out) throws Exception {
+    /** HttpURLConnection 下载（跟随同协议跳转），用于升级包；带进度回调 */
+    private void downloadToFile(String url, File out, android.app.Activity act) throws Exception {
         HttpURLConnection conn = null;
+        long lastNotify = 0;
         try {
             String target = url;
             for (int hop = 0; hop <= 5; hop++) {
@@ -208,11 +250,35 @@ public class SwBridgePlugin extends Plugin {
                 }
                 break;
             }
+            long total = conn.getContentLengthLong();
+            long received = 0;
             try (InputStream is = conn.getInputStream(); FileOutputStream os = new FileOutputStream(out)) {
                 byte[] buf = new byte[8192];
                 int n;
-                while ((n = is.read(buf)) > 0) os.write(buf, 0, n);
+                while ((n = is.read(buf)) > 0) {
+                    os.write(buf, 0, n);
+                    received += n;
+                    // 每 300ms 通知一次进度，避免高频 IPC 拖慢下载
+                    long now = System.currentTimeMillis();
+                    if (act != null && now - lastNotify > 300) {
+                        lastNotify = now;
+                        JSObject p = new JSObject();
+                        p.put("received", received);
+                        p.put("total", total > 0 ? total : 0);
+                        p.put("percent", total > 0 ? (int) (received * 100 / total) : 0);
+                        p.put("phase", "downloading");
+                        act.runOnUiThread(() -> notifyListeners("swUpdateProgress", p));
+                    }
+                }
                 os.flush();
+            }
+            if (act != null) {
+                JSObject p = new JSObject();
+                p.put("received", received);
+                p.put("total", total > 0 ? total : 0);
+                p.put("percent", 100);
+                p.put("phase", "downloaded");
+                act.runOnUiThread(() -> notifyListeners("swUpdateProgress", p));
             }
         } finally {
             if (conn != null) conn.disconnect();

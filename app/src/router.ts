@@ -22,11 +22,37 @@ const routes = [
     component: () => (__MOBILE__ ? import('@/pages/mobile/Mv.vue') : import('@/pages/Mv.vue')),
     meta: { title: '视频 / MV' },
   },
-  { path: '/mv/:bvid', name: 'mv-player', component: () => import('@/pages/MvPlayer.vue'), meta: { title: '视频播放' } },
+  {
+    path: '/mv/:bvid',
+    name: 'mv-player',
+    // 移动端播放页为模板级全新实现（B 站移动端架构），桌面保持原实现
+    component: () => (__MOBILE__ ? import('@/pages/mobile/MvPlayer.vue') : import('@/pages/MvPlayer.vue')),
+    meta: { title: '视频播放' },
+  },
   { path: '/search', name: 'search', component: () => import('@/pages/Search.vue'), meta: { title: '搜索' } },
-  { path: '/playlist/:id', name: 'playlist', component: () => import('@/pages/Playlist.vue'), meta: { title: '歌单' } },
+  {
+    path: '/playlist/:id',
+    name: 'playlist',
+    // 移动端为模板级独立详情页（大封面头 + 行式曲单 + 底部抽屉），
+    // 桌面保持表格语义实现
+    component: () => (__MOBILE__ ? import('@/pages/mobile/PlaylistDetail.vue') : import('@/pages/Playlist.vue')),
+    meta: { title: '歌单' },
+  },
   { path: '/podcast/:id', name: 'podcast', component: () => import('@/pages/Playlist.vue'), meta: { title: '播客' } },
-  { path: '/toplist/:platform/:id', name: 'toplist', component: () => import('@/pages/Playlist.vue'), meta: { title: '排行榜' } },
+  {
+    path: '/toplist/:platform/:id',
+    name: 'toplist',
+    // 榜单详情：移动端独立模板（此前复用桌面页导致窄屏下「榜单打不开列表」）
+    component: () => (__MOBILE__ ? import('@/pages/mobile/PlaylistDetail.vue') : import('@/pages/Playlist.vue')),
+    meta: { title: '排行榜' },
+  },
+  {
+    path: '/new',
+    name: 'new-songs',
+    // 全部新歌：移动端独立整页列表
+    component: () => (__MOBILE__ ? import('@/pages/mobile/NewSongs.vue') : import('@/pages/Discover.vue')),
+    meta: { title: '新歌速递' },
+  },
   { path: '/favorites', name: 'favorites', component: () => import('@/pages/Favorites.vue'), meta: { title: '我喜欢的音乐' } },
   { path: '/local', name: 'local', component: () => import('@/pages/Local.vue'), meta: { title: '本地音乐' } },
   // 离线缓存管理器（视频 MV）：桌面「我的音乐→本地音乐」下方，移动端在「我的」
@@ -42,7 +68,7 @@ const routes = [
   // 移动端「我的」二级中枢（底栏 4 tab 之一），二级入口都从这里跳
   // 移动端「我的」二级中枢（底栏 4 tab 之一）：模板级独立实现（资料卡 + 分组条目）
   { path: '/mine', name: 'mine', component: () => (__MOBILE__ ? import('@/pages/mobile/Mine.vue') : import('@/pages/Mine.vue')), meta: { title: '我的' } },
-  { path: '/settings', name: 'settings', component: () => import('@/pages/Settings.vue'), meta: { title: '设置' } },
+  { path: '/settings', name: 'settings', component: () => (__MOBILE__ ? import('@/pages/mobile/Settings.vue') : import('@/pages/Settings.vue')), meta: { title: '设置' } },
   {
     path: '/player',
     name: 'player',

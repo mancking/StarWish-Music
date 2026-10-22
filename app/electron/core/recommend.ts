@@ -95,7 +95,8 @@ export async function buildHomeFeed(force = false): Promise<any> {
     buildDailyMix().catch(() => [] as Song[]),
     neteasePlaylists('全部', 'hot', 1).catch(() => [] as PlaylistMeta[]),
     toplistTree().catch(() => ({ total: 0, tree: {} }) as ToplistTree),
-    neteaseNewSongs(10).catch(() => [] as Song[]),
+    // 多取一些再做跨区块去重，否则去重后新歌区会只剩寥寥几首
+    neteaseNewSongs(36).catch(() => [] as Song[]),
     searchPodcast('音乐', 8).catch(() => []),
     Promise.resolve(recentHistory(6)),
     Promise.resolve(onRepeat(20)),
@@ -143,11 +144,16 @@ export async function buildHomeFeed(force = false): Promise<any> {
     })
   )
 
+  // 跨区块去重：每日推荐 / 新歌 / 榜单 三者内容互斥。
+  // 用户反馈过「介绍语中的排行榜是重复内容」——榜单卡片展示的是榜单前几首，
+  // 若新歌区也含同一批曲目，用户会看到同一首歌出现两次。
+  const topSongs = topCards.flatMap(c => c.songs)
   const data = {
-    daily,
+    daily: dedupeAgainst(daily, newSongs, topSongs),
     playlists: playlists.slice(0, 12),
     toplists: topCards,
-    newSongs,
+    // 新歌既排除每日推荐，也排除榜单展示过的曲目
+    newSongs: dedupeAgainst(dedupeAgainst(newSongs, daily), topSongs),
     podcasts,
     continueListening: recentSongs,
     onRepeat: repeat,
@@ -164,8 +170,21 @@ export async function buildHomeFeed(force = false): Promise<any> {
   return data
 }
 
+/**
+ * 从列表里剔除出现在其它区块中的歌曲（按 id 去重）。
+ *
+ * 首页各分区必须内容互斥，否则「每日推荐」与「热门榜单」「新歌速递」
+ * 会展示同一批曲目——用户看到的就是「介绍语里的排行榜是重复内容」。
+ */
+function dedupeAgainst(main: Song[], ...others: Song[][]): Song[] {
+  if (!main.length) return main
+  const exclude = new Set<string>()
+  for (const list of others) for (const s of list || []) if (s?.id) exclude.add(s.id)
+  if (!exclude.size) return main
+  return main.filter(s => !exclude.has(s.id))
+}
+
 export function invalidateFeed(): void {
   feedCache = null
 }
-
 export const MOOD_LIST = MOODS

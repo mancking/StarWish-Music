@@ -408,9 +408,9 @@ function onGestureEnd(e: PointerEvent): void {
     </header>
 
     <!-- 主体 -->
-    <main class="p-body">
-      <section class="left">
-        <div class="stage-wrap">
+    <main class="p-body" :class="`body-${player.stage}`">
+      <section class="left" :class="`left-${player.stage}`">
+        <div class="stage-wrap" :class="`wrap-${player.stage}`">
           <canvas ref="canvas" class="particles" />
           <div class="glow" />
           <div class="vinyl-wrap" :class="{ spinning: player.playing, cinema: player.stage === 'cinema' }">
@@ -444,8 +444,9 @@ function onGestureEnd(e: PointerEvent): void {
         </div>
       </section>
 
-      <section class="right">
-        <div v-if="player.stage === 'podcast'" class="podcast-panel">
+      <section class="right" :class="`right-${player.stage}`">
+        <Transition name="stage-fade" mode="out-in">
+        <div v-if="player.stage === 'podcast'" class="podcast-panel" key="podcast">
           <div class="podcast-badge"><Icon name="radio" :size="16" />播客 / DJ 模式</div>
           <p>低能耗渲染，粒子与歌词已降级，适合长时间收听。</p>
           <div class="podcast-bars">
@@ -453,7 +454,7 @@ function onGestureEnd(e: PointerEvent): void {
           </div>
         </div>
 
-        <div v-else-if="!hasLyric" class="lyric-empty">
+        <div v-else-if="!hasLyric" class="lyric-empty" key="empty">
           <Icon name="lyric" :size="30" :stroke="1.3" />
           <div class="empty-title">{{ player.lyricLoading ? '正在匹配歌词…' : '暂无歌词' }}</div>
           <div class="empty-desc">
@@ -464,7 +465,7 @@ function onGestureEnd(e: PointerEvent): void {
           </button>
         </div>
 
-        <div v-else ref="lyricBox" class="lyrics" :style="{ fontSize: ui.settings.lyricFontSize + 'px' }">
+        <div v-else ref="lyricBox" class="lyrics" :style="{ fontSize: ui.settings.lyricFontSize + 'px' }" key="lyrics">
           <div class="lyric-inner">
             <div
               v-for="(line, i) in lines"
@@ -491,6 +492,7 @@ function onGestureEnd(e: PointerEvent): void {
             <div class="lyric-pad" />
           </div>
         </div>
+        </Transition>
       </section>
     </main>
 
@@ -774,6 +776,98 @@ function onGestureEnd(e: PointerEvent): void {
   grid-template-columns: minmax(360px, 0.95fr) minmax(420px, 1.05fr);
   gap: 30px;
   padding: 4px 46px 0;
+}
+
+/* ============ 舞台差异（v2.3.4 重构：此前 4 个 stage 类无任何样式，
+   切换时视觉几乎无差别，只剩「延迟」体感） ============ */
+
+/* 歌词舞台：封面居中偏上，歌词大字居右 */
+.body-lyrics .stage-wrap {
+  width: min(340px, 28vw);
+}
+.body-lyrics .vinyl {
+  box-shadow: 0 26px 70px rgba(0, 0, 0, 0.55);
+}
+
+/* 粒子舞台：封面缩小让位给粒子，歌词整体降一档 */
+.body-particle .stage-wrap {
+  width: min(280px, 23vw);
+}
+.body-particle .glow {
+  width: 96%;
+  height: 96%;
+  filter: blur(46px);
+  opacity: 0.85;
+}
+.body-particle .right .lyrics {
+  height: min(430px, 46vh);
+}
+.body-particle .right .line.active {
+  font-size: 1.16em;
+}
+
+/* 电影镜头：封面横移靠左 + 影院黑边，歌词偏暗 */
+.body-cinema {
+  grid-template-columns: minmax(300px, 0.8fr) minmax(420px, 1.2fr);
+}
+.body-cinema .stage-wrap {
+  width: min(320px, 26vw);
+}
+.body-cinema .glow {
+  width: 68%;
+  height: 68%;
+  filter: blur(52px);
+  opacity: 0.55;
+}
+.body-cinema .right .lyrics {
+  height: min(380px, 42vh);
+  opacity: 0.86;
+}
+.body-cinema .right .line.active {
+  font-size: 1.2em;
+}
+
+/* 播客 / DJ：封面缩小居顶，波形条为主视觉，右侧换成播客面板 */
+.body-podcast {
+  grid-template-columns: minmax(320px, 0.85fr) minmax(380px, 1.15fr);
+}
+.body-podcast .stage-wrap {
+  width: min(210px, 17vw);
+  margin-bottom: 4px;
+}
+.body-podcast .vinyl {
+  opacity: 0.9;
+}
+.body-podcast .glow {
+  width: 110%;
+  height: 110%;
+  filter: blur(60px);
+  opacity: 0.5;
+}
+.body-podcast .right {
+  align-items: center;
+}
+
+/* 舞台切换过渡：淡入淡出 + 轻微位移，避免生硬跳变 */
+.stage-fade-enter-active,
+.stage-fade-leave-active {
+  transition: opacity 0.22s ease, transform 0.22s ease;
+}
+.stage-fade-enter-from {
+  opacity: 0;
+  transform: translateY(10px);
+}
+.stage-fade-leave-to {
+  opacity: 0;
+  transform: translateY(-8px);
+}
+
+/* 主体在切换时的整体过渡，让「变化」可感知 */
+.p-body,
+.left,
+.right,
+.stage-wrap {
+  transition: grid-template-columns 0.32s ease, width 0.32s ease, opacity 0.28s ease;
 }
 .left {
   display: flex;

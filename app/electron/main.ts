@@ -15,7 +15,7 @@ import { beginWindowInitWatch, clearWindowInitMark, type GpuLevel } from './core
 import { migrateLegacyWallpaper } from './core/wallpaper'
 import { trace, writeBootTrace, isDiagnoseMode } from './core/boot-trace'
 import { player } from './core/player-service'
-import { registerIpc, navigateMain, applyProxy } from './ipc'
+import { registerIpc, navigateMain, applyProxy, markBootReady } from './ipc'
 import {
   applyTitleBarTheme,
   broadcast,
@@ -305,6 +305,25 @@ async function bootstrap(): Promise<void> {
     } catch (e: any) {
       logger.warn('旧壁纸迁移失败', e?.message)
     }
+
+    // ---- 窗口先行 --------------------------------------------------------
+    // 旧顺序：initDb() → lxHost.load() → registerIpc() → createMainWindow()。
+    // initDb（sql.js 读盘 + 建库）与 lxHost.load（同步解析全部音源脚本）都在
+    // 主线程上串行执行，耗时可达数秒到十余秒；窗口在这之后才创建，用户看到的是
+    // 「双击后桌面空窗很久才出现」。现改为：先把窗口建出来显示骨架，
+    // 重活儿挪到后台并行做，界面先可见、数据后到位。
+    nativeTheme.themeSource = getSettings().theme === 'auto' ? 'system' : (getSettings().theme as 'dark' | 'light')
+    applyTitleBarTheme(nativeTheme.shouldUseDarkColors)
+
+    // IPC 先注册：窗口已先行创建，渲染层的首批调用要能收到（内部会等启动就绪信号）
+    registerIpc()
+    trace('boot:ipc-registered')
+
+    const mainWin = createMainWindow()
+    trace('boot:window-created')
+    restoreWindowState(mainWin)
+
+    // ---- 后台重活儿 -------------------------------------------------------
     await initDb()
     trace('boot:db')
     initBiliLogin()
@@ -313,17 +332,11 @@ async function bootstrap(): Promise<void> {
     mfHost.init()
     registerCoverProtocol()
     registerMediaProtocol(biliCookie)
-    registerIpc()
-    trace('boot:ipc')
     // 启动即应用代理设置（若开启），保证音源与封面请求走代理
     applyProxy(getSettings())
 
-    nativeTheme.themeSource = getSettings().theme === 'auto' ? 'system' : (getSettings().theme as 'dark' | 'light')
     applyTitleBarTheme(nativeTheme.shouldUseDarkColors)
 
-    const mainWin = createMainWindow()
-    trace('boot:window-created')
-    restoreWindowState(mainWin)
     const audio = createAudioHost()
     trace('boot:audio-host')
 
@@ -331,6 +344,10 @@ async function bootstrap(): Promise<void> {
     player.attachHost(audio)
     player.initFromSettings()
     if (getSettings().rememberPosition) player.restoreSession()
+
+    // 数据库与音源均已就绪，放行此前排队的 IPC 调用
+    markBootReady()
+    trace('boot:ready')
 
     mainWin.on('maximize', () => mainWin.webContents.send('window:state', { maximized: true }))
     mainWin.on('unmaximize', () => mainWin.webContents.send('window:state', { maximized: false }))

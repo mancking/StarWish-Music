@@ -6,7 +6,7 @@ import Icon from '@/components/Icon.vue'
 import Toggle from '@/components/Toggle.vue'
 import Modal from '@/components/Modal.vue'
 import Slider from '@/components/Slider.vue'
-import { call, isDesktop } from '@/api'
+import { call, isDesktop, on } from '@/api'
 import { checkUpdate, type UpdateInfo } from '@/utils/update-check'
 import { searchSettings } from '@/settings/schema'
 import { useUiStore } from '@/stores/ui'
@@ -26,6 +26,8 @@ type Cat = 'appearance' | 'wallpaper' | 'playback' | 'lyric' | 'video' | 'downlo
 const cat = ref<Cat>('appearance')
 /** 移动端设置页为「单页滚动 + 分区标题」结构，一次渲染全部分区；桌面保持单面板切换 */
 const isMobileSettings = __MOBILE__
+/** 移动端两级导航：'' = 分类列表页；否则为该分类的整页面板 */
+const mobileCat = ref<Cat | ''>('')
 
 const cats: { key: Cat; label: string; icon: string }[] = [
   { key: 'appearance', label: '外观主题', icon: 'palette' },
@@ -54,6 +56,7 @@ function catLabel(key: string): string {
 
 function jumpTo(r: { cat: string; label: string }): void {
   cat.value = r.cat as Cat
+  if (isMobileSettings) mobileCat.value = r.cat as Cat
   q.value = ''
 }
 
@@ -788,7 +791,12 @@ async function doCheckUpdate(): Promise<void> {
       ui.toast('当前已是最新版本', 'success')
     }
   } catch (e: any) {
-    ui.toast(`检查更新失败：${e.message}`, 'error')
+    // GitHub API 在部分网络环境不可达：给出可执行的替代动作
+    updateInfo.value = null
+    ui.toast(`检查更新失败：${e.message}。可用浏览器打开 Releases 页手动下载`, 'error', 5000)
+    try {
+      await navigator.clipboard.writeText(`https://github.com/mancking/StarWish-Music/releases`)
+    } catch { /* 剪贴板不可用 */ }
   } finally {
     updateChecking.value = false
   }
@@ -797,35 +805,99 @@ async function doCheckUpdate(): Promise<void> {
 async function openUpdatePage(): Promise<void> {
   const url = updateInfo.value?.url || `https://github.com/${'mancking/StarWish-Music'}/releases/latest`
   if (isDesktop) {
+    // 桌面端：优先应用内下载安装包（Windows 便携 exe / macOS zip），失败再退回浏览器
+    const desktopUrl = updateInfo.value?.desktopUrl
+    if (desktopUrl) {
+      await desktopInstall(desktopUrl)
+      return
+    }
     await call('app:openExternal', { url }).catch(() => {})
     return
   }
   // v2.3.1：Release 里有 APK 产物时应用内直接下载并拉起安装器，不再跳浏览器
   const apkUrl = updateInfo.value?.apkUrl
   if (apkUrl) {
-    ui.toast('开始下载安装包…', 'info', 2400)
+    ui.toast('开始下载安装包，完成后会自动拉起安装器…', 'info', 3600)
     try {
       await call('app:downloadAndInstall', { url: apkUrl })
-      ui.toast('下载完成，请在弹出的安装器中确认安装', 'success', 4200)
+      ui.toast('下载完成，请在弹出的安装器中确认安装（首次需允许「安装未知应用」）', 'success', 6000)
     } catch (e: any) {
-      ui.toast(`下载失败：${e.message}，已复制下载页链接`, 'error', 4200)
+      ui.toast(`下载失败：${e.message}，已复制下载页链接`, 'error', 4600)
       try {
         await navigator.clipboard.writeText(url)
       } catch { /* 剪贴板不可用 */ }
     }
     return
   }
-  // 无 APK 产物：退回复制链接给系统浏览器
+  // 无 APK 产物：直接用系统浏览器打开 Release 页（SwBridge openExternal）
   try {
-    await navigator.clipboard.writeText(url)
-    ui.toast('下载页链接已复制，请在浏览器打开', 'success')
+    await call('app:openExternal', { url })
+    ui.toast('已打开下载页，请在 Assets 中下载 APK', 'info', 3600)
   } catch {
-    ui.toast(url, 'info', 8000)
+    try {
+      await navigator.clipboard.writeText(url)
+      ui.toast('下载页链接已复制，请在浏览器打开', 'success')
+    } catch {
+      ui.toast(url, 'info', 8000)
+    }
   }
 }
 
 async function restartApp(): Promise<void> {
   await call('app:relaunch').catch(() => {})
+}
+
+/* ---------------- 桌面端应用内更新（下载安装包 → 重启替换） ---------------- */
+const desktopUpdating = ref(false)
+const desktopProgress = ref<{ received: number; total: number; percent: number; phase: string } | null>(null)
+const desktopFilePath = ref('')
+let offDesktopProgress: (() => void) | null = null
+
+function ensureDesktopProgressListener(): void {
+  if (offDesktopProgress) return
+  offDesktopProgress = on('update:progress', (p: any) => {
+    if (!p) return
+    desktopProgress.value = {
+      received: Number(p.received || 0),
+      total: Number(p.total || 0),
+      percent: Number(p.percent || 0),
+      phase: String(p.phase || 'downloading'),
+    }
+  })
+}
+
+async function desktopInstall(downloadUrl: string): Promise<void> {
+  if (desktopUpdating.value) return
+  desktopUpdating.value = true
+  desktopProgress.value = null
+  desktopFilePath.value = ''
+  ensureDesktopProgressListener()
+  try {
+    const r = await call<{ path: string; fileName: string }>('app:downloadUpdate', {
+      url: downloadUrl,
+      version: updateInfo.value?.version || '',
+    })
+    desktopFilePath.value = r.path
+    ui.toast(`新版本已下载：${r.fileName}`, 'success', 5000)
+  } catch (e: any) {
+    ui.toast(`更新包下载失败：${e.message}，已改为打开下载页`, 'error', 5000)
+    const url = updateInfo.value?.url || 'https://github.com/mancking/StarWish-Music/releases/latest'
+    await call('app:openExternal', { url }).catch(() => {})
+  } finally {
+    desktopUpdating.value = false
+  }
+}
+
+/** 用已下载的新版可执行文件重启（便携版：拉起新 exe 后退出旧进程） */
+async function applyDesktopUpdate(): Promise<void> {
+  if (!desktopFilePath.value) return
+  await call('app:relaunchWithUpdate', { path: desktopFilePath.value }).catch(() => {})
+}
+
+/** 不重启，只在文件夹中显示已下载的安装包 */
+async function revealDesktopUpdate(): Promise<void> {
+  if (!desktopFilePath.value) return
+  await call('app:showUpdateFile', { path: desktopFilePath.value }).catch(() => {})
 }
 
 async function restoreSources(): Promise<void> {
@@ -992,7 +1064,26 @@ onBeforeUnmount(stopPoll)
       </div>
     </header>
 
-    <div class="layout">
+    <!-- 移动端：分类列表页（一级） -->
+    <div v-if="isMobileSettings && !mobileCat" class="m-cats">
+      <button v-for="c in cats" :key="c.key" class="m-cat" @click="mobileCat = c.key; cat = c.key">
+        <span class="m-cat-icon"><Icon :name="c.icon" :size="18" /></span>
+        <span class="m-cat-label">{{ c.label }}</span>
+        <Icon name="chevron-right" :size="15" class="m-cat-arrow" />
+      </button>
+    </div>
+
+    <!-- 移动端：分类整页面板（二级） -->
+    <template v-if="isMobileSettings && mobileCat">
+      <div class="m-back-row">
+        <button class="m-back" @click="mobileCat = ''">
+          <Icon name="chevron-left" :size="18" />设置
+        </button>
+        <b class="m-back-title">{{ catLabel(String(mobileCat)) }}</b>
+      </div>
+    </template>
+
+    <div v-show="!isMobileSettings || !!mobileCat" class="layout">
       <aside v-if="!isMobileSettings" class="cats">
         <button v-for="c in cats" :key="c.key" class="cat" :class="{ active: cat === c.key }" @click="cat = c.key">
           <Icon :name="c.icon" :size="16" />
@@ -1002,7 +1093,7 @@ onBeforeUnmount(stopPoll)
 
       <div class="panel">
         <!-- 外观 -->
-        <section v-if="cat === 'appearance' || isMobileSettings">
+        <section v-if="cat === 'appearance' || (isMobileSettings && mobileCat === 'appearance')">
           <h2>外观主题</h2>
           <div class="row">
             <div class="label"><b>主题模式</b><span>深色适合夜间长时间听歌</span></div>
@@ -1084,7 +1175,7 @@ onBeforeUnmount(stopPoll)
         </section>
 
         <!-- 壁纸引擎 -->
-        <section v-else-if="cat === 'wallpaper' || isMobileSettings">
+        <section v-else-if="cat === 'wallpaper' || (isMobileSettings && mobileCat === 'wallpaper')">
           <h2>壁纸引擎</h2>
           <p class="hint">图片壁纸库：导入多张图片、轮播、调节显示属性。壁纸只作用于应用内播放页，不修改系统桌面。</p>
 
@@ -1216,7 +1307,7 @@ onBeforeUnmount(stopPoll)
         </section>
 
         <!-- 视频与弹幕 -->
-        <section v-else-if="cat === 'video' || isMobileSettings">
+        <section v-else-if="cat === 'video' || (isMobileSettings && mobileCat === 'video')">
           <h2>视频与弹幕</h2>
           <p class="hint">MV / 视频播放器的默认行为。弹幕来自视频源，关闭后不影响视频播放。</p>
 
@@ -1305,7 +1396,7 @@ onBeforeUnmount(stopPoll)
         </section>
 
         <!-- 下载 -->
-        <section v-else-if="cat === 'download' || isMobileSettings">
+        <section v-else-if="cat === 'download' || (isMobileSettings && mobileCat === 'download')">
           <h2>下载</h2>
           <p class="hint">在歌曲列表右键选择「下载」，文件保存到下方目录，不参与缓存清理。</p>
 
@@ -1356,7 +1447,7 @@ onBeforeUnmount(stopPoll)
         </section>
 
         <!-- 播放 -->
-        <section v-else-if="cat === 'playback' || isMobileSettings">
+        <section v-else-if="cat === 'playback' || (isMobileSettings && mobileCat === 'playback')">
           <h2>播放</h2>
           <div class="row">
             <div class="label"><b>播放倍速</b><span>变速时保留音调，不产生「花栗鼠」效果</span></div>
@@ -1458,7 +1549,7 @@ onBeforeUnmount(stopPoll)
         </section>
 
         <!-- 歌词 -->
-        <section v-else-if="cat === 'lyric' || isMobileSettings">
+        <section v-else-if="cat === 'lyric' || (isMobileSettings && mobileCat === 'lyric')">
           <h2>歌词</h2>
           <div class="row">
             <div class="label"><b>桌面歌词</b><span>悬浮在桌面最上层，快捷键 Ctrl+Alt+L</span></div>
@@ -1489,7 +1580,7 @@ onBeforeUnmount(stopPoll)
         </section>
 
         <!-- 音源 -->
-        <section v-else-if="cat === 'sources' || isMobileSettings">
+        <section v-else-if="cat === 'sources' || (isMobileSettings && mobileCat === 'sources')">
           <div class="sec-head">
             <div>
               <h2>音源与插件</h2>
@@ -1627,7 +1718,7 @@ onBeforeUnmount(stopPoll)
         </section>
 
         <!-- 本地音乐 -->
-        <section v-else-if="cat === 'local' || isMobileSettings">
+        <section v-else-if="cat === 'local' || (isMobileSettings && mobileCat === 'local')">
           <h2>本地音乐</h2>
           <div class="row">
             <div class="label"><b>音乐文件夹</b><span>支持 MP3 / FLAC / M4A / OGG / WAV / APE</span></div>
@@ -1651,7 +1742,7 @@ onBeforeUnmount(stopPoll)
         </section>
 
         <!-- 缓存 -->
-        <section v-else-if="cat === 'cache' || isMobileSettings">
+        <section v-else-if="cat === 'cache' || (isMobileSettings && mobileCat === 'cache')">
           <h2>网络与缓存</h2>
           <div v-if="dataRestart" class="banner">
             <Icon name="info" :size="15" />
@@ -1799,7 +1890,7 @@ onBeforeUnmount(stopPoll)
         </section>
 
         <!-- 快捷键 -->
-        <section v-else-if="cat === 'shortcuts' || isMobileSettings">
+        <section v-else-if="cat === 'shortcuts' || (isMobileSettings && mobileCat === 'shortcuts')">
           <h2>快捷键与系统</h2>
           <div class="row">
             <div class="label"><b>任务栏歌词</b><span>在任务栏上方显示当前一句歌词（macOS 为菜单栏）</span></div>
@@ -1853,13 +1944,23 @@ onBeforeUnmount(stopPoll)
               <span v-if="updateInfo?.hasUpdate">发现新版本 v{{ updateInfo.version }}（当前 v{{ updateInfo.current }}）</span>
               <span v-else-if="updateInfo">当前 v{{ updateInfo.current }} 已是最新版本</span>
               <span v-else>检查是否有新版本可供下载</span>
+              <span v-if="desktopProgress && desktopProgress.phase === 'downloading'" class="muted">
+                正在下载更新包 {{ desktopProgress.percent }}%
+              </span>
+              <span v-else-if="desktopFilePath" class="muted">更新包已下载完成，可重启安装</span>
             </div>
-            <div style="display:flex;gap:8px;flex:none">
+            <div style="display:flex;gap:8px;flex:none;align-items:center">
               <button class="btn sm ghost" :disabled="updateChecking" @click="doCheckUpdate">
                 <Icon name="refresh" :size="14" />{{ updateChecking ? '检查中…' : '检查更新' }}
               </button>
-              <button v-if="updateInfo?.hasUpdate" class="btn sm" @click="openUpdatePage">
-                <Icon name="external" :size="14" />前往下载
+              <button v-if="updateInfo?.hasUpdate" class="btn sm" :disabled="desktopUpdating" @click="openUpdatePage">
+                <Icon name="external" :size="14" />{{ desktopUpdating ? '下载中…' : '下载并安装' }}
+              </button>
+              <button v-if="desktopFilePath" class="btn sm" @click="applyDesktopUpdate">
+                <Icon name="refresh" :size="14" />重启并安装
+              </button>
+              <button v-if="desktopFilePath" class="btn sm ghost" @click="revealDesktopUpdate">
+                <Icon name="folder-open" :size="14" />打开所在文件夹
               </button>
             </div>
           </div>

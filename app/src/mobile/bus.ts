@@ -7,6 +7,10 @@ export const EVENT_WHITELIST = new Set([
   'player:state', 'player:tick', 'player:error', 'player:queue', 'toast',
   'scan:progress', 'sources:changed', 'settings:changed', 'window:state',
   'app:navigate', 'lyric:payload', 'player:sleep',
+  // 下载进度（移动端 download:progress 与桌面同语义，此前漏登记导致进度条永不更新）
+  'download:progress',
+  // 应用内更新：原生下载进度与安装阶段
+  'update:progress',
 ])
 
 export function emit(channel: string, payload: any): void {

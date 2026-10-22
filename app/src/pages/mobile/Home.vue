@@ -1,7 +1,3 @@
-<script lang="ts">
-// 与桌面 Home.vue 共用模块级缓存（feedCache 跨实例存活）
-let feedCache: any = null
-</script>
 <script setup lang="ts">
 import { computed, defineOptions, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
@@ -13,13 +9,15 @@ import { useUiStore } from '@/stores/ui'
 import type { Song } from '@shared/types'
 
 /**
- * 移动端首页 —— 全新模板级实现（非桌面缩小版）。
+ * 移动端推荐页 —— 模板级重写（v2.3.4）。
  *
- * 与桌面首页的实质差异（设计依据 docs/mobile-ui-research-v2.3.1.md）：
- *  - 无巨型 hero 横幅：改为单手可达的问候头 + 横滑快捷入口（国内音乐 App 惯例）
- *  - 所有内容区一律「横向 snap 卡片流」，杜绝桌面网格在窄屏的挤压与截断
- *  - 文案单行 + 完整省略号，绝不出现「显示一半」
- *  - 每个分区独立加载容错，一处失败不拖垮整页
+ * 重写要点（对齐市面移动音乐 App 的「推荐」页信息架构）：
+ *  ① 顶部只有问候 + 搜索，不再堆快捷入口（与底栏重复）
+ *  ② 首个内容块是「每日推荐」——每日推荐是 App 的核心资产，必须在首屏
+ *  ③ 每个区块内容互斥：每日推荐 / 新歌速递 / 热门榜单 不再展示同一批曲目
+ *     （数据层 recommend.ts 已做跨区块去重）
+ *  ④ 榜单区展示「榜单速览」（封面 + 前 3 首 + 完整入口），点开进独立榜单页
+ *  ⑤ 新歌区只放 6 首 + 「全部」入口，点开进独立新歌页
  */
 defineOptions({ name: 'Home' })
 
@@ -56,10 +54,41 @@ const onRepeat = computed<Song[]>(() => feed.value?.onRepeat || [])
 const moods = computed<any[]>(() => feed.value?.moods || [])
 const memorySingers = computed<string[]>(() => memory.value?.topSingers?.slice(0, 6)?.map((s: any) => s.name || s) || [])
 
-const quickActions = computed(() => [
-  { icon: 'sparkles', label: '每日推荐', run: playDaily },
-  { icon: 'trophy', label: '排行榜', run: () => router.push('/discover') },
-])
+/* ---------------- 私人电台 ---------------- */
+const radio = ref<{ songs: Song[]; seeds: string[] }>({ songs: [], seeds: [] })
+const radioLoading = ref(false)
+
+async function loadRadio(force = false): Promise<void> {
+  if (radioLoading.value) return
+  radioLoading.value = true
+  try {
+    const r = await call<{ songs: Song[]; seeds: string[] }>('radio:build', { force, size: 60 })
+    radio.value = { songs: r.songs || [], seeds: r.seeds || [] }
+  } catch {
+    if (!radio.value.songs.length) radio.value = { songs: onRepeat.value, seeds: [] }
+  } finally {
+    radioLoading.value = false
+  }
+}
+
+function playRadio(): void {
+  if (!radio.value.songs.length) {
+    void loadRadio(true).then(() => {
+      if (radio.value.songs.length) player.playSongs(radio.value.songs, 0)
+    })
+    return
+  }
+  void player.playSongs(radio.value.songs, 0)
+}
+
+function shuffleRadio(): void {
+  void loadRadio(true).then(() => {
+    if (radio.value.songs.length) {
+      player.playSongs(radio.value.songs, 0)
+      ui.toast('已换一批电台', 'success', 1600)
+    }
+  })
+}
 
 /** 首页搜索：输入即跳搜索页（与底栏搜索同一去向） */
 const searchText = ref('')
@@ -71,24 +100,12 @@ function submitSearch(): void {
 }
 
 async function load(force = false): Promise<void> {
-  if (!force && feedCache) {
-    feed.value = feedCache
-    loading.value = false
-    void call('home:feed', { force: false })
-      .then((f: any) => {
-        feedCache = f
-        feed.value = f
-      })
-      .catch(() => {})
-    return
-  }
   if (force) refreshing.value = true
   else loading.value = true
   error.value = ''
   try {
     const [f, m] = await Promise.all([call('home:feed', { force }), call('music:memory').catch(() => null)])
     feed.value = f
-    feedCache = f
     memory.value = m
   } catch (e: any) {
     error.value = e?.message || '加载失败'
@@ -107,18 +124,14 @@ function openPlaylist(pl: any): void {
   router.push({ path: `/playlist/${pl.id}`, query: { src: pl.source || 'wy', name: pl.name } })
 }
 
-async function playToplist(card: any): Promise<void> {
-  try {
-    const r = await call<{ name: string; songs: Song[] }>('music:toplist', { platform: card.platform, id: card.id })
-    if (!r.songs.length) throw new Error('榜单暂无数据')
-    await player.playSongs(r.songs, 0)
-    ui.toast(`正在播放：${r.name}`, 'success', 1800)
-  } catch (e: any) {
-    ui.toast(e.message, 'error')
-  }
+function openToplist(card: any): void {
+  router.push(`/toplist/${card.platform}/${card.id}`)
 }
 
-onMounted(() => void load())
+onMounted(() => {
+  void load()
+  void loadRadio()
+})
 defineExpose({ refresh: () => load(true) })
 </script>
 
@@ -142,11 +155,10 @@ defineExpose({ refresh: () => load(true) })
     </div>
 
     <template v-else>
-      <!-- 问候头 + 搜索框：三行短文案，永不截断 -->
+      <!-- 问候头 + 搜索框 -->
       <header class="m-head">
         <div class="m-kicker">{{ dateText }}</div>
         <h1 class="m-greet">{{ greeting }}，欢迎回来</h1>
-        <p class="m-sub">从星河里捞一首歌，陪你度过此刻</p>
         <div class="m-search">
           <Icon name="search" :size="17" class="m-search-icon" />
           <input
@@ -160,20 +172,14 @@ defineExpose({ refresh: () => load(true) })
         </div>
       </header>
 
-      <!-- 快捷入口：仅保留有实际动作的项（每日推荐直达播放 / 排行榜直达榜单），
-           其余去重——底栏已有「发现/视频/我的」，我喜欢的在「我的」页 -->
-      <nav v-if="quickActions.length" class="m-quick">
-        <button v-for="q in quickActions" :key="q.label" class="m-quick-item" @click="q.run()">
-          <Icon :name="q.icon" :size="16" />
-          <span>{{ q.label }}</span>
-        </button>
-      </nav>
-
-      <!-- 继续收听：横滑大卡 -->
-      <section v-if="continueList.length" class="m-sec">
-        <div class="m-sec-title"><Icon name="clock" :size="16" />继续收听</div>
+      <!-- ① 每日推荐：首屏核心资产 -->
+      <section v-if="daily.length" class="m-sec">
+        <div class="m-sec-title">
+          <Icon name="sparkles" :size="16" />每日推荐
+          <button class="m-sec-act" @click="playDaily"><Icon name="play" :size="13" />播放</button>
+        </div>
         <div class="m-car">
-          <button v-for="s in continueList" :key="s.id" class="m-card" @click="player.playSongs(continueList)">
+          <button v-for="(s, i) in daily.slice(0, 10)" :key="s.id" class="m-card" @click="player.playSongs(daily, i)">
             <Cover :src="s.pic || ''" :size="132" radius="12" class="m-card-cover" />
             <div class="m-card-name">{{ s.name }}</div>
             <div class="m-card-sub">{{ s.singer }}</div>
@@ -181,9 +187,29 @@ defineExpose({ refresh: () => load(true) })
         </div>
       </section>
 
-      <!-- 推荐歌单：横滑卡 -->
+      <!-- ② 继续收听 -->
+      <section v-if="continueList.length" class="m-sec">
+        <div class="m-sec-title">
+          <Icon name="clock" :size="16" />继续收听
+          <button class="m-sec-act" @click="router.push('/history')"><Icon name="chevron-right" :size="13" />全部</button>
+        </div>
+        <div class="m-car">
+          <button v-for="(s, i) in continueList" :key="s.id" class="m-card" @click="player.playSongs(continueList, i)">
+            <Cover :src="s.pic || ''" :size="132" radius="12" class="m-card-cover" />
+            <div class="m-card-name">{{ s.name }}</div>
+            <div class="m-card-sub">{{ s.singer }}</div>
+          </button>
+        </div>
+      </section>
+
+      <!-- ③ 推荐歌单 -->
       <section v-if="playlists.length" class="m-sec">
-        <div class="m-sec-title"><Icon name="list" :size="16" />推荐歌单</div>
+        <div class="m-sec-title">
+          <Icon name="list" :size="16" />推荐歌单
+          <button class="m-sec-act" @click="router.push({ path: '/discover', query: { tab: 'playlists' } })">
+            <Icon name="chevron-right" :size="13" />全部
+          </button>
+        </div>
         <div class="m-car">
           <button v-for="pl in playlists" :key="pl.id" class="m-card" @click="openPlaylist(pl)">
             <Cover :src="pl.pic || ''" :size="132" radius="12" class="m-card-cover" />
@@ -193,11 +219,19 @@ defineExpose({ refresh: () => load(true) })
         </div>
       </section>
 
-      <!-- 新歌速递：紧凑编号列表 -->
+      <!-- ④ 新歌速递：只 6 首 + 全部入口 -->
       <section v-if="newSongs.length" class="m-sec">
-        <div class="m-sec-title"><Icon name="music" :size="16" />新歌速递</div>
+        <div class="m-sec-title">
+          <Icon name="music" :size="16" />新歌速递
+          <button class="m-sec-act" @click="router.push('/new')"><Icon name="chevron-right" :size="13" />全部</button>
+        </div>
         <div class="m-list">
-          <button v-for="(s, i) in newSongs.slice(0, 6)" :key="s.id" class="m-song" @click="player.playSongs(newSongs.slice(0, 6), i)">
+          <button
+            v-for="(s, i) in newSongs.slice(0, 6)"
+            :key="s.id"
+            class="m-song"
+            @click="player.playSongs(newSongs, i)"
+          >
             <span class="m-song-idx" :class="{ hot: i < 3 }">{{ i + 1 }}</span>
             <Cover :src="s.pic || ''" :size="44" radius="9" class="m-song-cover" />
             <span class="m-song-meta">
@@ -209,23 +243,44 @@ defineExpose({ refresh: () => load(true) })
         </div>
       </section>
 
-      <!-- 榜单快捷：横滑胶囊卡 -->
+      <!-- ⑤ 热门榜单速览：卡片含榜单前 3 首，点开进独立榜单页 -->
       <section v-if="toplists.length" class="m-sec">
-        <div class="m-sec-title"><Icon name="trophy" :size="16" />热门榜单</div>
-        <div class="m-car">
-          <button v-for="(t, i) in toplists.slice(0, 10)" :key="t.id" class="m-tl" @click="playToplist(t)">
-            <span class="m-tl-rank">{{ i + 1 }}</span>
-            <span class="m-tl-name">{{ t.name }}</span>
-            <Icon name="play" :size="14" class="m-tl-play" />
+        <div class="m-sec-title">
+          <Icon name="gauge" :size="16" />热门榜单
+          <button class="m-sec-act" @click="router.push({ path: '/discover', query: { tab: 'toplists' } })">
+            <Icon name="chevron-right" :size="13" />全部
+          </button>
+        </div>
+        <div class="m-tl-list">
+          <button v-for="card in toplists" :key="card.id" class="m-tl-card" @click="openToplist(card)">
+            <Cover :src="card.pic || ''" :size="52" radius="10" class="m-tl-cover" />
+            <span class="m-tl-info">
+              <span class="m-tl-name">{{ card.name }}</span>
+              <span class="m-tl-prev">
+                <span v-for="(s, i) in card.songs.slice(0, 3)" :key="s.id" class="m-tl-line">
+                  <i>{{ i + 1 }}</i>{{ s.name }} — {{ s.singer }}
+                </span>
+              </span>
+            </span>
+            <Icon name="chevron-right" :size="16" class="m-tl-arrow" />
           </button>
         </div>
       </section>
 
-      <!-- 单曲循环 / 心情 -->
-      <section v-if="onRepeat.length" class="m-sec">
-        <div class="m-sec-title"><Icon name="repeat" :size="16" />你在循环</div>
+      <!-- ⑥ 私人电台 -->
+      <section v-if="radio.songs.length" class="m-sec">
+        <div class="m-sec-title">
+          <Icon name="radio" :size="16" />私人电台
+          <button class="m-sec-act" @click="shuffleRadio">
+            <Icon name="refresh" :size="13" />{{ radioLoading ? '生成中…' : '换一批' }}
+          </button>
+          <button class="m-sec-act" @click="playRadio"><Icon name="play" :size="13" />播放</button>
+        </div>
+        <div class="m-sec-sub">
+          {{ radio.seeds.length ? `根据 ${radio.seeds.join('、')} 的口味持续推荐` : '按你的收听口味持续推荐' }}
+        </div>
         <div class="m-car">
-          <button v-for="s in onRepeat" :key="s.id" class="m-card sm" @click="player.playSongs(onRepeat)">
+          <button v-for="(s, i) in radio.songs.slice(0, 10)" :key="s.id" class="m-card sm" @click="player.playSongs(radio.songs, i)">
             <Cover :src="s.pic || ''" :size="96" radius="10" class="m-card-cover" />
             <div class="m-card-name">{{ s.name }}</div>
             <div class="m-card-sub">{{ s.singer }}</div>
@@ -233,21 +288,26 @@ defineExpose({ refresh: () => load(true) })
         </div>
       </section>
 
-      <!-- 音乐回忆 -->
+      <!-- ⑦ 音乐回忆 -->
       <section v-if="memorySingers.length" class="m-sec">
-        <div class="m-sec-title"><Icon name="sparkles" :size="16" />音乐回忆</div>
+        <div class="m-sec-title"><Icon name="star" :size="16" />音乐回忆</div>
         <div class="m-chips">
-          <button v-for="n in memorySingers" :key="n" class="m-chip" @click="router.push({ path: '/search', query: { keyword: n } })">
+          <button v-for="n in memorySingers" :key="n" class="m-chip" @click="router.push({ path: '/search', query: { q: n } })">
             {{ n }}
           </button>
         </div>
       </section>
 
-      <!-- 心情歌单入口 -->
+      <!-- ⑧ 按心情听 -->
       <section v-if="moods.length" class="m-sec">
         <div class="m-sec-title"><Icon name="compass" :size="16" />按心情听</div>
         <div class="m-chips">
-          <button v-for="m in moods.slice(0, 8)" :key="m.cat" class="m-chip" @click="router.push({ path: '/discover', query: { tab: 'playlists', cat: m.cat } })">
+          <button
+            v-for="m in moods.slice(0, 8)"
+            :key="m.cat"
+            class="m-chip"
+            @click="router.push({ path: '/discover', query: { tab: 'playlists', cat: m.cat } })"
+          >
             {{ m.cat }}
           </button>
         </div>
@@ -260,7 +320,7 @@ defineExpose({ refresh: () => load(true) })
 .m-home {
   padding-bottom: 28px;
 }
-/* 问候头：完整三行，绝不截断 */
+/* 问候头 */
 .m-head {
   padding: 10px 2px 4px;
 }
@@ -277,12 +337,6 @@ defineExpose({ refresh: () => load(true) })
   color: var(--text);
   white-space: nowrap;
   overflow: visible;
-}
-.m-sub {
-  margin: 6px 0 0;
-  font-size: 13px;
-  color: var(--text-3);
-  line-height: 1.5;
 }
 
 /* 搜索框 */
@@ -322,36 +376,6 @@ defineExpose({ refresh: () => load(true) })
   -webkit-tap-highlight-color: transparent;
 }
 
-/* 快捷入口：横滑胶囊 */
-.m-quick {
-  display: flex;
-  gap: 8px;
-  overflow-x: auto;
-  margin: 14px -16px 4px;
-  padding: 2px 16px;
-  scrollbar-width: none;
-}
-.m-quick::-webkit-scrollbar {
-  display: none;
-}
-.m-quick-item {
-  flex: none;
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  height: 42px;
-  padding: 0 16px;
-  border-radius: 21px;
-  border: 1px solid var(--line);
-  background: var(--bg-2);
-  color: var(--text-2);
-  font-size: 13.5px;
-  -webkit-tap-highlight-color: transparent;
-}
-.m-quick-item:active {
-  filter: brightness(1.2);
-}
-
 /* 分区 */
 .m-sec {
   margin-top: 26px;
@@ -371,6 +395,33 @@ defineExpose({ refresh: () => load(true) })
   height: 15px;
   border-radius: 2px;
   background: linear-gradient(180deg, #ff4d6d, #a855f7);
+}
+.m-sec-sub {
+  font-size: 12px;
+  color: var(--text-3);
+  margin: -6px 0 10px 11px;
+}
+.m-sec-act {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  height: 30px;
+  padding: 0 11px;
+  border: 1px solid var(--line);
+  border-radius: 15px;
+  background: var(--bg-2);
+  color: var(--text-2);
+  font-size: 12px;
+  font-weight: 500;
+  -webkit-tap-highlight-color: transparent;
+}
+.m-sec-act:active {
+  filter: brightness(1.2);
+}
+/* 多个操作按钮时：第一个靠右，其余紧随 */
+.m-sec-act + .m-sec-act {
+  margin-left: 6px;
 }
 
 /* 横滑卡片流 */
@@ -459,6 +510,9 @@ defineExpose({ refresh: () => load(true) })
 .m-song-idx.hot {
   color: var(--accent);
 }
+.m-song-cover {
+  flex: none;
+}
 .m-song-meta {
   flex: 1;
   min-width: 0;
@@ -486,34 +540,65 @@ defineExpose({ refresh: () => load(true) })
   color: var(--text-3);
 }
 
-/* 榜单胶囊 */
-.m-tl {
-  flex: none;
-  display: inline-flex;
+/* 榜单速览卡 */
+.m-tl-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.m-tl-card {
+  display: flex;
   align-items: center;
-  gap: 9px;
-  height: 46px;
-  padding: 0 14px;
-  border-radius: 14px;
+  gap: 12px;
+  padding: 12px;
   border: 1px solid var(--line);
+  border-radius: 16px;
   background: var(--bg-2);
-  scroll-snap-align: start;
+  text-align: left;
   -webkit-tap-highlight-color: transparent;
 }
-.m-tl:active {
-  filter: brightness(1.2);
+.m-tl-card:active {
+  filter: brightness(1.15);
 }
-.m-tl-rank {
-  font-size: 13px;
-  font-weight: 800;
-  color: var(--accent);
+.m-tl-cover {
+  flex: none;
+}
+.m-tl-info {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
 }
 .m-tl-name {
-  font-size: 13.5px;
+  font-size: 15px;
+  font-weight: 700;
   color: var(--text);
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
-.m-tl-play {
+.m-tl-prev {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.m-tl-line {
+  font-size: 11.5px;
+  color: var(--text-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.m-tl-line i {
+  display: inline-block;
+  width: 16px;
+  font-style: normal;
+  color: var(--accent);
+  font-weight: 700;
+}
+.m-tl-arrow {
+  flex: none;
   color: var(--text-3);
 }
 

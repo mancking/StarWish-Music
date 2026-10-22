@@ -888,6 +888,118 @@ onBeforeUnmount(() => {
                 </div>
               </div>
             </div>
+
+            <!-- 桌面端控制条：单行横排，完整功能（画质/倍速/循环/画面/弹幕/音量/画中画/全屏） -->
+            <div v-else class="ctrl-row d-ctrl">
+              <div class="ctrl-left">
+                <button class="cbtn" :title="playing ? '暂停' : '播放'" @click="togglePlay">
+                  <Icon :name="playing ? 'pause' : 'play'" :size="18" />
+                </button>
+                <button class="cbtn" title="后退 5 秒" @click="nudge(-5)"><Icon name="prev" :size="16" /></button>
+                <button class="cbtn" title="前进 5 秒" @click="nudge(5)"><Icon name="next" :size="16" /></button>
+                <span class="time mono">{{ fmtTime(curTime) }} / {{ fmtTime(duration) }}</span>
+              </div>
+              <div class="ctrl-right">
+                <div class="vol">
+                  <button class="cbtn" :title="muted || volume === 0 ? '取消静音' : '静音'" @click="toggleMute">
+                    <Icon :name="muted || volume === 0 ? 'volume-mute' : 'volume'" :size="16" />
+                  </button>
+                  <input
+                    class="vol-range"
+                    type="range"
+                    min="0"
+                    max="1"
+                    step="0.02"
+                    :value="muted ? 0 : volume"
+                    @input="setVolume(Number(($event.target as HTMLInputElement).value))"
+                  />
+                </div>
+
+                <div class="menu-wrap">
+                  <button class="cbtn toggle" :class="{ open: menu === 'quality' }" title="画质" @click="toggleMenu('quality')">
+                    <Icon name="gauge" :size="16" /><span class="tlab">画质</span>
+                  </button>
+                  <div v-if="menu === 'quality'" class="menu">
+                    <div class="menu-title">画质</div>
+                    <button
+                      v-for="q in qualities"
+                      :key="q.qn"
+                      class="menu-item"
+                      :class="{ active: q.qn === curQn }"
+                      @click="changeQuality(q.qn)"
+                    >
+                      {{ q.label }}
+                      <Icon v-if="q.qn === curQn" name="check" :size="13" />
+                    </button>
+                    <div v-if="!qualities.length" class="menu-empty">暂无更多画质</div>
+                  </div>
+                </div>
+
+                <div class="menu-wrap">
+                  <button class="cbtn toggle" :class="{ open: menu === 'speed' }" title="倍速" @click="toggleMenu('speed')">
+                    <Icon name="zap" :size="16" /><span class="tlab">{{ rate }}x</span>
+                  </button>
+                  <div v-if="menu === 'speed'" class="menu">
+                    <div class="menu-title">播放速度</div>
+                    <button
+                      v-for="r in RATES"
+                      :key="r"
+                      class="menu-item"
+                      :class="{ active: r === rate }"
+                      @click="setRate(r)"
+                    >
+                      {{ r === 1 ? '正常' : r + 'x' }}
+                      <Icon v-if="r === rate" name="check" :size="13" />
+                    </button>
+                  </div>
+                </div>
+
+                <div class="menu-wrap">
+                  <button class="cbtn toggle" :class="{ open: menu === 'more' }" title="更多" @click="toggleMenu('more')">
+                    <Icon name="more" :size="16" />
+                  </button>
+                  <div v-if="menu === 'more'" class="menu">
+                    <div class="menu-title">循环模式</div>
+                    <button
+                      v-for="m in LOOP_MODES"
+                      :key="m"
+                      class="menu-item"
+                      :class="{ active: m === loopMode }"
+                      @click="setLoop(m)"
+                    >
+                      {{ LOOP_LABEL[m] }}
+                      <Icon v-if="m === loopMode" name="check" :size="13" />
+                    </button>
+                    <div class="menu-title">画面模式</div>
+                    <button
+                      v-for="m in FILL_MODES"
+                      :key="m"
+                      class="menu-item"
+                      :class="{ active: m === fillMode }"
+                      @click="setFill(m)"
+                    >
+                      {{ FILL_LABEL[m] }}
+                      <Icon v-if="m === fillMode" name="check" :size="13" />
+                    </button>
+                    <div class="menu-title">其他</div>
+                    <button class="menu-item" :class="{ active: autoNext }" @click="autoNext = !autoNext">
+                      自动连播<Icon v-if="autoNext" name="check" :size="13" />
+                    </button>
+                    <button class="menu-item" :class="{ active: ui.settings.danmakuEnabled }" @click="toggleDanmaku">
+                      弹幕{{ ui.settings.danmakuEnabled ? '（开）' : '（关）' }}
+                    </button>
+                    <button class="menu-item" @click="toggleMute">
+                      {{ muted || volume === 0 ? '开启声音' : '静音' }}
+                    </button>
+                  </div>
+                </div>
+
+                <button class="cbtn" title="画中画" @click="togglePip"><Icon name="album" :size="16" /></button>
+                <button class="cbtn" title="全屏" @click="toggleFullscreen">
+                  <Icon :name="isFullscreen ? 'shrink' : 'expand'" :size="16" />
+                </button>
+              </div>
+            </div>
           </div>
         </div>
 
@@ -1192,6 +1304,27 @@ onBeforeUnmount(() => {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
+}
+/* 桌面端单行控制条：左播放/时间，右音量与功能 */
+.d-ctrl {
+  padding-top: 2px;
+}
+.d-ctrl .cbtn {
+  min-width: 32px;
+  height: 32px;
+}
+.d-ctrl .time {
+  margin-left: 10px;
+  font-size: 12px;
+}
+.d-ctrl .ctrl-right {
+  gap: 3px;
+}
+.d-ctrl .menu {
+  bottom: 40px;
+}
+.d-ctrl .tlab {
+  margin-left: 2px;
 }
 .ctrl-left,
 .ctrl-right {

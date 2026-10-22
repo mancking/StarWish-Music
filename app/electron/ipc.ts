@@ -23,6 +23,7 @@ import {
   searchMv,
 } from './core/music-service'
 import { buildHomeFeed, invalidateFeed } from './core/recommend'
+import { buildRadio, invalidateRadio } from './core/radio'
 import { player } from './core/player-service'
 import { listWallpapers, saveWallpaper, removeWallpaper, renameWallpaper, importWallpaperFromPath } from './core/wallpaper'
 import { getDanmaku } from './core/danmaku'
@@ -38,6 +39,7 @@ import {
   setDownloadEmitter,
 } from './core/download'
 import { getSettings, saveSettings } from './core/settings'
+import { downloadDesktopUpdate, relaunchWithUpdate } from './core/updater'
 import { applyTitleBarTheme, broadcast, sendToMain, setLyricLock, showLyricWindow, showTaskbarLyric, wins } from './windows'
 import {
   addHistory,
@@ -203,6 +205,20 @@ const handlers: Record<string, Handler> = {
     shell.showItemInFolder(p)
     return true
   },
+  /** 桌面端应用内更新：下载新版安装包到 <userData>/update/，完成后可重启替换 */
+  'app:downloadUpdate': async ({ url, version }: { url: string; version: string }) => {
+    if (!/^https?:\/\//i.test(String(url || ''))) throw new Error('更新地址无效')
+    const r = await downloadDesktopUpdate(url, version, p => broadcast('update:progress', p))
+    return r
+  },
+  'app:relaunchWithUpdate': ({ path: p }: { path: string }) => {
+    relaunchWithUpdate(p)
+    return true
+  },
+  'app:showUpdateFile': ({ path: p }: { path: string }) => {
+    shell.showItemInFolder(p)
+    return true
+  },
 
   /* ---------------- 设置 ---------------- */
   'settings:get': () => getSettings(),
@@ -333,6 +349,11 @@ const handlers: Record<string, Handler> = {
   'music:mvurl': ({ bvid, cid, qn }: any) => getMvUrl(bvid, cid, qn),
   'music:mvparts': ({ bvid }: any) => getMvParts(bvid),
   'home:feed': async ({ force }: any) => decFeed(await buildHomeFeed(!!force)),
+  /** 私人电台：按口味生成可连续播放的新歌队列（换一批时 force=true） */
+  'radio:build': async ({ force, size }: any) => {
+    const r = await buildRadio(!!force, Number(size) || 60)
+    return { songs: r.songs.map(dec), seeds: r.seeds, generatedAt: r.generatedAt }
+  },
 
   /* ---------------- 播放器 ---------------- */
   'player:state': () => decState(player.getState()),
@@ -785,6 +806,35 @@ const handlers: Record<string, Handler> = {
   },
 }
 
+/**
+ * 启动就绪门控。
+ *
+ * 窗口现在先于数据库/音源初始化创建（见 main.ts bootstrap），因此渲染层可能在
+ * DB 就绪前就发来 IPC（例如 db:favorites、home:feed）。这些调用不能直接报错，
+ * 否则首屏就是一堆「未实现/数据库未就绪」错误。
+ *
+ * 这里用一个可等待的 Promise 做闸门：IPC 注册即可接收调用，但真正执行前
+ * 先 await 启动就绪信号，最多等 bootTimeout 毫秒，超时则放行（走各自的降级分支）。
+ */
+let bootReadyResolve: (() => void) | null = null
+const bootReadyPromise = new Promise<void>(resolve => {
+  bootReadyResolve = resolve
+})
+const BOOT_TIMEOUT = 20000
+let bootResolved = false
+
+/** 标记启动就绪：数据库、音源、IPC 依赖均已可用 */
+export function markBootReady(): void {
+  if (bootResolved) return
+  bootResolved = true
+  bootReadyResolve?.()
+}
+
+/** 启动就绪信号（供其它模块 await） */
+export function whenBootReady(): Promise<void> {
+  return bootReadyPromise
+}
+
 export function registerIpc(): void {
   restoreDownloads()
   setDownloadEmitter(t => broadcast('download:progress', t))
@@ -794,6 +844,13 @@ export function registerIpc(): void {
       return { ok: false, error: `未实现的能力：${channel}` }
     }
     try {
+      // 等待启动就绪（DB / 音源）。已就绪时这段 await 直接返回，不产生额外延迟。
+      if (!bootResolved) {
+        await Promise.race([
+          bootReadyPromise,
+          new Promise<void>(resolve => setTimeout(resolve, BOOT_TIMEOUT)),
+        ])
+      }
       const data = await fn(payload || {}, event)
       return { ok: true, data }
     } catch (e: any) {
