@@ -30,14 +30,14 @@
 | M6 功能增补 | 完成 | WebDAV 单向上传（歌单 + 收藏）、任务栏/菜单栏歌词、播放倍速、睡眠定时、开机自启动、列表密度 |
 | M7 视频弹幕 | 完成 | 手写 protobuf 解析、分段并发拉取 + 缓存 + 采样、Canvas 弹幕层（贪心选轨、±2s 窗口、防挡字幕、屏蔽词）、8 项弹幕设置 |
 | M8 测试 | 完成 | `typecheck` 通过、桌面 `smoke` 错误数 0、移动端 `mobile:smoke` 9/9 通过 |
-| M9 跨平台构建 | 完成 | `package.json` 增 mac（dmg/zip，x64+arm64）与 linux（AppImage/deb）；CI 已产出 `starwish-macos-x64`(113.9MB)、`starwish-macos-arm64`(108.1MB)、`starwish-linux-x64`(202.7MB)；Android APK 与未签名 iOS ipa 由 `build-mobile.yml` 产出 |
+| M9 跨平台构建 | 完成 | **五端产物全部产出**：Windows `便携版.exe` 78MB + `x64.zip` 122MB（本地）；macOS x64 113.9MB、macOS arm64 108.1MB、Linux x64 202.7MB、Android APK 4.45MB、iOS 未签名 ipa 1.82MB（GitHub Actions，运行 #8 全绿） |
 
 **关于设置项数量的说明**：原计划 132 项，实际交付 75 项。差额不是遗漏，而是主动剔除的同类产品边缘项——DSD/ASIO 输出、声道平衡、皮肤引擎、歌词字体文件加载、OpenAPI 服务端、多用户配置等。这些在桌面音乐播放器里属于极小众需求，实现后无人使用却要长期维护；保留的 75 项覆盖了听歌、找歌、看视频、备份、外观定制的全部主路径。
 
 **已知限制（非未完成项）**
 
-- iOS 产物为未签名 ipa，需用户在仓库变量里开启 `ENABLE_IOS` 才会构建，且必须自签安装（不上架 App Store，已确认的决策）。
-- mac 产物未做 Apple 公证，首次打开需在系统设置里允许。
+- iOS 产物为未签名 ipa，不上架 App Store，用户需自签 / AltStore 安装（已确认的决策）。
+- macOS 产物未做 Apple 公证，首次打开需在「系统设置 → 隐私与安全性」里放行。
 
 ---
 
