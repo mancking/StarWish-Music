@@ -84,7 +84,9 @@ jobs:
         run: |
           chmod +x gradlew
           set +e
-          ./gradlew assembleDebug --no-daemon > /tmp/gradle.log 2>&1
+          # gradle.properties 里为本地开发写死了 Windows JDK 路径（org.gradle.java.home），
+          # runner 上不存在，用命令行参数覆盖成 runner 的 JAVA_HOME。
+          ./gradlew assembleDebug --no-daemon -Dorg.gradle.java.home="$JAVA_HOME" > /tmp/gradle.log 2>&1
           code=$?
           if [ $code -ne 0 ]; then
             tail -45 /tmp/gradle.log | while IFS= read -r line; do
