@@ -4,6 +4,8 @@ import { useRoute, useRouter } from 'vue-router'
 import Sidebar from '@/components/Sidebar.vue'
 import TopBar from '@/components/TopBar.vue'
 import MiniBar from '@/components/MiniBar.vue'
+import TabBar from '@/components/mobile/TabBar.vue'
+import MiniPlayer from '@/components/mobile/MiniPlayer.vue'
 import QueueDrawer from '@/components/QueueDrawer.vue'
 import ToastHost from '@/components/ToastHost.vue'
 import AddToPlaylistModal from '@/components/AddToPlaylistModal.vue'
@@ -22,6 +24,8 @@ const topbar = ref<InstanceType<typeof TopBar> | null>(null)
 
 const fullscreen = computed(() => !!route.meta.fullscreen)
 const isLyric = computed(() => !!route.meta.lyric)
+/** 移动端（Android / iOS WebView）使用独立布局：底部 Tab + 迷你播放条 */
+const isMobileApp = __MOBILE__
 
 watch(
   () => route.fullPath,
@@ -75,8 +79,21 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div v-if="fullscreen" class="fullscreen-root">
+  <div v-if="fullscreen" class="fullscreen-root" :class="{ 'is-lyric': isLyric }">
     <RouterView />
+  </div>
+
+  <!-- 移动端：底部 Tab + 全局迷你播放条，无侧栏、无顶栏 -->
+  <div v-else-if="isMobileApp" class="m-shell">
+    <main ref="content" class="m-content">
+      <RouterView v-slot="{ Component, route: r }">
+        <KeepAlive :include="['Home', 'Discover', 'Mv']">
+          <component :is="Component" :key="r.name === 'playlist' || r.name === 'toplist' ? r.fullPath : undefined" />
+        </KeepAlive>
+      </RouterView>
+    </main>
+    <MiniPlayer />
+    <TabBar />
   </div>
 
   <div v-else class="shell">
@@ -94,7 +111,7 @@ onBeforeUnmount(() => {
     </div>
   </div>
 
-  <QueueDrawer :bottom="fullscreen ? 0 : 92" />
+  <QueueDrawer :bottom="fullscreen ? 0 : isMobileApp ? 108 : 92" />
   <ToastHost />
   <AddToPlaylistModal />
   <ImportPlaylistModal />
@@ -124,6 +141,28 @@ onBeforeUnmount(() => {
 .fullscreen-root {
   height: 100vh;
   overflow: hidden;
+  /* 全屏路由（播放页）必须有不透明底色：transparent 会让下层页面的文字透出来，
+     形成「字压字」。歌词窗口是独立 BrowserWindow，用 .is-lyric 单独放开。 */
+  background: var(--bg);
+}
+.fullscreen-root.is-lyric {
   background: transparent;
+}
+
+/* 移动端外壳：内容区滚动，底部固定迷你条 + Tab */
+.m-shell {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
+  background: var(--bg);
+}
+.m-content {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  -webkit-overflow-scrolling: touch;
 }
 </style>

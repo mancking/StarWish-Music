@@ -1,0 +1,127 @@
+name: Build Mobile (Android / iOS)
+
+# 移动端产物：
+#   - Android：debug APK（可直接侧载），无需签名配置
+#   - iOS：未签名 ipa（不上架 App Store，用户自签 / AltStore 安装）
+#     iOS 默认关闭，需要在仓库 Settings → Variables 里设置 ENABLE_IOS=true 才执行。
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  android:
+    name: android-apk
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Normalize lockfile to public npm registry
+        working-directory: app
+        run: |
+          node -e "const f='package-lock.json',fs=require('fs');let s=fs.readFileSync(f,'utf8');s=s.replace(/https:\/\/registry\.npmmirror\.com\//g,'https://registry.npmjs.org/');fs.writeFileSync(f,s);"
+
+      - name: Install dependencies
+        working-directory: app
+        run: npm ci
+
+      - name: Build web bundle for mobile
+        working-directory: app
+        run: npm run build:mobile
+
+      - name: Capacitor sync
+        working-directory: app
+        run: npx cap sync android
+
+      - name: Gradle assembleDebug
+        working-directory: app/android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: starwish-android-apk
+          path: app/android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+  ios:
+    name: ios-unsigned-ipa
+    # 首次运行会用 `cap add ios` 生成 ios/ 工程；后续建议把 ios/ 提交进仓库以保证可复现。
+    if: vars.ENABLE_IOS == 'true'
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install dependencies
+        working-directory: app
+        run: npm ci
+
+      - name: Build web bundle for mobile
+        working-directory: app
+        run: npm run build:mobile
+
+      - name: Add iOS platform (first run only)
+        working-directory: app
+        run: |
+          npm i @capacitor/ios@^6.2.2
+          npx cap add ios || true
+          npx cap sync ios
+
+      - name: Xcode archive (unsigned)
+        working-directory: app/ios/App
+        run: |
+          xcodebuild -workspace App.xcworkspace \
+            -scheme App \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build
+
+      - name: Package unsigned ipa
+        working-directory: app/ios/App
+        run: |
+          APP_PATH=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' | head -1)
+          echo "app: $APP_PATH"
+          rm -rf Payload && mkdir Payload
+          cp -R "$APP_PATH" Payload/
+          zip -qry StarWish-unsigned.ipa Payload
+
+      - name: Upload ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: starwish-ios-ipa
+          path: app/ios/App/StarWish-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 14

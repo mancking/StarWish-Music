@@ -1,7 +1,7 @@
 {
   "name": "starwish-music",
   "productName": "星河音乐",
-  "version": "2.2.0",
+  "version": "2.3.0",
   "description": "星河音乐 StarWish Music —— 多音源聚合桌面音乐播放器（Electron + Vue3 + TypeScript 新架构）",
   "main": "dist/electron/main.js",
   "author": {
@@ -104,6 +104,12 @@
           "arch": [
             "x64"
           ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "x64"
+          ]
         }
       ],
       "icon": "resources/icon.ico",
@@ -122,6 +128,47 @@
     },
     "portable": {
       "artifactName": "星河音乐-${version}-便携版.${ext}"
+    },
+    "mac": {
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
+      ],
+      "icon": "resources/icon.png",
+      "category": "public.app-category.music",
+      "identity": null,
+      "artifactName": "StarWish-${version}-mac-${arch}.${ext}"
+    },
+    "linux": {
+      "target": [
+        {
+          "target": "AppImage",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "deb",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "resources/icon.png",
+      "category": "AudioVideo",
+      "artifactName": "StarWish-${version}-linux-${arch}.${ext}"
     }
   },
   "repository": {

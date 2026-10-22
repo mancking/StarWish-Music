@@ -3,6 +3,7 @@ import path from 'node:path'
 import fs from 'node:fs'
 import { resourcesDir } from './core/paths'
 import { endWindowInitWatch } from './core/crash-guard'
+import { trace } from './core/boot-trace'
 import { createLogger } from './core/log'
 
 const logger = createLogger('windows')
@@ -11,7 +12,8 @@ export const wins: {
   main: BrowserWindow | null
   audio: BrowserWindow | null
   lyric: BrowserWindow | null
-} = { main: null, audio: null, lyric: null }
+  taskbar: BrowserWindow | null
+} = { main: null, audio: null, lyric: null, taskbar: null }
 
 const isDev = !!process.env.VITE_DEV_SERVER_URL
 const DEV_URL = process.env.VITE_DEV_SERVER_URL || ''
@@ -60,21 +62,68 @@ export function createMainWindow(): BrowserWindow {
 
   // 窗口以 show:false 构造，等 ready-to-show 再显示；但若渲染进程始终不触发该事件
   // （页面加载失败、GPU 初始化卡住、容器环境无合成器），窗口就永远不会出现——用户
-  // 看到的正是「双击后任务管理器有进程、却没有任何窗口」。这里加两重兜底：超时强制
-  // 显示，以及加载失败时也显示（让用户看到错误页而不是彻底沉默）。
-  let shown = false
-  const showOnce = (): void => {
-    if (shown || win.isDestroyed()) return
-    shown = true
-    win.show()
-    // 延后清除标记：GPU/viz 首帧合成的崩溃发生在 show() 之后极短时间内，
-    // 立刻清除会让看门狗在真正崩溃的场景下失效（下次启动不会降级，陷入崩溃循环）。
-    setTimeout(endWindowInitWatch, 15000)
+  // 看到的正是「双击后任务管理器有进程、却没有任何窗口」。这里加三重兜底：
+  //   1. ready-to-show 正常显示
+  //   2. 8 秒超时强制显示
+  //   3. 显示后 1.2 秒校验可见性，不可见则重试（最多 4 次），仍失败就 reload 渲染进程
+  let showStarted = false
+  let shownOk = false
+
+  const forceShow = (attempt = 0): void => {
+    if (win.isDestroyed()) return
+    try {
+      if (win.isMinimized()) win.restore()
+      win.show()
+      win.focus()
+    } catch (e: any) {
+      logger.warn('窗口 show 调用失败', attempt, e?.message)
+    }
+    setTimeout(() => {
+      if (win.isDestroyed()) return
+      if (win.isVisible()) {
+        if (!shownOk) {
+          shownOk = true
+          trace('window:visible', `attempt=${attempt}`)
+          // 延后清除标记：GPU/viz 首帧合成的崩溃发生在 show() 之后极短时间内，
+          // 立刻清除会让看门狗在真正崩溃的场景下失效（下次启动不会降级，陷入崩溃循环）。
+          setTimeout(endWindowInitWatch, 15000)
+        }
+        return
+      }
+      if (attempt < 3) {
+        logger.warn('窗口 show 后仍不可见，重试', attempt + 1)
+        forceShow(attempt + 1)
+        return
+      }
+      logger.error('窗口连续多次无法显示，尝试重载渲染进程')
+      try {
+        win.webContents.reload()
+      } catch {
+        /* ignore */
+      }
+      setTimeout(() => {
+        if (win.isDestroyed()) return
+        try {
+          if (!win.isVisible()) win.show()
+        } catch {
+          /* ignore */
+        }
+      }, 1500)
+    }, 1200)
   }
+
+  const showOnce = (): void => {
+    if (showStarted || win.isDestroyed()) return
+    showStarted = true
+    trace('window:show')
+    forceShow(0)
+  }
+
   win.once('ready-to-show', showOnce)
   const showTimer = setTimeout(() => {
-    if (!shown) {
+    if (!showStarted) {
       logger.warn('ready-to-show 超时，强制显示窗口')
+      trace('window:show-timeout')
       showOnce()
     }
   }, 8000)
@@ -110,6 +159,38 @@ export function createMainWindow(): BrowserWindow {
     wins.main = null
   })
   return win
+}
+
+/**
+ * 自愈式唤醒：第二个实例启动时调用。
+ *
+ * 旧实现只在 second-instance 里 show/focus，但窗口若已崩溃或从未创建成功，
+ * show 是无效的——用户再点多少次图标都只会得到「有进程、没窗口」。这里补三种情况：
+ * 窗口不存在 → 重建；渲染进程崩溃/无响应 → reload；存在但不可见 → 强制显示。
+ */
+export function ensureMainWindow(): void {
+  let win = wins.main
+  if (!win || win.isDestroyed()) {
+    logger.warn('唤醒时未找到主窗口，重新创建')
+    trace('window:recreate')
+    win = createMainWindow()
+    return
+  }
+  try {
+    const wc = win.webContents as any
+    if (typeof wc.isCrashed === 'function' && wc.isCrashed()) {
+      logger.warn('唤醒时渲染进程已崩溃，重新加载')
+      win.webContents.reload()
+    }
+  } catch {
+    /* isCrashed 在部分平台不可用 */
+  }
+  if (win.isMinimized()) win.restore()
+  if (!win.isVisible()) {
+    win.show()
+    trace('window:reawake')
+  }
+  win.focus()
 }
 
 /** 隐藏的音频宿主进程：独立渲染进程，专管解码播放 */
@@ -200,6 +281,62 @@ export function setLyricLock(locked: boolean): void {
   if (!win || win.isDestroyed()) return
   win.setIgnoreMouseEvents(locked, { forward: true })
   if (locked) win.setAlwaysOnTop(true, 'screen-saver')
+}
+
+/**
+ * 任务栏 / 菜单栏歌词：单行、透明、置顶、鼠标穿透。
+ * Windows / Linux 贴工作区底部（任务栏上方），macOS 贴顶部（菜单栏下方）。
+ */
+export function createTaskbarLyric(): BrowserWindow {
+  if (wins.taskbar && !wins.taskbar.isDestroyed()) return wins.taskbar
+  const display = screen.getPrimaryDisplay()
+  const wa = display.workArea
+  const width = Math.min(760, Math.round(wa.width * 0.55))
+  const height = 30
+  const isMac = process.platform === 'darwin'
+  const win = new BrowserWindow({
+    width,
+    height,
+    x: Math.round(wa.x + (wa.width - width) / 2),
+    y: isMac ? wa.y + 2 : wa.y + wa.height - height - 2,
+    show: false,
+    frame: false,
+    transparent: true,
+    resizable: false,
+    movable: false,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    skipTaskbar: true,
+    hasShadow: false,
+    focusable: false,
+    alwaysOnTop: true,
+    webPreferences: {
+      preload: preloadPath('preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: false,
+      backgroundThrottling: false,
+    },
+  })
+  win.setAlwaysOnTop(true, 'screen-saver')
+  win.setIgnoreMouseEvents(true, { forward: true })
+  if (isDev) win.loadURL(`${DEV_URL}#/taskbar-lyric`)
+  else win.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'), { hash: '/taskbar-lyric' })
+  win.on('closed', () => {
+    wins.taskbar = null
+  })
+  wins.taskbar = win
+  return win
+}
+
+export function showTaskbarLyric(visible: boolean): void {
+  if (!visible) {
+    if (wins.taskbar && !wins.taskbar.isDestroyed()) wins.taskbar.hide()
+    return
+  }
+  const win = createTaskbarLyric()
+  win.showInactive()
 }
 
 export function applyTitleBarTheme(dark: boolean): void {

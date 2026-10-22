@@ -42,6 +42,40 @@ const DEFAULT: AppSettings = {
   playerBg: 'cover',
   playerWallpaper: '',
   mvVolume: 0.8,
+  wallpaperEnabled: true,
+  wallpaperId: '',
+  wallpaperRotation: 'off',
+  wallpaperIntervalMin: 15,
+  wallpaperBlur: 0,
+  wallpaperBrightness: 1,
+  wallpaperMask: 0.25,
+  wallpaperScale: 1.06,
+  wallpaperFit: 'cover',
+  wallpaperTint: '',
+  playbackRate: 1,
+  preservePitch: true,
+  sleepTimerMin: 0,
+  mvQuality: 0,
+  mvRememberProgress: true,
+  mvAutoNext: true,
+  danmakuEnabled: true,
+  danmakuOpacity: 0.85,
+  danmakuFontSize: 'medium',
+  danmakuSpeed: 'normal',
+  danmakuArea: 'half',
+  danmakuAntiSubtitle: true,
+  danmakuBlockWords: '',
+  webdavEnabled: false,
+  webdavUrl: '',
+  webdavUser: '',
+  webdavPass: '',
+  webdavPath: '',
+  webdavLastSync: 0,
+  showTaskbarLyric: false,
+  autoLaunch: false,
+  proxyEnabled: false,
+  proxyUrl: '',
+  listDensity: 'standard',
 }
 
 let toastSeq = 1
@@ -110,6 +144,9 @@ export const useUiStore = defineStore('ui', () => {
     root.dataset.theme = theme.value
     root.style.setProperty('--accent', accent.value)
     root.style.setProperty('--accent-soft', hexToRgba(accent.value, 0.16))
+    // 列表密度：只改一个变量，所有列表组件共用
+    const rowH = settings.value.listDensity === 'compact' ? '44px' : settings.value.listDensity === 'relaxed' ? '62px' : '52px'
+    root.style.setProperty('--row-h', rowH)
     document.body.classList.toggle('no-anim', !settings.value.animations)
   }
 

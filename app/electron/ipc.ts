@@ -1,4 +1,4 @@
-import { app, dialog, ipcMain, nativeTheme, shell } from 'electron'
+import { app, dialog, ipcMain, nativeTheme, session, shell } from 'electron'
 import fs from 'node:fs'
 import path from 'node:path'
 import type { AppSettings, Song } from '../shared/types'
@@ -24,8 +24,11 @@ import {
 } from './core/music-service'
 import { buildHomeFeed, invalidateFeed } from './core/recommend'
 import { player } from './core/player-service'
+import { listWallpapers, saveWallpaper, removeWallpaper, renameWallpaper, importWallpaperFromPath } from './core/wallpaper'
+import { getDanmaku } from './core/danmaku'
+import { testConnection, uploadBackup } from './core/webdav'
 import { getSettings, saveSettings } from './core/settings'
-import { applyTitleBarTheme, broadcast, sendToMain, setLyricLock, showLyricWindow, wins } from './windows'
+import { applyTitleBarTheme, broadcast, sendToMain, setLyricLock, showLyricWindow, showTaskbarLyric, wins } from './windows'
 import {
   addHistory,
   addSongsToPlaylist,
@@ -141,6 +144,22 @@ function friendly(e: any): string {
 
 type Handler = (payload: any, event: Electron.IpcMainInvokeEvent) => Promise<any> | any
 
+/**
+ * 应用系统代理。作用于 defaultSession 的全部请求（音源、封面、弹幕、WebDAV），
+ * 而不是只包一层 fetch —— 后者会漏掉 <img> 与自定义协议的请求。
+ */
+export function applyProxy(s: AppSettings): void {
+  const rules = s.proxyEnabled && (s.proxyUrl || '').trim() ? (s.proxyUrl || '').trim() : 'direct://'
+  try {
+    void session.defaultSession
+      .setProxy({ proxyRules: rules })
+      .then(() => session.defaultSession.closeAllConnections())
+      .catch((e: any) => logger.warn('设置代理失败', e?.message))
+  } catch (e: any) {
+    logger.warn('设置代理失败', e?.message)
+  }
+}
+
 const handlers: Record<string, Handler> = {
   /* ---------------- 应用 ---------------- */
   'app:info': () => ({
@@ -188,6 +207,16 @@ const handlers: Record<string, Handler> = {
     if (patch.playMode) player.setMode(patch.playMode)
     if (typeof patch.showDesktopLyric === 'boolean') showLyricWindow(patch.showDesktopLyric)
     if (typeof patch.desktopLyricLock === 'boolean') setLyricLock(patch.desktopLyricLock)
+    if (typeof patch.showTaskbarLyric === 'boolean') showTaskbarLyric(patch.showTaskbarLyric)
+    if (typeof patch.playbackRate === 'number') player.setRate(patch.playbackRate)
+    if (typeof patch.proxyEnabled === 'boolean' || patch.proxyUrl !== undefined) applyProxy(s)
+    if (typeof patch.autoLaunch === 'boolean') {
+      try {
+        app.setLoginItemSettings({ openAtLogin: patch.autoLaunch, args: ['--hidden'] })
+      } catch (e: any) {
+        logger.warn('设置开机启动失败', e?.message)
+      }
+    }
     if (typeof patch.fadeMs === 'number') {
       // 立即生效
       player.setVolume(s.volume)
@@ -568,6 +597,17 @@ const handlers: Record<string, Handler> = {
     })
     return r.canceled || !r.filePaths[0] ? '' : r.filePaths[0]
   },
+  // ---------------- 壁纸引擎（图片） ----------------
+  'wallpaper:list': () => listWallpapers(),
+  'wallpaper:save': (p: any) => saveWallpaper(p || {}),
+  'wallpaper:import': (p: any) => importWallpaperFromPath(String(p?.path || ''), String(p?.name || '')),
+  'wallpaper:remove': (p: any) => ({ ok: removeWallpaper(String(p?.id || '')) }),
+  'wallpaper:rename': (p: any) => ({ ok: renameWallpaper(String(p?.id || ''), String(p?.name || '')) }),
+  // ---------------- 视频弹幕 ----------------
+  'mv:danmaku': (p: any) => getDanmaku(String(p?.cid || '')),
+  // ---------------- WebDAV 备份（单向） ----------------
+  'webdav:test': () => testConnection(),
+  'webdav:upload': () => uploadBackup(),
   // kind: cache | cover | media —— 三类目录各自可改，均把旧内容搬到新位置
   'cache:setDir': ({ dir, kind = 'cache' }: any) => {
     const target = String(dir || '').trim()

@@ -207,10 +207,11 @@ function albumOf(s: Song): string {
   gap: 12px;
   align-items: center;
   padding: 6px 10px;
+  min-height: var(--row-h, 52px);
   border-radius: 9px;
   cursor: default;
   content-visibility: auto;
-  contain-intrinsic-size: 54px;
+  contain-intrinsic-size: var(--row-h, 52px);
 }
 .row.active .title {
   color: var(--accent);

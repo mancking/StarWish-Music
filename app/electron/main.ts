@@ -1,6 +1,7 @@
 import { app, globalShortcut, Menu, nativeImage, nativeTheme, protocol, Tray, dialog } from 'electron'
 import path from 'node:path'
 import fs from 'node:fs'
+import os from 'node:os'
 import { createLogger, getErrorCount } from './core/log'
 import { setUserDataDir, resourcesDir, userDataDir, ensureDir, dataDirPointerFile } from './core/paths'
 import { initDb, closeDb, dbGetSetting, dbSetSetting, getSong } from './core/db'
@@ -10,16 +11,20 @@ import { lxHost } from './core/lx-host'
 import { registerCoverProtocol } from './core/cover'
 import { registerMediaProtocol } from './core/media'
 import * as mfHost from './core/mf-host'
-import { beginWindowInitWatch } from './core/crash-guard'
+import { beginWindowInitWatch, clearWindowInitMark, type GpuLevel } from './core/crash-guard'
+import { migrateLegacyWallpaper } from './core/wallpaper'
+import { trace, writeBootTrace, isDiagnoseMode } from './core/boot-trace'
 import { player } from './core/player-service'
-import { registerIpc, navigateMain } from './ipc'
+import { registerIpc, navigateMain, applyProxy } from './ipc'
 import {
   applyTitleBarTheme,
   broadcast,
   createAudioHost,
   createMainWindow,
+  ensureMainWindow,
   setLyricLock,
   showLyricWindow,
+  showTaskbarLyric,
   wins,
 } from './windows'
 
@@ -59,12 +64,33 @@ ensureDir(dataDir)
 // 关键修复：显式设置 Electron 内部临时目录为我们已知可写的子目录
 // 解决 "Error writing temporary file. Make sure your temp folder is valid." 错误
 // （系统 %TEMP% 在某些环境下不可写或被占用）
-const tempDir = ensureDir(path.join(dataDir, 'temp'))
+// 三级回退：数据目录/temp → 系统临时目录/StarWish → 数据目录本身
+function pickWritableDir(candidates: string[]): string {
+  for (const dir of candidates) {
+    try {
+      ensureDir(dir)
+      const probe = path.join(dir, '.write-test')
+      fs.writeFileSync(probe, 'ok')
+      fs.unlinkSync(probe)
+      return dir
+    } catch {
+      /* 试下一个 */
+    }
+  }
+  return candidates[candidates.length - 1]
+}
+
+const tempDir = pickWritableDir([
+  path.join(dataDir, 'temp'),
+  path.join(os.tmpdir(), 'StarWish'),
+  dataDir,
+])
 try {
   app.setPath('temp', tempDir)
   // 同时设置环境变量，Chromium 子进程（GPU、Renderer）也会使用
   process.env.TEMP = tempDir
   process.env.TMP = tempDir
+  trace('boot:temp', tempDir)
 } catch (e: any) {
   logger.warn('设置临时目录失败', e?.message)
 }
@@ -74,14 +100,29 @@ app.setAppUserModelId('com.starwish.music')
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required')
 app.commandLine.appendSwitch('disable-features', 'HardwareMediaKeyHandling')
 
-// 崩溃看门狗：窗口创建/首帧合成阶段若因 GPU（D3D11/viz）初始化失败而崩溃，进程会在
-// 写入「启动完成」日志后立刻死掉，表现为「任务管理器有进程但永远没有窗口」。标记文件
-// 在窗口真正显示后由 windows.ts 清除；若下次启动仍发现它，说明上次死在窗口初始化阶段，
-// 本次自动关闭硬件加速降级重试，避免陷入永久崩溃循环（虚拟显示器驱动、异常显卡驱动）。
-if (beginWindowInitWatch()) {
-  logger.warn('检测到上次启动在窗口初始化阶段崩溃，本次关闭硬件加速降级启动')
+// 崩溃看门狗（三级降级）：窗口创建/首帧合成阶段若因 GPU（D3D11/viz）初始化失败而崩溃，
+// 进程会在写入「启动完成」日志后立刻死掉，表现为「任务管理器有进程但永远没有窗口」。
+// 标记文件在窗口真正显示后由 windows.ts 清除；若下次启动仍发现它，说明上次死在窗口
+// 初始化阶段，按连续失败次数逐级降级，避免陷入永久崩溃循环（虚拟显示器、异常显卡驱动）。
+function applyGpuLevel(level: GpuLevel): void {
+  if (level <= 0) return
+  logger.warn(`启用图形降级 L${level}`)
   app.disableHardwareAcceleration()
+  if (level >= 2) {
+    app.commandLine.appendSwitch('disable-gpu-compositing')
+    app.commandLine.appendSwitch('disable-webgl')
+  }
+  if (level >= 3) {
+    app.commandLine.appendSwitch('disable-gpu')
+  }
 }
+
+const watch = beginWindowInitWatch()
+if (watch.crashedLastRun) {
+  logger.warn(`检测到上次启动在窗口初始化阶段崩溃，本次降级到 L${watch.level}`)
+}
+applyGpuLevel(watch.level)
+trace('boot:crash-guard', `level=${watch.level} crashed=${watch.crashedLastRun}`)
 
 protocol.registerSchemesAsPrivileged([
   {
@@ -99,18 +140,25 @@ let quitting = false
 let trayTip = ''
 let lastTrayAt = 0
 
-const gotLock = app.requestSingleInstanceLock()
+// 单实例：拿不到锁说明已有实例在跑。旧实现在这里直接 quit()，用户看到的就是
+// 「双击没反应，任务管理器里却有进程」。现在改为：先让旧实例收到 second-instance
+// 自行唤醒（它会重建窗口 / reload 崩溃的渲染进程），1.5 秒后再退出本进程。
+// 逃生门：--force-new 或 STARWISH_FORCE_NEW=1 可跳过锁，用于旧进程彻底卡死的场景。
+const forceNew = process.argv.includes('--force-new') || process.env.STARWISH_FORCE_NEW === '1'
+const gotLock = forceNew ? true : app.requestSingleInstanceLock()
+
 if (!gotLock) {
-  app.quit()
-} else {
+  logger.warn('检测到已有实例在运行，已请求唤醒，本进程退出')
+  trace('boot:second-instance-blocked')
+  setTimeout(() => app.quit(), 1500)
+} else if (!forceNew) {
   app.on('second-instance', () => {
-    const w = wins.main
-    if (w) {
-      if (w.isMinimized()) w.restore()
-      if (!w.isVisible()) w.show()
-      w.focus()
-    }
+    logger.info('收到第二实例唤醒请求')
+    trace('boot:reawake')
+    ensureMainWindow()
   })
+} else {
+  logger.warn('强制新实例模式启动（--force-new）')
 }
 
 process.on('uncaughtException', e => {
@@ -246,20 +294,38 @@ function persistWindowState(): void {
 async function bootstrap(): Promise<void> {
   try {
     loadSettings()
+    trace('boot:settings')
+    // 旧版只存了一张壁纸路径，首次启动时把它登记进壁纸库，避免用户重选
+    try {
+      const legacy = getSettings().playerWallpaper
+      if (legacy) {
+        const item = migrateLegacyWallpaper(legacy)
+        if (item) saveSettings({ playerWallpaper: '', wallpaperId: item.id })
+      }
+    } catch (e: any) {
+      logger.warn('旧壁纸迁移失败', e?.message)
+    }
     await initDb()
+    trace('boot:db')
     initBiliLogin()
     lxHost.load()
+    trace('boot:sources', `音源 ${lxHost.list().length}`)
     mfHost.init()
     registerCoverProtocol()
     registerMediaProtocol(biliCookie)
     registerIpc()
+    trace('boot:ipc')
+    // 启动即应用代理设置（若开启），保证音源与封面请求走代理
+    applyProxy(getSettings())
 
     nativeTheme.themeSource = getSettings().theme === 'auto' ? 'system' : (getSettings().theme as 'dark' | 'light')
     applyTitleBarTheme(nativeTheme.shouldUseDarkColors)
 
     const mainWin = createMainWindow()
+    trace('boot:window-created')
     restoreWindowState(mainWin)
     const audio = createAudioHost()
+    trace('boot:audio-host')
 
     player.setBroadcast(broadcast)
     player.attachHost(audio)
@@ -304,10 +370,21 @@ async function bootstrap(): Promise<void> {
       showLyricWindow(true)
       setLyricLock(getSettings().desktopLyricLock)
     }
+    if (getSettings().showTaskbarLyric) showTaskbarLyric(true)
 
     logger.info('星河音乐启动完成', `v${app.getVersion()}`, `音源 ${lxHost.list().filter(s => !s.loadError).length}`)
+    trace('boot:done')
+    writeBootTrace({
+      dataDir,
+      tempDir,
+      gpuLevel: watch.level,
+      crashedLastRun: watch.crashedLastRun,
+      diagnose: isDiagnoseMode(),
+    })
   } catch (e: any) {
     logger.error('启动失败', e?.message, e?.stack)
+    trace('boot:failed', e?.message)
+    writeBootTrace({ dataDir, tempDir, gpuLevel: watch.level, error: String(e?.message || e) })
     dialog.showErrorBox('星河音乐启动失败', `${e?.message || e}\n\n日志目录：${userDataDir()}\\logs`)
   }
 }
@@ -331,6 +408,8 @@ app.on('before-quit', () => {
     player.dispose()
     persistWindowState()
     closeDb()
+    // 正常退出时清掉崩溃标记，避免「任务管理器结束进程」被下次启动误判为窗口初始化崩溃
+    clearWindowInitMark()
   } catch (e: any) {
     logger.warn('退出清理失败', e?.message)
   }

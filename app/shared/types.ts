@@ -157,10 +157,116 @@ export interface AppSettings {
   skipOnError: boolean
   /** 播放页背景：模糊专辑封面 / 动态渐变 / 自定义壁纸 / 纯色 */
   playerBg: 'cover' | 'gradient' | 'wallpaper' | 'solid'
-  /** 壁纸图片路径（playerBg === 'wallpaper' 时生效） */
+  /** 壁纸图片路径（playerBg === 'wallpaper' 时生效；旧字段，启动时自动迁移到壁纸库） */
   playerWallpaper: string
   /** MV 播放器音量（独立记忆，0-1） */
   mvVolume: number
+
+  /* ---------------- 壁纸引擎（仅图片） ---------------- */
+  /** 启用壁纸库（playerBg === 'wallpaper' 时从库中取图） */
+  wallpaperEnabled: boolean
+  /** 当前壁纸 id，空表示使用库中第一张 */
+  wallpaperId: string
+  /** 轮播方式：关闭 / 按歌切换 / 定时 / 随机 */
+  wallpaperRotation: 'off' | 'song' | 'timer' | 'random'
+  /** 定时轮播间隔（分钟） */
+  wallpaperIntervalMin: number
+  /** 模糊强度 0-40px */
+  wallpaperBlur: number
+  /** 亮度 0.5-1.3 */
+  wallpaperBrightness: number
+  /** 遮罩浓度 0-0.8，越大文字越清晰 */
+  wallpaperMask: number
+  /** 缩放 1.0-1.5 */
+  wallpaperScale: number
+  /** 填充方式 */
+  wallpaperFit: 'cover' | 'contain' | 'fill'
+  /** 色调叠加色，空字符串表示不叠加 */
+  wallpaperTint: string
+
+  /* ---------------- 播放增强 ---------------- */
+  /** 播放倍速 0.5-2.0 */
+  playbackRate: number
+  /** 变速保留音调 */
+  preservePitch: boolean
+  /** 睡眠定时（分钟），0 表示关闭 */
+  sleepTimerMin: number
+
+  /* ---------------- 视频 / 弹幕 ---------------- */
+  /** 默认画质（B 站 qn 值，0 表示自动） */
+  mvQuality: number
+  /** 记忆视频播放进度 */
+  mvRememberProgress: boolean
+  /** 播完自动下一集 */
+  mvAutoNext: boolean
+  /** 启用弹幕 */
+  danmakuEnabled: boolean
+  /** 弹幕透明度 0-1 */
+  danmakuOpacity: number
+  /** 弹幕字号 */
+  danmakuFontSize: 'small' | 'medium' | 'large'
+  /** 弹幕速度 */
+  danmakuSpeed: 'slow' | 'normal' | 'fast'
+  /** 弹幕显示区域 */
+  danmakuArea: 'quarter' | 'half' | 'full'
+  /** 防挡字幕（底部 20% 不投放滚动弹幕） */
+  danmakuAntiSubtitle: boolean
+  /** 屏蔽词，换行分隔 */
+  danmakuBlockWords: string
+
+  /* ---------------- WebDAV 备份（单向：本地 → 远端） ---------------- */
+  webdavEnabled: boolean
+  /** 服务器根地址，如 https://dav.example.com/remote.php/dav/files/user */
+  webdavUrl: string
+  webdavUser: string
+  webdavPass: string
+  /** 远端子目录，留空表示根目录 */
+  webdavPath: string
+  /** 上次同步成功时间戳 */
+  webdavLastSync: number
+
+  /* ---------------- 系统集成 ---------------- */
+  /** Windows 任务栏 / macOS 菜单栏歌词 */
+  showTaskbarLyric: boolean
+  /** 开机自启动 */
+  autoLaunch: boolean
+
+  /* ---------------- 网络 ---------------- */
+  /** 使用代理（作用于所有请求，包括音源与封面） */
+  proxyEnabled: boolean
+  /** 代理地址，host:port，如 127.0.0.1:7890 */
+  proxyUrl: string
+
+  /* ---------------- 列表密度 ---------------- */
+  /** 列表行高：紧凑 / 标准 / 宽松 */
+  listDensity: 'compact' | 'standard' | 'relaxed'
+}
+
+/** 壁纸条目（图片壁纸库） */
+export interface WallpaperItem {
+  id: string
+  name: string
+  /** 原图绝对路径 */
+  file: string
+  /** 缩略图绝对路径 */
+  thumb: string
+  width: number
+  height: number
+  size: number
+  addedAt: number
+}
+
+/** 弹幕条目 */
+export interface DanmakuItem {
+  /** 出现时间（秒） */
+  t: number
+  /** 1 滚动 / 4 底部 / 5 顶部 */
+  mode: 1 | 4 | 5
+  /** 字号 18/25/36 */
+  size: number
+  /** 十进制 RGB */
+  color: number
+  text: string
 }
 
 export interface ScanProgress {

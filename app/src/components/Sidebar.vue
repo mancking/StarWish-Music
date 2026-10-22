@@ -14,6 +14,13 @@ const ui = useUiStore()
 const creating = ref(false)
 const newName = ref('')
 
+/** 侧栏折叠：只留图标，给宽屏下的列表腾空间；状态存 localStorage */
+const collapsed = ref(localStorage.getItem('sw.sidebar.collapsed') === '1')
+function toggleCollapse(): void {
+  collapsed.value = !collapsed.value
+  localStorage.setItem('sw.sidebar.collapsed', collapsed.value ? '1' : '0')
+}
+
 const online = [
   { path: '/', icon: 'home', label: '个性推荐' },
   { path: '/discover', icon: 'compass', label: '发现音乐' },
@@ -58,7 +65,7 @@ async function submitCreate(): Promise<void> {
 </script>
 
 <template>
-  <aside class="sidebar">
+  <aside class="sidebar" :class="{ collapsed }">
     <!-- 移动端：4 个顶级 tab 底栏，不平铺（__MOBILE__ 构建期常量，桌面死分支摇掉） -->
     <div v-if="isMobile" class="scroll mobile-tabs">
       <button
@@ -80,6 +87,9 @@ async function submitCreate(): Promise<void> {
         <strong>星河</strong>
         <span>STARWISH</span>
       </div>
+      <button class="collapse-btn no-drag" :title="collapsed ? '展开侧栏' : '收起侧栏'" @click="toggleCollapse">
+        <Icon :name="collapsed ? 'chevron-right' : 'chevron-left'" :size="15" />
+      </button>
     </div>
 
     <div class="scroll">
@@ -327,5 +337,63 @@ async function submitCreate(): Promise<void> {
 }
 .foot .nav-item {
   flex: 1;
+}
+
+/* ---------------- 侧栏折叠 ---------------- */
+.brand {
+  position: relative;
+}
+.collapse-btn {
+  flex: none;
+  width: 26px;
+  height: 26px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-3);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.18s, background 0.18s;
+}
+.brand:hover .collapse-btn {
+  opacity: 1;
+}
+.collapse-btn:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+
+.sidebar.collapsed {
+  width: 76px;
+}
+.sidebar.collapsed .brand {
+  justify-content: center;
+  padding-left: 0;
+  padding-right: 0;
+}
+.sidebar.collapsed .brand-text,
+.sidebar.collapsed .group-label,
+.sidebar.collapsed .nav-item span,
+.sidebar.collapsed .dot-new {
+  display: none;
+}
+.sidebar.collapsed .collapse-btn {
+  opacity: 1;
+  position: absolute;
+  right: 4px;
+  top: 14px;
+  width: 20px;
+  height: 20px;
+}
+.sidebar.collapsed .nav-item {
+  justify-content: center;
+  padding-left: 0;
+  padding-right: 0;
+  gap: 0;
+}
+.sidebar.collapsed .group {
+  margin-top: 10px;
 }
 </style>

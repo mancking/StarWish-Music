@@ -38,6 +38,45 @@ export const DEFAULT_SETTINGS: AppSettings = {
   playerBg: 'cover',
   playerWallpaper: '',
   mvVolume: 0.8,
+
+  wallpaperEnabled: true,
+  wallpaperId: '',
+  wallpaperRotation: 'off',
+  wallpaperIntervalMin: 15,
+  wallpaperBlur: 0,
+  wallpaperBrightness: 1,
+  wallpaperMask: 0.25,
+  wallpaperScale: 1.06,
+  wallpaperFit: 'cover',
+  wallpaperTint: '',
+
+  playbackRate: 1,
+  preservePitch: true,
+  sleepTimerMin: 0,
+
+  mvQuality: 0,
+  mvRememberProgress: true,
+  mvAutoNext: true,
+  danmakuEnabled: true,
+  danmakuOpacity: 0.85,
+  danmakuFontSize: 'medium',
+  danmakuSpeed: 'normal',
+  danmakuArea: 'half',
+  danmakuAntiSubtitle: true,
+  danmakuBlockWords: '',
+
+  webdavEnabled: false,
+  webdavUrl: '',
+  webdavUser: '',
+  webdavPass: '',
+  webdavPath: '',
+  webdavLastSync: 0,
+
+  showTaskbarLyric: false,
+  autoLaunch: false,
+  proxyEnabled: false,
+  proxyUrl: '',
+  listDensity: 'standard',
 }
 
 let cache: AppSettings = { ...DEFAULT_SETTINGS }

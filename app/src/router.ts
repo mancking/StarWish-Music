@@ -18,7 +18,8 @@ const routes = [
   {
     path: '/player',
     name: 'player',
-    component: () => import('@/pages/Player.vue'),
+    // 桌面与移动端各有一套播放页：功能一致，交互与布局按端重写
+    component: () => (__MOBILE__ ? import('@/pages/mobile/Player.vue') : import('@/pages/Player.vue')),
     meta: { title: '正在播放', fullscreen: true },
   },
   {
@@ -26,6 +27,12 @@ const routes = [
     name: 'lyric',
     component: () => import('@/pages/LyricWindow.vue'),
     meta: { title: '桌面歌词', fullscreen: true, lyric: true },
+  },
+  {
+    path: '/taskbar-lyric',
+    name: 'taskbar-lyric',
+    component: () => import('@/pages/TaskbarLyric.vue'),
+    meta: { title: '任务栏歌词', fullscreen: true, lyric: true },
   },
   { path: '/:pathMatch(.*)*', redirect: '/' },
 ]

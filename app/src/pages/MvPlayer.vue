@@ -3,11 +3,12 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import Icon from '@/components/Icon.vue'
 import Cover from '@/components/Cover.vue'
+import DanmakuLayer from '@/components/DanmakuLayer.vue'
 import { call, isDesktop } from '@/api'
 import { formatTime } from '@shared/lrc'
 import { usePlayerStore } from '@/stores/player'
 import { useUiStore } from '@/stores/ui'
-import type { MvItem, Song } from '@shared/types'
+import type { DanmakuItem, MvItem, Song } from '@shared/types'
 
 interface Part {
   cid: string
@@ -101,6 +102,25 @@ const loopMode = ref<LoopMode>('off')
 /* 离线缓存状态 */
 const offlineReady = ref(false)
 const caching = ref(false)
+
+/* ---------------- 弹幕 ---------------- */
+const danmakuItems = ref<DanmakuItem[]>([])
+const danmakuLoading = ref(false)
+
+async function loadDanmaku(cid: string): Promise<void> {
+  danmakuItems.value = []
+  if (!ui.settings.danmakuEnabled || !cid) return
+  danmakuLoading.value = true
+  try {
+    const list = await call<DanmakuItem[]>('mv:danmaku', { cid })
+    danmakuItems.value = Array.isArray(list) ? list : []
+  } catch {
+    /* 弹幕失败不影响播放，静默降级为无弹幕 */
+    danmakuItems.value = []
+  } finally {
+    danmakuLoading.value = false
+  }
+}
 
 let hideTimer = 0
 function pokeControls(): void {
@@ -409,6 +429,8 @@ async function resolveStream(qn: number | undefined, autoplay: boolean, resumeAt
   loading.value = true
   videoError.value = ''
   ready.value = false
+  // 弹幕与视频流并行拉取，失败不影响播放
+  void loadDanmaku(p.cid)
   // 桌面端先查离线缓存
   if (isDesktop) {
     try {
@@ -697,6 +719,19 @@ onBeforeUnmount(() => {
             <span>{{ loading ? '正在解析视频流…' : videoError || '暂无可用视频流' }}</span>
             <button v-if="!loading && current" class="btn sm" @click="selectPart(current, true)">重试</button>
           </div>
+
+          <DanmakuLayer
+            v-if="videoSrc && ui.settings.danmakuEnabled"
+            :video="videoEl"
+            :items="danmakuItems"
+            :enabled="ui.settings.danmakuEnabled"
+            :opacity="ui.settings.danmakuOpacity"
+            :font-size="ui.settings.danmakuFontSize"
+            :speed="ui.settings.danmakuSpeed"
+            :area="ui.settings.danmakuArea"
+            :anti-subtitle="ui.settings.danmakuAntiSubtitle"
+            :block-words="ui.settings.danmakuBlockWords"
+          />
 
           <!-- 播放/暂停大按钮 -->
           <button

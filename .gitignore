@@ -22,6 +22,7 @@ release/
 .pkg2-data/
 .pkg3-data/
 .pkg4-data/
+app/.tmp/
 *.log
 
 # 旧版实现（仅本地留档）

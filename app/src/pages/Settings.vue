@@ -11,25 +11,96 @@ import { useUiStore } from '@/stores/ui'
 import { useLibraryStore } from '@/stores/library'
 import { usePlayerStore } from '@/stores/player'
 import { platformLabel } from '@/utils/labels'
-import type { AppSettings, SourceInfo, PluginInfo, PluginSubscription } from '@shared/types'
+import type { AppSettings, SourceInfo, PluginInfo, PluginSubscription, WallpaperItem } from '@shared/types'
 
 const ui = useUiStore()
 const library = useLibraryStore()
 const player = usePlayerStore()
 
-type Cat = 'appearance' | 'playback' | 'lyric' | 'sources' | 'local' | 'cache' | 'shortcuts' | 'about'
+type Cat = 'appearance' | 'wallpaper' | 'playback' | 'lyric' | 'video' | 'sources' | 'local' | 'cache' | 'shortcuts' | 'about'
 const cat = ref<Cat>('appearance')
 
 const cats: { key: Cat; label: string; icon: string }[] = [
   { key: 'appearance', label: '外观主题', icon: 'palette' },
+  { key: 'wallpaper', label: '壁纸引擎', icon: 'sparkles' },
   { key: 'playback', label: '播放', icon: 'play-circle' },
   { key: 'lyric', label: '歌词', icon: 'lyric' },
+  { key: 'video', label: '视频与弹幕', icon: 'video' },
   { key: 'sources', label: '音源与插件', icon: 'plug' },
   { key: 'local', label: '本地音乐', icon: 'folder' },
   { key: 'cache', label: '网络与缓存', icon: 'database' },
   { key: 'shortcuts', label: '快捷键', icon: 'keyboard' },
   { key: 'about', label: '关于', icon: 'info' },
 ]
+
+/**
+ * 设置项索引：跨分区搜索用。
+ * 不解析 DOM（脆弱），而是维护一份「分区 + 标题 + 关键词」的静态索引，
+ * 命中后直接跳到对应分区。新增设置项时补一行即可。
+ */
+const SETTING_INDEX: { cat: Cat; title: string; kw: string }[] = [
+  { cat: 'appearance', title: '主题模式', kw: '深色 浅色 跟随系统 夜间 dark light' },
+  { cat: 'appearance', title: '强调色', kw: '主色 取色 accent 封面' },
+  { cat: 'appearance', title: '界面动画', kw: '动效 过渡 性能' },
+  { cat: 'appearance', title: '粒子舞台', kw: '粒子 特效 低配' },
+  { cat: 'appearance', title: '播放页背景', kw: '背景 封面 渐变 壁纸 纯色' },
+  { cat: 'wallpaper', title: '启用壁纸', kw: '壁纸 背景 开关' },
+  { cat: 'wallpaper', title: '壁纸库', kw: '导入 图片 添加 删除 库' },
+  { cat: 'wallpaper', title: '轮播方式', kw: '轮播 按歌 定时 随机' },
+  { cat: 'wallpaper', title: '模糊与遮罩', kw: '模糊 遮罩 亮度 可读性' },
+  { cat: 'wallpaper', title: '填充方式', kw: '填充 适应 拉伸 缩放' },
+  { cat: 'playback', title: '播放倍速', kw: '倍速 变速 rate' },
+  { cat: 'playback', title: '睡眠定时', kw: '定时 关闭 睡眠 sleep' },
+  { cat: 'playback', title: '默认音质', kw: '音质 128k 320k 无损 flac' },
+  { cat: 'playback', title: '交叉淡入', kw: '淡入 淡出 无缝 crossfade' },
+  { cat: 'playback', title: '自动换源', kw: '换源 失败 跳过' },
+  { cat: 'playback', title: '输出设备', kw: '声卡 设备 音频输出' },
+  { cat: 'lyric', title: '歌词字号', kw: '歌词 字号 大小' },
+  { cat: 'lyric', title: '歌词偏移', kw: '偏移 校准 延迟' },
+  { cat: 'lyric', title: '桌面歌词', kw: '桌面歌词 悬浮 锁定 穿透' },
+  { cat: 'lyric', title: '歌词翻译', kw: '翻译 罗马音 繁简' },
+  { cat: 'video', title: '默认画质', kw: '画质 1080 720 480' },
+  { cat: 'video', title: '记忆播放进度', kw: '进度 续播 断点' },
+  { cat: 'video', title: '弹幕开关', kw: '弹幕 danmaku' },
+  { cat: 'video', title: '弹幕透明度', kw: '透明度 字号 速度 区域' },
+  { cat: 'video', title: '防挡字幕', kw: '字幕 遮挡 底部' },
+  { cat: 'video', title: '屏蔽词', kw: '屏蔽 过滤 关键词' },
+  { cat: 'sources', title: '音源管理', kw: '音源 导入 启用 移除' },
+  { cat: 'sources', title: '插件库', kw: '插件 订阅 市场 musicfree' },
+  { cat: 'sources', title: '音源健康检查', kw: '健康 失效 检测' },
+  { cat: 'local', title: '本地目录', kw: '扫描 本地 文件夹 目录' },
+  { cat: 'local', title: '启动时扫描', kw: '扫描 启动 自动' },
+  { cat: 'cache', title: '缓存上限', kw: '缓存 大小 限制' },
+  { cat: 'cache', title: '缓存目录', kw: '目录 位置 迁移' },
+  { cat: 'cache', title: '数据目录', kw: '数据 迁移 备份' },
+  { cat: 'cache', title: '网络代理', kw: '代理 proxy 端口' },
+  { cat: 'cache', title: 'WebDAV 备份', kw: 'webdav 备份 同步 坚果云 nextcloud' },
+  { cat: 'shortcuts', title: '任务栏歌词', kw: '任务栏 菜单栏 歌词' },
+  { cat: 'shortcuts', title: '开机自启动', kw: '开机 启动 自启' },
+  { cat: 'shortcuts', title: '关闭到托盘', kw: '托盘 最小化 后台' },
+  { cat: 'shortcuts', title: '全局快捷键', kw: '快捷键 热键 键盘' },
+  { cat: 'about', title: '版本与更新', kw: '版本 更新 日志 检查' },
+  { cat: 'about', title: '诊断信息', kw: '诊断 日志 导出 boot-trace' },
+]
+
+const q = ref('')
+const searchResults = computed(() => {
+  const key = q.value.trim().toLowerCase()
+  if (!key) return []
+  return SETTING_INDEX.filter(it => {
+    const hay = `${it.title} ${it.kw}`.toLowerCase()
+    return hay.includes(key)
+  }).slice(0, 8)
+})
+
+function catLabel(key: Cat): string {
+  return cats.find(c => c.key === key)?.label || ''
+}
+
+function jumpTo(r: { cat: Cat; title: string }): void {
+  cat.value = r.cat
+  q.value = ''
+}
 
 const sources = ref<SourceInfo[]>([])
 const sourcesLoading = ref(false)
@@ -165,6 +236,104 @@ function onWallpaperFile(e: Event): void {
 async function clearWallpaper(): Promise<void> {
   await patch({ playerWallpaper: '' })
   ui.toast('已清除壁纸', 'info')
+}
+
+/* ---------------- 睡眠定时 ---------------- */
+async function setSleep(minutes: number): Promise<void> {
+  try {
+    await call('player:sleep', { minutes })
+    await patch({ sleepTimerMin: minutes })
+    ui.toast(minutes ? `${minutes} 分钟后停止播放` : '已取消睡眠定时', 'info', 1600)
+  } catch (e: any) {
+    ui.toast(e?.message || '设置失败', 'error')
+  }
+}
+
+/* ---------------- WebDAV 备份 ---------------- */
+const webdavBusy = ref(false)
+const webdavMsg = ref('')
+
+async function testWebdav(): Promise<void> {
+  webdavBusy.value = true
+  webdavMsg.value = ''
+  try {
+    const r = await call<{ ok: boolean; status: number; message: string }>('webdav:test')
+    webdavMsg.value = r?.message || ''
+    ui.toast(r?.ok ? '连接正常' : r?.message || '连接失败', r?.ok ? 'success' : 'error', 2600)
+  } catch (e: any) {
+    webdavMsg.value = e?.message || '连接失败'
+    ui.toast(webdavMsg.value, 'error', 2600)
+  } finally {
+    webdavBusy.value = false
+  }
+}
+
+async function uploadWebdav(): Promise<void> {
+  webdavBusy.value = true
+  try {
+    const r = await call<{ bytes: number; playlists: number; favorites: number }>('webdav:upload')
+    ui.toast(`已上传 ${r.playlists} 个歌单、${r.favorites} 首收藏`, 'success', 2800)
+  } catch (e: any) {
+    ui.toast(e?.message || '上传失败', 'error', 3200)
+  } finally {
+    webdavBusy.value = false
+  }
+}
+
+/* ---------------- 壁纸引擎（图片库） ---------------- */
+const wallpapers = ref<WallpaperItem[]>([])
+const wallBusy = ref(false)
+
+function wallUrl(p: string): string {
+  if (!p) return ''
+  if (/^(https?|data|file):/i.test(p)) return p
+  return 'file:///' + p.replace(/\\/g, '/').replace(/^\/+/, '')
+}
+
+async function loadWallpapers(): Promise<void> {
+  if (!isDesktop) return
+  try {
+    const list = await call<WallpaperItem[]>('wallpaper:list')
+    wallpapers.value = Array.isArray(list) ? list : []
+  } catch {
+    wallpapers.value = []
+  }
+}
+
+async function addWallpaper(): Promise<void> {
+  if (isMobile) {
+    wallpaperInput.value?.click()
+    return
+  }
+  try {
+    const p = await call<string>('wallpaper:pick')
+    if (!p) return
+    wallBusy.value = true
+    const item = await call<WallpaperItem>('wallpaper:import', { path: p })
+    await loadWallpapers()
+    await patch({ wallpaperId: item.id, playerBg: 'wallpaper', wallpaperEnabled: true })
+    ui.toast('壁纸已加入库', 'success')
+  } catch (e: any) {
+    ui.toast(e?.message || '导入失败', 'error')
+  } finally {
+    wallBusy.value = false
+  }
+}
+
+async function applyWallpaper(id: string): Promise<void> {
+  await patch({ wallpaperId: id, playerBg: 'wallpaper', wallpaperEnabled: true })
+  ui.toast('已应用壁纸', 'success', 1400)
+}
+
+async function removeWallpaperItem(id: string): Promise<void> {
+  try {
+    await call('wallpaper:remove', { id })
+    await loadWallpapers()
+    if (setting.value.wallpaperId === id) await patch({ wallpaperId: '' })
+    ui.toast('已删除壁纸', 'info', 1400)
+  } catch (e: any) {
+    ui.toast(e?.message || '删除失败', 'error')
+  }
 }
 
 function fmtBytes(n: number): string {
@@ -714,7 +883,7 @@ async function pickDirs(): Promise<void> {
 }
 
 onMounted(async () => {
-  await Promise.all([loadSources(), loadMeta(), loadPlugins(), loadSubs()])
+  await Promise.all([loadSources(), loadMeta(), loadPlugins(), loadSubs(), loadWallpapers()])
 })
 
 watch(qrOpen, v => {
@@ -730,6 +899,20 @@ onBeforeUnmount(stopPoll)
       <div>
         <h1>设置</h1>
         <p>所有配置保存在本地，修改后立即生效</p>
+      </div>
+      <div class="search-wrap">
+        <div class="search-box">
+          <Icon name="search" :size="15" />
+          <input v-model="q" placeholder="搜索设置项，如「弹幕」「代理」" />
+          <button v-if="q" class="search-clear" @click="q = ''"><Icon name="close" :size="13" /></button>
+        </div>
+        <div v-if="q" class="search-pop">
+          <button v-for="r in searchResults" :key="r.cat + r.title" class="search-item" @click="jumpTo(r)">
+            <b>{{ r.title }}</b>
+            <span>{{ catLabel(r.cat) }}</span>
+          </button>
+          <div v-if="!searchResults.length" class="search-empty">没有匹配的设置项</div>
+        </div>
       </div>
     </header>
 
@@ -789,6 +972,15 @@ onBeforeUnmount(stopPoll)
           </div>
 
           <div class="row">
+            <div class="label"><b>列表密度</b><span>影响歌曲列表行高与一屏可见数量</span></div>
+            <div class="seg">
+              <button :class="{ on: setting.listDensity === 'compact' }" @click="patch({ listDensity: 'compact' })">紧凑</button>
+              <button :class="{ on: setting.listDensity === 'standard' }" @click="patch({ listDensity: 'standard' })">标准</button>
+              <button :class="{ on: setting.listDensity === 'relaxed' }" @click="patch({ listDensity: 'relaxed' })">宽松</button>
+            </div>
+          </div>
+
+          <div class="row">
             <div class="label"><b>播放页背景</b><span>封面模糊、动态渐变、自定义壁纸或纯色</span></div>
             <div class="seg">
               <button :class="{ on: bgMode === 'cover' }" @click="patch({ playerBg: 'cover' })">封面模糊</button>
@@ -815,9 +1007,262 @@ onBeforeUnmount(stopPoll)
           />
         </section>
 
+        <!-- 壁纸引擎 -->
+        <section v-else-if="cat === 'wallpaper'">
+          <h2>壁纸引擎</h2>
+          <p class="hint">图片壁纸库：导入多张图片、轮播、调节显示属性。壁纸只作用于应用内播放页，不修改系统桌面。</p>
+
+          <div class="row">
+            <div class="label"><b>启用壁纸</b><span>关闭后播放页回到封面模糊背景</span></div>
+            <Toggle :model-value="setting.wallpaperEnabled" @update:model-value="v => patch({ wallpaperEnabled: v })" />
+          </div>
+
+          <div class="row">
+            <div class="label"><b>背景来源</b><span>决定播放页使用哪种背景</span></div>
+            <div class="seg">
+              <button :class="{ on: bgMode === 'cover' }" @click="patch({ playerBg: 'cover' })">封面模糊</button>
+              <button :class="{ on: bgMode === 'gradient' }" @click="patch({ playerBg: 'gradient' })">动态渐变</button>
+              <button :class="{ on: bgMode === 'wallpaper' }" @click="patch({ playerBg: 'wallpaper' })">壁纸</button>
+              <button :class="{ on: bgMode === 'solid' }" @click="patch({ playerBg: 'solid' })">纯色</button>
+            </div>
+          </div>
+
+          <template v-if="!isMobile">
+            <div class="wall-head">
+              <b>壁纸库</b>
+              <span>{{ wallpapers.length }} 张</span>
+            </div>
+            <div class="wall-grid">
+              <button
+                v-for="w in wallpapers"
+                :key="w.id"
+                class="wall-item"
+                :class="{ on: setting.wallpaperId === w.id }"
+                :title="w.name"
+                @click="applyWallpaper(w.id)"
+              >
+                <img :src="wallUrl(w.thumb)" :alt="w.name" />
+                <span class="wall-name">{{ w.name }}</span>
+                <span class="wall-del" title="删除" @click.stop="removeWallpaperItem(w.id)">
+                  <Icon name="trash" :size="13" />
+                </span>
+              </button>
+              <button class="wall-add" :disabled="wallBusy" @click="addWallpaper">
+                <Icon name="plus" :size="20" />
+                <span>{{ wallBusy ? '导入中…' : '添加壁纸' }}</span>
+              </button>
+            </div>
+          </template>
+
+          <div v-else class="row">
+            <div class="label"><b>壁纸图片</b><span>{{ wallpaperSrc ? '已设置壁纸' : '还没有选择壁纸' }}</span></div>
+            <div class="inline">
+              <button class="btn sm" @click="addWallpaper"><Icon name="folder-open" :size="14" />选择图片</button>
+              <button v-if="wallpaperSrc" class="btn sm ghost" @click="clearWallpaper">清除</button>
+              <img v-if="wallpaperSrc" class="wall-thumb" :src="wallpaperSrc" alt="壁纸预览" />
+            </div>
+          </div>
+
+          <div class="row">
+            <div class="label"><b>轮播方式</b><span>按歌切换 / 定时轮播 / 随机</span></div>
+            <div class="inline">
+              <select
+                class="select"
+                :value="setting.wallpaperRotation"
+                @change="patch({ wallpaperRotation: ($event.target as HTMLSelectElement).value as any })"
+              >
+                <option value="off">关闭</option>
+                <option value="song">按歌切换</option>
+                <option value="timer">定时轮播</option>
+                <option value="random">随机</option>
+              </select>
+              <select
+                v-if="setting.wallpaperRotation === 'timer'"
+                class="select"
+                :value="String(setting.wallpaperIntervalMin)"
+                @change="patch({ wallpaperIntervalMin: Number(($event.target as HTMLSelectElement).value) })"
+              >
+                <option value="1">1 分钟</option>
+                <option value="5">5 分钟</option>
+                <option value="15">15 分钟</option>
+                <option value="30">30 分钟</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="row">
+            <div class="label"><b>模糊</b><span>{{ setting.wallpaperBlur }} px</span></div>
+            <Slider :model-value="setting.wallpaperBlur" :max="40" :step="1" @update:model-value="v => patch({ wallpaperBlur: Math.round(v) })" />
+          </div>
+
+          <div class="row">
+            <div class="label"><b>遮罩浓度</b><span>{{ Math.round(setting.wallpaperMask * 100) }}%，越高文字越清晰</span></div>
+            <Slider :model-value="setting.wallpaperMask * 100" :max="100" :step="1" @update:model-value="v => patch({ wallpaperMask: v / 100 })" />
+          </div>
+
+          <div class="row">
+            <div class="label"><b>亮度</b><span>浅色壁纸建议调低</span></div>
+            <select
+              class="select"
+              :value="String(Math.round(setting.wallpaperBrightness * 100))"
+              @change="patch({ wallpaperBrightness: Number(($event.target as HTMLSelectElement).value) / 100 })"
+            >
+              <option value="70">70%</option>
+              <option value="85">85%</option>
+              <option value="100">100%</option>
+              <option value="115">115%</option>
+              <option value="130">130%</option>
+            </select>
+          </div>
+
+          <div class="row">
+            <div class="label"><b>填充方式</b><span>图片比例与屏幕不一致时如何处理</span></div>
+            <div class="seg">
+              <button :class="{ on: setting.wallpaperFit === 'cover' }" @click="patch({ wallpaperFit: 'cover' })">填充</button>
+              <button :class="{ on: setting.wallpaperFit === 'contain' }" @click="patch({ wallpaperFit: 'contain' })">适应</button>
+              <button :class="{ on: setting.wallpaperFit === 'fill' }" @click="patch({ wallpaperFit: 'fill' })">拉伸</button>
+            </div>
+          </div>
+
+          <div class="row">
+            <div class="label"><b>缩放</b><span>轻微放大可以避免边缘模糊</span></div>
+            <select
+              class="select"
+              :value="String(Math.round(setting.wallpaperScale * 100))"
+              @change="patch({ wallpaperScale: Number(($event.target as HTMLSelectElement).value) / 100 })"
+            >
+              <option value="100">100%</option>
+              <option value="106">106%</option>
+              <option value="115">115%</option>
+              <option value="130">130%</option>
+            </select>
+          </div>
+        </section>
+
+        <!-- 视频与弹幕 -->
+        <section v-else-if="cat === 'video'">
+          <h2>视频与弹幕</h2>
+          <p class="hint">MV / 视频播放器的默认行为。弹幕来自视频源，关闭后不影响视频播放。</p>
+
+          <div class="row">
+            <div class="label"><b>默认画质</b><span>自动会按网络情况选择</span></div>
+            <select
+              class="select"
+              :value="String(setting.mvQuality)"
+              @change="patch({ mvQuality: Number(($event.target as HTMLSelectElement).value) })"
+            >
+              <option value="0">自动</option>
+              <option value="80">1080P</option>
+              <option value="64">720P</option>
+              <option value="32">480P</option>
+            </select>
+          </div>
+
+          <div class="row">
+            <div class="label"><b>记忆播放进度</b><span>下次进入同一视频时提示继续播放</span></div>
+            <Toggle :model-value="setting.mvRememberProgress" @update:model-value="v => patch({ mvRememberProgress: v })" />
+          </div>
+
+          <div class="row">
+            <div class="label"><b>自动连播下一集</b><span>多分 P 视频播完自动切换</span></div>
+            <Toggle :model-value="setting.mvAutoNext" @update:model-value="v => patch({ mvAutoNext: v })" />
+          </div>
+
+          <div class="row">
+            <div class="label"><b>启用弹幕</b><span>在视频上叠加弹幕层</span></div>
+            <Toggle :model-value="setting.danmakuEnabled" @update:model-value="v => patch({ danmakuEnabled: v })" />
+          </div>
+
+          <div class="row">
+            <div class="label"><b>弹幕透明度</b><span>{{ Math.round(setting.danmakuOpacity * 100) }}%</span></div>
+            <Slider
+              :model-value="setting.danmakuOpacity * 100"
+              :max="100"
+              :step="1"
+              :disabled="!setting.danmakuEnabled"
+              @update:model-value="v => patch({ danmakuOpacity: v / 100 })"
+            />
+          </div>
+
+          <div class="row">
+            <div class="label"><b>弹幕字号</b><span>影响弹幕密度</span></div>
+            <div class="seg">
+              <button :class="{ on: setting.danmakuFontSize === 'small' }" @click="patch({ danmakuFontSize: 'small' })">小</button>
+              <button :class="{ on: setting.danmakuFontSize === 'medium' }" @click="patch({ danmakuFontSize: 'medium' })">中</button>
+              <button :class="{ on: setting.danmakuFontSize === 'large' }" @click="patch({ danmakuFontSize: 'large' })">大</button>
+            </div>
+          </div>
+
+          <div class="row">
+            <div class="label"><b>弹幕速度</b><span>滚动弹幕的快慢</span></div>
+            <div class="seg">
+              <button :class="{ on: setting.danmakuSpeed === 'slow' }" @click="patch({ danmakuSpeed: 'slow' })">慢</button>
+              <button :class="{ on: setting.danmakuSpeed === 'normal' }" @click="patch({ danmakuSpeed: 'normal' })">中</button>
+              <button :class="{ on: setting.danmakuSpeed === 'fast' }" @click="patch({ danmakuSpeed: 'fast' })">快</button>
+            </div>
+          </div>
+
+          <div class="row">
+            <div class="label"><b>显示区域</b><span>弹幕占画面的高度</span></div>
+            <div class="seg">
+              <button :class="{ on: setting.danmakuArea === 'quarter' }" @click="patch({ danmakuArea: 'quarter' })">1/4</button>
+              <button :class="{ on: setting.danmakuArea === 'half' }" @click="patch({ danmakuArea: 'half' })">半屏</button>
+              <button :class="{ on: setting.danmakuArea === 'full' }" @click="patch({ danmakuArea: 'full' })">全屏</button>
+            </div>
+          </div>
+
+          <div class="row">
+            <div class="label"><b>防挡字幕</b><span>底部区域不投放滚动弹幕</span></div>
+            <Toggle :model-value="setting.danmakuAntiSubtitle" @update:model-value="v => patch({ danmakuAntiSubtitle: v })" />
+          </div>
+
+          <div class="row col">
+            <div class="label"><b>屏蔽词</b><span>每行一个，包含该词的弹幕不显示</span></div>
+            <textarea
+              class="textarea"
+              rows="4"
+              :value="setting.danmakuBlockWords"
+              placeholder="例如：\n前排\n签到"
+              @change="patch({ danmakuBlockWords: ($event.target as HTMLTextAreaElement).value })"
+            />
+          </div>
+        </section>
+
         <!-- 播放 -->
         <section v-else-if="cat === 'playback'">
           <h2>播放</h2>
+          <div class="row">
+            <div class="label"><b>播放倍速</b><span>变速时保留音调，不产生「花栗鼠」效果</span></div>
+            <select
+              class="select"
+              :value="String(setting.playbackRate)"
+              @change="patch({ playbackRate: Number(($event.target as HTMLSelectElement).value) })"
+            >
+              <option value="0.5">0.5×</option>
+              <option value="0.75">0.75×</option>
+              <option value="1">1.0×</option>
+              <option value="1.25">1.25×</option>
+              <option value="1.5">1.5×</option>
+              <option value="2">2.0×</option>
+            </select>
+          </div>
+
+          <div class="row">
+            <div class="label"><b>睡眠定时</b><span>到点自动暂停，适合睡前听歌</span></div>
+            <select
+              class="select"
+              :value="String(setting.sleepTimerMin)"
+              @change="setSleep(Number(($event.target as HTMLSelectElement).value))"
+            >
+              <option value="0">关闭</option>
+              <option value="15">15 分钟</option>
+              <option value="30">30 分钟</option>
+              <option value="45">45 分钟</option>
+              <option value="60">60 分钟</option>
+              <option value="90">90 分钟</option>
+            </select>
+          </div>
+
           <div class="row">
             <div class="label"><b>默认音质</b><span>优先请求高音质，取链失败会自动降级</span></div>
             <select class="select" :value="setting.quality" @change="patch({ quality: ($event.target as HTMLSelectElement).value as any })">
@@ -1135,11 +1580,112 @@ onBeforeUnmount(stopPoll)
               <button v-if="setting.dataDir" class="btn sm ghost" :disabled="dataMoving" @click="resetDataDir">恢复默认</button>
             </div>
           </div>
+
+          <div class="sec-head" style="margin-top: 30px">
+            <h3>网络代理</h3>
+            <p>作用于音源、封面、弹幕与备份的全部请求，修改后立即生效</p>
+          </div>
+
+          <div class="row">
+            <div class="label"><b>使用代理</b><span>支持 http / socks5，例如 127.0.0.1:7890</span></div>
+            <Toggle :model-value="setting.proxyEnabled" @update:model-value="v => patch({ proxyEnabled: v })" />
+          </div>
+
+          <div v-if="setting.proxyEnabled" class="row col">
+            <div class="label"><b>代理地址</b><span>host:port 或 socks5://host:port</span></div>
+            <input
+              class="input"
+              :value="setting.proxyUrl"
+              placeholder="127.0.0.1:7890"
+              @change="patch({ proxyUrl: ($event.target as HTMLInputElement).value.trim() })"
+            />
+          </div>
+
+          <div class="sec-head" style="margin-top: 30px">
+            <h3>WebDAV 备份</h3>
+            <p>把歌单与收藏单向备份到你的 WebDAV 服务器（坚果云、Nextcloud、群晖等）。首版只上传，不下载、不合并。</p>
+          </div>
+
+          <div class="row">
+            <div class="label"><b>启用 WebDAV</b><span>配置保存在本地，密码仅用于 Basic 认证</span></div>
+            <Toggle :model-value="setting.webdavEnabled" @update:model-value="v => patch({ webdavEnabled: v })" />
+          </div>
+
+          <template v-if="setting.webdavEnabled">
+            <div class="row col">
+              <div class="label"><b>服务器地址</b><span>例如 https://dav.jianguoyun.com/dav</span></div>
+              <input
+                class="input"
+                :value="setting.webdavUrl"
+                placeholder="https://"
+                @change="patch({ webdavUrl: ($event.target as HTMLInputElement).value.trim() })"
+              />
+            </div>
+            <div class="row col">
+              <div class="label"><b>用户名</b><span>多数服务使用邮箱或账号名</span></div>
+              <input
+                class="input"
+                :value="setting.webdavUser"
+                autocomplete="off"
+                @change="patch({ webdavUser: ($event.target as HTMLInputElement).value.trim() })"
+              />
+            </div>
+            <div class="row col">
+              <div class="label"><b>密码 / 应用密码</b><span>坚果云等需要单独生成应用密码</span></div>
+              <input
+                class="input"
+                type="password"
+                :value="setting.webdavPass"
+                autocomplete="new-password"
+                @change="patch({ webdavPass: ($event.target as HTMLInputElement).value })"
+              />
+            </div>
+            <div class="row col">
+              <div class="label"><b>子目录</b><span>留空则上传到根目录，例如 StarWish</span></div>
+              <input
+                class="input"
+                :value="setting.webdavPath"
+                placeholder="StarWish"
+                @change="patch({ webdavPath: ($event.target as HTMLInputElement).value.trim() })"
+              />
+            </div>
+            <div class="row">
+              <div class="label">
+                <b>连接与上传</b>
+                <span>
+                  {{
+                    webdavMsg ||
+                    (setting.webdavLastSync
+                      ? '上次同步：' + new Date(setting.webdavLastSync).toLocaleString()
+                      : '尚未同步')
+                  }}
+                </span>
+              </div>
+              <div class="inline">
+                <button class="btn sm" :disabled="webdavBusy" @click="testWebdav">测试连接</button>
+                <button class="btn sm" :disabled="webdavBusy" @click="uploadWebdav">
+                  {{ webdavBusy ? '处理中…' : '立即上传' }}
+                </button>
+              </div>
+            </div>
+          </template>
         </section>
 
         <!-- 快捷键 -->
         <section v-else-if="cat === 'shortcuts'">
-          <h2>快捷键</h2>
+          <h2>快捷键与系统</h2>
+          <div class="row">
+            <div class="label"><b>任务栏歌词</b><span>在任务栏上方显示当前一句歌词（macOS 为菜单栏）</span></div>
+            <Toggle :model-value="setting.showTaskbarLyric" @update:model-value="v => patch({ showTaskbarLyric: v })" />
+          </div>
+          <div class="row">
+            <div class="label"><b>开机自启动</b><span>登录系统后自动启动星河音乐</span></div>
+            <Toggle :model-value="setting.autoLaunch" @update:model-value="v => patch({ autoLaunch: v })" />
+          </div>
+          <div class="row">
+            <div class="label"><b>关闭时最小化到托盘</b><span>关闭窗口不退出，继续后台播放</span></div>
+            <Toggle :model-value="setting.closeToTray" @update:model-value="v => patch({ closeToTray: v })" />
+          </div>
           <div class="keys">
             <div class="key-row"><span>播放 / 暂停</span><kbd>Space</kbd></div>
             <div class="key-row"><span>播放 / 暂停（全局）</span><kbd>Ctrl + Alt + P</kbd></div>
@@ -1354,7 +1900,100 @@ onBeforeUnmount(stopPoll)
   padding-top: 16px;
 }
 .head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
   padding-bottom: 18px;
+}
+
+/* ---------------- 设置搜索 ---------------- */
+.search-wrap {
+  position: relative;
+  width: 268px;
+  flex: none;
+}
+.search-box {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 36px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+  color: var(--text-3);
+}
+.search-box:focus-within {
+  border-color: var(--accent);
+}
+.search-box input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font-size: 13px;
+  font-family: inherit;
+  outline: none;
+}
+.search-clear {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-3);
+  cursor: pointer;
+}
+.search-clear:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+.search-pop {
+  position: absolute;
+  top: 42px;
+  right: 0;
+  width: 320px;
+  max-height: 320px;
+  overflow-y: auto;
+  padding: 6px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--bg-2);
+  box-shadow: var(--shadow);
+  z-index: 30;
+}
+.search-item {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 10px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+.search-item:hover {
+  background: var(--hover);
+}
+.search-item span {
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+.search-empty {
+  padding: 16px;
+  font-size: 12.5px;
+  color: var(--text-3);
+  text-align: center;
 }
 h1 {
   font-size: 27px;
@@ -1451,6 +2090,148 @@ h1 {
   gap: 20px;
   padding: 14px 2px;
   border-bottom: 1px solid var(--line);
+}
+
+/* 竖向行：标签在上、控件在下（多行文本、壁纸网格等） */
+.row.col {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 10px;
+}
+
+.hint {
+  margin: -4px 0 12px;
+  font-size: 12.5px;
+  color: var(--text-3);
+  line-height: 1.6;
+}
+
+/* ---------------- 壁纸库 ---------------- */
+.wall-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  padding: 18px 2px 10px;
+}
+.wall-head b {
+  font-size: 14px;
+}
+.wall-head span {
+  font-size: 12px;
+  color: var(--text-3);
+}
+.wall-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(148px, 1fr));
+  gap: 10px;
+  margin-bottom: 8px;
+}
+.wall-item {
+  position: relative;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow: hidden;
+  background: var(--panel);
+  cursor: pointer;
+  aspect-ratio: 16 / 10;
+  transition: border-color 0.2s, transform 0.2s;
+}
+.wall-item:hover {
+  border-color: var(--line-2);
+  transform: translateY(-1px);
+}
+.wall-item.on {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent) inset;
+}
+.wall-item img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.wall-name {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 14px 8px 6px;
+  font-size: 11.5px;
+  color: #fff;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  background: linear-gradient(180deg, transparent, rgba(0, 0, 0, 0.68));
+}
+.wall-del {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 24px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.5);
+  color: #fff;
+  opacity: 0;
+  transition: opacity 0.18s;
+}
+.wall-item:hover .wall-del {
+  opacity: 1;
+}
+.wall-add {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  aspect-ratio: 16 / 10;
+  border: 1px dashed var(--line-2);
+  border-radius: 12px;
+  background: transparent;
+  color: var(--text-3);
+  font-size: 12px;
+  cursor: pointer;
+  transition: color 0.2s, border-color 0.2s;
+}
+.wall-add:hover:not(:disabled) {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.wall-add:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+.textarea {
+  width: 100%;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.6;
+  resize: vertical;
+}
+.input {
+  width: 100%;
+  height: 36px;
+  padding: 0 12px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 13px;
+}
+.input:focus,
+.textarea:focus {
+  outline: none;
+  border-color: var(--accent);
 }
 .row:last-child {
   border-bottom: none;

@@ -2,7 +2,8 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { findLyricIndex, formatTime } from '@shared/lrc'
-import type { LyricLine } from '@shared/types'
+import type { LyricLine, WallpaperItem } from '@shared/types'
+import { call, isDesktop } from '@/api'
 import Icon from '@/components/Icon.vue'
 import Cover from '@/components/Cover.vue'
 import Slider from '@/components/Slider.vue'
@@ -35,13 +36,77 @@ const song = computed(() => player.song)
 const isWin = computed(() => window.sw?.platform === 'win32')
 /** 播放页背景模式（设置 → 播放） */
 const bgMode = computed(() => ui.settings.playerBg || 'cover')
+
+/* ---------------- 壁纸引擎（图片） ---------------- */
+const wallpapers = ref<WallpaperItem[]>([])
+/** 运行时选中的壁纸 id：按歌/定时轮播时会临时改变，不改写设置 */
+const runtimeWallpaperId = ref('')
+
+watch(
+  () => ui.settings.wallpaperId,
+  v => {
+    runtimeWallpaperId.value = v || ''
+  },
+  { immediate: true }
+)
+
+const currentWallpaper = computed<WallpaperItem | null>(() => {
+  const list = wallpapers.value
+  if (!list.length) return null
+  const id = runtimeWallpaperId.value
+  return list.find(w => w.id === id) || list[0]
+})
+
+function toLocalUrl(p: string): string {
+  if (!p) return ''
+  if (/^(https?|data|file|swmedia|swcover):/i.test(p)) return p
+  return 'file:///' + p.replace(/\\/g, '/').replace(/^\/+/, '')
+}
+
 /** 本地壁纸需要转成 file:// 才能被 <img> 加载（Windows 路径直接拼会失效） */
 const wallpaperSrc = computed(() => {
-  const p = (ui.settings.playerWallpaper || '').trim()
-  if (!p) return ''
-  if (/^(https?|data|file):/i.test(p)) return p
-  return 'file:///' + p.replace(/\\/g, '/').replace(/^\/+/, '')
+  const w = currentWallpaper.value
+  if (w && ui.settings.wallpaperEnabled) return toLocalUrl(w.file)
+  // 移动端 / 旧数据：settings.playerWallpaper 存的是 dataURL 或路径
+  return toLocalUrl((ui.settings.playerWallpaper || '').trim())
 })
+
+const wallpaperStyle = computed(() => {
+  const s = ui.settings
+  return {
+    filter: `blur(${Math.max(0, s.wallpaperBlur || 0)}px) brightness(${s.wallpaperBrightness || 1})`,
+    transform: `scale(${s.wallpaperScale || 1.06})`,
+    objectFit: s.wallpaperFit || 'cover',
+  }
+})
+
+function pickRandomWallpaper(): void {
+  const list = wallpapers.value
+  if (list.length < 2) return
+  const cur = runtimeWallpaperId.value
+  const pool = list.filter(w => w.id !== cur)
+  runtimeWallpaperId.value = pool[Math.floor(Math.random() * pool.length)]?.id || cur
+}
+
+watch(
+  () => player.song?.id,
+  () => {
+    if (ui.settings.wallpaperRotation === 'song') pickRandomWallpaper()
+  }
+)
+
+let wallpaperTimer: ReturnType<typeof setInterval> | null = null
+function syncWallpaperTimer(): void {
+  if (wallpaperTimer) {
+    clearInterval(wallpaperTimer)
+    wallpaperTimer = null
+  }
+  if (ui.settings.wallpaperRotation !== 'timer') return
+  const min = Math.max(1, ui.settings.wallpaperIntervalMin || 15)
+  wallpaperTimer = setInterval(pickRandomWallpaper, min * 60 * 1000)
+}
+watch(() => [ui.settings.wallpaperRotation, ui.settings.wallpaperIntervalMin], syncWallpaperTimer)
+
 const liked = computed(() => (song.value ? library.isFavorite(song.value.id) : false))
 const offsetSec = computed(() => (ui.settings.lyricOffset || 0) / 1000)
 const lines = computed<LyricLine[]>(() => player.lyric?.lines || [])
@@ -226,11 +291,25 @@ onMounted(() => {
     ro.observe(canvas.value)
   }
   startCanvas()
+  syncWallpaperTimer()
+  if (isDesktop) {
+    void call<WallpaperItem[]>('wallpaper:list')
+      .then(list => {
+        wallpapers.value = Array.isArray(list) ? list : []
+      })
+      .catch(() => {
+        /* 移动端或无 IPC 环境下忽略，退回 playerWallpaper */
+      })
+  }
 })
 
 onBeforeUnmount(() => {
   stopCanvas()
   ro?.disconnect()
+  if (wallpaperTimer) {
+    clearInterval(wallpaperTimer)
+    wallpaperTimer = null
+  }
 })
 
 function back(): void {
@@ -286,11 +365,18 @@ function onGestureEnd(e: PointerEvent): void {
       <!-- 兜底氛围层在图片之下，图片才不会被盖住 -->
       <div v-if="bgMode !== 'solid'" class="bg-fallback" />
       <img v-if="bgMode === 'cover' && player.coverUrl" :src="player.coverUrl" class="bg-img" alt="" />
-      <img v-else-if="bgMode === 'wallpaper' && wallpaperSrc" :src="wallpaperSrc" class="bg-img bg-wall" alt="" />
+      <img v-else-if="bgMode === 'wallpaper' && wallpaperSrc" :src="wallpaperSrc" class="bg-img bg-wall" :style="wallpaperStyle" alt="" />
       <div v-if="bgMode === 'gradient'" class="bg-flow">
         <span /><span /><span /><span />
       </div>
       <div class="bg-mask" />
+      <!-- 壁纸模式：遮罩浓度与色调叠加都由设置控制 -->
+      <div v-if="bgMode === 'wallpaper'" class="bg-wall-mask" :style="{ opacity: ui.settings.wallpaperMask }" />
+      <div
+        v-if="bgMode === 'wallpaper' && ui.settings.wallpaperTint"
+        class="bg-tint"
+        :style="{ background: ui.settings.wallpaperTint }"
+      />
     </div>
 
     <!-- 顶栏 -->
@@ -479,12 +565,15 @@ function onGestureEnd(e: PointerEvent): void {
   overflow: hidden;
   color: #f4f6fb;
   background: #0a0b10;
+  /* 隔离层：bg-flow 用了 mix-blend-mode: screen，没有 isolation 时混合会溢出到
+     页面根，和下层内容一起参与混合，视觉上就是「透」。 */
+  isolation: isolate;
   animation: playerIn 0.36s var(--ease);
 }
 @keyframes playerIn {
+  /* 只动 transform，不动 opacity：入场时整页半透明会露出下层页面文字 */
   from {
-    opacity: 0;
-    transform: translateY(18px);
+    transform: translateY(18px) scale(0.995);
   }
 }
 .bg-layer {
@@ -570,9 +659,10 @@ function onGestureEnd(e: PointerEvent): void {
   background:
     radial-gradient(90% 70% at 25% 15%, color-mix(in srgb, var(--accent) 28%, transparent), transparent 60%),
     radial-gradient(80% 80% at 80% 85%, rgba(124, 108, 255, 0.22), transparent 65%),
-    linear-gradient(160deg, #14162266, #0a0b10);
+    linear-gradient(160deg, #141622, #0a0b10);
 }
-/* 遮罩只做压暗，保证封面颜色透出来 */
+/* 遮罩：在保留封面色彩的同时保证文字对比度。
+   浅色封面（白底专辑图）下，白色歌词会直接糊进背景——这层基础压暗是必需品。 */
 .bg-mask {
   position: absolute;
   inset: 0;
@@ -580,7 +670,26 @@ function onGestureEnd(e: PointerEvent): void {
   background:
     radial-gradient(120% 80% at 18% 20%, rgba(255, 77, 109, 0.12), transparent 55%),
     radial-gradient(100% 90% at 85% 80%, rgba(120, 80, 255, 0.14), transparent 60%),
-    linear-gradient(180deg, rgba(6, 8, 14, 0.12), rgba(6, 8, 14, 0.55));
+    linear-gradient(180deg, rgba(6, 8, 14, 0.44), rgba(6, 8, 14, 0.66)),
+    rgba(6, 8, 14, 0.1);
+}
+/* 壁纸遮罩：浓度由设置项 wallpaperMask 控制，保证浅色壁纸上的文字可读 */
+.bg-wall-mask {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  background: #06080e;
+  pointer-events: none;
+  transition: opacity 0.3s var(--ease);
+}
+/* 色调叠加：可选，给壁纸统一染色 */
+.bg-tint {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  opacity: 0.18;
+  pointer-events: none;
+  mix-blend-mode: overlay;
 }
 
 .p-head {
@@ -856,17 +965,18 @@ function onGestureEnd(e: PointerEvent): void {
   border-radius: 8px;
   font-size: 1em;
   line-height: 1.6;
-  color: rgba(255, 255, 255, 0.38);
+  /* 未播放行太淡会在浅色封面上消失，0.5 是可读与层次感的平衡点 */
+  color: rgba(255, 255, 255, 0.5);
   text-align: left;
   cursor: pointer;
   transition: color 0.24s, transform 0.24s, font-size 0.24s;
   transform-origin: left center;
 }
 .line:hover {
-  color: rgba(255, 255, 255, 0.62);
+  color: rgba(255, 255, 255, 0.78);
 }
 .line.near {
-  color: rgba(255, 255, 255, 0.55);
+  color: rgba(255, 255, 255, 0.68);
 }
 .line.active {
   color: #fff;
