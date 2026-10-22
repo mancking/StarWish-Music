@@ -1,5 +1,13 @@
 apply plugin: 'com.android.application'
 
+// 版本号单一来源：以 app/package.json 为准（v2.3.0 曾出现「安装 2.3.0 扫出 2.2.0」，
+// 根因是这里写死 versionName 与主包脱节）。versionCode 由 semver 推导，单调递增。
+import groovy.json.JsonSlurper
+def pkg = new JsonSlurper().parseText(file('../../package.json').text)
+def swVersionName = pkg.version
+def (swMajor, swMinor, swPatch) = swVersionName.tokenize('.').collect { it.toInteger() }
+def swVersionCode = swMajor * 1000000 + swMinor * 1000 + swPatch
+
 android {
     namespace "com.starwish.music"
     compileSdk rootProject.ext.compileSdkVersion
@@ -7,9 +15,8 @@ android {
         applicationId "com.starwish.music"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 2
-        // 与 desktop 版本号同步（app/package.json 的 version）
-        versionName "2.2.0"
+        versionCode swVersionCode
+        versionName swVersionName
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.

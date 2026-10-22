@@ -52,17 +52,46 @@ function isNativeCap(): boolean {
 }
 
 /**
- * 真机原生 HTTP 通道（Capacitor @capacitor-community/http 插件）。
+ * 真机原生 HTTP 通道。
  *
- * Android WebView 里裸 fetch/XHR 受 CORS 限制，B 站 passport 等接口全部被拦
- * （二维码获取失败的根因）。原生插件走 OkHttp/HttpURLConnection，没有跨域概念，
- * 且多值响应头完整返回（Set-Cookie 的 SESSDATA 才拿得到）。桌面与冒烟不走此分支。
+ * v2.3.1 根因修复：v2.3.0 走 `import('@capacitor-community/http')`，该 npm 包
+ * 在生产构建里是独立动态 chunk，真机上一旦加载失败（CSP/分包/版本错配），
+ * 所有请求集体报错 →「所有功能网络不可用」。现改为直连 Capacitor 运行时
+ * 内置的 `CapacitorHttp` 插件（`Capacitor.nativePromise`，零 npm 依赖），
+ * 并保留 npm 包 import 与 WebView fetch 两级回退——任何一级失败都不会
+ * 再拖垮全部网络。
  */
+type NativeRes = { status: number; headers: Record<string, unknown>; data: unknown; url?: string }
+
+/** 探明一条可用的原生通道并缓存：nativePromise → @capacitor-community/http → null(用 WebView fetch) */
+let nativeChannel: ((opts: any) => Promise<NativeRes>) | null | undefined
+
+async function resolveNativeChannel(): Promise<((opts: any) => Promise<NativeRes>) | null> {
+  if (nativeChannel !== undefined) return nativeChannel
+  const cap: any = (globalThis as any).Capacitor
+  // 1) Capacitor 6 内置 CapacitorHttp（与 capacitor.config 的 plugins.CapacitorHttp 同源）
+  if (cap && typeof cap.nativePromise === 'function') {
+    nativeChannel = (o: any) => cap.nativePromise('CapacitorHttp', 'request', o) as Promise<NativeRes>
+    return nativeChannel
+  }
+  // 2) 社区包（兜底，旧壳/自定义运行时）
+  try {
+    const mod: any = await import('@capacitor-community/http')
+    if (mod?.Http?.request) {
+      nativeChannel = (o: any) => mod.Http.request(o) as Promise<NativeRes>
+      return nativeChannel
+    }
+  } catch { /* 继续降级 */ }
+  nativeChannel = null
+  return null
+}
+
 async function nativeRequest(
   url: string,
   opts: RequestOptions
 ): Promise<HttpResponse & { bytes?: Buffer }> {
-  const { Http } = await import('@capacitor-community/http')
+  const send = await resolveNativeChannel()
+  if (!send) throw new Error('原生 HTTP 通道不可用')
   const method = (opts.method || 'GET').toUpperCase()
   const retry = opts.retry ?? 1
   const timeout = Math.max(1000, opts.timeout ?? 15000)
@@ -87,7 +116,7 @@ async function nativeRequest(
           headers['Content-Type'] = 'application/json'
         }
       }
-      const res = await Http.request({
+      const res = await send({
         url,
         method,
         headers,
@@ -148,8 +177,16 @@ async function nativeRequest(
  * 绝不向外抛裸异常（调用方可依赖 HttpError 判断状态码）。
  */
 export async function request(url: string, opts: RequestOptions = {}): Promise<HttpResponse & { bytes?: Buffer }> {
-  // 真机 WebView：跨域 fetch 全部被 CORS 拦截，改走原生 HTTP 通道
-  if (isNativeCap()) return nativeRequest(url, opts)
+  // 真机 WebView：跨域 fetch 全部被 CORS 拦截，优先走原生 HTTP 通道；
+  // 通道不可用（插件缺失/加载失败）时降级 WebView fetch——CapacitorHttp 开启时
+  // native-bridge 已接管 window.fetch，本身无 CORS，请求仍能继续。
+  if (isNativeCap()) {
+    try {
+      return await nativeRequest(url, opts)
+    } catch (e) {
+      logger.warn('原生通道失败，降级 WebView fetch', url, String((e as Error)?.message || e))
+    }
+  }
   const method = (opts.method || 'GET').toUpperCase()
   const retry = opts.retry ?? 1
   let lastErr: unknown = null

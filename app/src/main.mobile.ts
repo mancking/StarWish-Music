@@ -21,7 +21,12 @@ import { installBridge } from './mobile/bridge'
 import { installPullRefresh } from './mobile/pull-refresh'
 
 async function bootstrap(): Promise<void> {
+  // 平台感知：android / ios 分别注入（styles/platform.css 按此适配 HIG 细节，
+  // 如 iOS Large Title 与 Android M3 触控节奏），不再写死 'android'
+  const cap: any = (globalThis as any).Capacitor
+  const osName = typeof cap?.getPlatform === 'function' ? cap.getPlatform() : 'android'
   document.documentElement.dataset.platform = 'mobile'
+  document.documentElement.dataset.os = osName === 'ios' ? 'ios' : 'android'
   await installBridge()
   installPullRefresh()
 
@@ -52,14 +57,19 @@ async function bootstrap(): Promise<void> {
   const ui = useUiStore(pinia)
   const player = usePlayerStore(pinia)
   const library = useLibraryStore(pinia)
-  await Promise.all([ui.init(), player.init(), library.init()])
+  // v2.3.1：先把界面挂上（页面自带骨架/加载态），仓库初始化在后台并行进行——
+  // 不再让用户盯着 splash 等数据库/收藏/播放队列全部就绪。
   ;(window as any).__swStores = { player, library, ui }
   app.mount('#app')
-  const splash = document.getElementById('splash')
-  if (splash) {
-    splash.classList.add('splash-out')
-    setTimeout(() => splash.remove(), 450)
-  }
+  void Promise.all([ui.init(), player.init(), library.init()])
+    .catch(err => console.error('[renderer] 启动初始化失败', err))
+    .finally(() => {
+      const splash = document.getElementById('splash')
+      if (splash) {
+        splash.classList.add('splash-out')
+        setTimeout(() => splash.remove(), 450)
+      }
+    })
 }
 
 void bootstrap()

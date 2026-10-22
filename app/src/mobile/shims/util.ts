@@ -138,9 +138,17 @@ export async function patchNativeFetch(): Promise<void> {
   const orig = (globalThis as any).fetch
   if (!orig || orig.__starwishNative) return
   let httpMod: any = null
+  // 优先 Capacitor 运行时内置的 CapacitorHttp（零依赖、永不断链）；
+  // 拿不到再退 @capacitor-community/http；都没有则不接管（保持原 fetch）。
   const getHttp = async (): Promise<any> => {
-    if (!httpMod) httpMod = await import('@capacitor-community/http')
-    return httpMod.Http
+    const cap: any = (globalThis as any).Capacitor
+    if (cap && typeof cap.nativePromise === 'function') {
+      return {
+        request: (o: any) => cap.nativePromise('CapacitorHttp', 'request', o),
+      }
+    }
+    if (!httpMod) httpMod = await import('@capacitor-community/http').catch(() => null)
+    return httpMod?.Http ?? null
   }
   const nativeFetch = async (input: any, init?: any) => {
     let url = ''
@@ -158,6 +166,7 @@ export async function patchNativeFetch(): Promise<void> {
     }
     if (!external) return orig(input, init)
     const Http = await getHttp()
+    if (!Http) return orig(input, init)
     const method = String(init?.method || (typeof input === 'object' && input?.method) || 'GET').toUpperCase()
     const headers: Record<string, string> = {}
     const src = init?.headers ?? (typeof input === 'object' ? input?.headers : null)
@@ -173,15 +182,26 @@ export async function patchNativeFetch(): Promise<void> {
         headers['Content-Type'] = 'application/json'
       }
     }
-    const res = await Http.request({
-      url,
-      method,
-      headers,
-      data,
-      responseType: 'text',
-      connectTimeout: 15000,
-      readTimeout: 30000,
-    })
+    let res: any
+    try {
+      res = await Http.request({
+        url,
+        method,
+        headers,
+        data,
+        responseType: 'text',
+        connectTimeout: 15000,
+        readTimeout: 30000,
+      })
+    } catch (e) {
+      // 原生请求失败：退回 WebView fetch 再试一次（CapacitorHttp 的 native-bridge
+      // 接管时该 fetch 本身无 CORS；即便失败也比整层断网信息更明确）
+      try {
+        return await orig(input, init)
+      } catch {
+        throw e
+      }
+    }
     const hs = new Headers()
     for (const k of Object.keys(res.headers || {})) {
       const v = (res.headers as any)[k]

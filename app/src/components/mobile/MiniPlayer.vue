@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import Icon from '@/components/Icon.vue'
 import Cover from '@/components/Cover.vue'
@@ -26,10 +26,51 @@ function open(): void {
   if (!song.value) return
   router.push('/player')
 }
+
+/* 上滑手势：向上拖动超过阈值松手 → 展开播放页（跟手位移 + 回弹） */
+let tsY = 0
+let tsX = 0
+let dragging = false
+const dragDy = ref(0)
+
+function onTouchStart(e: TouchEvent): void {
+  if (e.touches.length !== 1) return
+  tsY = e.touches[0].clientY
+  tsX = e.touches[0].clientX
+  dragging = true
+  dragDy.value = 0
+}
+function onTouchMove(e: TouchEvent): void {
+  if (!dragging) return
+  const dy = e.touches[0].clientY - tsY
+  const dx = e.touches[0].clientX - tsX
+  // 明显横向滑动时放弃接管（避免误伤横切）
+  if (Math.abs(dx) > Math.abs(dy) * 1.2) {
+    dragging = false
+    dragDy.value = 0
+    return
+  }
+  dragDy.value = Math.min(0, dy)
+}
+function onTouchEnd(): void {
+  if (!dragging) return
+  dragging = false
+  const dy = dragDy.value
+  dragDy.value = 0
+  if (dy < -56) open()
+}
 </script>
 
 <template>
-  <div v-if="song" class="mini" @click="open">
+  <div
+    v-if="song"
+    class="mini"
+    :style="{ transform: `translateY(${dragDy}px)`, transition: dragging ? 'none' : 'transform .2s' }"
+    @click="open"
+    @touchstart="onTouchStart"
+    @touchmove="onTouchMove"
+    @touchend="onTouchEnd"
+  >
     <div class="mini-progress" :style="{ width: progress + '%' }" />
     <Cover :src="player.coverUrl" :size="40" radius="10" class="mini-cover" />
     <div class="mini-text">

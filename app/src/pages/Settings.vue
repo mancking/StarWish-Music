@@ -798,7 +798,22 @@ async function openUpdatePage(): Promise<void> {
     await call('app:openExternal', { url }).catch(() => {})
     return
   }
-  // 移动端 WebView 无 window.open 多窗口支持：复制链接给系统浏览器
+  // v2.3.1：Release 里有 APK 产物时应用内直接下载并拉起安装器，不再跳浏览器
+  const apkUrl = updateInfo.value?.apkUrl
+  if (apkUrl) {
+    ui.toast('开始下载安装包…', 'info', 2400)
+    try {
+      await call('app:downloadAndInstall', { url: apkUrl })
+      ui.toast('下载完成，请在弹出的安装器中确认安装', 'success', 4200)
+    } catch (e: any) {
+      ui.toast(`下载失败：${e.message}，已复制下载页链接`, 'error', 4200)
+      try {
+        await navigator.clipboard.writeText(url)
+      } catch { /* 剪贴板不可用 */ }
+    }
+    return
+  }
+  // 无 APK 产物：退回复制链接给系统浏览器
   try {
     await navigator.clipboard.writeText(url)
     ui.toast('下载页链接已复制，请在浏览器打开', 'success')

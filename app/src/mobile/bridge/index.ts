@@ -78,18 +78,21 @@ async function boot(): Promise<void> {
     })
   })
 
-  // 3) 设置与数据库
+  // 3) 设置与数据库、音源沙箱：两者互不依赖（lx-host 只依赖上面的 vfs 种子），
+  //    v2.3.1 起并行初始化，缩短真机冷启动白屏时间
   loadSettings()
-  await initDb()
-  initBiliLogin()
+  const dbReady = initDb().then(() => initBiliLogin())
+  const lxReady = (async () => {
+    try {
+      await lxHost.load()
+    } catch { /* 音源加载失败不阻断启动 */ }
+  })()
+  await Promise.all([dbReady, lxReady])
 
-  // 4) 音源沙箱（vm shim + 种子文件）
-  await lxHost.load()
-
-  // 5) 播放器
+  // 4) 播放器
   player.init()
 
-  // 6) 睡眠关机轮询（桌面由 player-service 内部定时器做）
+  // 5) 睡眠关机轮询（桌面由 player-service 内部定时器做）
   window.setInterval(() => player.checkSleep(), 20000)
 }
 
@@ -117,8 +120,40 @@ const handlers: Record<string, Handler> = {
   }),
   'app:quit': NOP_OK,
   'app:relaunch': NOP_OK,
-  'app:openExternal': UNSUPPORTED('打开外部浏览器'),
+  /**
+   * 打开外部链接（更新页、开源主页等）：Android 走原生 SwBridge 插件
+   * （ACTION_VIEW），iOS / 插件缺失退回 window.open；WebView 不支持多窗口时
+   * 最后由调用方降级为复制链接。
+   */
+  'app:openExternal': async ({ url }: any) => {
+    const cap: any = (globalThis as any).Capacitor
+    if (cap && typeof cap.nativePromise === 'function' && cap.isNativePlatform?.()) {
+      try {
+        // Android：原生 SwBridge 插件（ACTION_VIEW，market:// 等私有协议也能打开）
+        await cap.nativePromise('SwBridge', 'openExternal', { url: String(url) })
+        return true
+      } catch {
+        // iOS 等无 SwBridge 插件的平台：退回 WebView 多窗口（WKWebView 支持）
+        window.open(String(url), '_blank')
+        return true
+      }
+    }
+    window.open(String(url), '_blank')
+    return true
+  },
   'app:showItemInFolder': UNSUPPORTED('在文件夹中显示'),
+  /**
+   * 应用内下载安装包（APK）：原生 SwUpdate 插件下载到应用私有目录，
+   * 完成后拉起系统安装器——不再跳浏览器手动下载。
+   */
+  'app:downloadAndInstall': async ({ url }: any) => {
+    const cap: any = (globalThis as any).Capacitor
+    if (cap && typeof cap.nativePromise === 'function' && cap.isNativePlatform?.()) {
+      await cap.nativePromise('SwUpdate', 'downloadAndInstall', { url: String(url) })
+      return true
+    }
+    throw new Error('当前环境不支持应用内安装')
+  },
 
   /* ---- 设置 ---- */
   'settings:get': () => getSettings(),
@@ -281,15 +316,60 @@ const handlers: Record<string, Handler> = {
   'library:count': () => localCount(),
   'library:remove': ({ paths }: any) => { removeLocalSongs(paths || []); return localSongs() },
 
-  /* ---- 下载：WebView 沙盒没有对外文件系统写权限，诚实返回 ---- */
-  'download:list': () => [],
-  'download:dir': () => '',
-  'download:pickDir': async () => '',
-  'download:openDir': NOP_OK,
-  'download:add': UNSUPPORTED('下载到本地文件（请使用桌面版）'),
-  'download:cancel': NOP_OK,
-  'download:remove': NOP_OK,
-  'download:clear': NOP_OK,
+  /* ---- 下载：/swmedia/ 流式拉流（原生代理带防盗链头）→ 原生 SwBridge
+         写入公共音乐库 Music/星河音乐/。v2.3.0 是诚实降级（不支持），
+         v2.3.1 起真机可直接下载歌曲到本地。 ---- */
+  'download:list': () => dlTaskList(),
+  'download:dir': () => 'Music/星河音乐（系统音乐库）',
+  'download:pickDir': async () => 'Music/星河音乐',
+  'download:openDir': async () => {
+    // 系统文件管理器没有「打开指定目录」的公共入口，提示用户即可
+    emit('toast', { type: 'info', message: '下载的歌曲在系统音乐库「星河音乐」目录' })
+    return true
+  },
+  'download:add': async ({ songs, quality }: any) => {
+    const list: any[] = []
+    for (const song of songs || []) {
+      const t: any = {
+        id: `m-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
+        song,
+        status: 'queued',
+        quality: quality || getSettings().quality,
+        progress: 0,
+        received: 0,
+        total: 0,
+        createdAt: Date.now(),
+      }
+      dlTasks.set(t.id, t)
+      list.push(t)
+      dlChain = dlChain.then(() => runDownload(t))
+    }
+    return list.map(t => ({ ...t }))
+  },
+  'download:cancel': ({ id }: any) => {
+    dlAborts.get(String(id))?.abort()
+    return true
+  },
+  'download:remove': async ({ id, deleteFile }: any) => {
+    const t = dlTasks.get(String(id))
+    dlAborts.get(String(id))?.abort()
+    if (t && deleteFile && dlUris.get(t.id)) {
+      try {
+        await nativeCall('SwBridge', 'deleteMedia', { uri: dlUris.get(t.id) })
+      } catch { /* 文件可能已被用户删除 */ }
+    }
+    dlUris.delete(String(id))
+    dlTasks.delete(String(id))
+    return true
+  },
+  'download:clear': ({ onlyFinished = true }: any) => {
+    for (const [id, t] of dlTasks) {
+      if (onlyFinished && (t.status === 'running' || t.status === 'queued')) continue
+      dlTasks.delete(id)
+      dlUris.delete(id)
+    }
+    return true
+  },
 
   /* ---- B 站 ---- */
   'bili:status': () => biliStatus(),
@@ -322,6 +402,136 @@ const handlers: Record<string, Handler> = {
 async function resolveInline(song: Song, quality?: string) {
   const mod = await import('../../../electron/core/music-service')
   return mod.resolveUrl(song, quality || getSettings().quality, getSettings().autoSwitchSource)
+}
+
+/* ============================ 移动端下载队列 ============================ */
+
+type DlTask = {
+  id: string
+  song: Song
+  status: 'queued' | 'running' | 'done' | 'error' | 'canceled'
+  quality: string
+  progress: number
+  received: number
+  total: number
+  file?: string
+  error?: string
+  createdAt: number
+  finishedAt?: number
+}
+
+const dlTasks = new Map<string, DlTask>()
+const dlAborts = new Map<string, AbortController>()
+const dlUris = new Map<string, string>()
+let dlChain: Promise<void> = Promise.resolve()
+
+function nativeCall(plugin: string, method: string, opts: any): Promise<any> {
+  const cap: any = (globalThis as any).Capacitor
+  if (!cap || typeof cap.nativePromise !== 'function') throw new Error('原生通道不可用')
+  return cap.nativePromise(plugin, method, opts)
+}
+
+function dlEmit(t: DlTask): void {
+  emit('download:progress', { ...t, song: t.song })
+}
+
+function dlTaskList(): DlTask[] {
+  return [...dlTasks.values()].map(t => ({ ...t }))
+}
+
+function dlExtOf(url: string, quality: string): string {
+  if (quality === 'flac' || quality === 'flac24bit') return 'flac'
+  const m = /\.(mp3|flac|m4a|aac|ogg|wav)(\?|$)/i.exec(url)
+  return m ? m[1].toLowerCase() : 'mp3'
+}
+
+function dlMimeOf(ext: string): string {
+  const map: Record<string, string> = {
+    mp3: 'audio/mpeg', flac: 'audio/flac', m4a: 'audio/mp4',
+    aac: 'audio/aac', ogg: 'audio/ogg', wav: 'audio/wav',
+  }
+  return map[ext] || 'audio/mpeg'
+}
+
+function dlSafeName(s: string): string {
+  return s.replace(/[\\/:*?"<>|]/g, '_').slice(0, 120).trim() || '未命名'
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let bin = ''
+  const CH = 0x8000
+  for (let i = 0; i < bytes.length; i += CH) {
+    bin += String.fromCharCode(...bytes.subarray(i, i + CH))
+  }
+  return btoa(bin)
+}
+
+/** 单任务执行：resolveUrl → /swmedia/ 流式拉流（有真实进度）→ 原生写媒体库 */
+async function runDownload(t: DlTask): Promise<void> {
+  const ctl = new AbortController()
+  dlAborts.set(t.id, ctl)
+  try {
+    t.status = 'running'
+    dlEmit(t)
+    const r = await resolveInline(t.song, t.quality)
+    if (!r?.url) throw new Error('无法获取播放地址')
+    const ext = dlExtOf(r.url, r.quality)
+    const name = `${dlSafeName(`${t.song.singer || '未知'} - ${t.song.name || '未命名'}`)}.${ext}`
+    // 同源 /swmedia/：由原生 SwMediaClient 代理（注入 Referer/UA），流式可读
+    const res = await fetch(`/swmedia/?u=${encodeURIComponent(r.url)}`, { signal: ctl.signal })
+    if (!res.ok) throw new Error(`音频下载失败（HTTP ${res.status}）`)
+    const reader = res.body?.getReader()
+    if (!reader) throw new Error('当前环境不支持流式下载')
+    const total = Number(res.headers.get('content-length') || 0)
+    const chunks: Uint8Array[] = []
+    let received = 0
+    let lastEmit = 0
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      chunks.push(value)
+      received += value.length
+      const now = Date.now()
+      if (now - lastEmit > 300) {
+        lastEmit = now
+        t.received = received
+        t.total = total
+        t.progress = total ? Math.min(99, Math.round((received / total) * 100)) : 0
+        dlEmit(t)
+      }
+    }
+    if (ctl.signal.aborted) return
+    const all = new Uint8Array(received)
+    let off = 0
+    for (const c of chunks) {
+      all.set(c, off)
+      off += c.length
+    }
+    t.received = received
+    t.total = received
+    t.progress = 100
+    const ret = await nativeCall('SwBridge', 'saveToMedia', {
+      name,
+      mime: dlMimeOf(ext),
+      data: bytesToBase64(all),
+    })
+    if (ret?.uri) dlUris.set(t.id, String(ret.uri))
+    t.status = 'done'
+    t.file = String(ret?.path || name)
+    t.finishedAt = Date.now()
+  } catch (e: any) {
+    if (ctl.signal.aborted || e?.name === 'AbortError') {
+      t.status = 'canceled'
+      t.error = '已取消'
+    } else {
+      t.status = 'error'
+      t.error = e?.message || String(e)
+    }
+    t.finishedAt = Date.now()
+  } finally {
+    dlAborts.delete(t.id)
+    dlEmit(t)
+  }
 }
 
 /* ---------------- 安装 ---------------- */

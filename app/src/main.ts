@@ -7,8 +7,16 @@ import { usePlayerStore } from './stores/player'
 import { useLibraryStore } from './stores/library'
 import './styles/main.css'
 
-// 设计 token 按端切换：桌面用紧凑尺寸，移动端用大圆角/大行高
+// 设计 token 按端切换：桌面用紧凑尺寸，移动端用大圆角/大行高。
+// data-os 细分操作系统（styles/platform.css 按此适配各端 HIG 细节）：
+// 红绿灯避让（darwin）、Segoe UI（win32）、Cantarell（linux）。
+const os = /Mac|iP(hone|ad|od)/.test(navigator.userAgent)
+  ? 'darwin'
+  : /Win/.test(navigator.userAgent)
+    ? 'win32'
+    : 'linux'
 document.documentElement.dataset.platform = 'desktop'
+document.documentElement.dataset.os = os
 
 const app = createApp(App)
 const pinia = createPinia()

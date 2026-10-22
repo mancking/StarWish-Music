@@ -422,3 +422,366 @@
   color: var(--accent);
   font-weight: 600;
 }
+
+/* ==================================================================
+   v2.3.1 移动端全面 UI 重构（作用域 #app .m-shell —— 仅真机 WebView 外壳，
+   桌面 / 窄窗口冒烟不受影响）。设计依据 docs/mobile-ui-research-v2.3.1.md：
+   分区卡片流、大触控目标、底部动作面板、沉浸层级 —— 与桌面信息密度布局
+   完全异构，而非缩小的桌面网格。
+   ================================================================== */
+
+/* ---- 边缘返回指示条（src/mobile/gestures.ts） ---- */
+.sw-back-bar {
+  position: fixed;
+  top: 50%;
+  left: 0;
+  width: 4px;
+  height: 0;
+  border-radius: 0 4px 4px 0;
+  background: var(--accent, #7c9cff);
+  opacity: 0;
+  transform: translateY(-50%);
+  transition: opacity 0.15s ease, height 0.12s ease;
+  pointer-events: none;
+  z-index: 999;
+}
+
+/* ---- 画布与排版节奏 ---- */
+#app .m-shell .page {
+  padding: 14px 16px 40px;
+}
+#app .m-shell .section {
+  margin-top: 30px;
+}
+#app .m-shell .section-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 19px;
+  font-weight: 700;
+  letter-spacing: 0.2px;
+}
+#app .m-shell .section-title::before {
+  content: '';
+  width: 4px;
+  height: 16px;
+  border-radius: 2px;
+  background: linear-gradient(180deg, #ff4d6d, #a855f7);
+}
+
+/* ---- 首页：桌面多列网格 → 分区横滑卡片流（snap） ---- */
+#app .m-shell .grid-cards {
+  display: flex;
+  gap: 12px;
+  overflow-x: auto;
+  scroll-snap-type: x mandatory;
+  padding: 4px 2px 10px;
+  margin: 0 -16px;
+  padding-left: 16px;
+  padding-right: 16px;
+  scrollbar-width: none;
+}
+#app .m-shell .grid-cards::-webkit-scrollbar {
+  display: none;
+}
+#app .m-shell .grid-cards > * {
+  flex: 0 0 auto;
+  width: 148px;
+  scroll-snap-align: start;
+}
+/* 首页继续听 / 在循环：横滑行 */
+#app .m-shell .section .rows {
+  gap: 2px;
+}
+
+/* ---- 首页双栏区块 → 单列 ---- */
+#app .m-shell .section.two-col {
+  display: block;
+}
+#app .m-shell .section.two-col > * + * {
+  margin-top: 26px;
+}
+
+/* ---- 发现页：歌单 3 列小卡 → 2 列大封面卡 ---- */
+#app .m-shell .pl-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px 12px;
+}
+#app .m-shell .pl-grid > * {
+  border-radius: 14px;
+}
+
+/* ---- 歌曲列表：桌面表格式 → 触屏行式 ---- */
+#app .m-shell .song-list .list-head {
+  display: none; /* 移动端没有「专辑/时长」表格语义，行内已带 */
+}
+#app .m-shell .song-list .row {
+  min-height: 56px;
+  border-radius: 12px;
+  padding: 4px 6px;
+}
+#app .m-shell .song-list .row .col-name .title-line {
+  font-size: 14.5px;
+}
+#app .m-shell .song-list .row .col-actions {
+  opacity: 1; /* 无 hover，操作按钮常显 */
+}
+#app .m-shell .song-list .row .col-actions .icon-btn {
+  width: 44px;
+  height: 44px;
+}
+#app .m-shell .song-list .row .col-dur {
+  display: none;
+}
+#app .m-shell .song-list .row .col-album {
+  display: none;
+}
+
+/* ---- 通用可点元素：触控目标 ≥44px ---- */
+#app .m-shell .btn {
+  min-height: 44px;
+  border-radius: 12px;
+}
+#app .m-shell .btn.sm {
+  min-height: 40px;
+}
+#app .m-shell .chip {
+  height: 40px;
+  padding: 0 16px;
+  border-radius: 18px;
+  font-size: 13.5px;
+}
+#app .m-shell .icon-btn {
+  min-width: 44px;
+  min-height: 44px;
+}
+#app .m-shell .hot-tags,
+#app .m-shell .cats {
+  gap: 8px;
+}
+
+/* ---- 歌单 / 播客详情：大封面头部 → 紧凑渐变头部 ---- */
+#app .m-shell .hero {
+  gap: 14px;
+  padding: 8px 2px 4px;
+}
+#app .m-shell .hero .hero-cover {
+  width: 104px !important;
+  height: 104px !important;
+  border-radius: 14px !important;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.35);
+}
+#app .m-shell .hero .hero-info h1 {
+  font-size: 20px;
+  line-height: 1.35;
+}
+
+/* ---- 搜索页：入口更突出、热词更大 ---- */
+#app .m-shell .search-hero {
+  padding-top: 18px;
+}
+#app .m-shell .m-search {
+  height: 48px;
+  border-radius: 14px;
+}
+#app .m-shell .platform-bar {
+  overflow-x: auto;
+  scrollbar-width: none;
+  margin: 0 -16px;
+  padding: 2px 16px;
+}
+#app .m-shell .platform-bar::-webkit-scrollbar {
+  display: none;
+}
+
+/* ---- 「我的」：入口卡片化，图标块加品牌色底 ---- */
+#app .m-shell .mine-item {
+  min-height: 56px;
+  border-radius: 14px;
+  padding: 8px 12px;
+}
+#app .m-shell .mine-item .mi-icon {
+  width: 38px;
+  height: 38px;
+  border-radius: 11px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: color-mix(in srgb, var(--accent, #7c9cff) 14%, transparent);
+  color: var(--accent, #7c9cff);
+}
+
+/* ---- 播放队列：桌面右下弹层 → 底部动作面板（bottom sheet） ---- */
+#app .m-shell .queue-wrap .queue {
+  left: 0;
+  right: 0;
+  width: 100%;
+  max-width: none;
+  border-radius: 20px 20px 0 0;
+  border-left: none;
+  border-right: none;
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+  max-height: 72vh;
+}
+#app .m-shell .queue-wrap .queue::before {
+  content: '';
+  position: absolute;
+  top: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 40px;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--line);
+}
+#app .m-shell .q-row {
+  min-height: 52px;
+}
+
+/* ---- 弹窗：桌面居中窗 → 底部抽屉 ---- */
+#app .m-shell .backdrop {
+  align-items: flex-end;
+}
+#app .m-shell .backdrop .modal {
+  width: 100% !important;
+  max-width: none;
+  border-radius: 20px 20px 0 0;
+  border: none;
+  border-top: 1px solid var(--line);
+  animation: m-sheet-up 0.24s ease;
+}
+@keyframes m-sheet-up {
+  from {
+    transform: translateY(30%);
+    opacity: 0.6;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+/* ---- 轻提示：顶部 → 底部悬浮（避开状态栏，靠近拇指） ---- */
+#app .m-shell .toast-host {
+  top: auto;
+  bottom: calc(132px + env(safe-area-inset-bottom, 0px));
+}
+
+/* ---- 滚动条：移动端全隐藏 ---- */
+#app .m-shell ::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
+
+/* ==================================================================
+   v2.3.1 移动端全面 UI 重构 · 第二层（全页面覆盖）
+   ================================================================== */
+
+/* ---- 页头统一移动化：大标题 + 渐变分隔，桌面小灰头不复存在 ---- */
+#app .m-shell .page > header.head,
+#app .m-shell .page > header.hero {
+  padding-top: 6px;
+}
+#app .m-shell .page > header.head h1,
+#app .m-shell .page > header.hero h1 {
+  font-size: 24px;
+  font-weight: 800;
+  letter-spacing: 0.3px;
+}
+#app .m-shell .page > header.head p,
+#app .m-shell .page > header.hero p {
+  font-size: 12.5px;
+  color: var(--text-3);
+  margin-top: 2px;
+}
+
+/* ---- 设置页：单栏 + 分类胶囊行 + 行卡片化 ---- */
+#app .m-shell .layout {
+  grid-template-columns: 1fr;
+  gap: 14px;
+}
+#app .m-shell .cats {
+  flex-direction: row;
+  overflow-x: auto;
+  position: static;
+  gap: 6px;
+  margin: 0 -16px;
+  padding: 2px 16px 6px;
+  scrollbar-width: none;
+}
+#app .m-shell .cats::-webkit-scrollbar {
+  display: none;
+}
+#app .m-shell .cat {
+  flex: none;
+  height: 40px;
+  padding: 0 16px;
+  border-radius: 18px;
+  white-space: nowrap;
+  font-size: 13.5px;
+}
+#app .m-shell .panel {
+  max-width: none;
+  border-radius: 16px;
+}
+#app .m-shell .panel .row {
+  min-height: 52px;
+  padding: 8px 2px;
+  flex-wrap: wrap;
+}
+#app .m-shell .panel .row .label {
+  flex: 1 1 140px;
+  font-size: 14px;
+}
+/* 设置页内联控件触控目标 */
+#app .m-shell .panel select,
+#app .m-shell .panel input[type='text'],
+#app .m-shell .panel input[type='password'],
+#app .m-shell .panel input[type='number'] {
+  min-height: 44px;
+  font-size: 14px;
+}
+#app .m-shell .toggle {
+  min-width: 52px;
+  min-height: 32px;
+}
+
+/* ---- 我的歌单 / 收藏 / 历史 / 本地：列表卡化 ---- */
+#app .m-shell .empty-hint,
+#app .m-shell .empty {
+  padding: 44px 18px;
+  border-radius: 16px;
+}
+#app .m-shell .empty-title {
+  font-size: 15.5px;
+}
+
+/* ---- 播放队列 / 各类弹层蒙层：更深的沉浸遮罩 ---- */
+#app .m-shell .queue-wrap .mask,
+#app .m-shell .backdrop {
+  background: rgba(4, 6, 14, 0.55);
+  backdrop-filter: blur(6px);
+}
+
+/* ---- 顶栏内搜索入口（各页面自带 search 行）统一 48px ---- */
+#app .m-shell input[type='search'],
+#app .m-shell .search input {
+  min-height: 44px;
+}
+
+/* ---- 列表操作菜单：桌面悬停小菜单 → 底部大菜单项 ---- */
+#app .m-shell .menu {
+  min-width: 200px;
+  border-radius: 16px;
+  padding: 6px;
+}
+#app .m-shell .menu .menu-item {
+  min-height: 46px;
+  font-size: 14px;
+  border-radius: 11px;
+}
+
+/* ---- 骨架屏：更接近卡片形状，减少「跳变感」 ---- */
+#app .m-shell .sk {
+  border-radius: 10px;
+}

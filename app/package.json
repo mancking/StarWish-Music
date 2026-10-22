@@ -1,7 +1,7 @@
 {
   "name": "starwish-music",
   "productName": "星河音乐",
-  "version": "2.3.0",
+  "version": "2.3.1",
   "description": "星河音乐 StarWish Music —— 多音源聚合桌面音乐播放器（Electron + Vue3 + TypeScript 新架构）",
   "main": "dist/electron/main.js",
   "author": {

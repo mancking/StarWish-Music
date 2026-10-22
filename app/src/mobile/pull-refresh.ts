@@ -1,16 +1,16 @@
 /**
- * 移动端触屏下拉刷新（下拉持续 3 秒触发）。
+ * 移动端触屏下拉刷新（下拉超过阈值后松手即刷新）。
  *
- * 手机没有 F5/刷新按钮：主滚动区（App 的 .content）在顶部时继续下拉超过
- * 阈值，顶部露出提示条；**按住不放持续 3 秒**后整页 reload，当前页所有
- * 数据（音源、榜单、推荐、播客）重新拉取。中途松手或推回则取消。
+ * 手机没有 F5/刷新按钮：主滚动区（App 的 .m-content，桌面冒烟是 .content）
+ * 在顶部时继续下拉超过阈值，顶部露出提示条，**松手立即整页 reload**，
+ * 当前页所有数据（音源、榜单、推荐、播客）重新拉取。
  *
- * ponytail: 整页 reload 而不是各页面各自实现 refresh —— 覆盖全部路由且不
- * 侵入任何组件；升级路径是各路由暴露 refresh() 做局部刷新，消除刷新白屏。
+ * v2.3.1 修复：v2.3.0 绑定的是桌面滚动容器 `.content`，移动端外壳是
+ * `.m-content`——真机上手势完全无响应；且旧版要求按住 3 秒才触发，
+ * 体感「刷新时间过长」。现在两处一起修掉。
  */
-const THRESHOLD = 60 // 下拉多少 px 后进入「按住计时」状态
+const THRESHOLD = 64 // 下拉多少 px 后松手即刷新
 const MAX = 110 // 提示条跟随位移上限
-const HOLD_MS = 3000 // 持续按住多久触发刷新
 
 export function installPullRefresh(): void {
   const hint = document.createElement('div')
@@ -18,7 +18,8 @@ export function installPullRefresh(): void {
   hint.textContent = '下拉刷新'
   document.body.appendChild(hint)
 
-  const content = (): HTMLElement | null => document.querySelector<HTMLElement>('.content')
+  const content = (): HTMLElement | null =>
+    document.querySelector<HTMLElement>('.m-content, .content')
   const atTop = (): boolean => {
     const el = content()
     return !el || el.scrollTop <= 0
@@ -27,57 +28,19 @@ export function installPullRefresh(): void {
   let startX = 0
   let startY = 0
   let active = false // 已确认是「顶部下拉」手势，接管后续 touchmove
-  let dist = 0
-  let holdTimer: number | null = null // 按住计时器
-  let tickTimer: number | null = null // 进度文案刷新
-  let holdStart = 0
+  let ready = false // 位移已达阈值，松手即刷新
   let fired = false
 
-  const clearTimers = (): void => {
-    if (holdTimer !== null) clearTimeout(holdTimer)
-    if (tickTimer !== null) clearInterval(tickTimer)
-    holdTimer = null
-    tickTimer = null
-  }
-
   const show = (d: number): void => {
-    dist = d
     hint.style.transition = 'none'
     hint.style.transform = `translateY(${Math.min(d, MAX) - 44}px)`
-    const ready = d >= THRESHOLD
+    ready = d >= THRESHOLD
     hint.classList.toggle('ready', ready)
-    if (!ready) hint.textContent = '下拉刷新'
-    // 进入计时状态由 startHold 负责；这里只在计时未跑时更新文案
-    if (ready && holdTimer === null && !fired) startHold()
-    if (!ready && holdTimer !== null) stopHold('下拉刷新')
-  }
-
-  const stopHold = (text: string): void => {
-    clearTimers()
-    hint.textContent = text
-  }
-
-  const startHold = (): void => {
-    holdStart = Date.now()
-    hint.textContent = '按住 3 秒刷新…'
-    holdTimer = window.setTimeout(() => {
-      fired = true
-      clearTimers()
-      hint.style.transition = 'none'
-      hint.style.transform = `translateY(${MAX - 44}px)`
-      hint.classList.add('ready')
-      hint.textContent = '正在刷新…'
-      setTimeout(() => window.location.reload(), 200)
-    }, HOLD_MS)
-    tickTimer = window.setInterval(() => {
-      const left = Math.max(0, HOLD_MS - (Date.now() - holdStart))
-      hint.textContent = left > 0 ? `按住 ${Math.ceil(left / 1000)} 秒刷新…` : '正在刷新…'
-    }, 200)
+    hint.textContent = ready ? '松手刷新' : '下拉刷新'
   }
 
   const hide = (): void => {
-    dist = 0
-    clearTimers()
+    ready = false
     fired = false
     hint.style.transition = 'transform .18s'
     hint.style.transform = 'translateY(-100%)'
@@ -91,6 +54,7 @@ export function installPullRefresh(): void {
       startX = e.touches[0].clientX
       startY = e.touches[0].clientY
       active = false
+      ready = false
       fired = false
     },
     { passive: true },
@@ -123,11 +87,20 @@ export function installPullRefresh(): void {
     { passive: false },
   )
 
-  // 松手：未到 3 秒一律取消（含已达阈值但提前松手）
+  // 松手：已达阈值立即刷新，否则取消
   const end = (): void => {
     if (!active || fired) return
     active = false
-    hide()
+    if (ready) {
+      fired = true
+      hint.style.transition = 'none'
+      hint.style.transform = `translateY(${MAX - 44}px)`
+      hint.classList.add('ready')
+      hint.textContent = '正在刷新…'
+      setTimeout(() => window.location.reload(), 200)
+    } else {
+      hide()
+    }
   }
   document.addEventListener('touchend', end, { passive: true })
   document.addEventListener('touchcancel', end, { passive: true })

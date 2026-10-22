@@ -6,6 +6,8 @@ import TopBar from '@/components/TopBar.vue'
 import MiniBar from '@/components/MiniBar.vue'
 import TabBar from '@/components/mobile/TabBar.vue'
 import MiniPlayer from '@/components/mobile/MiniPlayer.vue'
+import EngineGuard from '@/components/mobile/EngineGuard.vue'
+import { installEdgeBack } from '@/mobile/gestures'
 import QueueDrawer from '@/components/QueueDrawer.vue'
 import ToastHost from '@/components/ToastHost.vue'
 import AddToPlaylistModal from '@/components/AddToPlaylistModal.vue'
@@ -90,6 +92,8 @@ onMounted(() => {
   window.addEventListener('keydown', onKey)
   // 下载队列全局初始化：侧栏计数、进度事件从启动就生效，不必等进入下载页
   void download.init()
+  // 移动端：全局边缘右滑返回（Android 肌肉记忆手势）
+  if (__MOBILE__) installEdgeBack(router)
   offNavigate = on('app:navigate', (p: any) => {
     if (p?.route) router.push(p.route)
   })
@@ -117,6 +121,7 @@ onBeforeUnmount(() => {
     </main>
     <MiniPlayer />
     <TabBar />
+    <EngineGuard />
   </div>
 
   <div v-else class="shell">

@@ -12,6 +12,8 @@ export interface UpdateInfo {
   current: string
   url: string // Release 页面
   notes: string
+  /** 最新 Release 里的 Android APK 直链（无则为空）；移动端应用内下载安装用 */
+  apkUrl: string
 }
 
 /** 语义化版本比较：a > b 返回 1，= 0，< -1（忽略 v 前缀与预发布后缀） */
@@ -33,11 +35,15 @@ export async function checkUpdate(currentVersion: string): Promise<UpdateInfo> {
   const data = await res.json()
   const version = String(data.tag_name || '').replace(/^v/i, '')
   if (!version) throw new Error('未找到最新版本信息')
+  // Android 安装包直链：优先 debug APK 之外命名规范的 release 产物
+  const assets: Array<{ name?: string; browser_download_url?: string }> = Array.isArray(data.assets) ? data.assets : []
+  const apk = assets.find(a => /\.(apk)$/i.test(String(a.name || ''))) || null
   return {
     hasUpdate: cmp(version, currentVersion) > 0,
     version,
     current: currentVersion,
     url: data.html_url || `https://github.com/${REPO}/releases/latest`,
     notes: String(data.body || '').slice(0, 2000),
+    apkUrl: apk?.browser_download_url || '',
   }
 }

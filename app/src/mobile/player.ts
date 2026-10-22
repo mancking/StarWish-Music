@@ -122,6 +122,7 @@ async function load(i: number, autoplay = true, keepFailures = false): Promise<v
     el.playbackRate = state().rate
     if (autoplay) await el.play()
     status = el.paused ? 'paused' : 'playing'
+    updateMediaSession()
   } catch (e: any) {
     if (index !== i) return
     // 自动播放被系统策略阻止不是音源故障：换源/跳过都无意义，提示手动播放即可
@@ -196,8 +197,9 @@ el.addEventListener('playing', () => {
   consecutiveFails = 0
   startTick()
   publish()
+  updateMediaSession()
 })
-el.addEventListener('pause', () => { status = 'paused'; stopTick(); publish() })
+el.addEventListener('pause', () => { status = 'paused'; stopTick(); publish(); updateMediaSession() })
 el.addEventListener('waiting', () => { status = 'loading'; publish() })
 el.addEventListener('ratechange', () => publish())
 el.addEventListener('volumechange', () => publish())
@@ -220,6 +222,63 @@ el.addEventListener('ended', () => {
 })
 el.addEventListener('timeupdate', tick)
 el.addEventListener('progress', tick)
+
+/* ---------------- MediaSession：锁屏 / 通知栏 / 蓝牙线控 ----------------
+ * v2.3.1 新增系统能力：后台播放时锁屏出现「封面 + 标题 + 上/下/播控」，
+ * 耳机线控与蓝牙按键同样生效（此前移动端完全没有系统集成，表现为
+ * 「系统能力受限」）。WebView 的 MediaSession 由系统直接取 URL 拉封面，
+ * 所以 artwork 用原始 pic 直链，而不是 /swmedia/ 代理路径。 */
+function mediaSessionCover(): MediaImage[] {
+  const song = queue[index]
+  const pic = song?.pic || ''
+  const url = /^https:\/\//i.test(pic)
+    ? pic
+    : /^http:\/\//i.test(pic) && !isNativeWebView()
+      ? pic
+      : ''
+  return url ? [{ src: url, sizes: '512x512', type: 'image/jpeg' }] : []
+}
+
+function updateMediaSession(): void {
+  const ms = (navigator as any).mediaSession
+  if (!ms) return
+  try {
+    const song = queue[index]
+    if (!song) {
+      ms.metadata = null
+      ms.playbackState = 'none'
+      return
+    }
+    ms.metadata = new (window as any).MediaMetadata({
+      title: song.name || '未命名',
+      artist: song.singer || '未知歌手',
+      album: song.album || '星河音乐',
+      artwork: mediaSessionCover(),
+    })
+    ms.playbackState = el.paused ? 'paused' : 'playing'
+  } catch { /* 老内核无 MediaMetadata，静默跳过 */ }
+}
+
+function installMediaSessionHandlers(): void {
+  const ms = (navigator as any).mediaSession
+  if (!ms || ms.__swInstalled) return
+  try {
+    ms.setActionHandler('play', () => { void el.play().catch(() => undefined) })
+    ms.setActionHandler('pause', () => el.pause())
+    ms.setActionHandler('previoustrack', () => prev())
+    ms.setActionHandler('nexttrack', () => next(false))
+    ms.setActionHandler('seekto', (d: any) => {
+      if (d && typeof d.seekTime === 'number') {
+        el.currentTime = Math.max(0, d.seekTime)
+        position = el.currentTime
+      }
+    })
+    ms.setActionHandler('stop', () => el.pause())
+    ms.__swInstalled = true
+  } catch { /* 个别 action 不支持时整组跳过 */ }
+}
+installMediaSessionHandlers()
+
 
 /* ---------------- 频道实现 ---------------- */
 export const player = {
