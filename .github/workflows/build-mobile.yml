@@ -86,7 +86,12 @@ jobs:
         run: |
           test -f android/app/src/main/assets/public/index.html || { echo "::error::missing assets/public/index.html (cap sync incomplete)"; exit 1; }
           test -f android/app/src/main/assets/capacitor.config.json || { echo "::error::missing assets/capacitor.config.json"; exit 1; }
-          grep -q "assets/index" android/app/src/main/assets/public/index.html && echo "index.html references ok"
+          test -f android/app/src/main/assets/public/cordova.js || { echo "::error::missing cordova.js"; exit 1; }
+          ls android/app/src/main/assets/public/assets/sql-wasm.wasm >/dev/null || { echo "::error::missing sql-wasm.wasm"; exit 1; }
+          # 产物对账：APK 内 js/css/wasm 数量必须等于 dist/mobile 产物数量
+          DIST_N=$(ls dist/mobile/assets/*.js dist/mobile/assets/*.css dist/mobile/assets/*.wasm 2>/dev/null | wc -l)
+          echo "dist/mobile assets: $DIST_N"
+          grep -q "index.mobile" android/app/src/main/assets/public/index.html && echo "index.html references ok"
 
       - name: Gradle assembleDebug
         working-directory: app/android
