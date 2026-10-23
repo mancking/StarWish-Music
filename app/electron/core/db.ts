@@ -431,8 +431,15 @@ export function reorderPlaylist(playlistId: string, ids: string[]): void {
 
 /* ============================ 本地音乐 ============================ */
 
-export function localSongs(limit = 5000): Song[] {
-  const rows = all('SELECT * FROM songs WHERE source = ? ORDER BY name COLLATE NOCASE LIMIT ?', ['local', limit])
+/**
+ * 本地曲库分页读取（规格书 4.1：DB 分页懒加载，首屏不拉全量）。
+ * 默认一页 200 条；调用方可传 offset 追加下一页。
+ */
+export function localSongs(limit = 200, offset = 0): Song[] {
+  const rows = all(
+    'SELECT * FROM songs WHERE source = ? ORDER BY name COLLATE NOCASE LIMIT ? OFFSET ?',
+    ['local', limit, offset]
+  )
   return rows.map(rowToSong)
 }
 

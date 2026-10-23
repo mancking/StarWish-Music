@@ -1,7 +1,7 @@
 import { BrowserWindow, screen, nativeImage, nativeTheme } from 'electron'
 import path from 'node:path'
 import fs from 'node:fs'
-import { resourcesDir } from './core/paths'
+import { resourcesDir, userDataDir } from './core/paths'
 import { endWindowInitWatch } from './core/crash-guard'
 import { trace } from './core/boot-trace'
 import { createLogger } from './core/log'
@@ -228,19 +228,55 @@ export function createAudioHost(): BrowserWindow {
   return win
 }
 
+/**
+ * 桌面歌词悬浮窗的几何常量（规格书 1.8）：固定 400×60，底部居中。
+ * 位置在拖动后写入 userData/lyric-win.json，下次启动复原。
+ */
+const LYRIC_WIN = { width: 400, height: 60, margin: 90 }
+
+function lyricPosFile(): string {
+  return path.join(userDataDir(), 'lyric-win.json')
+}
+
+function loadLyricPos(): { x: number; y: number } | null {
+  try {
+    const raw = JSON.parse(fs.readFileSync(lyricPosFile(), 'utf8'))
+    if (raw && Number.isFinite(raw.x) && Number.isFinite(raw.y)) return { x: raw.x, y: raw.y }
+  } catch {
+    /* 首次运行或文件损坏 */
+  }
+  return null
+}
+
+function saveLyricPos(x: number, y: number): void {
+  try {
+    fs.writeFileSync(lyricPosFile(), JSON.stringify({ x, y }), 'utf8')
+  } catch (e: any) {
+    logger.warn('桌面歌词位置写入失败', e?.message)
+  }
+}
+
 export function createLyricWindow(): BrowserWindow {
   if (wins.lyric && !wins.lyric.isDestroyed()) return wins.lyric
   const display = screen.getPrimaryDisplay()
-  const width = Math.min(1000, Math.round(display.workAreaSize.width * 0.7))
+  const { width, height } = LYRIC_WIN
+  const saved = loadLyricPos()
+  // 显示器变更后旧坐标可能落到屏幕外：只有仍落在某个显示器工作区内才复原
+  const inSomeDisplay =
+    !!saved &&
+    screen
+      .getAllDisplays()
+      .some(d => saved.x >= d.workArea.x - 20 && saved.y >= d.workArea.y - 20 && saved.x < d.workArea.x + d.workArea.width - 40 && saved.y < d.workArea.y + d.workArea.height - 20)
+  const usePos = inSomeDisplay ? saved : null
   const win = new BrowserWindow({
     width,
-    height: 180,
-    x: Math.round((display.workAreaSize.width - width) / 2),
-    y: display.workAreaSize.height - 240,
+    height,
+    x: usePos ? usePos.x : Math.round(display.workArea.x + (display.workArea.width - width) / 2),
+    y: usePos ? usePos.y : display.workArea.y + display.workArea.height - height - LYRIC_WIN.margin,
     show: false,
     frame: false,
     transparent: true,
-    resizable: true,
+    resizable: false,
     movable: true,
     minimizable: false,
     maximizable: false,
@@ -258,6 +294,12 @@ export function createLyricWindow(): BrowserWindow {
     },
   })
   win.setAlwaysOnTop(true, 'screen-saver')
+  // 拖动后记住位置（规格书 1.8「位置写入本地存储」），但坐标要落在可见区域内
+  win.on('moved', () => {
+    if (win.isDestroyed()) return
+    const [x, y] = win.getPosition()
+    saveLyricPos(x, y)
+  })
   if (isDev) win.loadURL(`${DEV_URL}#/lyric`)
   else win.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'), { hash: '/lyric' })
   win.on('closed', () => {

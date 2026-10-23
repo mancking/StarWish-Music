@@ -10,9 +10,8 @@ import { useDownloadStore } from '@/stores/download'
  * 设计差异：
  *  - 大卡片单列布局，封面 52px，信息两行，触达区域 ≥44px
  *  - 进度条做进卡片内部，不做桌面那种密集网格
- *  - WebView 沙盒没有对外文件系统的写权限，桌面版的「下载到本地 mp3」
- *    在移动端暂不支持——这里如实告知，并保留队列 UI（后续接入原生
- *    Filesystem 插件后无需改版即可启用）
+ *  - 移动端已通过 SwBridge.saveToMedia 走原生媒体库落盘
+ *    （目录 Music/星河音乐（系统音乐库）），因此与桌面版能力对齐
  */
 
 const dl = useDownloadStore()
@@ -27,9 +26,16 @@ function pct(t: { progress: number }): number {
 function statusText(t: { status: string; error?: string }): string {
   if (t.status === 'queued') return '排队中'
   if (t.status === 'running') return '下载中'
+  if (t.status === 'paused') return '已暂停'
   if (t.status === 'done') return '已完成'
   if (t.status === 'canceled') return '已取消'
   return t.error || '失败'
+}
+
+/** 规格书 3.5：暂停 / 继续 */
+async function togglePause(t: { id: string; status: string }): Promise<void> {
+  if (t.status === 'paused') await dl.resume(t.id)
+  else await dl.pause(t.id)
 }
 
 onMounted(() => void dl.init())
@@ -42,10 +48,10 @@ onMounted(() => void dl.init())
       <p>{{ running.length ? `${running.length} 个任务进行中` : '没有进行中的任务' }}</p>
     </header>
 
-    <!-- 移动端能力说明 -->
+    <!-- 保存位置说明（已接原生媒体库） -->
     <div class="notice">
-      <Icon name="info" :size="16" />
-      <p>移动端暂不支持下载歌曲到本地文件（WebView 沙盒限制），请使用桌面版下载。此页面将在后续版本接入原生存储后开放。</p>
+      <Icon name="folder" :size="16" />
+      <p>歌曲原格式保存到系统音乐库：Music/星河音乐（系统音乐库），可在系统音乐 App 中直接播放。</p>
     </div>
 
     <section v-if="running.length" class="block">
@@ -59,7 +65,10 @@ onMounted(() => void dl.init())
             <div class="bar-fill" :style="{ width: pct(t) + '%' }" />
           </div>
           <div class="row2">
-            <span>{{ t.status === 'queued' ? '排队中' : `${pct(t)}% · ${dl.fmtBytes(t.received)} / ${dl.fmtBytes(t.total)}` }}</span>
+            <span>{{ t.status === 'queued' ? '排队中' : t.status === 'paused' ? '已暂停' : `${pct(t)}% · ${dl.fmtBytes(t.received)} / ${dl.fmtBytes(t.total)}` }}</span>
+            <button class="op" @click="togglePause(t)">
+              <Icon :name="t.status === 'paused' ? 'play-circle' : 'pause'" :size="14" />{{ t.status === 'paused' ? '继续' : '暂停' }}
+            </button>
             <button class="op" @click="dl.cancel(t.id)"><Icon name="close" :size="14" />取消</button>
           </div>
         </div>
@@ -71,7 +80,7 @@ onMounted(() => void dl.init())
       <div v-if="!done.length" class="empty">
         <Icon name="download" :size="34" :stroke="1.3" />
         <p>还没有下载记录</p>
-        <span>下载功能将在后续版本开放，敬请期待</span>
+        <span>在歌曲菜单里选择「下载」即可保存到系统音乐库</span>
       </div>
       <div v-for="t in done" :key="t.id" class="card" :class="{ failed: t.status === 'error' }">
         <Cover :src="t.song.pic" :size="52" radius="10" />

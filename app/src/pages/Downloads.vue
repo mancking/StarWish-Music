@@ -29,9 +29,21 @@ function pct(t: { progress: number }): number {
 function statusText(t: { status: string; error?: string }): string {
   if (t.status === 'queued') return '排队中'
   if (t.status === 'running') return '下载中'
+  if (t.status === 'paused') return '已暂停'
   if (t.status === 'done') return '已完成'
   if (t.status === 'canceled') return '已取消'
   return t.error || '失败'
+}
+
+/** 规格书 3.5：暂停 / 继续（继续即从头重下，不做断点续传） */
+async function togglePause(t: { id: string; status: string }): Promise<void> {
+  if (t.status === 'paused') {
+    await dl.resume(t.id)
+    ui.toast('已继续下载', 'info', 1400)
+  } else {
+    await dl.pause(t.id)
+    ui.toast('已暂停', 'info', 1400)
+  }
 }
 
 async function reveal(file?: string): Promise<void> {
@@ -88,7 +100,14 @@ onMounted(() => void dl.init())
         <div class="bar">
           <div class="bar-fill" :style="{ width: pct(t) + '%' }" />
         </div>
-        <span class="pct">{{ t.status === 'queued' ? '排队' : pct(t) + '%' }}</span>
+        <span class="pct">{{ t.status === 'queued' ? '排队' : t.status === 'paused' ? '已暂停' : pct(t) + '%' }}</span>
+        <button
+          class="icon-btn"
+          :title="t.status === 'paused' ? '继续下载' : '暂停下载'"
+          @click="togglePause(t)"
+        >
+          <Icon :name="t.status === 'paused' ? 'play-circle' : 'pause'" :size="15" />
+        </button>
         <button class="icon-btn" title="取消" @click="dl.cancel(t.id)"><Icon name="close" :size="15" /></button>
       </div>
     </section>

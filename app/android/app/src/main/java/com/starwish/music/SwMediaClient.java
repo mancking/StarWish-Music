@@ -1,5 +1,9 @@
 package com.starwish.music;
 
+import android.content.res.AssetFileDescriptor;
+import android.database.Cursor;
+import android.net.Uri;
+import android.provider.MediaStore;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceResponse;
 import android.webkit.WebView;
@@ -33,14 +37,20 @@ public class SwMediaClient extends BridgeWebViewClient {
     private static final String UA =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
 
+    private final Bridge bridge;
+
     public SwMediaClient(Bridge bridge) {
         super(bridge);
+        this.bridge = bridge;
     }
 
     @Override
     public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
         try {
             String path = request.getUrl().getPath();
+            if ("/swlocal/".equals(path) || "/swlocal".equals(path)) {
+                return serveLocal(request);
+            }
             if ("/swmedia/".equals(path) || "/swmedia".equals(path)) {
                 String target = request.getUrl().getQueryParameter("u");
                 if (target != null && target.startsWith("http")) {
@@ -51,6 +61,80 @@ public class SwMediaClient extends BridgeWebViewClient {
             // 代理失败不阻断页面：回退 Capacitor 本地服务
         }
         return super.shouldInterceptRequest(view, request);
+    }
+
+    /**
+     * 本地音乐回放（规格书 3.4 / 4.4）：/swlocal/?id=<mediaId>。
+     *
+     * WebView 的 &lt;audio&gt; 不能直接吃 content:// URI，这里用 ContentResolver
+     * 打开 MediaStore 音频流并按 Range 返回 206，支持拖动进度与边下边播。
+     */
+    private WebResourceResponse serveLocal(WebResourceRequest request) {
+        String id = request.getUrl().getQueryParameter("id");
+        if (id == null || id.isEmpty()) {
+            return new WebResourceResponse("text/plain", "UTF-8", 400, "Bad Request",
+                    new HashMap<String, String>(), new ByteArrayInputStream(new byte[0]));
+        }
+        try {
+            Uri uri = Uri.withAppendedPath(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, id);
+            AssetFileDescriptor afd = bridge.getContext().getContentResolver()
+                    .openAssetFileDescriptor(uri, "r");
+            if (afd == null) throw new IllegalStateException("媒体库条目不可读");
+            long total = afd.getLength();
+            long start = 0;
+            long end = total > 0 ? total - 1 : -1;
+            String range = request.getRequestHeaders().get("Range");
+            boolean partial = false;
+            if (range != null && range.startsWith("bytes=") && total > 0) {
+                String spec = range.substring(6).split(",")[0];
+                int dash = spec.indexOf('-');
+                if (dash >= 0) {
+                    String a = spec.substring(0, dash).trim();
+                    String b = spec.substring(dash + 1).trim();
+                    if (!a.isEmpty()) start = Long.parseLong(a);
+                    if (!b.isEmpty()) end = Math.min(Long.parseLong(b), total - 1);
+                    partial = true;
+                }
+            }
+            InputStream is = afd.createInputStream();
+            if (start > 0) {
+                long skipped = 0;
+                while (skipped < start) {
+                    long n = is.skip(start - skipped);
+                    if (n <= 0) break;
+                    skipped += n;
+                }
+            }
+            Map<String, String> headers = new HashMap<>();
+            headers.put("Access-Control-Allow-Origin", "*");
+            headers.put("Accept-Ranges", "bytes");
+            if (total > 0) {
+                long len = end - start + 1;
+                headers.put("Content-Length", String.valueOf(len));
+                if (partial) headers.put("Content-Range", "bytes " + start + "-" + end + "/" + total);
+            }
+            String mime = queryMime(id);
+            return new WebResourceResponse(mime, "", partial ? 206 : 200,
+                    partial ? "Partial Content" : "OK", headers, is);
+        } catch (Exception e) {
+            byte[] msg = ("local error: " + e.getMessage()).getBytes(StandardCharsets.UTF_8);
+            return new WebResourceResponse("text/plain", "UTF-8", 404, "Not Found",
+                    new HashMap<String, String>(), new ByteArrayInputStream(msg));
+        }
+    }
+
+    /** 读 MediaStore 里该条目的 MIME，拿不到时按 mp3 兜底。 */
+    private String queryMime(String id) {
+        try (Cursor c = bridge.getContext().getContentResolver().query(
+                Uri.withAppendedPath(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, id),
+                new String[] { MediaStore.Audio.Media.MIME_TYPE }, null, null, null)) {
+            if (c != null && c.moveToFirst()) {
+                String m = c.getString(0);
+                if (m != null && !m.isEmpty()) return m;
+            }
+        } catch (Exception ignore) {
+        }
+        return "audio/mpeg";
     }
 
     /** 与 media.ts refererFor() 保持一致的防盗链 Referer 表。 */

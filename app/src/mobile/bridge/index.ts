@@ -25,7 +25,7 @@ import { lxHost } from '../../../electron/core/lx-host'
 import * as mfHost from '../../../electron/core/mf-host'
 import { loadSettings, saveSettings, getSettings } from '../../../electron/core/settings'
 import { userDataDir } from '../../../electron/core/paths'
-import { dbStats, playStats, favoriteIds, favoriteSongs, toggleFavorite, historySongs, addHistory, clearHistory, listPlaylists, createPlaylist, updatePlaylist, deletePlaylist, playlistSongs, addSongsToPlaylist, removeSongFromPlaylist, reorderPlaylist, getSongs, localSongs, localCount, removeLocalSongs, dbGetSetting, dbSetSetting, isFavorite } from '../../../electron/core/db'
+import { dbStats, playStats, favoriteIds, favoriteSongs, toggleFavorite, historySongs, addHistory, clearHistory, listPlaylists, createPlaylist, updatePlaylist, deletePlaylist, playlistSongs, addSongsToPlaylist, removeSongFromPlaylist, reorderPlaylist, getSongs, saveSongs, localSongs, localCount, removeLocalSongs, dbGetSetting, dbSetSetting, isFavorite } from '../../../electron/core/db'
 import {
   searchAll, getLyric, getCover, getPlaylists, getPlaylistTags, getPlaylistDetail, getToplist, getToplistTree,
   getNewSongs, importPlaylist, searchMv, getMvInfo, getMvParts, getMvUrl, getPodcastEpisodes,
@@ -351,14 +351,14 @@ const handlers: Record<string, Handler> = {
   'db:songs': ({ ids }: any) => getSongs(ids || []),
   'db:stats': () => dbStats(),
 
-  /* ---- 本地音乐：WebView 无文件系统扫描能力，诚实返回 ---- */
-  'library:pick': UNSUPPORTED('选择本地音乐文件夹（请使用桌面版扫描本地曲库）'),
-  'library:scan': UNSUPPORTED('扫描本地音乐（请使用桌面版）'),
+  /* ---- 本地音乐：v2.3.5 起走系统媒体库（SwBridge.scanLocal + /swlocal/ 回放） ---- */
+  'library:pick': () => scanLocalMusic(),
+  'library:scan': () => scanLocalMusic(),
   'library:cancel': NOP_OK,
   'library:progress': () => ({ phase: 'idle', found: 0, parsed: 0, current: '' }),
-  'library:songs': () => localSongs(),
+  'library:songs': ({ limit, offset }: any) => localSongs(limit || 200, offset || 0),
   'library:count': () => localCount(),
-  'library:remove': ({ paths }: any) => { removeLocalSongs(paths || []); return localSongs() },
+  'library:remove': ({ paths }: any) => { removeLocalSongs(paths || []); return localSongs(200, 0) },
 
   /* ---- 下载：/swmedia/ 流式拉流（原生代理带防盗链头）→ 原生 SwBridge
          写入公共音乐库 Music/星河音乐/。v2.3.0 是诚实降级（不支持），
@@ -481,6 +481,48 @@ function nativeCall(plugin: string, method: string, opts: any): Promise<any> {
   const cap: any = (globalThis as any).Capacitor
   if (!cap || typeof cap.nativePromise !== 'function') throw new Error('原生通道不可用')
   return cap.nativePromise(plugin, method, opts)
+}
+
+/**
+ * 扫描系统媒体库（MediaStore）并入库（规格书 3.4 / 4.4）。
+ *
+ * 真机 WebView 没有文件系统遍历能力，改由原生 SwBridge.scanLocal 返回
+ * MediaStore 索引；音频字节由 SwMediaClient 的 /swlocal/?id= 按 Range 回放，
+ * 因此这里只落元数据（localPath 保留 content:// URI，取链时再换成 /swlocal/）。
+ */
+async function scanLocalMusic(): Promise<{ started: boolean; dirs: string[] }> {
+  emit('scan:progress', { phase: 'scanning', found: 0, parsed: 0, current: '正在读取系统媒体库…' })
+  const res: any = await nativeCall('SwBridge', 'scanLocal', {})
+  const rows: any[] = Array.isArray(res?.songs) ? res.songs : []
+  const songs: Song[] = []
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i]
+    const uri = String(r?.uri || '')
+    if (!uri) continue
+    songs.push({
+      id: `local:${uri}`,
+      source: 'local',
+      songId: uri,
+      name: r?.name || '未知歌曲',
+      singer: r?.singer || '未知歌手',
+      album: r?.album || '',
+      duration: Number(r?.duration) || 0,
+      pic: '',
+      localPath: uri,
+      qualitys: ['local'],
+      extra: { mediaId: String(r?.id || '') },
+    })
+    if (i % 40 === 0) {
+      emit('scan:progress', { phase: 'parsing', found: rows.length, parsed: i, current: r?.name || '' })
+    }
+  }
+  saveSongs(songs)
+  emit('scan:progress', { phase: 'done', found: rows.length, parsed: songs.length, current: '' })
+  emit('toast', {
+    type: songs.length ? 'success' : 'info',
+    message: songs.length ? `已导入 ${songs.length} 首本地音乐` : '系统媒体库里没有找到音乐',
+  })
+  return { started: true, dirs: ['系统音乐库'] }
 }
 
 function dlEmit(t: DlTask): void {

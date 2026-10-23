@@ -117,8 +117,10 @@ async function load(i: number, autoplay = true, keepFailures = false): Promise<v
     if (index !== i) return // 已切歌
     lastSource = r.matched?.source || song.source
     // 真机走原生 /swmedia/ 代理（注入 Referer/UA 防盗链，SwMediaClient 拦截），
-    // 否则（Electron smoke / 浏览器）直连；桌面主进程另有 swmedia:// 协议
-    el.src = isNativeWebView() ? `/swmedia/?u=${encodeURIComponent(r.url)}` : r.url
+    // 否则（Electron smoke / 浏览器）直连；桌面主进程另有 swmedia:// 协议。
+    // 本地音乐已解析为同源 /swlocal/?id=，不能再套一层 /swmedia/。
+    const sameOrigin = r.url.startsWith('/')
+    el.src = isNativeWebView() && !sameOrigin ? `/swmedia/?u=${encodeURIComponent(r.url)}` : r.url
     el.playbackRate = state().rate
     if (autoplay) await el.play()
     status = el.paused ? 'paused' : 'playing'

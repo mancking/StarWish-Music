@@ -1,10 +1,12 @@
 package com.starwish.music;
 
+import android.Manifest;
 import android.app.DownloadManager;
 import android.content.ContentResolver;
 import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
+import android.database.Cursor;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Environment;
@@ -12,11 +14,15 @@ import android.provider.MediaStore;
 import android.webkit.MimeTypeMap;
 import android.webkit.URLUtil;
 
+import com.getcapacitor.JSArray;
 import com.getcapacitor.JSObject;
+import com.getcapacitor.PermissionState;
 import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginCall;
 import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.CapacitorPlugin;
+import com.getcapacitor.annotation.Permission;
+import com.getcapacitor.annotation.PermissionCallback;
 
 import java.io.File;
 import java.io.FileOutputStream;
@@ -37,10 +43,19 @@ import java.nio.charset.StandardCharsets;
  *    Music/星河音乐/（MediaStore，API 29+ 无需存储权限；低版本退回
  *    应用外部私有目录）——移动端「下载歌曲到本地」由此落地
  *  - deleteMedia：按 uri 删除已保存的条目（下载管理「同时删除文件」）
+ *  - scanLocal（v2.3.5）：查询系统媒体库（MediaStore.Audio），把本机音乐曲目
+ *    交给 JS 侧入库，配合 SwMediaClient 的 /swlocal/ 流式回放，
+ *    移动端「本地音乐扫描」由此落地（规格书 3.4 / 4.4）
  *
  * JS 侧统一走 Capacitor.nativePromise('SwBridge', ...)（见 src/mobile/bridge）。
  */
-@CapacitorPlugin(name = "SwBridge")
+@CapacitorPlugin(
+        name = "SwBridge",
+        permissions = {
+                @Permission(alias = "audio", strings = { Manifest.permission.READ_MEDIA_AUDIO }),
+                @Permission(alias = "storage", strings = { Manifest.permission.READ_EXTERNAL_STORAGE })
+        }
+)
 public class SwBridgePlugin extends Plugin {
 
     private static final String UA =
@@ -223,6 +238,88 @@ public class SwBridgePlugin extends Plugin {
         } catch (Exception e) {
             call.reject("删除失败：" + e.getMessage());
         }
+    }
+
+    /**
+     * 扫描系统媒体库里的音乐（规格书 3.4 / 4.4）。
+     *
+     * 只读取 MediaStore 索引（不遍历文件系统），返回曲目元数据；音频字节由
+     * SwMediaClient 的 /swlocal/?id=<mediaId> 按 Range 流式回放，避免整曲进内存。
+     * 权限：API 33+ 用 READ_MEDIA_AUDIO，之前用 READ_EXTERNAL_STORAGE。
+     */
+    @PluginMethod
+    public void scanLocal(PluginCall call) {
+        String alias = audioPermissionAlias();
+        if (getPermissionState(alias) != PermissionState.GRANTED) {
+            requestPermissionForAlias(alias, call, "afterAudioPermission");
+            return;
+        }
+        runScanLocal(call);
+    }
+
+    @PermissionCallback
+    private void afterAudioPermission(PluginCall call) {
+        if (getPermissionState(audioPermissionAlias()) == PermissionState.GRANTED) {
+            runScanLocal(call);
+        } else {
+            call.reject("未获得读取本地音乐权限，请在 系统设置 → 应用 → 星河音乐 → 权限 中允许「音乐和音频」后重试");
+        }
+    }
+
+    private static String audioPermissionAlias() {
+        return Build.VERSION.SDK_INT >= 33 ? "audio" : "storage";
+    }
+
+    private void runScanLocal(PluginCall call) {
+        new Thread(() -> {
+            try {
+                JSArray arr = new JSArray();
+                ContentResolver cr = getContext().getContentResolver();
+                String[] proj = {
+                        MediaStore.Audio.Media._ID,
+                        MediaStore.Audio.Media.TITLE,
+                        MediaStore.Audio.Media.ARTIST,
+                        MediaStore.Audio.Media.ALBUM,
+                        MediaStore.Audio.Media.DURATION,
+                        MediaStore.Audio.Media.SIZE,
+                        MediaStore.Audio.Media.MIME_TYPE,
+                        MediaStore.Audio.Media.DISPLAY_NAME,
+                };
+                String where = MediaStore.Audio.Media.IS_MUSIC + " != 0";
+                try (Cursor c = cr.query(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, proj, where, null,
+                        MediaStore.Audio.Media.TITLE + " ASC")) {
+                    if (c != null) {
+                        while (c.moveToNext() && arr.length() < 5000) {
+                            long id = c.getLong(0);
+                            String name = c.getString(1);
+                            String singer = c.getString(2);
+                            String album = c.getString(3);
+                            long ms = c.getLong(4);
+                            long size = c.getLong(5);
+                            String mime = c.getString(6);
+                            String display = c.getString(7);
+                            if (name == null || name.trim().isEmpty()) name = display;
+                            JSObject o = new JSObject();
+                            o.put("id", String.valueOf(id));
+                            o.put("name", name == null ? "未知歌曲" : name);
+                            o.put("singer", singer == null || singer.trim().isEmpty() ? "未知歌手" : singer);
+                            o.put("album", album == null ? "" : album);
+                            o.put("duration", ms > 0 ? ms / 1000 : 0);
+                            o.put("size", size);
+                            o.put("mime", mime == null ? "audio/mpeg" : mime);
+                            o.put("uri", Uri.withAppendedPath(
+                                    MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, String.valueOf(id)).toString());
+                            arr.put(o);
+                        }
+                    }
+                }
+                JSObject ret = new JSObject();
+                ret.put("songs", arr);
+                call.resolve(ret);
+            } catch (Exception e) {
+                call.reject("扫描本地音乐失败：" + e.getMessage());
+            }
+        }).start();
     }
 
     /** HttpURLConnection 下载（跟随同协议跳转），用于升级包；带进度回调 */

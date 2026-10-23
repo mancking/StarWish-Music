@@ -5,7 +5,6 @@ import Icon from '@/components/Icon.vue'
 import SongList from '@/components/SongList.vue'
 import { useLibraryStore } from '@/stores/library'
 import { usePlayerStore } from '@/stores/player'
-import brand from '@/assets/brand-cover.png'
 
 const library = useLibraryStore()
 const player = usePlayerStore()
@@ -19,11 +18,11 @@ onMounted(() => void library.refreshFavorites())
 <template>
   <div class="page">
     <header class="hero">
-      <img :src="brand" class="art" alt="我喜欢的音乐" />
+      <div class="art"><Icon name="heart-filled" :size="56" /></div>
       <div class="info">
         <div class="kicker"><Icon name="heart-filled" :size="12" />收藏夹</div>
         <h1>我喜欢的音乐</h1>
-        <p>{{ songs.length }} 首歌曲 · 保存在本地数据库</p>
+        <p>收藏夹 · {{ songs.length }} 首 · 保存在本地</p>
         <div class="actions">
           <button class="btn primary" :disabled="!songs.length" @click="player.playSongs(songs, 0)">
             <Icon name="play" :size="15" />播放全部
@@ -58,7 +57,11 @@ onMounted(() => void library.refreshFavorites())
 .art {
   width: 168px;
   height: 168px;
+  display: grid;
+  place-items: center;
   border-radius: 16px;
+  color: rgba(255, 255, 255, 0.92);
+  background: linear-gradient(135deg, #a78bfa, #f472b6);
   box-shadow: 0 22px 50px -22px rgba(0, 0, 0, 0.75);
 }
 .kicker {

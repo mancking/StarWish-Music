@@ -26,6 +26,15 @@ const error = ref('')
 const feed = ref<any>(null)
 const refreshing = ref(false)
 
+/* 首页搜索（规格书 3.1：问候语下方胶囊搜索框，40~48px） */
+const searchText = ref('')
+function submitSearch(): void {
+  const k = searchText.value.trim()
+  if (!k) return
+  router.push({ path: '/search', query: { q: k } })
+  searchText.value = ''
+}
+
 const greeting = computed(() => {
   const h = new Date().getHours()
   if (h < 6) return '夜深了'
@@ -207,6 +216,17 @@ onMounted(() => {
           <div class="kicker">{{ dateText }}</div>
           <h1>{{ greeting }}，欢迎回来</h1>
           <p class="sub">从星河里捞一首歌，陪你度过此刻。</p>
+          <div class="hero-search">
+            <Icon name="search" :size="16" class="hs-icon" />
+            <input
+              v-model="searchText"
+              type="search"
+              placeholder="搜索歌曲、歌手、歌单"
+              enterkeyhint="search"
+              @keydown.enter="submitSearch"
+            />
+            <button class="hs-go" @click="submitSearch">搜索</button>
+          </div>
           <div class="hero-actions">
             <button class="btn primary lg" @click="playDaily">
               <Icon name="play" :size="15" />播放每日推荐
@@ -425,6 +445,15 @@ onMounted(() => {
         </div>
       </section>
 
+      <!-- 底部星河 Logo 背景卡片（规格书 3.1：右对齐、半透明） -->
+      <section class="brand-card">
+        <div class="bc-text">
+          <div class="bc-title">星河音乐</div>
+          <div class="bc-sub">StarWish Music · 全端同步的私人曲库</div>
+        </div>
+        <img class="bc-art" :src="brand" alt="星河" draggable="false" />
+      </section>
+
       <div class="foot-note">
         <Icon name="sparkles" :size="13" />
         <span>星河音乐 · 所有歌曲来自公开音源，仅供个人学习与试听</span>
@@ -471,7 +500,7 @@ onMounted(() => {
   max-width: 58%;
 }
 .kicker {
-  font-size: 11px;
+  font-size: 13px;
   letter-spacing: 1.4px;
   color: #b9a7ff;
   margin-bottom: 8px;
@@ -479,7 +508,7 @@ onMounted(() => {
 }
 .hero h1 {
   font-size: 27px;
-  font-weight: 700;
+  font-weight: 600;
   letter-spacing: 0.5px;
   color: #fff;
 }
@@ -857,6 +886,98 @@ onMounted(() => {
 .mem-right {
   color: rgba(255, 255, 255, 0.25);
 }
+/* 首页胶囊搜索框（规格书 3.1：40~48px） */
+.hero-search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  max-width: 420px;
+  height: 44px;
+  margin: 14px 0 4px;
+  padding: 0 6px 0 14px;
+  border: 1px solid var(--line);
+  border-radius: 22px;
+  background: rgba(255, 255, 255, 0.06);
+}
+.hero-search:focus-within {
+  border-color: var(--accent);
+  background: rgba(255, 255, 255, 0.1);
+}
+.hs-icon {
+  flex: none;
+  color: var(--text-3);
+}
+.hero-search input {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: var(--text);
+  font-size: 13px;
+}
+.hero-search input::placeholder {
+  color: var(--text-3);
+}
+.hero-search input::-webkit-search-cancel-button {
+  display: none;
+}
+.hs-go {
+  flex: none;
+  height: 32px;
+  padding: 0 16px;
+  border: 0;
+  border-radius: 16px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+/* 底部星河 Logo 背景卡片：右对齐、半透明 */
+.brand-card {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 14px;
+  margin-top: 30px;
+  padding: 18px 22px;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  overflow: hidden;
+  background: linear-gradient(120deg, rgba(167, 139, 250, 0.1), rgba(244, 114, 182, 0.06));
+}
+.bc-text {
+  position: relative;
+  z-index: 1;
+  text-align: right;
+  margin-right: 84px;
+}
+.bc-title {
+  font-size: 15px;
+  font-weight: 650;
+  color: rgba(255, 255, 255, 0.72);
+}
+.bc-sub {
+  margin-top: 3px;
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+.bc-art {
+  position: absolute;
+  right: 14px;
+  top: 50%;
+  width: 70px;
+  height: 70px;
+  transform: translateY(-50%);
+  border-radius: 14px;
+  opacity: 0.55;
+  object-fit: cover;
+}
+
 .foot-note {
   display: flex;
   align-items: center;

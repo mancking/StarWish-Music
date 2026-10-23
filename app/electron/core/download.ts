@@ -8,6 +8,8 @@ import { createLogger } from './log'
 import { UA } from './http'
 import { getSettings } from './settings'
 import { resolveUrl, getLyric } from './music-service'
+import { writeId3 } from './id3'
+import { scanLibrary } from './library'
 
 /**
  * 音乐下载。
@@ -20,7 +22,7 @@ import { resolveUrl, getLyric } from './music-service'
 
 const logger = createLogger('download')
 
-export type DownloadStatus = 'queued' | 'running' | 'done' | 'error' | 'canceled'
+export type DownloadStatus = 'queued' | 'running' | 'done' | 'error' | 'canceled' | 'paused'
 
 export interface DownloadTask {
   id: string
@@ -39,6 +41,8 @@ export interface DownloadTask {
 const tasks = new Map<string, DownloadTask>()
 const queue: string[] = []
 const aborters = new Map<string, AbortController>()
+/** 被用户暂停的任务：abort 后落到 paused 而不是 canceled（规格书 3.5「暂停」） */
+const pausedIds = new Set<string>()
 let running = 0
 let lastEmit = 0
 
@@ -116,8 +120,31 @@ function throttleEmit(task: DownloadTask): void {
   emit(task)
 }
 
-async function streamTo(url: string, dest: string, signal: AbortSignal, onProgress: (r: number, got: number, total: number) => void): Promise<void> {
-  const headers: Record<string, string> = { 'User-Agent': UA, Accept: '*/*' }
+/** 抓取封面二进制（用于写 ID3 APIC 帧）；失败不影响下载结果 */
+async function fetchCover(url?: string): Promise<{ mime: string; data: Uint8Array } | null> {
+  const u = (url || '').trim()
+  if (!/^https?:\/\//i.test(u)) return null
+  try {
+    const headers: Record<string, string> = { 'User-Agent': UA, Accept: 'image/*,*/*' }
+    if (/hdslb|bilivideo|bilibili/i.test(u)) headers.Referer = 'https://www.bilibili.com/'
+    let res: Response
+    try {
+      res = await fetch(u, { headers, redirect: 'follow' })
+    } catch {
+      res = await net.fetch(u, { headers, redirect: 'follow' })
+    }
+    if (!res.ok) return null
+    const buf = new Uint8Array(await res.arrayBuffer())
+    if (buf.length < 100) return null
+    const ct = (res.headers.get('content-type') || '').split(';')[0].trim()
+    const mime = /^image\//.test(ct) ? ct : /\.png(\?|$)/i.test(u) ? 'image/png' : 'image/jpeg'
+    return { mime, data: buf }
+  } catch {
+    return null
+  }
+}
+
+async function streamTo(url: string, dest: string, signal: AbortSignal, onProgress: (r: number, got: number, total: number) => void): Promise<void> {  const headers: Record<string, string> = { 'User-Agent': UA, Accept: '*/*' }
   if (/bilibili|bilivideo|hdslb/i.test(url)) headers.Referer = 'https://www.bilibili.com/'
   let res: Response
   try {
@@ -197,9 +224,29 @@ async function runOne(id: string): Promise<void> {
     task.progress = 1
     task.file = file
     task.finishedAt = Date.now()
+
+    // 规格书 1.12：原格式不转码 + 写入 ID3 封面（仅 MP3 生效，失败不阻塞）
+    const cover = await fetchCover(task.song.pic)
+    await writeId3(file, {
+      title: task.song.name,
+      artist: task.song.singer,
+      album: task.song.album || '',
+      cover: cover || undefined,
+    })
+
+    // 规格书 1.12：已下载识别为本地曲目——下载目录并入本地库
+    try {
+      await scanLibrary([dir], () => {})
+    } catch {
+      /* 正在扫描或目录不可读时跳过，不影响下载结果 */
+    }
+
     logger.info('下载完成', task.song.name, path.basename(file))
   } catch (e: any) {
-    if (ac.signal.aborted) {
+    if (ac.signal.aborted && pausedIds.has(id)) {
+      task.status = 'paused'
+      task.error = '已暂停'
+    } else if (ac.signal.aborted) {
       task.status = 'canceled'
       task.error = '已取消'
     } else {
@@ -274,8 +321,42 @@ export function cancelDownload(id: string): boolean {
   return true
 }
 
-export function removeDownload(id: string, deleteFile = false): boolean {
+/** 暂停（规格书 3.5）：排队中直接挂起；下载中中断流并标记 paused。 */
+export function pauseDownload(id: string): boolean {
   const t = tasks.get(id)
+  if (!t) return false
+  if (t.status === 'queued') {
+    const i = queue.indexOf(id)
+    if (i >= 0) queue.splice(i, 1)
+    t.status = 'paused'
+    t.error = '已暂停'
+    emit(t)
+    return true
+  }
+  if (t.status !== 'running') return false
+  pausedIds.add(id)
+  const ac = aborters.get(id)
+  if (ac) ac.abort()
+  return true
+}
+
+/** 继续下载：不做断点续传（规格书 1.12 明确不做），从头重下。 */
+export function resumeDownload(id: string): boolean {
+  const t = tasks.get(id)
+  if (!t || t.status !== 'paused') return false
+  pausedIds.delete(id)
+  t.status = 'queued'
+  t.progress = 0
+  t.received = 0
+  t.total = 0
+  t.error = undefined
+  queue.push(id)
+  emit(t)
+  pump()
+  return true
+}
+
+export function removeDownload(id: string, deleteFile = false): boolean {  const t = tasks.get(id)
   if (!t) return false
   if (t.status === 'running') cancelDownload(id)
   if (deleteFile && t.file) {

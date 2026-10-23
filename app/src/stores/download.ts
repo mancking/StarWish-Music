@@ -3,7 +3,7 @@ import { computed, ref } from 'vue'
 import { call, on } from '@/api'
 import type { Song } from '@shared/types'
 
-export type DownloadStatus = 'queued' | 'running' | 'done' | 'error' | 'canceled'
+export type DownloadStatus = 'queued' | 'running' | 'done' | 'error' | 'canceled' | 'paused'
 
 export interface DownloadTask {
   id: string
@@ -31,11 +31,35 @@ export const useDownloadStore = defineStore('download', () => {
   const panelOpen = ref(false)
   let inited = false
 
-  const active = computed(() => tasks.value.filter(t => t.status === 'running' || t.status === 'queued'))
+  const active = computed(() =>
+    tasks.value.filter(t => t.status === 'running' || t.status === 'queued' || t.status === 'paused')
+  )
   const finished = computed(() =>
     tasks.value.filter(t => t.status === 'done' || t.status === 'error' || t.status === 'canceled')
   )
   const runningCount = computed(() => active.value.length)
+
+  /** 规格书 0.5：下载清单镜像到 xinyuan_downloads，供离线页/设置页快速读取 */
+  function mirror(): void {
+    try {
+      localStorage.setItem(
+        'xinyuan_downloads',
+        JSON.stringify(
+          tasks.value.slice(0, 300).map(t => ({
+            id: t.id,
+            songId: t.song?.id,
+            name: t.song?.name,
+            singer: t.song?.singer,
+            status: t.status,
+            file: t.file,
+            total: t.total,
+          }))
+        )
+      )
+    } catch {
+      /* 配额不足时忽略 */
+    }
+  }
 
   async function init(): Promise<void> {
     if (inited) return
@@ -56,7 +80,9 @@ export const useDownloadStore = defineStore('download', () => {
       const i = tasks.value.findIndex(x => x.id === t.id)
       if (i >= 0) tasks.value[i] = t
       else tasks.value.unshift(t)
+      mirror()
     })
+    mirror()
   }
 
   async function add(songs: Song[], quality?: string): Promise<number> {
@@ -67,6 +93,25 @@ export const useDownloadStore = defineStore('download', () => {
 
   async function cancel(id: string): Promise<void> {
     await call('download:cancel', { id })
+  }
+
+  /** 规格书 3.5：暂停 / 继续（不做断点续传，继续即从头重下） */
+  async function pause(id: string): Promise<void> {
+    await call('download:pause', { id })
+    const t = tasks.value.find(x => x.id === id)
+    if (t) t.status = 'paused'
+    mirror()
+  }
+
+  async function resume(id: string): Promise<void> {
+    await call('download:resume', { id })
+    const t = tasks.value.find(x => x.id === id)
+    if (t) {
+      t.status = 'queued'
+      t.progress = 0
+      t.received = 0
+    }
+    mirror()
   }
 
   async function remove(id: string, deleteFile = false): Promise<void> {
@@ -107,6 +152,8 @@ export const useDownloadStore = defineStore('download', () => {
     init,
     add,
     cancel,
+    pause,
+    resume,
     remove,
     clear,
     openDir,

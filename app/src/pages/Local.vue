@@ -6,12 +6,15 @@ import { useLibraryStore } from '@/stores/library'
 import { usePlayerStore } from '@/stores/player'
 import { useUiStore } from '@/stores/ui'
 import { tryCall } from '@/api'
+import { platform } from '@/platform'
 
 const library = useLibraryStore()
 const player = usePlayerStore()
 const ui = useUiStore()
 
 const filter = ref('')
+/** 手机/平板走系统媒体库（MediaStore），桌面走目录扫描 */
+const mobile = computed(() => platform.value.kind === 'phone' || platform.value.kind === 'pad')
 
 const songs = computed(() => {
   const k = filter.value.trim().toLowerCase()
@@ -22,6 +25,17 @@ const songs = computed(() => {
 })
 
 const scanning = computed(() => ['scanning', 'parsing'].includes(library.scanProgress.phase))
+const loadingMore = ref(false)
+const hasMore = computed(() => library.localSongs.length < library.localCount)
+
+async function loadMore(): Promise<void> {
+  loadingMore.value = true
+  try {
+    await library.loadMoreLocal()
+  } finally {
+    loadingMore.value = false
+  }
+}
 const progressPct = computed(() => {
   const p = library.scanProgress
   if (!p.found) return 0
@@ -37,6 +51,23 @@ onMounted(async () => {
 function cancel(): void {
   void (window as any).sw.invoke('library:cancel')
 }
+
+/** 规格书 4.4：权限被拒时给友好提示，而不是抛栈 */
+async function scanNow(): Promise<void> {
+  try {
+    await library.pickAndScan()
+  } catch (e: any) {
+    ui.toast(e?.message || '扫描失败，请检查系统「音乐和音频」权限', 'error', 3600)
+  }
+}
+
+async function rescan(): Promise<void> {
+  try {
+    await library.scan()
+  } catch (e: any) {
+    ui.toast(e?.message || '扫描失败，请检查系统「音乐和音频」权限', 'error', 3600)
+  }
+}
 </script>
 
 <template>
@@ -45,14 +76,14 @@ function cancel(): void {
       <div>
         <h1>本地音乐</h1>
         <p>
-          {{ library.localCount }} 首歌曲<span v-if="ui.settings.localDirs.length"> · 已添加 {{ ui.settings.localDirs.length }} 个文件夹</span>
+          {{ library.localCount }} 首歌曲<span v-if="mobile"> · 来自系统音乐库</span><span v-else-if="ui.settings.localDirs.length"> · 已添加 {{ ui.settings.localDirs.length }} 个文件夹</span>
         </p>
       </div>
       <div class="actions">
-        <button class="btn primary" :disabled="scanning" @click="library.pickAndScan()">
-          <Icon name="scan" :size="15" />{{ scanning ? '扫描中…' : '添加文件夹并扫描' }}
+        <button class="btn primary" :disabled="scanning" @click="scanNow">
+          <Icon name="scan" :size="15" />{{ scanning ? '扫描中…' : mobile ? '扫描系统音乐库' : '添加文件夹并扫描' }}
         </button>
-        <button class="btn" :disabled="scanning" @click="library.scan()"><Icon name="refresh" :size="15" />重新扫描</button>
+        <button v-if="!mobile" class="btn" :disabled="scanning" @click="rescan"><Icon name="refresh" :size="15" />重新扫描</button>
         <button v-if="scanning" class="btn" @click="cancel">取消</button>
       </div>
     </header>
@@ -94,6 +125,13 @@ function cancel(): void {
       empty-text="本地曲库还是空的"
       empty-desc="点击右上角「添加文件夹并扫描」，支持 MP3 / FLAC / M4A / OGG / WAV 等格式，会自动读取内嵌封面与标签"
     />
+
+    <!-- 规格书 4.1：分页懒加载，避免一次渲染上千条 -->
+    <div v-if="hasMore" class="more">
+      <button class="btn" :disabled="loadingMore" @click="loadMore">
+        <Icon name="chevron-down" :size="14" />{{ loadingMore ? '加载中…' : `加载更多（已显示 ${library.localSongs.length} / ${library.localCount}）` }}
+      </button>
+    </div>
   </div>
 </template>
 
@@ -223,5 +261,10 @@ h1 {
 .count {
   font-size: 11px;
   color: var(--text-3);
+}
+.more {
+  display: flex;
+  justify-content: center;
+  padding: 18px 0 8px;
 }
 </style>

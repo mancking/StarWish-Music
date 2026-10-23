@@ -201,7 +201,14 @@ export async function resolveUrl(
   }
 
   if (song.localPath) {
-    return { url: song.localPath, quality: 'local', via: '本地文件' }
+    // 移动端扫描到的是 MediaStore 的 content:// URI，WebView 无法直接播放，
+    // 改走原生 SwMediaClient 的 /swlocal/?id=<mediaId> 流式回放（规格书 3.4 / 4.4）。
+    const lp = song.localPath
+    if (lp.startsWith('content://')) {
+      const mediaId = lp.split('/').pop() || ''
+      return { url: `/swlocal/?id=${encodeURIComponent(mediaId)}`, quality: 'local', via: '本地文件' }
+    }
+    return { url: lp, quality: 'local', via: '本地文件' }
   }
 
   if (!skipPrimary) {

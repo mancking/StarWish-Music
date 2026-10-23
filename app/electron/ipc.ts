@@ -34,8 +34,10 @@ import {
   clearDownloads,
   downloadDir,
   listDownloads,
+  pauseDownload,
   removeDownload,
   restoreDownloads,
+  resumeDownload,
   setDownloadEmitter,
 } from './core/download'
 import { getSettings, saveSettings } from './core/settings'
@@ -563,7 +565,7 @@ const handlers: Record<string, Handler> = {
     return true
   },
   'library:progress': () => getScanProgress(),
-  'library:songs': () => decList(localSongs()),
+  'library:songs': ({ limit, offset }: any) => decList(localSongs(limit || 200, offset || 0)),
   'library:count': () => localCount(),
   'library:remove': ({ paths }: any) => {
     const { removeLocalSongs } = require('./core/db')
@@ -655,6 +657,8 @@ const handlers: Record<string, Handler> = {
   'download:add': ({ songs, quality }: any) => addDownloads(songs || [], quality),
   'download:list': () => listDownloads(),
   'download:cancel': ({ id }: any) => ({ ok: cancelDownload(String(id || '')) }),
+  'download:pause': ({ id }: any) => ({ ok: pauseDownload(String(id || '')) }),
+  'download:resume': ({ id }: any) => ({ ok: resumeDownload(String(id || '')) }),
   'download:remove': ({ id, deleteFile }: any) => ({ ok: removeDownload(String(id || ''), !!deleteFile) }),
   'download:clear': ({ onlyFinished }: any) => ({ count: clearDownloads(onlyFinished !== false) }),
   'download:dir': () => downloadDir(),
