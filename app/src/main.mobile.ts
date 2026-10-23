@@ -20,6 +20,10 @@ import './styles/mobile.css'
 import { installBridge } from './mobile/bridge'
 import { installPullRefresh } from './mobile/pull-refresh'
 import { installBackHandler } from './mobile/back-handler'
+import { initPlatform } from './platform'
+import { registerEqBackend } from './audio/eq'
+import { feedSpectrum, registerLocalSpectrumSource } from './audio/spectrum'
+import { player as mobileAudio } from './mobile/player'
 
 async function bootstrap(): Promise<void> {
   // 平台感知：android / ios 分别注入（styles/platform.css 按此适配 HIG 细节，
@@ -28,6 +32,8 @@ async function bootstrap(): Promise<void> {
   const osName = typeof cap?.getPlatform === 'function' ? cap.getPlatform() : 'android'
   document.documentElement.dataset.platform = 'mobile'
   document.documentElement.dataset.os = osName === 'ios' ? 'ios' : 'android'
+  // 规格书 v2.7 · 0.1 / 0.3 / 0.5：断点（手机/平板/车机）、性能档位、xinyuan_* 键
+  initPlatform()
   await installBridge()
   installPullRefresh()
 
@@ -62,6 +68,21 @@ async function bootstrap(): Promise<void> {
   // 不再让用户盯着 splash 等数据库/收藏/播放队列全部就绪。
   ;(window as any).__swStores = { player, library, ui }
   app.mount('#app')
+
+  // 音效与频谱（规格书 v2.7 · 1.11 / 1.6）：WebView 里没有 IPC，
+  // 直接把后端接到本地 <audio> 的 Web Audio 图（按需建图，不影响播放）。
+  registerEqBackend({
+    setBands: bands => mobileAudio.setEqBands(bands),
+  })
+  let spectrumUnsub: (() => void) | null = null
+  registerLocalSpectrumSource(on => {
+    if (on) {
+      if (!spectrumUnsub) spectrumUnsub = mobileAudio.subscribeSpectrum(feedSpectrum)
+    } else {
+      spectrumUnsub?.()
+      spectrumUnsub = null
+    }
+  })
   // 系统返回（含手势）：MainActivity 统一转 backButton 事件，这里接管
   // ——关弹层 → 回退 → 根页双击退后台，不再直接退出应用
   installBackHandler(router)

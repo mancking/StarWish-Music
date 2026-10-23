@@ -13,6 +13,7 @@ import ToastHost from '@/components/ToastHost.vue'
 import AddToPlaylistModal from '@/components/AddToPlaylistModal.vue'
 import ImportPlaylistModal from '@/components/ImportPlaylistModal.vue'
 import { usePlayerStore } from '@/stores/player'
+import { useLibraryStore } from '@/stores/library'
 import { useUiStore } from '@/stores/ui'
 import { useDownloadStore } from '@/stores/download'
 import { on } from '@/api'
@@ -20,6 +21,7 @@ import { on } from '@/api'
 const route = useRoute()
 const router = useRouter()
 const player = usePlayerStore()
+const library = useLibraryStore()
 const ui = useUiStore()
 const download = useDownloadStore()
 
@@ -40,6 +42,25 @@ watch(
     }
   },
   { deep: true }
+)
+
+/**
+ * 规格书 v2.7 · 4.3（Bug：最近播放写入延迟）：
+ * 播放一开始就立刻写内存并刷新列表，DB 落库交给主进程异步完成，用户回到
+ * 「最近播放」页时不再看到过期数据。
+ */
+watch(
+  () => [player.state.status, player.song?.id] as const,
+  ([status, id]) => {
+    if (status !== 'playing' || !id) return
+    const s = player.song
+    if (!s) return
+    const list = library.history
+    const idx = list.findIndex(x => x.id === s.id)
+    if (idx >= 0) list.splice(idx, 1)
+    list.unshift(s)
+    if (list.length > 120) list.length = 120
+  }
 )
 
 const content = ref<HTMLElement | null>(null)
@@ -68,17 +89,44 @@ function isTyping(e: KeyboardEvent): boolean {
 
 function onKey(e: KeyboardEvent): void {
   if (isLyric.value) return
-  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
+  const mod = e.ctrlKey || e.metaKey
+  if (mod && e.key.toLowerCase() === 'k') {
     e.preventDefault()
     topbar.value?.focusSearch()
     return
   }
+  // 规格书 v2.7 · 1.9：输入框聚焦时所有播放快捷键都不响应
   if (isTyping(e)) return
+  const key = e.key.toLowerCase()
   if (e.code === 'Space') {
     e.preventDefault()
     void player.toggle()
   } else if (e.key === 'Escape') {
     player.queueOpen = false
+  } else if (mod && e.key === 'ArrowRight') {
+    e.preventDefault()
+    void player.next()
+  } else if (mod && e.key === 'ArrowLeft') {
+    e.preventDefault()
+    void player.prev()
+  } else if (e.key === 'ArrowRight') {
+    e.preventDefault()
+    void player.seekTo(Math.min(player.duration, player.displayPosition + 5))
+  } else if (e.key === 'ArrowLeft') {
+    e.preventDefault()
+    void player.seekTo(Math.max(0, player.displayPosition - 5))
+  } else if (e.key === 'ArrowUp') {
+    e.preventDefault()
+    void player.setVolume(Math.min(1, Math.round((player.state.volume + 0.05) * 100) / 100))
+  } else if (e.key === 'ArrowDown') {
+    e.preventDefault()
+    void player.setVolume(Math.max(0, Math.round((player.state.volume - 0.05) * 100) / 100))
+  } else if (mod && key === 'l') {
+    e.preventDefault()
+    void player.cycleMode()
+  } else if (mod && key === 'd') {
+    e.preventDefault()
+    void ui.patch({ showDesktopLyric: !ui.settings.showDesktopLyric })
   } else if (e.key === 'ArrowRight' && e.altKey) {
     void player.next()
   } else if (e.key === 'ArrowLeft' && e.altKey) {

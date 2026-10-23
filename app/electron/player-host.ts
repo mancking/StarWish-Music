@@ -26,6 +26,97 @@ let lastPosition = 0
 let tickTimer: number | null = null
 let loadingSince = 0
 
+/* ---------------- 音效图（规格书 v2.7 · 1.11 EQ / 1.6 频谱） ----------------
+ * audio → MediaElementSource → 5×BiquadFilter(60/230/910/3.6k/14k) → Analyser → 输出。
+ * 安全性：swmedia 协议响应带 Access-Control-Allow-Origin: *，且 audio 已设
+ * crossOrigin='anonymous'，属于 CORS 干净媒体，createMediaElementSource 不会把
+ * 输出变成静音（tainted media 才静音）。
+ * 图只在用户真的用到 EQ / 频谱时创建（首次下发指令），不影响普通播放路径。
+ */
+const EQ_FREQS = [60, 230, 910, 3600, 14000]
+let audioCtx: AudioContext | null = null
+let filters: BiquadFilterNode[] = []
+let analyser: AnalyserNode | null = null
+let graphFailed = false
+let spectrumTimer: number | null = null
+let spectrumOn = false
+let eqBands: number[] = [0, 0, 0, 0, 0]
+
+function buildGraph(): void {
+  if (audioCtx || graphFailed) return
+  try {
+    const Ctor: typeof AudioContext =
+      (window as any).AudioContext || (window as any).webkitAudioContext
+    if (!Ctor) throw new Error('AudioContext 不可用')
+    audioCtx = new Ctor()
+    const source = audioCtx.createMediaElementSource(audio)
+    filters = EQ_FREQS.map((freq, i) => {
+      const f = audioCtx!.createBiquadFilter()
+      f.type = i === 0 ? 'lowshelf' : i === EQ_FREQS.length - 1 ? 'highshelf' : 'peaking'
+      f.frequency.value = freq
+      f.Q.value = 1
+      f.gain.value = eqBands[i] || 0
+      return f
+    })
+    analyser = audioCtx.createAnalyser()
+    analyser.fftSize = 256
+    analyser.smoothingTimeConstant = 0.75
+    let node: AudioNode = source
+    for (const filter of filters) {
+      node.connect(filter)
+      node = filter
+    }
+    node.connect(analyser)
+    analyser.connect(audioCtx.destination)
+    void audioCtx.resume().catch(() => undefined)
+    report({ type: 'log', message: '音效图已就绪（EQ + 频谱）' })
+  } catch (e: any) {
+    graphFailed = true
+    report({ type: 'log', message: `音效图初始化失败：${e?.message || e}` })
+  }
+}
+
+function applyEq(bands: number[]): void {
+  eqBands = EQ_FREQS.map((_, i) => Math.max(-12, Math.min(12, Math.round(Number(bands?.[i]) || 0))))
+  buildGraph()
+  if (!audioCtx) return
+  filters.forEach((f, i) => {
+    // 平滑过渡，避免拖滑块时爆音
+    f.gain.setTargetAtTime(eqBands[i], audioCtx!.currentTime, 0.03)
+  })
+}
+
+function pushSpectrum(): void {
+  if (!analyser) return
+  const bins = new Uint8Array(analyser.frequencyBinCount)
+  analyser.getByteFrequencyData(bins)
+  // 抽 64 段（低频密、高频疏），前端再按端降采样为 32 / 16
+  const out: number[] = []
+  const n = 64
+  for (let i = 0; i < n; i++) {
+    const from = Math.floor((i / n) ** 1.7 * bins.length)
+    const to = Math.max(from + 1, Math.floor(((i + 1) / n) ** 1.7 * bins.length))
+    let sum = 0
+    for (let k = from; k < to && k < bins.length; k++) sum += bins[k]
+    out.push(Math.round(sum / Math.max(1, to - from)))
+  }
+  report({ type: 'spectrum', data: out })
+}
+
+function setSpectrum(on: boolean): void {
+  spectrumOn = on
+  if (on) buildGraph()
+  if (spectrumTimer !== null) {
+    window.clearInterval(spectrumTimer)
+    spectrumTimer = null
+  }
+  if (!on || !analyser) return
+  spectrumTimer = window.setInterval(() => {
+    if (audio.paused) return
+    pushSpectrum()
+  }, 60)
+}
+
 function report(msg: any): void {
   try {
     api.report(msg)
@@ -268,6 +359,12 @@ function handle(cmd: any): void {
       if (typeof cmd.volume === 'number') targetVolume = Math.max(0, Math.min(1, cmd.volume))
       if (typeof cmd.fadeMs === 'number') fadeMs = cmd.fadeMs
       audio.volume = muted ? 0 : targetVolume
+      break
+    case 'eq':
+      applyEq(Array.isArray(cmd.bands) ? cmd.bands : [])
+      break
+    case 'spectrum':
+      setSpectrum(!!cmd.on)
       break
     default:
       break

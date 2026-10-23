@@ -13,6 +13,11 @@ import { usePlayerStore, type StageMode } from '@/stores/player'
 import { useLibraryStore } from '@/stores/library'
 import { useUiStore } from '@/stores/ui'
 import { songSourceLabel } from '@/utils/labels'
+import { particleCount, platform } from '@/platform'
+import ParticleField from '@/components/player/ParticleField.vue'
+import SpectrumBars from '@/components/player/SpectrumBars.vue'
+import EqPanel from '@/components/player/EqPanel.vue'
+import CarPlayer from '@/pages/CarPlayer.vue'
 
 const router = useRouter()
 const player = usePlayerStore()
@@ -26,14 +31,18 @@ const dragging = ref(false)
 const dragValue = ref(0)
 
 const stages: { key: StageMode; label: string; icon: string }[] = [
-  { key: 'lyrics', label: '歌词舞台', icon: 'lyric' },
-  { key: 'particle', label: '粒子舞台', icon: 'sparkles' },
-  { key: 'cinema', label: '电影镜头', icon: 'video' },
-  { key: 'podcast', label: '播客 / DJ', icon: 'radio' },
+  { key: 'cover', label: '封面', icon: 'disc' },
+  { key: 'lyrics', label: '歌词', icon: 'lyric' },
+  { key: 'particle', label: '粒子', icon: 'sparkles' },
+  { key: 'stage', label: '频谱', icon: 'sliders' },
 ]
 
 const song = computed(() => player.song)
 const isWin = computed(() => window.sw?.platform === 'win32')
+/** 规格书 v2.7 · 0.1：车机走独立横屏布局 */
+const car = computed(() => platform.value.car)
+/** 音效面板开关（规格书 1.11：桌面为右侧抽屉） */
+const eqOpen = ref(false)
 /** 播放页背景模式（设置 → 播放） */
 const bgMode = computed(() => ui.settings.playerBg || 'cover')
 
@@ -165,12 +174,17 @@ const menuItems = computed<MenuItem[]>(() => [
   { label: '打开桌面歌词', icon: 'lyric' },
   { label: `播放速度 ${player.state.rate || 1}×（切换）`, icon: 'gauge' },
   { label: player.sleepUntil ? '取消定时关闭' : '定时关闭 30 分钟', icon: 'clock' },
+  { label: '音效均衡器', icon: 'sliders' },
   { divider: true, label: '' },
   { label: '打开文件所在位置', icon: 'folder-open' },
 ])
 
 async function onMenuSelect(i: number): Promise<void> {
   menu.value = null
+  if (i === 5) {
+    eqOpen.value = true
+    return
+  }
   const s = song.value
   if (!s) return
   if (i === 0) ui.playlistPickerSong = s
@@ -178,7 +192,7 @@ async function onMenuSelect(i: number): Promise<void> {
   else if (i === 2) await ui.patch({ showDesktopLyric: !ui.settings.showDesktopLyric })
   else if (i === 3) await player.cycleRate()
   else if (i === 4) await player.setSleep(player.sleepUntil ? 0 : 30)
-  else if (i === 6 && s.localPath) await (window as any).sw.invoke('app:showItemInFolder', { path: s.localPath })
+  else if (i === 7 && s.localPath) await (window as any).sw.invoke('app:showItemInFolder', { path: s.localPath })
 }
 
 function openMenu(e: MouseEvent): void {
@@ -215,7 +229,12 @@ function resizeCanvas(): void {
 }
 
 function seedParticles(): void {
-  const count = 64
+  // 规格书 v2.7 · 1.5 / 0.3：桌面 200 / 平板 80 / 手机 50 / 车机 0（低性能再折半）
+  const count = particleCount()
+  if (!count) {
+    parts = []
+    return
+  }
   parts = Array.from({ length: count }, () => ({
     x: Math.random() * w,
     y: Math.random() * h,
@@ -258,7 +277,7 @@ function draw(): void {
 function startCanvas(): void {
   stopCanvas()
   if (!ui.settings.particle) return
-  if (player.stage !== 'particle' && player.stage !== 'cinema') return
+  if (player.stage !== 'particle' && player.stage !== 'stage') return
   resizeCanvas()
   if (!parts.length || w === 0) seedParticles()
   raf = requestAnimationFrame(draw)
@@ -275,7 +294,7 @@ function stopCanvas(): void {
 watch(
   () => [player.stage, ui.settings.particle, player.playing],
   () => {
-    if (player.stage === 'particle' || player.stage === 'cinema') startCanvas()
+    if (player.stage === 'particle' || player.stage === 'stage') startCanvas()
     else stopCanvas()
   }
 )
@@ -354,9 +373,13 @@ function onGestureEnd(e: PointerEvent): void {
 </script>
 
 <template>
+  <!-- 规格书 v2.7 · 1.1：车机横屏大字布局，其余端用标准播放页 -->
+  <CarPlayer v-if="car" />
   <div
+    v-else
     class="player"
     :class="`stage-${player.stage}`"
+    :style="{ '--sw-blur': `${platform.blur}px` }"
     @pointerdown="onGestureStart"
     @pointerup="onGestureEnd"
   >
@@ -390,17 +413,17 @@ function onGestureEnd(e: PointerEvent): void {
         </span>
       </div>
       <div class="p-head-actions no-drag">
-        <button class="stage-btn" :class="{ active: player.stage === 'lyrics' }" title="歌词舞台" @click="player.setStage('lyrics')">
+        <button class="stage-btn" :class="{ active: player.stage === 'cover' }" title="封面" @click="player.setStage('cover')">
+          <Icon name="disc" :size="15" /><span>封面</span>
+        </button>
+        <button class="stage-btn" :class="{ active: player.stage === 'lyrics' }" title="歌词" @click="player.setStage('lyrics')">
           <Icon name="lyric" :size="15" /><span>歌词</span>
         </button>
-        <button class="stage-btn" :class="{ active: player.stage === 'particle' }" title="粒子舞台" @click="player.setStage('particle')">
+        <button class="stage-btn" :class="{ active: player.stage === 'particle' }" title="粒子" @click="player.setStage('particle')">
           <Icon name="sparkles" :size="15" /><span>粒子</span>
         </button>
-        <button class="stage-btn" :class="{ active: player.stage === 'cinema' }" title="电影镜头" @click="player.setStage('cinema')">
-          <Icon name="video" :size="15" /><span>电影</span>
-        </button>
-        <button class="stage-btn" :class="{ active: player.stage === 'podcast' }" title="播客 / DJ" @click="player.setStage('podcast')">
-          <Icon name="radio" :size="15" /><span>DJ</span>
+        <button class="stage-btn" :class="{ active: player.stage === 'stage' }" title="舞台频谱" @click="player.setStage('stage')">
+          <Icon name="sliders" :size="15" /><span>频谱</span>
         </button>
       </div>
       <!-- Windows 右上角悬浮窗口控制按钮（约 138px），让位避免遮挡 stage 按钮 -->
@@ -412,8 +435,9 @@ function onGestureEnd(e: PointerEvent): void {
       <section class="left" :class="`left-${player.stage}`">
         <div class="stage-wrap" :class="`wrap-${player.stage}`">
           <canvas ref="canvas" class="particles" />
+          <SpectrumBars v-if="player.stage === 'stage'" placement="bottom" />
           <div class="glow" />
-          <div class="vinyl-wrap" :class="{ spinning: player.playing, cinema: player.stage === 'cinema' }">
+          <div class="vinyl-wrap" :class="{ spinning: player.playing }">
             <div class="vinyl">
               <div class="grooves" />
               <div class="label">
@@ -422,10 +446,6 @@ function onGestureEnd(e: PointerEvent): void {
               <div class="hole" />
             </div>
           </div>
-        </div>
-
-        <div v-if="player.stage === 'podcast'" class="wave">
-          <span v-for="i in 42" :key="i" :style="{ animationDelay: (i % 9) * 0.09 + 's', height: 12 + ((i * 7) % 34) + 'px' }" />
         </div>
 
         <div class="song-info">
@@ -446,15 +466,7 @@ function onGestureEnd(e: PointerEvent): void {
 
       <section class="right" :class="`right-${player.stage}`">
         <Transition name="stage-fade" mode="out-in">
-        <div v-if="player.stage === 'podcast'" class="podcast-panel" key="podcast">
-          <div class="podcast-badge"><Icon name="radio" :size="16" />播客 / DJ 模式</div>
-          <p>低能耗渲染，粒子与歌词已降级，适合长时间收听。</p>
-          <div class="podcast-bars">
-            <span v-for="i in 24" :key="i" :style="{ animationDelay: (i % 7) * 0.11 + 's' }" />
-          </div>
-        </div>
-
-        <div v-else-if="!hasLyric" class="lyric-empty" key="empty">
+        <div v-if="!hasLyric" class="lyric-empty" key="empty">
           <Icon name="lyric" :size="30" :stroke="1.3" />
           <div class="empty-title">{{ player.lyricLoading ? '正在匹配歌词…' : '暂无歌词' }}</div>
           <div class="empty-desc">
@@ -555,6 +567,15 @@ function onGestureEnd(e: PointerEvent): void {
     </footer>
 
     <Menu v-if="menu" :x="menu.x" :y="menu.y" :items="menuItems" @select="onMenuSelect" @close="menu = null" />
+
+    <!-- 规格书 v2.7 · 1.11：桌面为右侧抽屉 -->
+    <Transition name="eq-fade">
+      <div v-if="eqOpen" class="eq-mask" @click.self="eqOpen = false">
+        <div class="eq-drawer">
+          <EqPanel @close="eqOpen = false" />
+        </div>
+      </div>
+    </Transition>
   </div>
 </template>
 
@@ -591,7 +612,8 @@ function onGestureEnd(e: PointerEvent): void {
   width: 100%;
   height: 100%;
   object-fit: cover;
-  filter: blur(60px) saturate(1.6) brightness(1);
+  /* 规格书 v2.7 · 1.2：桌面封面背景 blur(30px) brightness(.4)，平板 12px，手机 0 */
+  filter: blur(var(--sw-blur, 30px)) saturate(1.5) brightness(0.4);
   transform: scale(1.2);
   transition: opacity 0.6s;
 }
@@ -773,7 +795,8 @@ function onGestureEnd(e: PointerEvent): void {
   flex: 1;
   min-height: 0;
   display: grid;
-  grid-template-columns: minmax(360px, 0.95fr) minmax(420px, 1.05fr);
+  /* 规格书 v2.7 · 1.1：桌面两栏，右栏歌词固定 280px */
+  grid-template-columns: minmax(360px, 1fr) 280px;
   gap: 30px;
   padding: 4px 46px 0;
 }
@@ -1288,5 +1311,48 @@ function onGestureEnd(e: PointerEvent): void {
   .stage-btn span {
     display: none;
   }
+}
+
+/* ============ 规格书 v2.7 · 1.2：桌面圆唱片 200px / 12s 一圈 / 中心 70px 封面 / 8px 黑边 ============ */
+.body-cover .stage-wrap,
+.body-stage .stage-wrap {
+  width: min(200px, 26vh);
+}
+.body-stage .stage-wrap {
+  margin-bottom: 26px;
+}
+.vinyl {
+  animation-duration: 12s;
+  box-shadow: 0 30px 70px rgba(0, 0, 0, 0.65), inset 0 0 0 8px rgba(4, 4, 6, 0.9);
+}
+.label {
+  width: 35%;
+  height: 35%;
+}
+
+/* 规格书 v2.7 · 1.11：桌面音效为右侧抽屉 */
+.eq-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 70;
+  display: flex;
+  justify-content: flex-end;
+  background: rgba(0, 0, 0, 0.5);
+}
+.eq-drawer {
+  width: min(380px, 88vw);
+  height: 100%;
+  padding: 20px 18px;
+  background: #13131b;
+  border-left: 1px solid #262633;
+  overflow-y: auto;
+}
+.eq-fade-enter-active,
+.eq-fade-leave-active {
+  transition: opacity 0.18s ease;
+}
+.eq-fade-enter-from,
+.eq-fade-leave-to {
+  opacity: 0;
 }
 </style>

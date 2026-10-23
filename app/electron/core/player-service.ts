@@ -39,6 +39,8 @@ class PlayerService {
   private host: BrowserWindow | null = null
   private hostReady = false
   private pendingLoad: any = null
+  /** 宿主未就绪时暂存的非 load 指令（EQ / 频谱等），就绪后按序补发 */
+  private pendingCmds: any[] = []
   private loadToken = 0
   private failures = 0
   /** 连续「换源用尽后跳下一首」仍失败的歌曲数，播放成功即清零 */
@@ -63,6 +65,7 @@ class PlayerService {
         this.send(this.pendingLoad)
         this.pendingLoad = null
       }
+      for (const cmd of this.pendingCmds.splice(0)) this.send(cmd)
     })
   }
 
@@ -91,6 +94,10 @@ class PlayerService {
       case 'error':
         this.handlePlaybackError(String(msg.message || '音频加载失败'), Number(msg.code) || 0)
         break
+      case 'spectrum':
+        // 频谱数据（规格书 v2.7 · 1.6）：直接转发给渲染层，主进程不做平滑
+        this.broadcast('player:spectrum', Array.isArray(msg.data) ? msg.data : [])
+        break
       case 'log':
         logger.debug('host', msg.message)
         break
@@ -118,7 +125,9 @@ class PlayerService {
   private send(msg: any): void {
     if (!this.host || this.host.isDestroyed()) return
     if (!this.hostReady) {
-      this.pendingLoad = msg
+      // load 只保留最新一条（连续切歌以最后一次为准），其余指令排队补发
+      if (msg?.type === 'load') this.pendingLoad = msg
+      else this.pendingCmds.push(msg)
       return
     }
     try {
@@ -467,6 +476,20 @@ class PlayerService {
 
   getSleepUntil(): number {
     return this.sleepUntil
+  }
+
+  /** 音效（规格书 v2.7 · 1.11）：bands 为 5 段增益，单位 dB，范围 -12~12 */
+  setEq(bands: number[]): void {
+    const safe = [0, 1, 2, 3, 4].map(i => {
+      const v = Number(bands?.[i])
+      return Number.isFinite(v) ? Math.max(-12, Math.min(12, Math.round(v))) : 0
+    })
+    this.send({ type: 'eq', bands: safe })
+  }
+
+  /** 频谱订阅开关（规格书 v2.7 · 1.6）：只在舞台视图可见时打开 */
+  setSpectrum(on: boolean): void {
+    this.send({ type: 'spectrum', on: !!on })
   }
 
   setQuality(q: string): void {

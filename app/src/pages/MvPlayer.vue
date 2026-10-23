@@ -104,6 +104,27 @@ const menu = ref<'' | 'settings' | 'speed' | 'quality' | 'loop' | 'fill' | 'more
 type LoopMode = 'off' | 'one' | 'list'
 const LOOP_MODES: LoopMode[] = ['off', 'one', 'list']
 const LOOP_LABEL: Record<LoopMode, string> = { off: '不循环', one: '单集循环', list: '列表循环' }
+
+/* AB 段循环（规格书 v2.7 · 2.5）：第一次点设 A（绿），第二次设 B（粉），第三次清除 */
+const abA = ref<number | null>(null)
+const abB = ref<number | null>(null)
+const abLabel = computed(() => {
+  if (abA.value === null) return 'AB 循环'
+  if (abB.value === null) return `A ${fmtTime(abA.value)} · 再点设 B`
+  return `A ${fmtTime(abA.value)} - B ${fmtTime(abB.value)}`
+})
+function markAB(): void {
+  const t = videoEl.value?.currentTime ?? curTime.value
+  if (abA.value === null) {
+    abA.value = t
+  } else if (abB.value === null) {
+    if (t > abA.value + 0.5) abB.value = t
+    else abA.value = t
+  } else {
+    abA.value = null
+    abB.value = null
+  }
+}
 const loopMode = ref<LoopMode>('off')
 
 /* 离线缓存状态 */
@@ -292,24 +313,30 @@ function onTimeUpdate(): void {
   const v = videoEl.value
   if (!v) return
   curTime.value = v.currentTime
-  // 进度记忆：每 3s 落一次 localStorage（按 bvid+cid），临近结尾不记
+  // AB 段循环：到 B 点立刻回到 A 点
+  if (abA.value !== null && abB.value !== null && v.currentTime >= abB.value - 0.05) {
+    v.currentTime = abA.value
+  }
+  // 进度记忆：每 5s 落一次 localStorage（规格书 2.7），播放到 95% 以上视为看完并清除
   const now = Date.now()
-  if (now - lastProgSave < 3000) return
+  if (now - lastProgSave < 5000) return
   lastProgSave = now
-  if (v.currentTime > 5 && (duration.value || 0) - v.currentTime > 10 && bvid.value && current.value) {
+  const dur = duration.value || 0
+  if (bvid.value && current.value && v.currentTime > 5 && dur > 0) {
     try {
-      localStorage.setItem(progKey(bvid.value, current.value.cid), String(v.currentTime))
+      if (v.currentTime / dur > 0.95) localStorage.removeItem(progKey(bvid.value, current.value.cid))
+      else localStorage.setItem(progKey(bvid.value, current.value.cid), String(v.currentTime))
     } catch { /* 隐私模式等忽略 */ }
   }
 }
 
-/** 视频进度记忆：按 bvid+cid 存取（双端通用，localStorage） */
+/** 视频进度记忆：按 bvid+cid 存取（规格书 0.5：xinyuan_resume_ 前缀，兼容旧 sw.mvprog） */
 function progKey(bv: string, cid: string): string {
-  return `sw.mvprog:${bv}:${cid}`
+  return `xinyuan_resume_${bv}_${cid}`
 }
 function lastProgressOf(bv: string, cid: string): number {
   try {
-    return Number(localStorage.getItem(progKey(bv, cid)) || 0)
+    return Number(localStorage.getItem(progKey(bv, cid)) || localStorage.getItem(`sw.mvprog:${bv}:${cid}`) || 0)
   } catch {
     return 0
   }
@@ -793,6 +820,8 @@ onBeforeUnmount(() => {
             <div class="bar" @click="onProgressClick">
               <div class="bar-buffer" :style="{ width: (buffered / (duration || 1)) * 100 + '%' }"></div>
               <div class="bar-played" :style="{ width: (curTime / (duration || 1)) * 100 + '%' }"></div>
+              <div v-if="abA !== null" class="bar-ab a" :style="{ left: (abA / (duration || 1)) * 100 + '%' }"></div>
+              <div v-if="abB !== null" class="bar-ab b" :style="{ left: (abB / (duration || 1)) * 100 + '%' }"></div>
               <div class="bar-thumb" :style="{ left: (curTime / (duration || 1)) * 100 + '%' }"></div>
             </div>
 
@@ -866,6 +895,10 @@ onBeforeUnmount(() => {
                   >
                     {{ LOOP_LABEL[m] }}
                     <Icon v-if="m === loopMode" name="check" :size="13" />
+                  </button>
+                  <button class="menu-item" :class="{ active: abA !== null }" @click="markAB">
+                    {{ abLabel }}
+                    <Icon v-if="abA !== null" name="check" :size="13" />
                   </button>
                   <div class="menu-title">画面模式</div>
                   <button
@@ -1284,6 +1317,21 @@ onBeforeUnmount(() => {
 }
 .bar-played {
   background: var(--accent, #7c9cff);
+}
+/* AB 段标记（规格书 2.5：A 绿 / B 粉） */
+.bar-ab {
+  position: absolute;
+  top: -2px;
+  width: 3px;
+  height: calc(100% + 4px);
+  border-radius: 2px;
+  pointer-events: none;
+}
+.bar-ab.a {
+  background: #22c55e;
+}
+.bar-ab.b {
+  background: #f472b6;
 }
 .bar-thumb {
   position: absolute;

@@ -426,6 +426,15 @@ const handlers: Record<string, Handler> = {
     saveSettings({ quality })
     return decState(player.getState())
   },
+  // 音效与频谱（规格书 v2.7 · 1.11 / 1.6）
+  'player:eq': ({ bands }: any) => {
+    player.setEq(Array.isArray(bands) ? bands : [])
+    return true
+  },
+  'player:spectrum': ({ on }: any) => {
+    player.setSpectrum(!!on)
+    return true
+  },
   'player:addNext': ({ song }: any) => {
     player.addNext(song)
     return decState(player.getState())

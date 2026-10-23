@@ -50,6 +50,26 @@ const rate = ref(1)
 const fillMode = ref<(typeof FILL_MODES)[number]>('contain')
 const autoNext = ref(true)
 const loopMode = ref<'off' | 'one' | 'list'>('off')
+
+/* AB 段循环（规格书 v2.7 · 2.5）：第一次点设 A（绿），第二次设 B（粉），第三次清除 */
+const abA = ref<number | null>(null)
+const abB = ref<number | null>(null)
+const abLabel = computed(() => {
+  if (abA.value === null) return 'AB 循环'
+  if (abB.value === null) return `A ${fmtTime(abA.value)}`
+  return `AB ${fmtTime(abA.value)}-${fmtTime(abB.value)}`
+})
+function markAB(): void {
+  const t = videoEl.value?.currentTime ?? curTime.value
+  if (abA.value === null) abA.value = t
+  else if (abB.value === null) {
+    if (t > abA.value + 0.5) abB.value = t
+    else abA.value = t
+  } else {
+    abA.value = null
+    abB.value = null
+  }
+}
 const muted = ref(false)
 const volume = ref(1)
 const showSheet = ref(false)
@@ -76,7 +96,15 @@ const fmtTime = (t: number): string => {
 const fmtCount = (n: number): string => (n >= 10000 ? `${(n / 10000).toFixed(1)}万` : String(n || 0))
 
 function progKey(cid: string): string {
-  return `sw.mvprog:${bvid.value}:${cid}`
+  return `xinyuan_resume_${bvid.value}_${cid}`
+}
+
+/** 时间推进：AB 段到 B 点回跳 A 点（规格书 2.5） */
+function onTimeUpdate(): void {
+  const v = videoEl.value
+  if (!v) return
+  curTime.value = v.currentTime
+  if (abA.value !== null && abB.value !== null && v.currentTime >= abB.value - 0.05) v.currentTime = abA.value
 }
 
 function poke(): void {
@@ -224,6 +252,20 @@ function toggleFullscreen(): void {
   else void v.requestFullscreen?.().catch(() => undefined)
 }
 
+/** 画中画（规格书 2.9）：Android 8+ / iOS 14+ 支持，不支持时提示 */
+async function togglePip(): Promise<void> {
+  const v = videoEl.value as any
+  if (!v) return
+  try {
+    if ((document as any).pictureInPictureElement) await (document as any).exitPictureInPicture()
+    else if (v.requestPictureInPicture) await v.requestPictureInPicture()
+    else if (v.webkitSetPresentationMode) v.webkitSetPresentationMode('picture-in-picture')
+    else ui.toast('当前系统不支持画中画', 'info', 1600)
+  } catch {
+    ui.toast('画中画启动失败', 'error', 1600)
+  }
+}
+
 function onEnded(): void {
   const v = videoEl.value
   if (v && current.value) {
@@ -271,7 +313,7 @@ watch(bvid, () => void load())
         class="video"
         playsinline
         @click.stop="togglePlay"
-        @timeupdate="curTime = videoEl?.currentTime || 0"
+        @timeupdate="onTimeUpdate"
         @loadedmetadata="duration = videoEl?.duration || 0"
         @play="playing = true; poke()"
         @pause="playing = false; showControls = true"
@@ -383,6 +425,8 @@ watch(bvid, () => void load())
             <button class="s-chip" :class="{ on: autoNext }" @click="autoNext = !autoNext">自动连播</button>
             <button class="s-chip" :class="{ on: loopMode === 'one' }" @click="loopMode = loopMode === 'one' ? 'off' : 'one'">单集循环</button>
             <button class="s-chip" :class="{ on: loopMode === 'list' }" @click="loopMode = loopMode === 'list' ? 'off' : 'list'">列表循环</button>
+            <button class="s-chip" :class="{ on: abA !== null }" @click="markAB">{{ abLabel }}</button>
+            <button class="s-chip" @click="togglePip">画中画</button>
             <button class="s-chip" :class="{ on: ui.settings.danmakuEnabled }" @click="toggleDanmaku">弹幕</button>
             <button class="s-chip" :class="{ on: !muted }" @click="muted = !muted; if (videoEl) videoEl.muted = muted">{{ muted ? '静音中' : '声音' }}</button>
           </div>

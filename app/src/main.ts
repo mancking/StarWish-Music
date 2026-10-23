@@ -5,6 +5,9 @@ import { router } from './router'
 import { useUiStore } from './stores/ui'
 import { usePlayerStore } from './stores/player'
 import { useLibraryStore } from './stores/library'
+import { initPlatform } from './platform'
+import { registerEqBackend } from './audio/eq'
+import { call } from './api'
 import './styles/main.css'
 
 // 设计 token 按端切换：桌面用紧凑尺寸，移动端用大圆角/大行高。
@@ -17,6 +20,8 @@ const os = /Mac|iP(hone|ad|od)/.test(navigator.userAgent)
     : 'linux'
 document.documentElement.dataset.platform = 'desktop'
 document.documentElement.dataset.os = os
+// 规格书 v2.7 · 0.1 / 0.3 / 0.5：四端断点、性能档位、xinyuan_* 键统一入口
+initPlatform()
 
 const app = createApp(App)
 const pinia = createPinia()
@@ -57,6 +62,14 @@ async function bootstrap(): Promise<void> {
   // 先挂载：界面骨架立刻可见
   app.mount('#app')
   ;(window as any).__swStores = { player, library, ui }
+
+  // 音效（规格书 v2.7 · 1.11）：状态与预设在本进程，滤波在隐藏音频宿主的
+  // AudioContext 里做；宿主未就绪时主进程会排队补发，不会丢曲线。
+  registerEqBackend({
+    setBands: bands => {
+      void call('player:eq', { bands }).catch(() => {})
+    },
+  })
 
   const splash = document.getElementById('splash')
   const hideSplash = (): void => {

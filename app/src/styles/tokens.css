@@ -39,6 +39,19 @@
   --z-sticky: 20;
   --z-overlay: 40;
   --z-modal: 60;
+
+  /* ------------------------------------------------------------
+     全端播放模块规格书 v2.7 · 0.2 配色 token（固定值，不随强调色变化）
+     ------------------------------------------------------------ */
+  --sw-bg: #0b0b10;
+  --sw-card: #13131b;
+  --sw-line: #262633;
+  --sw-text: #ececf1;
+  --sw-text-dim: #9b9ba8;
+  --sw-music: #a78bfa;
+  --sw-video: #f472b6;
+  --sw-car: #fbbf24;
+  --sw-grad: linear-gradient(135deg, #a78bfa, #f472b6);
 }
 
 :root[data-theme='dark'] {

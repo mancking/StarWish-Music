@@ -4,9 +4,13 @@ import { useRouter } from 'vue-router'
 import { findLyricIndex, formatTime } from '@shared/lrc'
 import Icon from '@/components/Icon.vue'
 import Cover from '@/components/Cover.vue'
-import { usePlayerStore } from '@/stores/player'
+import { usePlayerStore, type StageMode } from '@/stores/player'
 import { useLibraryStore } from '@/stores/library'
 import { useUiStore } from '@/stores/ui'
+import { lsGet, lsSet, platform } from '@/platform'
+import ParticleField from '@/components/player/ParticleField.vue'
+import SpectrumBars from '@/components/player/SpectrumBars.vue'
+import EqPanel from '@/components/player/EqPanel.vue'
 
 /**
  * 移动端全屏播放页 —— 模板级重写（v2.3.4）。
@@ -34,29 +38,36 @@ const offset = computed(() => (ui.settings.lyricOffset || 0) / 1000)
 const activeIndex = computed(() => findLyricIndex(lines.value, player.displayPosition + offset.value))
 
 /**
- * 舞台：与桌面端 player.stage 同源（localStorage 'sw.stage'），三选一。
- * 移动端只有「歌词舞台」与「DJ 舞台」两种可视化，粒子舞台在移动端用封面页的
- * 呼吸光晕代替（移动端 GPU 开销敏感）。
+ * 视觉模式（规格书 v2.7 · 1.4）：封面 → 歌词 → 粒子 → 舞台频谱 四态循环，
+ * 状态由 player.stage 统一持久化（xinyuan_visual_mode）。
  */
 const stage = computed(() => player.stage)
-/** 页签：封面 / 歌词（仅在歌词舞台下有效） */
+/** 页签：封面 / 歌词 */
 const tab = ref<'cover' | 'lyric'>('cover')
 /** 更多面板 */
 const moreOpen = ref(false)
 /** 定时关闭面板 */
 const sleepOpen = ref(false)
+/** 音效面板（规格书 1.11：手机为底部面板） */
+const eqOpen = ref(false)
 
-const STAGE_LABEL: Record<string, string> = {
+const STAGE_LABEL: Record<StageMode, string> = {
+  cover: '封面',
   lyrics: '歌词',
   particle: '粒子',
-  cinema: '电影',
-  podcast: 'DJ',
+  stage: '频谱',
+}
+const STAGE_ICON: Record<StageMode, string> = {
+  cover: 'disc',
+  lyrics: 'lyric',
+  particle: 'sparkles',
+  stage: 'sliders',
 }
 
-/** 切舞台：DJ 舞台直接切到歌词页外的面板，其余回落到封面/歌词页 */
-function setStage(s: 'lyrics' | 'particle' | 'cinema' | 'podcast'): void {
+/** 切视觉模式：歌词模式自动落到歌词页，其余回封面页 */
+function setStage(s: StageMode): void {
   player.setStage(s)
-  if (s === 'podcast') tab.value = 'cover'
+  tab.value = s === 'lyrics' ? 'lyric' : 'cover'
 }
 
 const progress = computed(() => {
@@ -70,23 +81,59 @@ function back(): void {
   else router.push('/')
 }
 
-/* ---------------- 手势 ---------------- */
+/* ---------------- 手势（规格书 v2.7 · 1.10） ----------------
+   左半屏上下滑 = 亮度；右半屏上下滑 = 音量；封面左右滑 = 切歌；
+   点封面 = 切歌词视图；双击 = 播放/暂停。车机端不进入本页面。 */
 let startX = 0
 let startY = 0
+let lastY = 0
 let startAt = 0
 let moved = false
+let side: 'left' | 'right' = 'left'
+let tapTimer = 0
+let hudTimer = 0
+
+const brightness = ref(Number(lsGet('brightness') || 1))
+const hud = ref<{ kind: 'bright' | 'volume'; value: number } | null>(null)
+
+function showHud(kind: 'bright' | 'volume', value: number): void {
+  hud.value = { kind, value }
+  window.clearTimeout(hudTimer)
+  hudTimer = window.setTimeout(() => {
+    hud.value = null
+  }, 900)
+}
 
 function onDown(e: PointerEvent): void {
-  if ((e.target as HTMLElement).closest('button, input, a, .seek, .lyric-scroll')) return
+  if ((e.target as HTMLElement).closest('button, input, a, .seek, .lyric-scroll, .eq-sheet')) return
   startX = e.clientX
   startY = e.clientY
+  lastY = e.clientY
   startAt = Date.now()
   moved = false
+  side = e.clientX < window.innerWidth / 2 ? 'left' : 'right'
 }
 
 function onMove(e: PointerEvent): void {
   if (!startAt) return
-  if (Math.abs(e.clientX - startX) > 8 || Math.abs(e.clientY - startY) > 8) moved = true
+  const dx = e.clientX - startX
+  const dy = e.clientY - startY
+  if (Math.abs(dx) > 8 || Math.abs(dy) > 8) moved = true
+  if (!moved) return
+  // 横向滑动留给切歌，只有纵向才调亮度/音量
+  if (Math.abs(dx) > Math.abs(dy)) return
+  const step = (lastY - e.clientY) / Math.max(320, window.innerHeight)
+  lastY = e.clientY
+  if (side === 'left') {
+    const v = Math.min(1, Math.max(0.1, Math.round((brightness.value + step * 1.6) * 100) / 100))
+    brightness.value = v
+    lsSet('brightness', String(v))
+    showHud('bright', v)
+  } else {
+    const v = Math.min(1, Math.max(0, Math.round((player.state.volume + step * 1.6) * 100) / 100))
+    void player.setVolume(v)
+    showHud('volume', v)
+  }
 }
 
 function onUp(e: PointerEvent): void {
@@ -95,24 +142,25 @@ function onUp(e: PointerEvent): void {
   const dy = e.clientY - startY
   const dt = Date.now() - startAt
   startAt = 0
-
-  // 纵向优先：上滑下一首 / 下滑收起
-  if (Math.abs(dy) > 70 && Math.abs(dy) > Math.abs(dx) * 1.4) {
-    if (dy < 0) void player.next()
-    else back()
+  if (moved) {
+    if (Math.abs(dx) > 70 && Math.abs(dx) > Math.abs(dy) * 1.4) {
+      if (dx < 0) void player.next()
+      else void player.prev()
+    }
     return
   }
-  // 左右滑切歌
-  if (Math.abs(dx) > 70 && Math.abs(dx) > Math.abs(dy) * 1.4) {
-    if (dx < 0) void player.next()
-    else void player.prev()
+  if (dt >= 300) return
+  // 双击播放/暂停，单击封面切歌词
+  if (tapTimer) {
+    window.clearTimeout(tapTimer)
+    tapTimer = 0
+    void player.toggle()
     return
   }
-  // 轻点封面区切歌词页（国内 App 通用：点封面看歌词）
-  if (!moved && dt < 300 && tab.value === 'cover') {
-    if (lines.value.length) tab.value = 'lyric'
-    else void player.toggle()
-  }
+  tapTimer = window.setTimeout(() => {
+    tapTimer = 0
+    if (tab.value === 'cover' && lines.value.length) tab.value = 'lyric'
+  }, 240)
 }
 
 /* ---------------- 进度拖动 ---------------- */
@@ -196,6 +244,13 @@ function toggleSleep(): void {
       <div class="bg-mask" />
     </div>
 
+    <!-- 规格书 1.10：左半屏上下滑调亮度 -->
+    <div class="dim" :style="{ opacity: 1 - brightness }" />
+    <div v-if="hud" class="hud">
+      <Icon :name="hud.kind === 'bright' ? 'sun' : 'volume'" :size="16" />
+      <span>{{ Math.round(hud.value * 100) }}%</span>
+    </div>
+
     <!-- ① 顶栏 -->
     <header class="head">
       <button class="round" aria-label="收起" @click="back"><Icon name="chevron-down" :size="24" /></button>
@@ -212,14 +267,11 @@ function toggleSleep(): void {
       <Transition :name="tab === 'lyric' ? 'pane-left' : 'pane-right'" mode="out-in">
         <!-- 封面页 -->
         <div v-if="tab === 'cover'" class="pane cover-pane" key="cover">
+          <!-- 规格书 v2.7 · 1.6：手机顶部 24px 窄条频谱（16 柱） -->
+          <SpectrumBars v-if="stage === 'stage'" placement="top" />
+          <ParticleField v-if="stage === 'particle'" :count="80" class="pane-particles" />
           <div class="stage">
-            <Cover :src="player.coverUrl" :size="300" radius="22" class="cover" />
-            <!-- 粒子舞台：封面外围呼吸光晕（移动端用低成本方案替代 canvas 粒子） -->
-            <div v-if="stage === 'particle'" class="stage-halo" />
-            <!-- DJ 舞台：封面下方的律动波形 -->
-            <div v-if="stage === 'podcast'" class="wave">
-              <span v-for="i in 28" :key="i" :style="{ animationDelay: (i % 8) * 0.1 + 's', height: 10 + ((i * 7) % 26) + 'px' }" />
-            </div>
+            <Cover :src="player.coverUrl" :size="200" radius="12" class="cover" />
           </div>
         </div>
 
@@ -257,16 +309,15 @@ function toggleSleep(): void {
           <button :class="{ on: tab === 'cover' }" @click="tab = 'cover'">封面</button>
           <button :class="{ on: tab === 'lyric' }" @click="tab = 'lyric'">歌词</button>
         </div>
-        <!-- 舞台切换：与桌面端对齐，切换即时生效并带过渡 -->
+        <!-- 视觉模式：单按钮循环 4 态（规格书 1.4），音效入口（1.11） -->
         <div class="stage-tabs">
-          <button
-            v-for="s in (['lyrics', 'particle', 'podcast'] as const)"
-            :key="s"
-            :class="{ on: stage === s }"
-            @click="setStage(s)"
-          >
-            <Icon :name="s === 'lyrics' ? 'lyric' : s === 'particle' ? 'sparkles' : 'radio'" :size="13" />
-            {{ STAGE_LABEL[s] }}
+          <button class="cycle" @click="player.cycleStage()">
+            <Icon :name="STAGE_ICON[stage]" :size="13" />
+            {{ STAGE_LABEL[stage] }}
+          </button>
+          <button class="cycle" @click="eqOpen = true">
+            <Icon name="sliders" :size="13" />
+            音效
           </button>
         </div>
       </div>
@@ -364,6 +415,14 @@ function toggleSleep(): void {
         </div>
       </div>
     </Transition>
+    <!-- 音效面板（规格书 1.11：手机为底部面板） -->
+    <Transition name="fade">
+      <div v-if="eqOpen" class="panel-wrap eq-sheet" @click="eqOpen = false">
+        <div class="panel" @click.stop>
+          <EqPanel @close="eqOpen = false" />
+        </div>
+      </div>
+    </Transition>
   </div>
 </template>
 
@@ -389,6 +448,8 @@ function toggleSleep(): void {
   position: absolute;
   inset: 0;
   z-index: 0;
+  /* 规格书 v2.7 · 1.2：手机背景为 180deg 渐变，不用模糊封面 */
+  background: linear-gradient(180deg, #2a1f4d, #0f0d1f);
 }
 .bg-img {
   position: absolute;
@@ -398,6 +459,7 @@ function toggleSleep(): void {
   object-fit: cover;
   filter: blur(46px) saturate(1.5);
   transform: scale(1.25);
+  opacity: 0.5;
 }
 .bg-mask {
   position: absolute;
@@ -528,7 +590,38 @@ function toggleSleep(): void {
 }
 .cover {
   box-shadow: 0 26px 60px rgba(0, 0, 0, 0.55);
-  border-radius: 22px;
+  /* 规格书 v2.7 · 1.2：手机为 200×200 方形封面、圆角 12、不旋转 */
+  border-radius: 12px;
+}
+.pane-particles {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+}
+/* 亮度手势遮罩（规格书 1.10） */
+.dim {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  background: #000;
+  pointer-events: none;
+  transition: opacity 0.12s linear;
+}
+.hud {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px;
+  border-radius: 12px;
+  background: rgba(11, 11, 16, 0.82);
+  color: #ececf1;
+  font-size: 15px;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
 }
 
 /* 歌词页：整页滚动 + 当前行高亮 */

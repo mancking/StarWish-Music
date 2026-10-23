@@ -3,9 +3,42 @@ import { computed, ref, watch } from 'vue'
 import type { LyricResult, PlayMode, PlayerState, Song } from '@shared/types'
 import { call, on } from '@/api'
 import { extractAccent } from '@/utils/color'
+import { lsGet, lsSet, platform } from '@/platform'
 import { useUiStore } from './ui'
 
-export type StageMode = 'lyrics' | 'particle' | 'cinema' | 'podcast'
+/**
+ * 播放页视觉模式（规格书 v2.7 · 1.4）
+ * 0 封面 / 1 歌词 / 2 粒子 / 3 舞台频谱，循环切换并持久化到 xinyuan_visual_mode。
+ * 旧版本用 'sw.stage' 存 lyrics|particle|cinema|podcast，这里做一次迁移映射。
+ */
+export type StageMode = 'cover' | 'lyrics' | 'particle' | 'stage'
+
+const STAGE_ORDER: StageMode[] = ['cover', 'lyrics', 'particle', 'stage']
+const STAGE_LEGACY: Record<string, StageMode> = {
+  cover: 'cover',
+  lyrics: 'lyrics',
+  particle: 'particle',
+  stage: 'stage',
+  cinema: 'cover',
+  podcast: 'cover',
+}
+
+function readStage(): StageMode {
+  let raw = lsGet('visual_mode')
+  if (!raw) {
+    try {
+      raw = localStorage.getItem('sw.stage')
+    } catch {
+      raw = null
+    }
+  }
+  return (raw && STAGE_LEGACY[raw]) || 'cover'
+}
+
+function readLoopMode(): PlayMode | null {
+  const raw = lsGet('loop_mode')
+  return raw === 'repeat-all' || raw === 'repeat-one' || raw === 'shuffle' || raw === 'order' ? raw : null
+}
 
 const EMPTY: PlayerState = {
   status: 'idle',
@@ -30,7 +63,7 @@ export const usePlayerStore = defineStore('player', () => {
   const lyric = ref<LyricResult | null>(null)
   const lyricLoading = ref(false)
   const queueOpen = ref(false)
-  const stage = ref<StageMode>((localStorage.getItem('sw.stage') as StageMode) || 'lyrics')
+  const stage = ref<StageMode>(readStage())
   const initialized = ref(false)
   const coverUrl = ref('')
   const sleepUntil = ref(0)
@@ -79,6 +112,9 @@ export const usePlayerStore = defineStore('player', () => {
     try {
       const s = await call<PlayerState>('player:state')
       applyState(s, true)
+      // 规格书 1.7：循环模式持久化（xinyuan_loop_mode），重启后恢复
+      const savedLoop = readLoopMode()
+      if (savedLoop && s?.mode !== savedLoop) void setMode(savedLoop)
     } catch (e: any) {
       ui.toast(`播放器初始化失败：${e.message}`, 'error')
     }
@@ -244,13 +280,17 @@ export const usePlayerStore = defineStore('player', () => {
   }
 
   async function cycleMode(): Promise<void> {
-    const order: PlayMode[] = ['repeat-all', 'repeat-one', 'shuffle', 'order']
+    // 规格书 v2.7 · 1.7：列表 → 单曲 → 随机 → 关闭；车机只保留两态
+    const order: PlayMode[] = platform.value.car
+      ? ['repeat-all', 'repeat-one']
+      : ['repeat-all', 'repeat-one', 'shuffle', 'order']
     const idx = order.indexOf(state.value.mode)
     const nextMode = order[(idx + 1) % order.length]
     try {
       applyState(await call<PlayerState>('player:mode', { mode: nextMode }), true)
+      lsSet('loop_mode', nextMode)
       ui.toast(
-        nextMode === 'repeat-one' ? '单曲循环' : nextMode === 'repeat-all' ? '列表循环' : nextMode === 'shuffle' ? '随机播放' : '顺序播放',
+        nextMode === 'repeat-one' ? '单曲循环' : nextMode === 'repeat-all' ? '列表循环' : nextMode === 'shuffle' ? '随机播放' : '关闭循环',
         'info',
         1400
       )
@@ -262,6 +302,7 @@ export const usePlayerStore = defineStore('player', () => {
   async function setMode(mode: PlayMode): Promise<void> {
     try {
       applyState(await call<PlayerState>('player:mode', { mode }), true)
+      lsSet('loop_mode', mode)
     } catch (e: any) {
       ui.toast(e.message, 'error')
     }
@@ -350,7 +391,19 @@ export const usePlayerStore = defineStore('player', () => {
 
   function setStage(s: StageMode): void {
     stage.value = s
-    localStorage.setItem('sw.stage', s)
+    lsSet('visual_mode', s)
+    try {
+      localStorage.removeItem('sw.stage')
+    } catch {
+      /* ignore */
+    }
+  }
+
+  /** 视觉模式按钮：封面 → 歌词 → 粒子 → 舞台，循环（车机不提供该按钮） */
+  function cycleStage(): void {
+    const order = platform.value.car ? (['cover', 'lyrics'] as StageMode[]) : STAGE_ORDER
+    const idx = order.indexOf(stage.value)
+    setStage(order[(idx + 1) % order.length])
   }
 
   watch(
@@ -396,6 +449,7 @@ export const usePlayerStore = defineStore('player', () => {
     move,
     clearQueue,
     setStage,
+    cycleStage,
     reloadLyric,
     sleepUntil,
     setRate,

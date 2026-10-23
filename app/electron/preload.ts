@@ -13,6 +13,7 @@ const EVENT_WHITELIST = new Set([
   'app:navigate',
   'lyric:payload',
   'player:sleep',
+  'player:spectrum',
 ])
 
 const api = {

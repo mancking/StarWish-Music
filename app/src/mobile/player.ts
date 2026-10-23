@@ -414,4 +414,133 @@ export const player = {
       publish()
     }
   },
+
+  /* ---------------- 音效与频谱（规格书 v2.7 · 1.11 / 1.6） ---------------- */
+
+  /** 写入 5 段 EQ 增益（dB，-12~12）。图按需建立：正在播放时立刻生效，否则等下次播放 */
+  setEqBands(bands: number[]): void {
+    eqBands = EQ_FREQS.map((_, i) => {
+      const v = Number(bands?.[i])
+      return Number.isFinite(v) ? Math.max(-12, Math.min(12, Math.round(v))) : 0
+    })
+    if (audioCtx) {
+      applyGains()
+      return
+    }
+    if (!el.paused && ensureGraph()) applyGains()
+  },
+
+  /** 频谱订阅：返回取消函数。舞台视图可见时订阅，离开即退订（省电） */
+  subscribeSpectrum(sink: (bars: number[]) => void): () => void {
+    spectrumSinks.add(sink)
+    startPump()
+    return () => {
+      spectrumSinks.delete(sink)
+      if (!spectrumSinks.size) stopPump()
+    }
+  },
 }
+
+/* ---------------- Web Audio 图（移动端） ----------------
+ * 移动端音频走同源 /swmedia 代理，因此可以安全建立 MediaElementSource，
+ * 不会出现「跨域媒体被污染 → 输出静音」的问题。
+ * 图只在用户真的开启音效/频谱时创建；创建失败则整体降级，不影响普通播放。
+ */
+const EQ_FREQS = [60, 230, 910, 3600, 14000]
+let audioCtx: AudioContext | null = null
+let eqFilters: BiquadFilterNode[] = []
+let analyser: AnalyserNode | null = null
+let eqBands: number[] = [0, 0, 0, 0, 0]
+let graphBroken = false
+
+function ensureGraph(): boolean {
+  if (audioCtx) return true
+  if (graphBroken) return false
+  try {
+    const Ctor: typeof AudioContext | undefined =
+      (window as any).AudioContext || (window as any).webkitAudioContext
+    if (!Ctor) throw new Error('AudioContext 不可用')
+    const ctx = new Ctor()
+    const source = ctx.createMediaElementSource(el)
+    eqFilters = EQ_FREQS.map((freq, i) => {
+      const f = ctx.createBiquadFilter()
+      f.type = i === 0 ? 'lowshelf' : i === EQ_FREQS.length - 1 ? 'highshelf' : 'peaking'
+      f.frequency.value = freq
+      f.Q.value = 1
+      f.gain.value = eqBands[i] || 0
+      return f
+    })
+    const an = ctx.createAnalyser()
+    an.fftSize = 256
+    an.smoothingTimeConstant = 0.75
+    let node: AudioNode = source
+    for (const f of eqFilters) {
+      node.connect(f)
+      node = f
+    }
+    node.connect(an)
+    an.connect(ctx.destination)
+    audioCtx = ctx
+    analyser = an
+    void ctx.resume().catch(() => undefined)
+    return true
+  } catch {
+    graphBroken = true
+    return false
+  }
+}
+
+type SpectrumSink = (bars: number[]) => void
+const spectrumSinks = new Set<SpectrumSink>()
+let spectrumTimer = 0
+
+function applyGains(): void {
+  if (!audioCtx) return
+  eqFilters.forEach((f, i) => {
+    // 平滑过渡，拖滑块时不爆音
+    f.gain.setTargetAtTime(eqBands[i], audioCtx!.currentTime, 0.03)
+  })
+}
+
+function pumpSpectrum(): void {
+  if (!analyser || !spectrumSinks.size || el.paused) return
+  const bins = new Uint8Array(analyser.frequencyBinCount)
+  analyser.getByteFrequencyData(bins)
+  const n = 64
+  const out: number[] = []
+  for (let i = 0; i < n; i++) {
+    const from = Math.floor((i / n) ** 1.7 * bins.length)
+    const to = Math.max(from + 1, Math.floor(((i + 1) / n) ** 1.7 * bins.length))
+    let sum = 0
+    for (let k = from; k < to && k < bins.length; k++) sum += bins[k]
+    out.push(Math.round(sum / Math.max(1, to - from)))
+  }
+  for (const sink of spectrumSinks) {
+    try {
+      sink(out)
+    } catch {
+      /* 单个订阅者异常不影响其它 */
+    }
+  }
+}
+
+function startPump(): void {
+  if (spectrumTimer) return
+  if (!ensureGraph()) return
+  spectrumTimer = window.setInterval(pumpSpectrum, 60)
+}
+
+function stopPump(): void {
+  if (spectrumTimer) window.clearInterval(spectrumTimer)
+  spectrumTimer = 0
+}
+
+// 移动端 AudioContext 常被自动播放策略挂起，恢复播放时必须显式 resume；
+// 同时在这里按需建图（有已保存的 EQ 曲线或有人在听频谱时才建），
+// 避免一启动就把 <audio> 接到挂起的 AudioContext 上导致「没声音」。
+el.addEventListener('play', () => {
+  if (!audioCtx && (spectrumSinks.size > 0 || eqBands.some(v => v !== 0))) {
+    if (ensureGraph()) applyGains()
+  }
+  void audioCtx?.resume().catch(() => undefined)
+})
