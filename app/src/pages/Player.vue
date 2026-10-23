@@ -1,581 +1,257 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+/**
+ * 桌面 / 平板播放页（规格书 1.1 ~ 1.11）
+ *
+ * 页面只做装配：封面与歌词在 CoverStage / LyricsPane，
+ * 进度、控制、功能行在 ProgressBar / TransportBar / FunctionBar，
+ * 粒子与频谱按端降级（0.3），EQ 面板在 EqPanel。
+ */
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
-import { findLyricIndex, formatTime } from '@shared/lrc'
-import type { LyricLine, WallpaperItem } from '@shared/types'
-import { call, isDesktop } from '@/api'
 import Icon from '@/components/Icon.vue'
-import Cover from '@/components/Cover.vue'
-import Slider from '@/components/Slider.vue'
-import Menu from '@/components/Menu.vue'
-import type { MenuItem } from '@/components/menu-types'
-import { usePlayerStore, type StageMode } from '@/stores/player'
-import { useLibraryStore } from '@/stores/library'
-import { useUiStore } from '@/stores/ui'
-import { songSourceLabel } from '@/utils/labels'
-import { particleCount, platform } from '@/platform'
 import ParticleField from '@/components/player/ParticleField.vue'
 import SpectrumBars from '@/components/player/SpectrumBars.vue'
 import EqPanel from '@/components/player/EqPanel.vue'
+import CoverStage from '@/player/components/CoverStage.vue'
+import LyricsPane from '@/player/components/LyricsPane.vue'
+import ProgressBar from '@/player/components/ProgressBar.vue'
+import TransportBar from '@/player/components/TransportBar.vue'
+import FunctionBar from '@/player/components/FunctionBar.vue'
+import { useLyricSync } from '@/player/lyrics'
+import { LOOP_ICON, STAGE_ICON, STAGE_LABEL } from '@/player/stages'
+import { usePlayerStore } from '@/stores/player'
+import { useLibraryStore } from '@/stores/library'
+import { useUiStore } from '@/stores/ui'
+import { lsGet, lsSet, particleCount, platform } from '@/platform'
 import CarPlayer from '@/pages/CarPlayer.vue'
+
+defineOptions({ name: 'Player' })
 
 const router = useRouter()
 const player = usePlayerStore()
 const library = useLibraryStore()
 const ui = useUiStore()
 
-const lyricBox = ref<HTMLElement | null>(null)
-const canvas = ref<HTMLCanvasElement | null>(null)
-const menu = ref<{ x: number; y: number } | null>(null)
-const dragging = ref(false)
-const dragValue = ref(0)
+const car = computed(() => platform.value.car)
+const kind = computed(() => (platform.value.kind === 'pad' ? 'pad' : 'desktop'))
+const lyric = useLyricSync(
+  computed(() => player.lyric),
+  computed(() => player.displayPosition)
+)
 
-const stages: { key: StageMode; label: string; icon: string }[] = [
-  { key: 'cover', label: '封面', icon: 'disc' },
-  { key: 'lyrics', label: '歌词', icon: 'lyric' },
-  { key: 'particle', label: '粒子', icon: 'sparkles' },
-  { key: 'stage', label: '频谱', icon: 'sliders' },
-]
+const queueOpen = ref(false)
+const eqOpen = ref(false)
+const lyricsVisible = ref(lsGet('lyrics_panel') !== '0')
+const sleepOpen = ref(false)
 
 const song = computed(() => player.song)
-const isWin = computed(() => window.sw?.platform === 'win32')
-/** 规格书 v2.7 · 0.1：车机走独立横屏布局 */
-const car = computed(() => platform.value.car)
-/** 音效面板开关（规格书 1.11：桌面为右侧抽屉） */
-const eqOpen = ref(false)
-/** 播放页背景模式（设置 → 播放） */
-const bgMode = computed(() => ui.settings.playerBg || 'cover')
-
-/* ---------------- 壁纸引擎（图片） ---------------- */
-const wallpapers = ref<WallpaperItem[]>([])
-/** 运行时选中的壁纸 id：按歌/定时轮播时会临时改变，不改写设置 */
-const runtimeWallpaperId = ref('')
-
-watch(
-  () => ui.settings.wallpaperId,
-  v => {
-    runtimeWallpaperId.value = v || ''
-  },
-  { immediate: true }
-)
-
-const currentWallpaper = computed<WallpaperItem | null>(() => {
-  const list = wallpapers.value
-  if (!list.length) return null
-  const id = runtimeWallpaperId.value
-  return list.find(w => w.id === id) || list[0]
-})
-
-function toLocalUrl(p: string): string {
-  if (!p) return ''
-  if (/^(https?|data|file|swmedia|swcover):/i.test(p)) return p
-  return 'file:///' + p.replace(/\\/g, '/').replace(/^\/+/, '')
-}
-
-/** 本地壁纸需要转成 file:// 才能被 <img> 加载（Windows 路径直接拼会失效） */
-const wallpaperSrc = computed(() => {
-  const w = currentWallpaper.value
-  if (w && ui.settings.wallpaperEnabled) return toLocalUrl(w.file)
-  // 移动端 / 旧数据：settings.playerWallpaper 存的是 dataURL 或路径
-  return toLocalUrl((ui.settings.playerWallpaper || '').trim())
-})
-
-const wallpaperStyle = computed(() => {
-  const s = ui.settings
-  return {
-    filter: `blur(${Math.max(0, s.wallpaperBlur || 0)}px) brightness(${s.wallpaperBrightness || 1})`,
-    transform: `scale(${s.wallpaperScale || 1.06})`,
-    objectFit: s.wallpaperFit || 'cover',
-  }
-})
-
-function pickRandomWallpaper(): void {
-  const list = wallpapers.value
-  if (list.length < 2) return
-  const cur = runtimeWallpaperId.value
-  const pool = list.filter(w => w.id !== cur)
-  runtimeWallpaperId.value = pool[Math.floor(Math.random() * pool.length)]?.id || cur
-}
-
-watch(
-  () => player.song?.id,
-  () => {
-    if (ui.settings.wallpaperRotation === 'song') pickRandomWallpaper()
-  }
-)
-
-let wallpaperTimer: ReturnType<typeof setInterval> | null = null
-function syncWallpaperTimer(): void {
-  if (wallpaperTimer) {
-    clearInterval(wallpaperTimer)
-    wallpaperTimer = null
-  }
-  if (ui.settings.wallpaperRotation !== 'timer') return
-  const min = Math.max(1, ui.settings.wallpaperIntervalMin || 15)
-  wallpaperTimer = setInterval(pickRandomWallpaper, min * 60 * 1000)
-}
-watch(() => [ui.settings.wallpaperRotation, ui.settings.wallpaperIntervalMin], syncWallpaperTimer)
-
+const cover = computed(() => player.coverUrl || '')
 const liked = computed(() => (song.value ? library.isFavorite(song.value.id) : false))
-const offsetSec = computed(() => (ui.settings.lyricOffset || 0) / 1000)
-const lines = computed<LyricLine[]>(() => player.lyric?.lines || [])
-const hasLyric = computed(() => lines.value.length > 0)
+const stage = computed(() => player.stage)
+const stageLabel = computed(() => STAGE_LABEL[stage.value] || '封面')
+const stageIcon = computed(() => STAGE_ICON[stage.value] || 'disc')
+const modeIcon = computed(() => LOOP_ICON[player.state.mode] || 'repeat')
 
-const activeIndex = computed(() => findLyricIndex(lines.value, player.displayPosition + offsetSec.value))
-const activeLine = computed(() => (activeIndex.value >= 0 ? lines.value[activeIndex.value] : null))
-
-const lineProgress = computed(() => {
-  const idx = activeIndex.value
-  if (idx < 0) return 0
-  const cur = lines.value[idx]
-  const next = lines.value[idx + 1]
-  const start = cur.time
-  const end = next ? next.time : start + 4
-  const t = (player.displayPosition + offsetSec.value - start) / Math.max(0.2, end - start)
-  return Math.max(0, Math.min(1, t))
-})
-
-const displayPos = computed(() => (dragging.value ? dragValue.value : player.displayPosition))
-
-watch(activeIndex, async idx => {
-  if (idx < 0 || !lyricBox.value) return
-  await nextTick()
-  const node = lyricBox.value.querySelector<HTMLElement>(`[data-idx="${idx}"]`)
-  const box = lyricBox.value
-  if (!node) return
-  const boxRect = box.getBoundingClientRect()
-  const nodeRect = node.getBoundingClientRect()
-  const target = box.scrollTop + (nodeRect.top - boxRect.top) - box.clientHeight / 2 + nodeRect.height / 2
-  box.scrollTo({ top: Math.max(0, target), behavior: 'smooth' })
-})
-
-function onSeek(v: number): void {
-  dragging.value = false
-  void player.seekTo(v)
+function setStage(s: 'cover' | 'lyrics' | 'particle' | 'stage'): void {
+  player.setStage(s)
 }
 
-function seekLine(line: LyricLine): void {
-  void player.seekTo(Math.max(0, line.time - offsetSec.value))
+function cycleVisual(): void {
+  player.cycleStage()
 }
 
-function qualityLabel(): string {
-  const q = player.state.quality
-  return q === 'flac24bit' ? 'Hi-Res' : q === 'flac' ? '无损' : q === '320k' ? '320K' : '128K'
+function toggleLyricsPanel(): void {
+  lyricsVisible.value = !lyricsVisible.value
+  lsSet('lyrics_panel', lyricsVisible.value ? '1' : '0')
 }
 
-const modeIcon = computed(() => {
-  const m = player.state.mode
-  return m === 'repeat-one' ? 'repeat-one' : m === 'shuffle' ? 'shuffle' : 'repeat'
-})
-
-const menuItems = computed<MenuItem[]>(() => [
-  { label: '添加到歌单', icon: 'plus' },
-  { label: '下一首播放', icon: 'arrow-down' },
-  { label: '打开桌面歌词', icon: 'lyric' },
-  { label: `播放速度 ${player.state.rate || 1}×（切换）`, icon: 'gauge' },
-  { label: player.sleepUntil ? '取消定时关闭' : '定时关闭 30 分钟', icon: 'clock' },
-  { label: '音效均衡器', icon: 'sliders' },
-  { divider: true, label: '' },
-  { label: '打开文件所在位置', icon: 'folder-open' },
-])
-
-async function onMenuSelect(i: number): Promise<void> {
-  menu.value = null
-  if (i === 5) {
-    eqOpen.value = true
-    return
-  }
-  const s = song.value
-  if (!s) return
-  if (i === 0) ui.playlistPickerSong = s
-  else if (i === 1) await player.addNext(s)
-  else if (i === 2) await ui.patch({ showDesktopLyric: !ui.settings.showDesktopLyric })
-  else if (i === 3) await player.cycleRate()
-  else if (i === 4) await player.setSleep(player.sleepUntil ? 0 : 30)
-  else if (i === 7 && s.localPath) await (window as any).sw.invoke('app:showItemInFolder', { path: s.localPath })
+function toggleLike(): void {
+  if (song.value) void library.toggleFavorite(song.value)
 }
 
-function openMenu(e: MouseEvent): void {
-  menu.value = { x: e.clientX, y: e.clientY }
+function openSleep(): void {
+  sleepOpen.value = !sleepOpen.value
 }
 
-/* ---------------- 粒子舞台 ---------------- */
-interface Particle {
-  x: number
-  y: number
-  r: number
-  vx: number
-  vy: number
-  a: number
-  hue: number
-}
-let parts: Particle[] = []
-let raf = 0
-let w = 0
-let h = 0
-let dpr = 1
-
-function resizeCanvas(): void {
-  const c = canvas.value
-  if (!c) return
-  const rect = c.getBoundingClientRect()
-  dpr = Math.min(2, window.devicePixelRatio || 1)
-  w = rect.width
-  h = rect.height
-  c.width = Math.max(1, Math.round(w * dpr))
-  c.height = Math.max(1, Math.round(h * dpr))
-  const ctx = c.getContext('2d')
-  if (ctx) ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+function setSleep(minutes: number): void {
+  player.setSleep(minutes)
+  sleepOpen.value = false
+  ui.toast(minutes ? `已设置 ${minutes} 分钟后停止播放` : '已取消定时关闭', 'info', 1800)
 }
 
-function seedParticles(): void {
-  // 规格书 v2.7 · 1.5 / 0.3：桌面 200 / 平板 80 / 手机 50 / 车机 0（低性能再折半）
-  const count = particleCount()
-  if (!count) {
-    parts = []
-    return
-  }
-  parts = Array.from({ length: count }, () => ({
-    x: Math.random() * w,
-    y: Math.random() * h,
-    r: 0.8 + Math.random() * 2.6,
-    vx: (Math.random() - 0.5) * 0.18,
-    vy: -0.12 - Math.random() * 0.35,
-    a: 0.12 + Math.random() * 0.55,
-    hue: Math.random() > 0.5 ? 340 : 268,
-  }))
+function openEq(): void {
+  eqOpen.value = true
 }
-
-function draw(): void {
-  const c = canvas.value
-  const ctx = c?.getContext('2d')
-  if (!c || !ctx) return
-  ctx.clearRect(0, 0, w, h)
-  ctx.globalCompositeOperation = 'lighter'
-  const accent = ui.accent
-  for (const p of parts) {
-    p.x += p.vx
-    p.y += p.vy
-    if (p.y < -10) {
-      p.y = h + 10
-      p.x = Math.random() * w
-    }
-    if (p.x < -10) p.x = w + 10
-    if (p.x > w + 10) p.x = -10
-    const pulse = player.playing ? 1 + Math.sin(performance.now() / 520 + p.x) * 0.35 : 0.7
-    ctx.beginPath()
-    ctx.fillStyle = p.hue === 340 ? accent : '#a78bfa'
-    ctx.globalAlpha = p.a * 0.75
-    ctx.arc(p.x, p.y, p.r * pulse, 0, Math.PI * 2)
-    ctx.fill()
-  }
-  ctx.globalAlpha = 1
-  ctx.globalCompositeOperation = 'source-over'
-  raf = requestAnimationFrame(draw)
-}
-
-function startCanvas(): void {
-  stopCanvas()
-  if (!ui.settings.particle) return
-  if (player.stage !== 'particle' && player.stage !== 'stage') return
-  resizeCanvas()
-  if (!parts.length || w === 0) seedParticles()
-  raf = requestAnimationFrame(draw)
-}
-
-function stopCanvas(): void {
-  if (raf) cancelAnimationFrame(raf)
-  raf = 0
-  const c = canvas.value
-  const ctx = c?.getContext('2d')
-  if (ctx) ctx.clearRect(0, 0, c!.width, c!.height)
-}
-
-watch(
-  () => [player.stage, ui.settings.particle, player.playing],
-  () => {
-    if (player.stage === 'particle' || player.stage === 'stage') startCanvas()
-    else stopCanvas()
-  }
-)
-
-let ro: ResizeObserver | null = null
 
 onMounted(() => {
-  if (canvas.value) {
-    ro = new ResizeObserver(() => {
-      resizeCanvas()
-      parts = []
-    })
-    ro.observe(canvas.value)
-  }
-  startCanvas()
-  syncWallpaperTimer()
-  if (isDesktop) {
-    void call<WallpaperItem[]>('wallpaper:list')
-      .then(list => {
-        wallpapers.value = Array.isArray(list) ? list : []
-      })
-      .catch(() => {
-        /* 移动端或无 IPC 环境下忽略，退回 playerWallpaper */
-      })
-  }
+  if (!player.song && player.state.queue.length) void player.playAt(0)
 })
 
 onBeforeUnmount(() => {
-  stopCanvas()
-  ro?.disconnect()
-  if (wallpaperTimer) {
-    clearInterval(wallpaperTimer)
-    wallpaperTimer = null
-  }
+  queueOpen.value = false
 })
 
-function back(): void {
-  if (window.history.length > 1) router.back()
-  else router.push('/')
-}
-
-/* 舞台切换手势：右上角按钮在 Windows 上可能被窗口控制区遮挡，
-   左右滑动页面或点击页面左右边缘即可切换（从按钮/滑杆上起手的不触发）。 */
-function cycleStage(dir: 1 | -1): void {
-  const i = stages.findIndex(s => s.key === player.stage)
-  const next = stages[(i + dir + stages.length) % stages.length]
-  player.setStage(next.key)
-  ui.toast(`已切换到${next.label}`, 'info', 1400)
-}
-let gX = 0
-let gY = 0
-let gT = 0
-function onGestureStart(e: PointerEvent): void {
-  if ((e.target as HTMLElement).closest('button, input, a, .slider, canvas')) return
-  gX = e.clientX
-  gY = e.clientY
-  gT = Date.now()
-}
-function onGestureEnd(e: PointerEvent): void {
-  if (!gT) return
-  const dx = e.clientX - gX
-  const dy = e.clientY - gY
-  const dt = Date.now() - gT
-  gT = 0
-  if (dt > 800) return
-  if (Math.abs(dx) > 60 && Math.abs(dx) > Math.abs(dy) * 1.5) {
-    cycleStage(dx < 0 ? 1 : -1)
-    return
+watch(
+  () => player.stage,
+  s => {
+    if (s === 'lyrics') lyricsVisible.value = true
   }
-  if (Math.abs(dx) < 10 && Math.abs(dy) < 10) {
-    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
-    if (e.clientX - rect.left < 48) cycleStage(-1)
-    else if (rect.right - e.clientX < 48) cycleStage(1)
-  }
-}
+)
 </script>
 
 <template>
-  <!-- 规格书 v2.7 · 1.1：车机横屏大字布局，其余端用标准播放页 -->
   <CarPlayer v-if="car" />
-  <div
-    v-else
-    class="player"
-    :class="`stage-${player.stage}`"
-    :style="{ '--sw-blur': `${platform.blur}px` }"
-    @pointerdown="onGestureStart"
-    @pointerup="onGestureEnd"
-  >
-    <!-- 背景：模糊封面 / 动态渐变 / 壁纸 / 纯色（设置 → 播放页背景） -->
-    <div class="bg-layer" :class="`bg-${bgMode}`">
-      <!-- 兜底氛围层在图片之下，图片才不会被盖住 -->
-      <div v-if="bgMode !== 'solid'" class="bg-fallback" />
-      <img v-if="bgMode === 'cover' && player.coverUrl" :src="player.coverUrl" class="bg-img" alt="" />
-      <img v-else-if="bgMode === 'wallpaper' && wallpaperSrc" :src="wallpaperSrc" class="bg-img bg-wall" :style="wallpaperStyle" alt="" />
-      <div v-if="bgMode === 'gradient'" class="bg-flow">
-        <span /><span /><span /><span />
-      </div>
-      <div class="bg-mask" />
-      <!-- 壁纸模式：遮罩浓度与色调叠加都由设置控制 -->
-      <div v-if="bgMode === 'wallpaper'" class="bg-wall-mask" :style="{ opacity: ui.settings.wallpaperMask }" />
-      <div
-        v-if="bgMode === 'wallpaper' && ui.settings.wallpaperTint"
-        class="bg-tint"
-        :style="{ background: ui.settings.wallpaperTint }"
-      />
-    </div>
 
-    <!-- 顶栏 -->
-    <header class="p-head drag">
-      <button class="icon-btn no-drag" title="收起" @click="back"><Icon name="chevron-down" :size="22" /></button>
-      <div class="p-head-mid">
-        <span class="p-kicker">正在播放</span>
-        <span class="p-source ellipsis">
-          {{ song ? song.singer : '星河音乐' }}
-          <span v-if="player.lyric?.source" class="lyric-src">· 歌词来自{{ player.lyric.source }}</span>
-        </span>
+  <div v-else class="player" :class="kind">
+    <!-- 背景（规格书 1.2：封面 blur(30px) brightness(.4) + 50% 黑遮罩） -->
+    <div
+      class="bg"
+      :style="cover ? { backgroundImage: `url(${cover})`, filter: `blur(${platform.blur}px) brightness(.4)` } : undefined"
+    />
+    <div class="veil" />
+
+    <ParticleField v-if="stage === 'particle'" :count="particleCount()" :enabled="true" />
+    <SpectrumBars v-if="stage === 'stage'" placement="bottom" />
+
+    <header class="top">
+      <button class="ghost" aria-label="返回" @click="router.back()">
+        <Icon name="shrink" :size="18" />
+      </button>
+      <div class="tmeta">
+        <b>{{ song?.name || '未在播放' }}</b>
+        <span>{{ song?.singer || '星河音乐' }}</span>
       </div>
-      <div class="p-head-actions no-drag">
-        <button class="stage-btn" :class="{ active: player.stage === 'cover' }" title="封面" @click="player.setStage('cover')">
-          <Icon name="disc" :size="15" /><span>封面</span>
+      <div class="tactions">
+        <button class="pill" :class="{ on: stage === 'lyrics' }" @click="cycleVisual">
+          <Icon :name="stageIcon" :size="15" />
+          <span>{{ stageLabel }}</span>
         </button>
-        <button class="stage-btn" :class="{ active: player.stage === 'lyrics' }" title="歌词" @click="player.setStage('lyrics')">
-          <Icon name="lyric" :size="15" /><span>歌词</span>
+        <button class="ghost" :class="{ on: lyricsVisible }" aria-label="歌词面板" @click="toggleLyricsPanel">
+          <Icon name="lyric" :size="17" />
         </button>
-        <button class="stage-btn" :class="{ active: player.stage === 'particle' }" title="粒子" @click="player.setStage('particle')">
-          <Icon name="sparkles" :size="15" /><span>粒子</span>
+        <button class="ghost" aria-label="播放队列" @click="queueOpen = !queueOpen">
+          <Icon name="queue" :size="17" />
         </button>
-        <button class="stage-btn" :class="{ active: player.stage === 'stage' }" title="舞台频谱" @click="player.setStage('stage')">
-          <Icon name="sliders" :size="15" /><span>频谱</span>
+        <button class="ghost" aria-label="音效" @click="openEq">
+          <Icon name="sliders" :size="17" />
+        </button>
+        <button class="ghost" aria-label="桌面歌词" @click="ui.patch({ showDesktopLyric: !ui.settings.showDesktopLyric })">
+          <Icon name="quote" :size="17" />
         </button>
       </div>
-      <!-- Windows 右上角悬浮窗口控制按钮（约 138px），让位避免遮挡 stage 按钮 -->
-      <div v-if="isWin" class="win-ctl-area no-drag" aria-hidden="true" />
     </header>
 
-    <!-- 主体 -->
-    <main class="p-body" :class="`body-${player.stage}`">
-      <section class="left" :class="`left-${player.stage}`">
-        <div class="stage-wrap" :class="`wrap-${player.stage}`">
-          <canvas ref="canvas" class="particles" />
-          <SpectrumBars v-if="player.stage === 'stage'" placement="bottom" />
-          <div class="glow" />
-          <div class="vinyl-wrap" :class="{ spinning: player.playing }">
-            <div class="vinyl">
-              <div class="grooves" />
-              <div class="label">
-                <Cover :src="player.coverUrl || song?.pic || ''" :alt="song?.name || '星河'" size="100%" round cover="1" />
-              </div>
-              <div class="hole" />
-            </div>
-          </div>
-        </div>
+    <main class="main" :class="{ split: lyricsVisible }">
+      <section class="left">
+        <CoverStage
+          :kind="kind"
+          :cover="cover"
+          :name="song?.name || ''"
+          :singer="song?.singer || ''"
+          :playing="player.playing"
+          :visible="stage !== 'lyrics'"
+          @tap="setStage(stage === 'lyrics' ? 'cover' : 'lyrics')"
+        />
 
-        <div class="song-info">
-          <h1 class="ellipsis">{{ song?.name || '未在播放' }}</h1>
-          <p class="ellipsis">
-            {{ song?.singer || '在星河里，找到属于你的声音' }}
-            <span v-if="song?.album" class="album"> · {{ song.album }}</span>
-          </p>
-          <div class="tags">
-            <span v-if="song" class="pill">{{ songSourceLabel(song) }}</span>
-            <span v-if="song?.localPath" class="pill">本地文件</span>
-            <span v-if="player.lyric?.hasWordByWord" class="pill">逐字歌词</span>
-            <span v-if="player.state.status === 'loading'" class="pill loading">缓冲中…</span>
-            <span v-if="player.state.error" class="pill error">{{ player.state.error }}</span>
-          </div>
-        </div>
-      </section>
-
-      <section class="right" :class="`right-${player.stage}`">
-        <Transition name="stage-fade" mode="out-in">
-        <div v-if="!hasLyric" class="lyric-empty" key="empty">
-          <Icon name="lyric" :size="30" :stroke="1.3" />
-          <div class="empty-title">{{ player.lyricLoading ? '正在匹配歌词…' : '暂无歌词' }}</div>
-          <div class="empty-desc">
-            {{ player.lyricLoading ? '从音源与平台曲库中检索中' : '该歌曲暂未找到歌词，你仍可以继续欣赏音乐' }}
-          </div>
-          <button v-if="!player.lyricLoading && song" class="btn sm" style="margin-top: 6px" @click="player.reloadLyric()">
-            <Icon name="refresh" :size="13" />重新匹配歌词
+        <div class="meta">
+          <h1>{{ song?.name || '未在播放' }}</h1>
+          <p>{{ song?.singer || '—' }}</p>
+          <button class="like" :class="{ on: liked }" aria-label="收藏" @click="toggleLike">
+            <Icon :name="liked ? 'heart-filled' : 'heart'" :size="17" />
           </button>
         </div>
 
-        <div v-else ref="lyricBox" class="lyrics" :style="{ fontSize: ui.settings.lyricFontSize + 'px' }" key="lyrics">
-          <div class="lyric-inner">
-            <div
-              v-for="(line, i) in lines"
-              :key="i"
-              class="line"
-              :class="{ active: i === activeIndex, near: Math.abs(i - activeIndex) === 1 }"
-              :data-idx="i"
-              @click="seekLine(line)"
-            >
-              <div class="line-main">
-                <span v-if="line.words && i === activeIndex" class="word-line">
-                  <span
-                    v-for="(wd, wi) in line.words"
-                    :key="wi"
-                    class="word"
-                    :class="{ on: (player.displayPosition + offsetSec) * 1000 >= wd.t }"
-                    >{{ wd.w }}</span
-                  >
-                </span>
-                <span v-else>{{ line.text || '♪' }}</span>
-              </div>
-              <div v-if="line.trans" class="line-trans">{{ line.trans }}</div>
-            </div>
-            <div class="lyric-pad" />
-          </div>
-        </div>
-        </Transition>
+        <ProgressBar
+          class="progress"
+          :position="player.displayPosition"
+          :duration="player.duration"
+          variant="desktop"
+          accent="#a78bfa"
+          @seek="player.seekTo"
+        />
+
+        <TransportBar
+          class="transport"
+          :playing="player.playing"
+          variant="desktop"
+          :mode-label="player.modeLabel"
+          :mode-icon="modeIcon"
+          @prev="player.prev()"
+          @next="player.next()"
+          @toggle="player.toggle()"
+          @cycle-mode="player.cycleMode()"
+          @queue="queueOpen = !queueOpen"
+        />
+
+        <FunctionBar
+          class="functions"
+          variant="desktop"
+          :rate="player.state.rate"
+          :stage-label="stageLabel"
+          :stage-icon="stageIcon"
+          :stage-active="stage !== 'cover'"
+          :eq-active="eqOpen"
+          :sleep-on="player.sleepUntil > 0"
+          @eq="openEq"
+          @rate="player.cycleRate()"
+          @visual="cycleVisual()"
+          @sleep="openSleep()"
+        />
       </section>
+
+      <aside v-if="lyricsVisible" class="right">
+        <div class="lyric-head">LYRICS</div>
+        <LyricsPane
+          class="lyric-pane"
+          :lines="lyric.lines.value"
+          :active-index="lyric.activeIndex.value"
+          variant="desktop"
+          @seek="player.seekTo"
+        />
+      </aside>
     </main>
 
-    <!-- 底部控制 -->
-    <footer class="p-foot">
-      <div class="progress-row">
-        <span class="time mono">{{ formatTime(displayPos) }}</span>
-        <Slider
-          class="p-progress"
-          :model-value="displayPos"
-          :max="player.duration || 1"
-          :step="0.5"
-          :buffered="player.state.buffered"
-          @update:model-value="v => { dragging = true; dragValue = v }"
-          @change="onSeek"
-        />
-        <span class="time mono">{{ formatTime(player.duration) }}</span>
-      </div>
-
-      <div class="controls">
-        <div class="side">
-          <button class="icon-btn" :title="player.modeLabel" @click="player.cycleMode()">
-            <Icon :name="modeIcon" :size="18" />
-          </button>
-          <button class="icon-btn" :class="{ liked }" :title="liked ? '取消喜欢' : '喜欢'" @click="song && library.toggleFavorite(song)">
-            <Icon :name="liked ? 'heart-filled' : 'heart'" :size="18" />
-          </button>
-        </div>
-
-        <div class="center">
-          <button class="icon-btn big" title="上一首" @click="player.prev()"><Icon name="prev" :size="26" /></button>
-          <button class="main-play" :disabled="!song" @click="player.toggle()">
-            <Icon :name="player.playing ? 'pause' : 'play'" :size="28" />
-          </button>
-          <button class="icon-btn big" title="下一首" @click="player.next()"><Icon name="next" :size="26" /></button>
-        </div>
-
-        <div class="side right-side">
-          <button class="quality" @click="player.setQuality(player.state.quality === '320k' ? 'flac' : player.state.quality === 'flac' ? '128k' : '320k')">
-            {{ qualityLabel() }}
-          </button>
-          <div class="vol">
-            <button class="icon-btn" :title="player.state.muted ? '取消静音' : '静音'" @click="player.toggleMute()">
-              <Icon :name="player.state.muted ? 'volume-mute' : player.state.volume < 0.45 ? 'volume-low' : 'volume'" :size="18" />
-            </button>
-            <Slider
-              class="vol-slider"
-              :model-value="player.state.muted ? 0 : player.state.volume"
-              :max="1"
-              :step="0.01"
-              @change="v => player.setVolume(v)"
-            />
+    <!-- 队列 -->
+    <div v-if="queueOpen" class="mask" @click.self="queueOpen = false">
+      <div class="panel">
+        <header class="phead">
+          <b>播放队列 · {{ player.state.queue.length }}</b>
+          <div class="pacts">
+            <button class="txt" @click="player.clearQueue()">清空</button>
+            <button class="txt" @click="queueOpen = false">关闭</button>
           </div>
-          <button class="icon-btn" title="播放队列" @click="player.queueOpen = !player.queueOpen">
-            <Icon name="queue" :size="18" />
+        </header>
+        <div class="qlist">
+          <button
+            v-for="(s, i) in player.state.queue"
+            :key="s.id + i"
+            class="qrow"
+            :class="{ on: i === player.state.index }"
+            @click="player.playAt(i)"
+          >
+            <span class="qno">{{ i + 1 }}</span>
+            <span class="qt">{{ s.name }}</span>
+            <span class="qs">{{ s.singer }}</span>
           </button>
-          <button class="icon-btn" title="更多" @click="openMenu"><Icon name="more" :size="18" /></button>
         </div>
       </div>
-    </footer>
+    </div>
 
-    <Menu v-if="menu" :x="menu.x" :y="menu.y" :items="menuItems" @select="onMenuSelect" @close="menu = null" />
-
-    <!-- 规格书 v2.7 · 1.11：桌面为右侧抽屉 -->
-    <Transition name="eq-fade">
-      <div v-if="eqOpen" class="eq-mask" @click.self="eqOpen = false">
-        <div class="eq-drawer">
-          <EqPanel @close="eqOpen = false" />
+    <!-- 定时关闭 -->
+    <div v-if="sleepOpen" class="mask" @click.self="sleepOpen = false">
+      <div class="panel small">
+        <header class="phead">
+          <b>定时关闭</b>
+          <button class="txt" @click="sleepOpen = false">关闭</button>
+        </header>
+        <div class="sleep-grid">
+          <button v-for="m in [15, 30, 60, 90]" :key="m" class="txt" @click="setSleep(m)">{{ m }} 分钟</button>
+          <button class="txt" @click="setSleep(0)">取消定时</button>
         </div>
       </div>
-    </Transition>
+    </div>
+
+    <EqPanel v-if="eqOpen" @close="eqOpen = false" />
   </div>
 </template>
 
@@ -585,774 +261,253 @@ function onGestureEnd(e: PointerEvent): void {
   inset: 0;
   display: flex;
   flex-direction: column;
+  background: #0b0b10;
+  color: #ececf1;
   overflow: hidden;
-  color: #f4f6fb;
-  background: #0a0b10;
-  /* 隔离层：bg-flow 用了 mix-blend-mode: screen，没有 isolation 时混合会溢出到
-     页面根，和下层内容一起参与混合，视觉上就是「透」。 */
-  isolation: isolate;
-  animation: playerIn 0.36s var(--ease);
 }
-@keyframes playerIn {
-  /* 只动 transform，不动 opacity：入场时整页半透明会露出下层页面文字 */
-  from {
-    transform: translateY(18px) scale(0.995);
-  }
-}
-.bg-layer {
+.bg {
   position: absolute;
-  inset: 0;
-  z-index: 0;
-}
-/* 注意分层：bg-img 必须显式定位并给 z-index，否则会被后面的 absolute 层（兜底/遮罩）盖住 */
-.bg-img {
-  position: absolute;
-  inset: 0;
-  z-index: 1;
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  /* 规格书 v2.7 · 1.2：桌面封面背景 blur(30px) brightness(.4)，平板 12px，手机 0 */
-  filter: blur(var(--sw-blur, 30px)) saturate(1.5) brightness(0.4);
-  transform: scale(1.2);
-  transition: opacity 0.6s;
-}
-/* 壁纸：保留图片可辨识度，只轻度压暗，避免糊成一片 */
-.bg-wall {
-  filter: brightness(0.85) saturate(1.1);
+  inset: -8%;
+  background: #13131b center/cover no-repeat;
   transform: scale(1.06);
+  transition: opacity 300ms ease;
 }
-/* 动态渐变：四个色团缓慢漂移，纯 CSS 不占主线程 */
-.bg-flow {
-  position: absolute;
-  inset: -20%;
-  z-index: 1;
-  filter: blur(60px);
-}
-.bg-flow span {
-  position: absolute;
-  width: 55%;
-  height: 55%;
-  border-radius: 50%;
-  opacity: 0.85;
-  mix-blend-mode: screen;
-  animation: bgDrift 22s ease-in-out infinite alternate;
-}
-.bg-flow span:nth-child(1) {
-  top: 0;
-  left: 0;
-  background: color-mix(in srgb, var(--accent) 70%, transparent);
-}
-.bg-flow span:nth-child(2) {
-  top: 10%;
-  right: 0;
-  background: #5a3cff;
-  animation-duration: 27s;
-  animation-delay: -6s;
-}
-.bg-flow span:nth-child(3) {
-  bottom: 0;
-  left: 15%;
-  background: #00b7c7;
-  animation-duration: 31s;
-  animation-delay: -13s;
-}
-.bg-flow span:nth-child(4) {
-  bottom: 5%;
-  right: 10%;
-  background: color-mix(in srgb, var(--accent) 45%, #ffb347);
-  animation-duration: 19s;
-  animation-delay: -3s;
-}
-@keyframes bgDrift {
-  0% {
-    transform: translate3d(0, 0, 0) scale(1);
-  }
-  50% {
-    transform: translate3d(8%, 12%, 0) scale(1.18);
-  }
-  100% {
-    transform: translate3d(-10%, -8%, 0) scale(0.92);
-  }
-}
-/* 无封面兜底：随主题色微调的氛围渐变（垫底，被封面盖住才对） */
-.bg-fallback {
+.veil {
   position: absolute;
   inset: 0;
-  z-index: 0;
-  background:
-    radial-gradient(90% 70% at 25% 15%, color-mix(in srgb, var(--accent) 28%, transparent), transparent 60%),
-    radial-gradient(80% 80% at 80% 85%, rgba(124, 108, 255, 0.22), transparent 65%),
-    linear-gradient(160deg, #141622, #0a0b10);
+  background: rgba(0, 0, 0, 0.5);
 }
-/* 遮罩：在保留封面色彩的同时保证文字对比度。
-   浅色封面（白底专辑图）下，白色歌词会直接糊进背景——这层基础压暗是必需品。 */
-.bg-mask {
-  position: absolute;
-  inset: 0;
-  z-index: 2;
-  background:
-    radial-gradient(120% 80% at 18% 20%, rgba(255, 77, 109, 0.12), transparent 55%),
-    radial-gradient(100% 90% at 85% 80%, rgba(120, 80, 255, 0.14), transparent 60%),
-    linear-gradient(180deg, rgba(6, 8, 14, 0.44), rgba(6, 8, 14, 0.66)),
-    rgba(6, 8, 14, 0.1);
-}
-/* 壁纸遮罩：浓度由设置项 wallpaperMask 控制，保证浅色壁纸上的文字可读 */
-.bg-wall-mask {
-  position: absolute;
-  inset: 0;
-  z-index: 2;
-  background: #06080e;
-  pointer-events: none;
-  transition: opacity 0.3s var(--ease);
-}
-/* 色调叠加：可选，给壁纸统一染色 */
-.bg-tint {
-  position: absolute;
-  inset: 0;
-  z-index: 2;
-  opacity: 0.18;
-  pointer-events: none;
-  mix-blend-mode: overlay;
-}
-
-.p-head {
+.top {
   position: relative;
   z-index: 3;
-  height: 56px;
-  flex: none;
   display: flex;
   align-items: center;
-  gap: 14px;
+  gap: 12px;
+  height: 56px;
   padding: 0 20px;
 }
-.p-head .icon-btn {
-  color: rgba(255, 255, 255, 0.7);
-}
-.p-head .icon-btn:hover {
-  color: #fff;
-  background: rgba(255, 255, 255, 0.1);
-}
-.p-head-mid {
-  display: flex;
-  flex-direction: column;
-  line-height: 1.3;
+.tmeta {
+  flex: 1;
   min-width: 0;
 }
-.p-kicker {
-  font-size: 9.5px;
-  letter-spacing: 2px;
-  color: rgba(255, 255, 255, 0.45);
-  text-transform: uppercase;
+.tmeta b {
+  display: block;
+  font-size: 13px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.p-source {
-  font-size: 12px;
-  color: rgba(255, 255, 255, 0.75);
-  max-width: 46vw;
+.tmeta span {
+  display: block;
+  font-size: 11px;
+  color: #9b9ba8;
 }
-.lyric-src {
-  color: rgba(255, 255, 255, 0.35);
-  font-size: 10.5px;
-}
-.p-head-actions {
-  margin-left: auto;
+.tactions {
   display: flex;
-  gap: 4px;
-  padding: 3px;
-  border-radius: 11px;
-  background: rgba(255, 255, 255, 0.06);
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  align-items: center;
+  gap: 8px;
 }
-.stage-btn {
+.ghost {
+  width: 32px;
+  height: 32px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: #ececf1;
+  cursor: pointer;
+}
+.ghost:hover,
+.ghost.on {
+  background: rgba(255, 255, 255, 0.1);
+}
+.pill {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
-  height: 26px;
-  padding: 0 9px;
-  border-radius: 8px;
-  font-size: 11px;
-  color: rgba(255, 255, 255, 0.6);
-  transition: all 0.18s;
+  gap: 6px;
+  height: 30px;
+  padding: 0 12px;
+  border: 1px solid #262633;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.05);
+  color: #ececf1;
+  font-size: 12px;
+  cursor: pointer;
 }
-.stage-btn:hover {
-  color: #fff;
-  background: rgba(255, 255, 255, 0.08);
+.pill.on {
+  border-color: #a78bfa;
+  color: #a78bfa;
 }
-.stage-btn.active {
-  color: #fff;
-  background: var(--accent);
-  box-shadow: 0 4px 12px -4px var(--accent);
-}
-.win-ctl-area {
-  width: 138px;
-  height: 100%;
-  flex: none;
-}
-
-.p-body {
+.main {
   position: relative;
   z-index: 2;
   flex: 1;
   min-height: 0;
   display: grid;
-  /* 规格书 v2.7 · 1.1：桌面两栏，右栏歌词固定 280px */
-  grid-template-columns: minmax(360px, 1fr) 280px;
-  gap: 30px;
-  padding: 4px 46px 0;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 24px;
+  padding: 8px 28px 24px;
 }
-
-/* ============ 舞台差异（v2.3.4 重构：此前 4 个 stage 类无任何样式，
-   切换时视觉几乎无差别，只剩「延迟」体感） ============ */
-
-/* 歌词舞台：封面居中偏上，歌词大字居右 */
-.body-lyrics .stage-wrap {
-  width: min(340px, 28vw);
-}
-.body-lyrics .vinyl {
-  box-shadow: 0 26px 70px rgba(0, 0, 0, 0.55);
-}
-
-/* 粒子舞台：封面缩小让位给粒子，歌词整体降一档 */
-.body-particle .stage-wrap {
-  width: min(280px, 23vw);
-}
-.body-particle .glow {
-  width: 96%;
-  height: 96%;
-  filter: blur(46px);
-  opacity: 0.85;
-}
-.body-particle .right .lyrics {
-  height: min(430px, 46vh);
-}
-.body-particle .right .line.active {
-  font-size: 1.16em;
-}
-
-/* 电影镜头：封面横移靠左 + 影院黑边，歌词偏暗 */
-.body-cinema {
-  grid-template-columns: minmax(300px, 0.8fr) minmax(420px, 1.2fr);
-}
-.body-cinema .stage-wrap {
-  width: min(320px, 26vw);
-}
-.body-cinema .glow {
-  width: 68%;
-  height: 68%;
-  filter: blur(52px);
-  opacity: 0.55;
-}
-.body-cinema .right .lyrics {
-  height: min(380px, 42vh);
-  opacity: 0.86;
-}
-.body-cinema .right .line.active {
-  font-size: 1.2em;
-}
-
-/* 播客 / DJ：封面缩小居顶，波形条为主视觉，右侧换成播客面板 */
-.body-podcast {
-  grid-template-columns: minmax(320px, 0.85fr) minmax(380px, 1.15fr);
-}
-.body-podcast .stage-wrap {
-  width: min(210px, 17vw);
-  margin-bottom: 4px;
-}
-.body-podcast .vinyl {
-  opacity: 0.9;
-}
-.body-podcast .glow {
-  width: 110%;
-  height: 110%;
-  filter: blur(60px);
-  opacity: 0.5;
-}
-.body-podcast .right {
-  align-items: center;
-}
-
-/* 舞台切换过渡：淡入淡出 + 轻微位移，避免生硬跳变 */
-.stage-fade-enter-active,
-.stage-fade-leave-active {
-  transition: opacity 0.22s ease, transform 0.22s ease;
-}
-.stage-fade-enter-from {
-  opacity: 0;
-  transform: translateY(10px);
-}
-.stage-fade-leave-to {
-  opacity: 0;
-  transform: translateY(-8px);
-}
-
-/* 主体在切换时的整体过渡，让「变化」可感知 */
-.p-body,
-.left,
-.right,
-.stage-wrap {
-  transition: grid-template-columns 0.32s ease, width 0.32s ease, opacity 0.28s ease;
+.main.split {
+  grid-template-columns: minmax(0, 1fr) 280px;
 }
 .left {
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  min-width: 0;
+  gap: 14px;
+  min-height: 0;
 }
-.stage-wrap {
+.meta {
   position: relative;
-  width: min(360px, 30vw);
-  aspect-ratio: 1;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-.particles {
-  position: absolute;
-  inset: -18%;
-  width: 136%;
-  height: 136%;
-  pointer-events: none;
-}
-.glow {
-  position: absolute;
-  width: 78%;
-  height: 78%;
-  border-radius: 50%;
-  background: radial-gradient(circle, var(--accent-soft), transparent 65%);
-  filter: blur(30px);
-}
-.vinyl-wrap {
-  position: relative;
-  width: 100%;
-  height: 100%;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-.vinyl-wrap.cinema {
-  animation: cinema 22s ease-in-out infinite alternate;
-}
-@keyframes cinema {
-  0% {
-    transform: scale(1) translateY(0);
-  }
-  50% {
-    transform: scale(1.07) translateY(-6px);
-  }
-  100% {
-    transform: scale(1.03) translateX(5px);
-  }
-}
-.vinyl {
-  position: relative;
-  width: 100%;
-  height: 100%;
-  border-radius: 50%;
-  background: radial-gradient(circle at 50% 50%, #1a1a1f 0%, #08080a 62%, #141418 100%);
-  box-shadow: 0 30px 70px rgba(0, 0, 0, 0.65), inset 0 0 0 1px rgba(255, 255, 255, 0.06);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  animation: spin 26s linear infinite;
-  animation-play-state: paused;
-}
-.vinyl-wrap.spinning .vinyl {
-  animation-play-state: running;
-}
-@keyframes spin {
-  to {
-    transform: rotate(360deg);
-  }
-}
-.grooves {
-  position: absolute;
-  inset: 4%;
-  border-radius: 50%;
-  background: repeating-radial-gradient(circle at 50% 50%, rgba(255, 255, 255, 0.045) 0 1px, transparent 1px 5px);
-  opacity: 0.7;
-}
-.label {
-  width: 46%;
-  height: 46%;
-  border-radius: 50%;
-  overflow: hidden;
-  box-shadow: 0 0 0 8px rgba(255, 255, 255, 0.04), 0 10px 24px rgba(0, 0, 0, 0.55);
-}
-.hole {
-  position: absolute;
-  width: 12px;
-  height: 12px;
-  border-radius: 50%;
-  background: #0a0b10;
-  box-shadow: inset 0 0 0 2px rgba(255, 255, 255, 0.18);
-}
-.wave {
-  display: flex;
-  align-items: center;
-  gap: 3px;
-  height: 46px;
-  margin-top: -6px;
-}
-.wave span {
-  width: 3px;
-  border-radius: 3px;
-  background: linear-gradient(180deg, var(--accent), #a78bfa);
-  animation: wave 1.1s ease-in-out infinite alternate;
-}
-@keyframes wave {
-  from {
-    transform: scaleY(0.35);
-    opacity: 0.5;
-  }
-  to {
-    transform: scaleY(1);
-    opacity: 1;
-  }
-}
-.song-info {
   text-align: center;
-  margin-top: 22px;
-  max-width: 92%;
 }
-.song-info h1 {
-  font-size: 24px;
-  font-weight: 700;
-  letter-spacing: 0.3px;
+.meta h1 {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
 }
-.song-info p {
-  margin-top: 6px;
-  font-size: 12.5px;
-  color: rgba(255, 255, 255, 0.6);
+.meta p {
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: #9b9ba8;
 }
-.album {
-  color: rgba(255, 255, 255, 0.4);
+.like {
+  position: absolute;
+  right: -34px;
+  top: 2px;
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: #9b9ba8;
+  cursor: pointer;
 }
-.tags {
+.like.on {
+  color: #f472b6;
+}
+.progress {
+  width: min(560px, 100%);
+}
+.transport,
+.functions {
+  width: min(560px, 100%);
+}
+.right {
   display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-left: 1px solid rgba(255, 255, 255, 0.06);
+  padding-left: 20px;
+}
+.lyric-head {
+  font-size: 11px;
+  letter-spacing: 1.6px;
+  color: #63636f;
+  padding: 6px 0 10px;
+}
+.lyric-pane {
+  flex: 1;
+  min-height: 0;
+}
+.mask {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
   justify-content: center;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-top: 12px;
 }
-.pill {
-  padding: 2px 8px;
-  border-radius: 20px;
-  border: 1px solid rgba(255, 255, 255, 0.16);
-  font-size: 10px;
-  color: rgba(255, 255, 255, 0.65);
+.panel {
+  width: min(520px, 92vw);
+  max-height: 72vh;
+  overflow-y: auto;
+  border-radius: 16px;
+  background: #13131b;
+  border: 1px solid #262633;
+  padding: 14px 18px;
 }
-.pill.loading {
-  border-color: rgba(255, 200, 100, 0.4);
-  color: #ffd08a;
+.panel.small {
+  width: min(380px, 92vw);
 }
-.pill.error {
-  border-color: rgba(255, 120, 140, 0.5);
-  color: #ffb0bd;
-  max-width: 320px;
+.phead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-bottom: 10px;
+}
+.pacts {
+  display: flex;
+  gap: 8px;
+}
+.txt {
+  border: 1px solid #262633;
+  background: rgba(255, 255, 255, 0.04);
+  color: #ececf1;
+  font-size: 12px;
+  padding: 6px 12px;
+  border-radius: 999px;
+  cursor: pointer;
+}
+.qlist {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.qrow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 36px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: #ececf1;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+.qrow:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+.qrow.on {
+  color: #a78bfa;
+}
+.qno {
+  width: 18px;
+  color: #63636f;
+  font-variant-numeric: tabular-nums;
+}
+.qt {
+  flex: 1;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-
-.right {
-  position: relative;
-  min-width: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 10px 0;
-}
-.lyrics {
-  width: 100%;
-  height: min(520px, 56vh);
-  overflow-y: auto;
-  scrollbar-width: none;
-  mask-image: linear-gradient(180deg, transparent, #000 12%, #000 84%, transparent);
-  -webkit-mask-image: linear-gradient(180deg, transparent, #000 12%, #000 84%, transparent);
-}
-.lyrics::-webkit-scrollbar {
-  display: none;
-}
-.lyric-inner {
-  padding: 42% 8px;
-}
-.line {
-  padding: 9px 6px;
-  border-radius: 8px;
-  font-size: 1em;
-  line-height: 1.6;
-  /* 未播放行太淡会在浅色封面上消失，0.5 是可读与层次感的平衡点 */
-  color: rgba(255, 255, 255, 0.5);
-  text-align: left;
-  cursor: pointer;
-  transition: color 0.24s, transform 0.24s, font-size 0.24s;
-  transform-origin: left center;
-}
-.line:hover {
-  color: rgba(255, 255, 255, 0.78);
-}
-.line.near {
-  color: rgba(255, 255, 255, 0.68);
-}
-.line.active {
-  color: #fff;
-  font-size: 1.32em;
-  font-weight: 650;
-  transform: scale(1.02);
-}
-.line.active .line-main {
-  text-shadow: 0 4px 24px var(--accent-soft);
-}
-.line-trans {
-  font-size: 0.72em;
-  color: rgba(255, 255, 255, 0.4);
-  margin-top: 3px;
-  font-weight: 400;
-}
-.word {
-  transition: color 0.18s;
-}
-.word.on {
-  color: var(--accent);
-}
-.lyric-pad {
-  height: 40vh;
-}
-.lyric-empty {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 8px;
-  color: rgba(255, 255, 255, 0.45);
-  text-align: center;
-}
-.lyric-empty .empty-title {
-  font-size: 14px;
-  color: rgba(255, 255, 255, 0.8);
-}
-.lyric-empty .empty-desc {
-  font-size: 12px;
-  max-width: 320px;
-  line-height: 1.7;
-}
-.podcast-panel {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 14px;
-  color: rgba(255, 255, 255, 0.6);
-  text-align: center;
-}
-.podcast-badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  padding: 6px 12px;
-  border-radius: 20px;
-  background: rgba(255, 255, 255, 0.08);
-  font-size: 12px;
-  color: #fff;
-}
-.podcast-bars {
-  display: flex;
-  align-items: flex-end;
-  gap: 4px;
-  height: 90px;
-  margin-top: 8px;
-}
-.podcast-bars span {
-  width: 4px;
-  height: 30px;
-  border-radius: 3px;
-  background: linear-gradient(180deg, var(--accent), #a78bfa);
-  animation: wave 1.3s ease-in-out infinite alternate;
-}
-
-.p-foot {
-  position: relative;
-  z-index: 3;
-  flex: none;
-  padding: 6px 46px 22px;
-}
-.progress-row {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-}
-.p-progress {
-  flex: 1;
-}
-.time {
+.qs {
+  color: #9b9ba8;
   font-size: 11px;
-  color: rgba(255, 255, 255, 0.5);
-  min-width: 40px;
-  text-align: center;
 }
-.controls {
+.sleep-grid {
   display: grid;
-  grid-template-columns: 1fr auto 1fr;
-  align-items: center;
-  margin-top: 4px;
-}
-.side {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-}
-.right-side {
-  justify-content: flex-end;
-}
-.center {
-  display: flex;
-  align-items: center;
-  gap: 16px;
-}
-.icon-btn {
-  color: rgba(255, 255, 255, 0.62);
-}
-.icon-btn:hover {
-  color: #fff;
-  background: rgba(255, 255, 255, 0.1);
-}
-.icon-btn.big {
-  width: 46px;
-  height: 46px;
-}
-.icon-btn.liked {
-  color: var(--accent);
-}
-.main-play {
-  width: 62px;
-  height: 62px;
-  border-radius: 50%;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: #fff;
-  color: #14161d;
-  box-shadow: 0 14px 34px rgba(0, 0, 0, 0.45);
-  transition: transform 0.16s, background 0.16s;
-}
-.main-play:hover {
-  transform: scale(1.04);
-  background: var(--accent);
-  color: #fff;
-}
-.main-play:active {
-  transform: scale(0.96);
-}
-.main-play:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-.quality {
-  height: 24px;
-  padding: 0 9px;
-  border-radius: 6px;
-  border: 1px solid rgba(255, 255, 255, 0.2);
-  color: rgba(255, 255, 255, 0.7);
-  font-size: 10px;
-  font-weight: 600;
-  letter-spacing: 0.4px;
-  margin-right: 6px;
-}
-.quality:hover {
-  color: #fff;
-  border-color: #fff;
-}
-.vol {
-  display: flex;
-  align-items: center;
-  gap: 2px;
-}
-.vol-slider {
-  width: 76px;
-}
-/* 播放页浮在封面/壁纸之上：滑轨加亮 + 描边，避免与背景同色看不清 */
-.vol-slider :deep(.slider-track) {
-  height: 5px;
-  background: rgba(200, 208, 226, 0.62);
-  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.45), 0 1px 4px rgba(0, 0, 0, 0.5);
-}
-.vol-slider :deep(.slider-fill) {
-  background: linear-gradient(90deg, #ffffff, var(--accent));
-}
-.vol-slider:hover :deep(.slider-track) {
-  background: rgba(226, 232, 245, 0.8);
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
 }
 @media (max-width: 1120px) {
-  .p-body {
-    grid-template-columns: 1fr;
-    gap: 10px;
-    padding: 0 26px;
-    overflow-y: auto;
+  .main.split {
+    grid-template-columns: minmax(0, 1fr);
   }
-  .stage-wrap {
-    width: min(260px, 40vh);
-  }
-  /* 歌词区堆叠到唱片/歌名下方，窄屏与移动端才能看到歌词 */
   .right {
-    display: block;
-    padding: 0;
-  }
-  .lyrics {
-    height: min(460px, 52vh);
-  }
-  .lyric-inner {
-    padding: 20% 8px;
-  }
-  .p-foot {
-    padding: 4px 26px 16px;
-  }
-  .vol-slider {
     display: none;
   }
-  .stage-btn span {
-    display: none;
-  }
-}
-
-/* ============ 规格书 v2.7 · 1.2：桌面圆唱片 200px / 12s 一圈 / 中心 70px 封面 / 8px 黑边 ============ */
-.body-cover .stage-wrap,
-.body-stage .stage-wrap {
-  width: min(200px, 26vh);
-}
-.body-stage .stage-wrap {
-  margin-bottom: 26px;
-}
-.vinyl {
-  animation-duration: 12s;
-  box-shadow: 0 30px 70px rgba(0, 0, 0, 0.65), inset 0 0 0 8px rgba(4, 4, 6, 0.9);
-}
-.label {
-  width: 35%;
-  height: 35%;
-}
-
-/* 规格书 v2.7 · 1.11：桌面音效为右侧抽屉 */
-.eq-mask {
-  position: fixed;
-  inset: 0;
-  z-index: 70;
-  display: flex;
-  justify-content: flex-end;
-  background: rgba(0, 0, 0, 0.5);
-}
-.eq-drawer {
-  width: min(380px, 88vw);
-  height: 100%;
-  padding: 20px 18px;
-  background: #13131b;
-  border-left: 1px solid #262633;
-  overflow-y: auto;
-}
-.eq-fade-enter-active,
-.eq-fade-leave-active {
-  transition: opacity 0.18s ease;
-}
-.eq-fade-enter-from,
-.eq-fade-leave-to {
-  opacity: 0;
 }
 </style>

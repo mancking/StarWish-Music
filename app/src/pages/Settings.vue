@@ -2999,7 +2999,7 @@ kbd {
 .lf-field textarea {
   width: 100%;
   padding: 10px 12px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--line, #262633);
   border-radius: 10px;
   background: var(--bg-3);
   color: var(--text);

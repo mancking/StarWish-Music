@@ -54,17 +54,21 @@ app.whenReady().then(async () => {
   record('0.1 桌面端识别', plat.kind === 'desktop' && plat.w >= 1024, plat)
 
   const home = await js(`(() => ({
-    search: !!document.querySelector('.hero-search input'),
+    heroSearch: !!document.querySelector('.hero-search input'),
     brand: !!document.querySelector('.brand-card'),
     kicker: document.querySelector('.kicker') ? getComputedStyle(document.querySelector('.kicker')).fontSize : null,
     h1w: document.querySelector('.hero h1') ? getComputedStyle(document.querySelector('.hero h1')).fontWeight : null
   }))()`)
-  record('3.1 首页搜索框+品牌卡片', home.search && home.brand, home)
+  // 需求（m01415）：桌面问候语下方不再放搜索框，避免与顶栏搜索重复
+  record('3.1 首页无重复搜索框 + 品牌卡片', home.heroSearch === false && home.brand === true, home)
   await shot('v235-01-home')
 
   // 播放页：两栏 + 歌词栏（规格书 1.1/1.3）+ 四个视觉模式按钮（1.4）
   await js(`location.hash = '#/player'`)
   await wait(3000)
+  // 歌词栏只在「歌词」视觉模式下渲染，先切过去再量宽度
+  await js(`(() => { const b = [...document.querySelectorAll('.stage-btn')].find(x => x.innerText.trim() === '歌词'); if (b) b.click(); })()`)
+  await wait(600)
   const player = await js(`(() => {
     const root = document.querySelector('.player')
     const idxNode = document.querySelector('.lyrics')

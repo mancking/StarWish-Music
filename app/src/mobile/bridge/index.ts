@@ -153,6 +153,26 @@ async function httpGetText(url: string, timeoutMs = 8000): Promise<string> {
   }
 }
 
+/** 带自定义请求头的取文本：必须走原生网络栈，浏览器 fetch 不允许设置 Referer/UA */
+async function httpGetWithHeaders(
+  url: string,
+  headers: Record<string, string>,
+  timeoutMs = 10000
+): Promise<string> {
+  const r: any = await nativeCall('CapacitorHttp', 'request', {
+    url,
+    method: 'GET',
+    headers,
+    responseType: 'text',
+    connectTimeout: timeoutMs,
+    readTimeout: timeoutMs,
+  })
+  const status = Number(r?.status ?? 0)
+  const data = typeof r?.data === 'string' ? r.data : JSON.stringify(r?.data ?? '')
+  if (status >= 200 && status < 300 && data) return data
+  throw new Error(`HTTP ${status || 'ERR'}`)
+}
+
 /** 把 raw.githubusercontent 的插件地址改写成当前可用的镜像地址 */
 function mirrorOf(raw: string, base: string): string {
   const m = /^https:\/\/raw\.githubusercontent\.com\/([^/]+)\/([^/]+)\/([^/]+)\/(.+)$/.exec(raw)
@@ -558,16 +578,21 @@ const handlers: Record<string, Handler> = {
     return true
   },
 
-  /* ---- 视频离线缓存：移动端暂无视频离线能力，管理器诚实返回空列表 ---- */
-  'video:offline:list': () => ({ items: [], total: 0 }),
-  'video:offline:file': () => null,
-  'video:offline:save': async () => {
-    throw new Error('移动端暂不支持视频离线缓存')
-  },
-  'video:offline:remove': () => true,
-
   /* ---- 弹幕（规格书 2.x）：移动端直接拉 B 站 XML 弹幕并解析 ---- */
   'mv:danmaku': async ({ cid }: any) => await fetchDanmaku(String(cid || '')),
+  /* 视频离线缓存（规格书 1.12 / 2.x）：移动端把整片保存进系统视频库，并在本地留一份索引 */
+  'video:offline:file': () => null,
+  'video:offline:save': async ({ url, title }: any) => await saveVideoOffline(String(url || ''), title ? String(title) : ''),
+  'video:offline:list': () => {
+    const items = videoOfflineList()
+    return { items, total: items.reduce((n, v) => n + (v.size || 0), 0) }
+  },
+  'video:offline:remove': async ({ id }: any) => {
+    videoOfflineWrite(videoOfflineList().filter(v => v.id !== String(id)))
+    return true
+  },
+  'video:save': async ({ url, title }: any) => await saveVideoOffline(String(url || ''), title ? String(title) : ''),
+  'video:cache:release': () => true,
 
   /* ---- B 站 ---- */
   'bili:status': () => biliStatus(),
@@ -708,6 +733,59 @@ function bytesToBase64(bytes: Uint8Array): string {
   return btoa(bin)
 }
 
+/* ---------------- 视频离线缓存（移动端：整片写入系统视频库 + 本地索引） ---------------- */
+const VIDEO_OFFLINE_KEY = 'xinyuan_video_offline'
+/** 移动端离线缓存的索引条目 */
+interface VideoOffline {
+  id: string
+  title: string
+  uri: string
+  size: number
+  at: number
+}
+
+function videoOfflineList(): VideoOffline[] {
+  try {
+    const raw = localStorage.getItem(VIDEO_OFFLINE_KEY)
+    return raw ? (JSON.parse(raw) as VideoOffline[]) : []
+  } catch {
+    return []
+  }
+}
+
+function videoOfflineWrite(list: VideoOffline[]): void {
+  try {
+    localStorage.setItem(VIDEO_OFFLINE_KEY, JSON.stringify(list.slice(0, 60)))
+  } catch {
+    /* 配额不足时忽略：索引丢失不影响已保存的文件 */
+  }
+}
+
+/** 整片下载并写入系统视频库；超过 300MB 拒绝（避免把整段视频塞进内存） */
+async function saveVideoOffline(url: string, title: string): Promise<VideoOffline> {
+  if (!url) throw new Error('缺少视频地址')
+  const src = url.startsWith('/') ? url : `/swmedia/?u=${encodeURIComponent(url)}`
+  const res = await fetch(src)
+  if (!res.ok) throw new Error(`下载失败：HTTP ${res.status}`)
+  const total = Number(res.headers.get('content-length') || 0)
+  if (total > 300 * 1024 * 1024) throw new Error('视频超过 300MB，暂不支持离线缓存')
+  const all = new Uint8Array(await res.arrayBuffer())
+  const ret = await nativeCall('SwBridge', 'saveToMedia', {
+    name: `${dlSafeName(title || '视频')}.mp4`,
+    mime: 'video/mp4',
+    data: bytesToBase64(all),
+  })
+  const item: VideoOffline = {
+    id: `${Date.now()}`,
+    title: title || '视频',
+    uri: String(ret?.uri || ''),
+    size: all.byteLength,
+    at: Date.now(),
+  }
+  videoOfflineWrite([item, ...videoOfflineList()])
+  return item
+}
+
 /** 单任务执行：resolveUrl → /swmedia/ 流式拉流（有真实进度）→ 原生写媒体库 */
 async function runDownload(t: DlTask): Promise<void> {
   const ctl = new AbortController()
@@ -792,11 +870,19 @@ async function fetchDanmaku(cid: string): Promise<DanmakuItem[]> {
   if (!cid) return []
   const hit = dmCache.get(cid)
   if (hit && Date.now() - hit.at < 10 * 60_000) return hit.items
-  const res = await fetch(`https://api.bilibili.com/x/v1/dm/list.so?oid=${encodeURIComponent(cid)}`, {
-    headers: { Referer: 'https://www.bilibili.com/' },
-  })
-  if (!res.ok) throw new Error(`弹幕接口返回 ${res.status}`)
-  const xml = await res.text()
+  // Referer 属于浏览器禁止脚本设置的请求头（fetch 会静默丢弃），而弹幕接口会校验来源，
+  // 所以这里必须走原生网络栈；失败时再退化为普通 fetch（部分源不校验 Referer）。
+  let xml = ''
+  try {
+    xml = await httpGetWithHeaders(
+      `https://api.bilibili.com/x/v1/dm/list.so?oid=${encodeURIComponent(cid)}`,
+      { Referer: 'https://www.bilibili.com/', 'User-Agent': 'Mozilla/5.0 StarWishMusic' }
+    )
+  } catch {
+    const res = await fetch(`https://api.bilibili.com/x/v1/dm/list.so?oid=${encodeURIComponent(cid)}`)
+    if (!res.ok) throw new Error(`弹幕接口返回 ${res.status}`)
+    xml = await res.text()
+  }
   const doc = new DOMParser().parseFromString(xml, 'text/xml')
   const items: DanmakuItem[] = []
   for (const d of Array.from(doc.getElementsByTagName('d'))) {

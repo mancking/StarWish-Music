@@ -124,3 +124,44 @@ v2.3.5 是一次**播放内核级**的版本。本版依据《星河音乐 · �
 - **桌面端**：`scripts/v235-desktop-check2.cjs` 自检 17/18 通过（端识别、视觉四态、粒子/频谱、EQ IPC、歌词窗 400×60、循环四态、快捷键、曲库分页、下载暂停恢复、六条路由渲染、无渲染层未捕获错误）。
 - **安卓端本地构建**（此前缺失的链路已补齐）：JDK 17 + cmdline-tools + platforms;android-34 + build-tools;34.0.0 装在 `app/.tmp/android-tools/`，`local.properties` 指向该 SDK；必须设置 `ANDROID_USER_HOME`、`GRADLE_USER_HOME` 与 `TEMP/TMP` 到工作区目录，否则 sdkmanager / Gradle / esbuild 会因写系统临时目录被拒绝而失败。
 - **已知限制**：移动端插件市场的「安装/更新」状态判定依赖插件在 WebView 内成功加载（`mfHost.list()`）；部分协议插件依赖桌面端 `lx` 能力，安装后可能无法在移动端运行，此时按钮仍显示「安装」，属插件兼容性而非市场链路问题。
+
+### 十一、播放页切换落实 · 视频转音频模式 · 手势与四模式（本轮补齐）
+
+对照规格书重新逐条核对后，本轮补上此前「只在文档里、界面没反应」的条目：
+
+- **1.4 视觉模式四态循环（修复）**：移动端底部「视觉」按钮此前直接调 store 的 `cycleStage()`，绕过了页面本地状态，点击后 `tab` 不跟随、界面毫无变化。现在改为页面内的 `cycleVisual()` 按「封面 → 歌词 → 粒子 → 舞台」循环，并在 `setStage()` 中同步封面/歌词页签；单击封面也改为封面 ⇄ 歌词双向切换（规格书 1.3）。
+- **2.12 视频转音频模式（新增 `src/components/video/AudioModeView.vue`）**：桌面与移动视频播放器都加入「音频模式」——画面隐藏、布局切换成音乐播放器（首帧做静态封面、标题/UP 主、进度条、上一/播放/下一、循环/倍速/音效），播放器实例不重建，所以**切回视频时进度完全不变**；EQ 面板直接复用 `EqPanel`。原桌面「听音频」按钮（跳转到音乐播放器、丢进度）已替换为该模式。
+- **2.3 画面适应四模式**：桌面与移动的 `FILL_MODES` 补齐为「适应窗口 / 填充 / 拉伸 / 100%」，100% 用 `object-fit: none` 呈现原始像素。
+- **2.8 手势（移动端）**：单击画面播放/暂停、双击左 35% 区 −10s / 右 65% 区 +10s、横向滑动进度预览（松手落点）、左半屏纵向滑亮度、右半屏纵向滑音量，配合居中 HUD 与底部进度预览条；`touch-action: none` + `preventDefault` 避免页面跟着滚动。
+- **2.1 / 2.5**：控件自动隐藏统一为 3 秒（规格书 2.1）；桌面双击画面切换全屏（规格书 2.5）。
+- **1.12 视频离线缓存（移动端）**：新增 `video:offline:save / list / remove` 桥接通道——整片拉流后经 `SwBridge.saveToMedia` 写入系统视频库，索引保存在 `xinyuan_video_offline`；移动端「更多」面板新增「离线缓存」入口（超过 300MB 会明确拒绝，避免把整段视频塞进内存）。
+- **弹幕（移动端）**：`mv:danmaku` 直接用 B 站 XML 接口拉取并解析（10 分钟内存缓存），不再依赖桌面端的 Electron `net`。
+
+### 十二、播放模块模块化重构（按规格书重建，不再打补丁）
+
+按要求「禁止补丁修复、重新模块化重构」，这一轮把四个播放页从「一个文件塞满全部逻辑」改成「模块层 + 薄壳页面」：
+
+| 页面 | 重构前 | 重构后 |
+| --- | --- | --- |
+| `app/src/pages/MvPlayer.vue`（桌面/车机视频） | 1947 行 | 776 行 |
+| `app/src/pages/Player.vue`（桌面/平板音乐） | 1358 行 | 513 行 |
+| `app/src/pages/mobile/MvPlayer.vue` | 1055 行 | 695 行 |
+| `app/src/pages/mobile/Player.vue` | 944 行 | 522 行 |
+| `app/src/pages/CarPlayer.vue` | 189 行 | 166 行（按 1.1 车机版式重写） |
+
+新增模块层（页面只做装配）：
+
+- `app/src/player/lyrics.ts`（61 行）：`useLyricSync()` 二分查找当前行，供四端歌词面板共用。
+- `app/src/player/usePlaybackGestures.ts`（149 行）：左半屏亮度 / 右半屏音量 / 左右滑切歌 / 双击播停 / 单击切歌词（规格书 1.10）。
+- `app/src/player/stages.ts`（26 行）：四态视觉模式与循环模式的图标、文案、顺序。
+- `app/src/player/components/`：`CoverStage.vue`（112）、`LyricsPane.vue`（129）、`ProgressBar.vue`（142）、`TransportBar.vue`（129）、`FunctionBar.vue`（91）——四端尺寸由 `variant` 决定（44/48/36/56，规格书 3.0）。
+- `app/src/video/useVideoSession.ts`（174 行）：BV 号 → 分P/清晰度/播放地址/弹幕/相关推荐/续播位置。
+- `app/src/video/useVideoGestures.ts`（165 行）：视频手势（2.8）。
+- `app/src/video/components/VideoStage.vue`（163）、`PlaySettingsSheet.vue`（267）与 `app/src/components/video/AudioModeView.vue`：画面舞台、B 站式紧凑设置面板、视频转音频界面。
+
+同时修掉两处由此暴露的真实缺陷：
+
+- **EQ 面板点开「看不见」**：`EqPanel` 原本只是内容块（由父级决定形态），四个页面都直接 `<EqPanel v-if="open" />` 挂在流式布局末尾，实际被挤到视口外。现在组件自带遮罩与容器：手机/平板是底部弹出面板，桌面是右侧抽屉，点遮罩关闭。
+- **播放页手势抢走按钮点击**：手势监听原本挂在页面根节点，点「音效」会同时触发「切歌词」。现在手势只绑定在封面/歌词舞台区，按钮点击不再被截获；手机端进入「粒子」视觉模式会自动开启粒子（规格书 1.5 的「开启后 50 粒子」）。
+
+**验证**：`npm run typecheck`、`npm run build`、`npm run build:mobile` 全部通过；新增 `app/scripts/v235-refactor-check.cjs` 桌面自检 **8/8 PASS**（启动、桌面两栏播放页、歌词栏、视觉四态循环、队列面板、视频列表、设置页、渲染层零错误）；安卓真机（23117RK66C / Android 14）装机复验：封面加载正常、视觉按钮四态循环「封面→粒子→舞台→歌词」、舞台频谱随音频跳动、EQ 面板正常弹出。

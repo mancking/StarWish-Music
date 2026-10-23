@@ -1,189 +1,166 @@
 <script setup lang="ts">
 /**
- * 车机横屏播放页（规格书 v2.7 · 1.1 / 1.4 / 1.7 / 1.11）
- * 左 1/3 歌名 28px + 歌手 18px，右 2/3 三按钮（播放 80px，其余 64px）；无封面/歌词/粒子/频谱；
- * 视觉模式固定封面（无按钮）；循环仅两态；音效仅 3 个预设且无滑块；不做手势与快捷键。
+ * 车机播放页（规格书 1.1 / 0.2 / 0.3）
+ *
+ * 横屏单栏：左 1/3 歌名 28px + 歌手 18px，右 2/3 三个大按钮（64 / 80px）。
+ * 不显示封面、歌词、粒子、频谱；文字琥珀黄 #FBBF24；控件常显不自动隐藏。
  */
-import { computed, ref } from 'vue'
+import { computed } from 'vue'
+import { useRouter } from 'vue-router'
 import Icon from '@/components/Icon.vue'
-import EqPanel from '@/components/player/EqPanel.vue'
+import ProgressBar from '@/player/components/ProgressBar.vue'
 import { usePlayerStore } from '@/stores/player'
-import { formatTime } from '@shared/lrc'
 
+defineOptions({ name: 'CarPlayer' })
+
+const router = useRouter()
 const player = usePlayerStore()
-const eqOpen = ref(false)
 
 const song = computed(() => player.song)
-const title = computed(() => song.value?.name || '未在播放')
-const artist = computed(() => song.value?.singer || '星河音乐')
-const playing = computed(() => player.state.status === 'playing')
-const loopOne = computed(() => player.state.mode === 'repeat-one')
-const progress = computed(() => (player.duration > 0 ? player.displayPosition / player.duration : 0))
+const modeLabel = computed(() => (player.state.mode === 'repeat-one' ? '单曲循环' : '列表循环'))
+
+function cycleMode(): void {
+  player.cycleMode()
+}
 </script>
 
 <template>
   <div class="car">
-    <div class="car-head">
-      <span class="brand">星河音乐</span>
-      <span class="hint">驾驶模式 · 已简化控制</span>
-    </div>
+    <header class="top">
+      <button class="back" aria-label="返回" @click="router.back()">
+        <Icon name="shrink" :size="24" />
+      </button>
+      <span class="tag">车机模式 · 驾驶勿扰</span>
+    </header>
 
-    <div class="car-body">
-      <section class="meta">
-        <h1 class="title" :title="title">{{ title }}</h1>
-        <p class="artist">{{ artist }}</p>
-        <div class="bar"><i :style="{ width: `${Math.min(100, progress * 100)}%` }" /></div>
-        <p class="time">
-          {{ formatTime(player.displayPosition) }} / {{ formatTime(player.duration) }}
-        </p>
+    <main class="body">
+      <section class="info">
+        <h1>{{ song?.name || '未在播放' }}</h1>
+        <p>{{ song?.singer || '星河音乐' }}</p>
+        <ProgressBar
+          class="bar"
+          :position="player.displayPosition"
+          :duration="player.duration"
+          variant="car"
+          accent="#fbbf24"
+          @seek="player.seekTo"
+        />
+        <span class="mode" @click="cycleMode">{{ modeLabel }}</span>
       </section>
 
-      <section class="ctrl">
-        <button class="btn" title="上一首" @click="player.prev()"><Icon name="prev" :size="34" /></button>
-        <button class="btn primary" :title="playing ? '暂停' : '播放'" @click="player.toggle()">
-          <Icon :name="playing ? 'pause' : 'play'" :size="44" />
+      <section class="controls">
+        <button class="btn side" aria-label="上一首" @click="player.prev()">
+          <Icon name="prev" :size="30" />
         </button>
-        <button class="btn" title="下一首" @click="player.next()"><Icon name="next" :size="34" /></button>
-      </section>
-
-      <section class="sub">
-        <button class="btn small" :class="{ on: player.state.mode !== 'order' }" title="循环模式" @click="player.cycleMode()">
-          <Icon :name="loopOne ? 'repeat-one' : 'repeat'" :size="26" />
-          <span>{{ loopOne ? '单曲循环' : '列表循环' }}</span>
+        <button class="btn main" aria-label="播放暂停" @click="player.toggle()">
+          <Icon :name="player.playing ? 'pause' : 'play'" :size="38" />
         </button>
-        <button class="btn small" title="音效" @click="eqOpen = true">
-          <Icon name="sliders" :size="26" />
-          <span>音效</span>
+        <button class="btn side" aria-label="下一首" @click="player.next()">
+          <Icon name="next" :size="30" />
         </button>
       </section>
-    </div>
-
-    <EqPanel v-if="eqOpen" class="car-eq" @close="eqOpen = false" />
+    </main>
   </div>
 </template>
 
 <style scoped>
 .car {
-  position: absolute;
+  position: fixed;
   inset: 0;
   display: flex;
   flex-direction: column;
-  gap: 18px;
-  padding: 32px 40px;
-  color: #fbbf24;
-  background: radial-gradient(1200px 600px at 20% -10%, #2a1f0a 0%, #0b0b10 60%);
-  overflow: hidden;
-}
-.car-head {
-  display: flex;
-  align-items: baseline;
-  gap: 16px;
-  font-size: 20px;
-  color: #9b9ba8;
-}
-.car-head .brand {
-  font-weight: 600;
-  color: #fbbf24;
-}
-.car-body {
-  flex: 1;
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 2fr);
-  gap: 32px;
-  align-items: center;
-}
-.meta {
-  min-width: 0;
-}
-.title {
-  margin: 0 0 10px;
-  font-size: 28px;
-  font-weight: 700;
-  line-height: 1.3;
+  background: #0b0b10;
   color: #fbbf24;
   overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
-.artist {
-  margin: 0 0 20px;
-  font-size: 18px;
-  color: #d8d8e2;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.bar {
-  height: 6px;
-  border-radius: 3px;
-  background: #262633;
-  overflow: hidden;
-}
-.bar i {
-  display: block;
-  height: 100%;
-  background: #fbbf24;
-  transition: width 0.2s linear;
-}
-.time {
-  margin: 8px 0 0;
-  font-size: 18px;
-  color: #9b9ba8;
-}
-.ctrl {
+.top {
   display: flex;
   align-items: center;
-  justify-content: center;
-  gap: 28px;
-}
-.sub {
-  display: flex;
-  justify-content: center;
-  gap: 20px;
-  grid-column: 1 / -1;
-}
-.btn {
-  display: inline-flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 4px;
-  width: 64px;
+  gap: 14px;
   height: 64px;
+  padding: 0 24px;
+}
+.back {
+  width: 56px;
+  height: 56px;
+  display: grid;
+  place-items: center;
   border: 0;
-  border-radius: 16px;
+  border-radius: 14px;
+  background: rgba(251, 191, 36, 0.1);
   color: #fbbf24;
-  background: #13131b;
-  font-size: 14px;
   cursor: pointer;
 }
-.btn.primary {
+.tag {
+  font-size: 20px;
+  color: rgba(251, 191, 36, 0.72);
+}
+.body {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 1fr 2fr;
+  gap: 32px;
+  padding: 12px 32px 32px;
+  min-height: 0;
+}
+.info {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 10px;
+  min-width: 0;
+}
+.info h1 {
+  margin: 0;
+  font-size: 28px;
+  font-weight: 600;
+  line-height: 1.3;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+.info p {
+  margin: 0;
+  font-size: 18px;
+  color: rgba(251, 191, 36, 0.68);
+}
+.bar {
+  margin-top: 8px;
+}
+.mode {
+  margin-top: 6px;
+  font-size: 20px;
+  color: rgba(251, 191, 36, 0.8);
+  cursor: pointer;
+}
+.controls {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 40px;
+}
+.btn {
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 24px;
+  background: rgba(251, 191, 36, 0.12);
+  color: #fbbf24;
+  cursor: pointer;
+}
+.btn.side {
+  width: 64px;
+  height: 64px;
+}
+.btn.main {
   width: 80px;
   height: 80px;
-  border-radius: 50%;
   background: #fbbf24;
   color: #0b0b10;
 }
-.btn.small {
-  width: auto;
-  min-width: 64px;
-  height: 56px;
-  padding: 0 18px;
-  flex-direction: row;
-  gap: 8px;
-  font-size: 16px;
-  color: #d8d8e2;
-}
-.btn.small.on {
-  color: #fbbf24;
-}
 .btn:active {
-  transform: scale(0.96);
-}
-.car-eq {
-  position: absolute;
-  right: 32px;
-  bottom: 24px;
-  width: 380px;
+  transform: scale(0.97);
 }
 </style>
