@@ -1442,7 +1442,9 @@ onBeforeUnmount(() => {
   position: absolute;
   bottom: 38px;
   right: 0;
-  min-width: 120px;
+  min-width: 132px;
+  max-height: min(58vh, 380px);
+  overflow-y: auto;
   padding: 6px;
   border-radius: 10px;
   background: rgba(20, 20, 24, 0.96);

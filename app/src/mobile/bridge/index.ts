@@ -12,7 +12,7 @@
  *   - providers / music-service / recommend 原样
  *   - 播放器换成 src/mobile/player.ts（<audio>）
  */
-import type { Song } from '@shared/types'
+import type { DanmakuItem, Song } from '@shared/types'
 import axios from 'axios'
 import { emit, subscribe } from '../bus'
 import { fail, ok } from './envelope'
@@ -120,6 +120,110 @@ type Handler = (payload: any) => Promise<any> | any
 const NOP_OK = () => true
 const UNSUPPORTED = (what: string) => () => { throw new Error(`移动端暂不支持${what}`) }
 
+  /* ---- MusicFree 插件市场：移动端自带实现 ---- */
+/**
+ * 拉取插件市场目录。
+ * 移动端不能用 mf-host 的 request（依赖 Electron net，WebView 内会挂住），
+ * 这里直接用 WebView 的 fetch，并在 GitHub raw 失败时回退 jsDelivr 镜像。
+ */
+/** 移动端 HTTP 取文本：优先原生 CapacitorHttp（系统网络栈），失败回落 WebView fetch */
+async function httpGetText(url: string, timeoutMs = 8000): Promise<string> {
+  try {
+    const r: any = await nativeCall('CapacitorHttp', 'request', {
+      url,
+      method: 'GET',
+      responseType: 'text',
+      connectTimeout: timeoutMs,
+      readTimeout: timeoutMs,
+    })
+    const status = Number(r?.status ?? 0)
+    const data = typeof r?.data === 'string' ? r.data : JSON.stringify(r?.data ?? '')
+    if (status >= 200 && status < 300 && data) return data
+    throw new Error(`HTTP ${status || 'ERR'}`)
+  } catch (e) {
+    const ac = new AbortController()
+    const timer = setTimeout(() => ac.abort(), timeoutMs)
+    try {
+      const res = await fetch(url, { headers: { Accept: 'application/json' }, signal: ac.signal })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      return await res.text()
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+}
+
+/** 把 raw.githubusercontent 的插件地址改写成当前可用的镜像地址 */
+function mirrorOf(raw: string, base: string): string {
+  const m = /^https:\/\/raw\.githubusercontent\.com\/([^/]+)\/([^/]+)\/([^/]+)\/(.+)$/.exec(raw)
+  if (!m) return raw
+  const [, owner, repo, branch, path] = m
+  if (base === 'fastly') return `https://fastly.jsdelivr.net/gh/${owner}/${repo}@${branch}/${path}`
+  if (base === 'ghproxy') return `https://ghproxy.net/https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${path}`
+  if (base === 'gh-proxy') return `https://gh-proxy.com/https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${path}`
+  return raw
+}
+
+function mirrorBaseOf(candidate: string): string {
+  if (candidate.startsWith('https://fastly.jsdelivr.net')) return 'fastly'
+  if (candidate.startsWith('https://ghproxy.net')) return 'ghproxy'
+  if (candidate.startsWith('https://gh-proxy.com')) return 'gh-proxy'
+  return ''
+}
+
+async function fetchMarketManifest(url: string): Promise<any[]> {
+  let lastFail = ''
+  // 多镜像兜底：国内网络常连不上 raw.githubusercontent.com / cdn.jsdelivr.net
+  const candidates: string[] = []
+  if (url) candidates.push(url)
+  const m = /^https:\/\/raw\.githubusercontent\.com\/([^/]+)\/([^/]+)\/([^/]+)\/(.+)$/.exec(url)
+  if (m) {
+    const [, owner, repo, branch, path] = m
+    candidates.push(
+      `https://fastly.jsdelivr.net/gh/${owner}/${repo}@${branch}/${path}`,
+      `https://ghproxy.net/https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${path}`,
+      `https://gh-proxy.com/https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${path}`,
+      `https://raw.gitmirror.com/${owner}/${repo}/${branch}/${path}`,
+      `https://cdn.jsdelivr.net/gh/${owner}/${repo}@${branch}/${path}`
+    )
+  }
+  const uniq = Array.from(new Set(candidates.filter(Boolean)))
+  if (!uniq.length) return []
+  // 并发竞速：镜像时快时慢，谁先回谁生效，避免串行超时叠加
+  // 首个成功即返回：任一镜像先回就用它，不等待其余请求（Promise.all 会等最慢的那个）
+  const winner = await new Promise<{ u: string; text: string } | null>(resolve => {
+    let settled = false
+    let pending = uniq.length
+    const done = (v: { u: string; text: string } | null): void => {
+      if (settled) return
+      settled = true
+      resolve(v)
+    }
+    const failures: string[] = []
+    for (const u of uniq) {
+      void httpGetText(u)
+        .then(text => done({ u, text }))
+        .catch((e: any) => {
+          failures.push(`${u.split('/')[2]}: ${e?.message || e}`)
+          lastFail = failures.join('；')
+        })
+        .finally(() => {
+          pending -= 1
+          if (pending <= 0) done(null)
+        })
+    }
+    setTimeout(() => done(null), 9000)
+  })
+  if (!winner) throw new Error(`插件目录拉取失败：${lastFail || '网络不可用'}`)
+  const data: any = JSON.parse(winner.text)
+  const arr: any[] = Array.isArray(data) ? data : Array.isArray(data?.plugins) ? data.plugins : []
+  const base = mirrorBaseOf(winner.u)
+  return arr
+    .map((it: any) => (typeof it === 'string' ? { name: it, url: it } : it))
+    .filter((it: any) => it && /^https?:\/\//i.test(it.url))
+    .map((it: any) => ({ ...it, url: mirrorOf(String(it.url), base) }))
+}
+
 const handlers: Record<string, Handler> = {
   /* ---- 应用 ---- */
   'app:info': () => ({
@@ -194,6 +298,20 @@ const handlers: Record<string, Handler> = {
     return false
   },
 
+  /**
+   * 桌面端「下载更新包」在移动端不适用（Android 走 APK 安装器、iOS 走 App Store），
+   * 这里给出可读提示而不是「移动端暂不支持…」的通用文案。
+   */
+  'app:downloadUpdate': async () => {
+    throw new Error('移动端请在「设置 → 检查更新」中打开下载页，或直接安装新的 APK / 前往 App Store 更新')
+  },
+  'app:showUpdateFile': async () => {
+    throw new Error('移动端无法在文件管理器中定位更新包')
+  },
+  'app:relaunchWithUpdate': async () => {
+    throw new Error('移动端请手动安装下载好的更新包')
+  },
+
   /* ---- 设置 ---- */
   'settings:get': () => getSettings(),
   'settings:set': (patch: any) => {
@@ -241,8 +359,9 @@ const handlers: Record<string, Handler> = {
     return lxHost.list()
   },
 
-  /* ---- MusicFree 插件 ---- */
+/* ---- MusicFree 插件 ---- */
   'plugins:list': () => mfHost.list(),
+  'plugins:market': async ({ url }: any) => await fetchMarketManifest(String(url || '')),
   'plugins:code': ({ file }: any) => mfHost.getSourceCode(file),
   'plugins:toggle': async ({ file, enabled }: any) => {
     await mfHost.togglePlugin(file, enabled)
@@ -255,8 +374,11 @@ const handlers: Record<string, Handler> = {
     return mfHost.list()
   },
   'plugins:import': async ({ url, content, origin, file }: any) => {
-    if (url) await mfHost.importFromUrl(url, file)
-    else if (content) await mfHost.importFromContent(content, origin || 'local', url, file)
+    if (url) {
+      // 移动端用原生 HTTP 取插件源码：Electron net 在 WebView 里不可用
+      const code = await httpGetText(url, 20000)
+      await mfHost.importFromContent(code, 'url', url, file)
+    } else if (content) await mfHost.importFromContent(content, origin || 'local', url, file)
     emit('plugins:changed', mfHost.list())
     return mfHost.list()
   },
@@ -270,7 +392,6 @@ const handlers: Record<string, Handler> = {
     await mfHost.removeSubscription(url)
     return mfHost.listSubscriptions()
   },
-  'plugins:market': async ({ url }: any) => await mfHost.fetchMarket(url),
   'plugins:search': ({ file, query, page, type }: any) => mfHost.search(file, query, page, type),
   'plugins:lyric': ({ file, musicItem }: any) => mfHost.getLyric(file, musicItem),
   'plugins:url': ({ file, musicItem, quality }: any) => mfHost.getMediaSource(file, musicItem, quality),
@@ -394,6 +515,28 @@ const handlers: Record<string, Handler> = {
     dlAborts.get(String(id))?.abort()
     return true
   },
+  /* 暂停/继续（规格书 1.12）：移动端按「取消当前流 + 保留任务」实现，
+     不做断点续传；继续时进度归零重新拉流。 */
+  'download:pause': ({ id }: any) => {
+    const t = dlTasks.get(String(id))
+    if (!t) return false
+    dlPaused.add(String(id))
+    if (t.status === 'running') dlAborts.get(String(id))?.abort()
+    t.status = 'paused'
+    dlEmit(t)
+    return true
+  },
+  'download:resume': ({ id }: any) => {
+    const t = dlTasks.get(String(id))
+    if (!t) return false
+    dlPaused.delete(String(id))
+    t.status = 'queued'
+    t.progress = 0
+    t.received = 0
+    dlEmit(t)
+    dlChain = dlChain.then(() => runDownload(t))
+    return true
+  },
   'download:remove': async ({ id, deleteFile }: any) => {
     const t = dlTasks.get(String(id))
     dlAborts.get(String(id))?.abort()
@@ -422,6 +565,9 @@ const handlers: Record<string, Handler> = {
     throw new Error('移动端暂不支持视频离线缓存')
   },
   'video:offline:remove': () => true,
+
+  /* ---- 弹幕（规格书 2.x）：移动端直接拉 B 站 XML 弹幕并解析 ---- */
+  'mv:danmaku': async ({ cid }: any) => await fetchDanmaku(String(cid || '')),
 
   /* ---- B 站 ---- */
   'bili:status': () => biliStatus(),
@@ -461,13 +607,13 @@ async function resolveInline(song: Song, quality?: string) {
 type DlTask = {
   id: string
   song: Song
-  status: 'queued' | 'running' | 'done' | 'error' | 'canceled'
+  status: 'queued' | 'running' | 'paused' | 'done' | 'error' | 'canceled'
   quality: string
   progress: number
   received: number
   total: number
   file?: string
-  error?: string
+  error?: string | null
   createdAt: number
   finishedAt?: number
 }
@@ -475,6 +621,8 @@ type DlTask = {
 const dlTasks = new Map<string, DlTask>()
 const dlAborts = new Map<string, AbortController>()
 const dlUris = new Map<string, string>()
+/** 被用户暂停的任务（规格书 1.12：暂停后保留任务，继续时重新拉流） */
+const dlPaused = new Set<string>()
 let dlChain: Promise<void> = Promise.resolve()
 
 function nativeCall(plugin: string, method: string, opts: any): Promise<any> {
@@ -615,8 +763,14 @@ async function runDownload(t: DlTask): Promise<void> {
     t.finishedAt = Date.now()
   } catch (e: any) {
     if (ctl.signal.aborted || e?.name === 'AbortError') {
-      t.status = 'canceled'
-      t.error = '已取消'
+      // 规格书 1.12：暂停与取消要区分开，暂停保留任务可继续
+      if (dlPaused.has(t.id)) {
+        t.status = 'paused'
+        t.error = null
+      } else {
+        t.status = 'canceled'
+        t.error = '已取消'
+      }
     } else {
       t.status = 'error'
       t.error = e?.message || String(e)
@@ -626,6 +780,39 @@ async function runDownload(t: DlTask): Promise<void> {
     dlAborts.delete(t.id)
     dlEmit(t)
   }
+}
+
+/* ---------------- 弹幕 ----------------
+ * 桌面端走主进程 electron/core/danmaku.ts（protobuf 分段）；
+ * 移动端没有 http shim，这里直接拉 XML 弹幕（dm/list.so）并用 DOMParser 解析，
+ * 只取 progress/mode/fontsize/color/content 五个字段，结果缓存 10 分钟。 */
+const dmCache = new Map<string, { at: number; items: DanmakuItem[] }>()
+
+async function fetchDanmaku(cid: string): Promise<DanmakuItem[]> {
+  if (!cid) return []
+  const hit = dmCache.get(cid)
+  if (hit && Date.now() - hit.at < 10 * 60_000) return hit.items
+  const res = await fetch(`https://api.bilibili.com/x/v1/dm/list.so?oid=${encodeURIComponent(cid)}`, {
+    headers: { Referer: 'https://www.bilibili.com/' },
+  })
+  if (!res.ok) throw new Error(`弹幕接口返回 ${res.status}`)
+  const xml = await res.text()
+  const doc = new DOMParser().parseFromString(xml, 'text/xml')
+  const items: DanmakuItem[] = []
+  for (const d of Array.from(doc.getElementsByTagName('d'))) {
+    const p = (d.getAttribute('p') || '').split(',')
+    if (p.length < 4) continue
+    const t = Number(p[0])
+    const rawMode = Number(p[1])
+    const size = Number(p[2]) || 25
+    const color = Number(p[3]) || 0xffffff
+    const text = (d.textContent || '').trim()
+    if (!text || !Number.isFinite(t)) continue
+    const mode: 1 | 4 | 5 = rawMode === 4 ? 4 : rawMode === 5 ? 5 : 1
+    items.push({ t, mode, size: size >= 36 ? 36 : size >= 25 ? 25 : 18, color, text })
+  }
+  dmCache.set(cid, { at: Date.now(), items })
+  return items
 }
 
 /* ---------------- 安装 ---------------- */

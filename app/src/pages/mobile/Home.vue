@@ -4,6 +4,7 @@ import { useRouter } from 'vue-router'
 import Icon from '@/components/Icon.vue'
 import Cover from '@/components/Cover.vue'
 import { call } from '@/api'
+import brandIcon from '@/assets/brand-icon.png'
 import { usePlayerStore } from '@/stores/player'
 import { useUiStore } from '@/stores/ui'
 import type { Song } from '@shared/types'
@@ -313,12 +314,65 @@ defineExpose({ refresh: () => load(true) })
         </div>
       </section>
     </template>
+
+    <!-- 星河 Logo 背景卡片（规格书 3.1：页面底部、底部 Tab 上方，Logo 右对齐、半透明、融合渐变） -->
+    <section class="m-brand" aria-hidden="true">
+      <div class="m-brand-text">
+        <b>星河音乐</b>
+        <span>StarWish Music · 全端同步的私人曲库</span>
+      </div>
+      <img class="m-brand-logo" :src="brandIcon" alt="" draggable="false" />
+    </section>
   </div>
 </template>
 
 <style scoped>
 .m-home {
-  padding-bottom: 28px;
+  padding-bottom: 36px;
+}
+/* 星河 Logo 背景卡片：页面底部、底部 Tab 上方，Logo 右对齐、半透明、融合渐变 */
+.m-brand {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 18px 0 4px;
+  padding: 16px 18px;
+  border-radius: 18px;
+  overflow: hidden;
+  pointer-events: none;
+  background: linear-gradient(
+    135deg,
+    rgba(167, 139, 250, 0.16),
+    rgba(244, 114, 182, 0.1) 55%,
+    rgba(11, 11, 16, 0) 100%
+  );
+  border: 1px solid rgba(255, 255, 255, 0.05);
+}
+.m-brand-text {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.m-brand-text b {
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 0.4px;
+  color: var(--text);
+  opacity: 0.72;
+}
+.m-brand-text span {
+  font-size: 11px;
+  color: var(--text-3);
+  opacity: 0.8;
+}
+.m-brand-logo {
+  width: 54px;
+  height: 54px;
+  border-radius: 14px;
+  opacity: 0.38;
+  flex: 0 0 auto;
 }
 /* 问候头 */
 .m-head {

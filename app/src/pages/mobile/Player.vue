@@ -255,8 +255,9 @@ function toggleSleep(): void {
     <header class="head">
       <button class="round" aria-label="收起" @click="back"><Icon name="chevron-down" :size="24" /></button>
       <div class="head-mid">
-        <span>正在播放</span>
-        <b>{{ song?.name || '未在播放' }}</b>
+        <span>{{ tab === 'lyric' ? '歌词' : '正在播放' }}</span>
+        <b v-if="song?.album">{{ song.album }}</b>
+        <b v-else>{{ song?.singer || '未在播放' }}</b>
       </div>
       <button class="round" aria-label="更多" @click="moreOpen = !moreOpen"><Icon name="more" :size="22" /></button>
     </header>
@@ -294,7 +295,7 @@ function toggleSleep(): void {
         </div>
       </Transition>
 
-      <!-- 歌曲信息 + 页签切换 -->
+      <!-- 歌曲信息（唯一「喜欢」入口；封面/歌词靠点击封面切换，不再放页签行） -->
       <div class="info">
         <div class="title-row">
           <div class="meta">
@@ -303,21 +304,6 @@ function toggleSleep(): void {
           </div>
           <button class="round sm" :class="{ liked }" aria-label="喜欢" @click="toggleLike">
             <Icon :name="liked ? 'heart-filled' : 'heart'" :size="20" />
-          </button>
-        </div>
-        <div class="tabs">
-          <button :class="{ on: tab === 'cover' }" @click="tab = 'cover'">封面</button>
-          <button :class="{ on: tab === 'lyric' }" @click="tab = 'lyric'">歌词</button>
-        </div>
-        <!-- 视觉模式：单按钮循环 4 态（规格书 1.4），音效入口（1.11） -->
-        <div class="stage-tabs">
-          <button class="cycle" @click="player.cycleStage()">
-            <Icon :name="STAGE_ICON[stage]" :size="13" />
-            {{ STAGE_LABEL[stage] }}
-          </button>
-          <button class="cycle" @click="eqOpen = true">
-            <Icon name="sliders" :size="13" />
-            音效
           </button>
         </div>
       </div>
@@ -345,7 +331,7 @@ function toggleSleep(): void {
         </div>
       </div>
 
-      <!-- 主控 -->
+      <!-- 主控：循环 / 上一首 / 播放 / 下一首 / 队列（每项只出现一次） -->
       <div class="controls">
         <button class="round sm mode" aria-label="播放模式" @click="player.cycleMode()">
           <Icon name="repeat" :size="17" />
@@ -356,33 +342,28 @@ function toggleSleep(): void {
           <Icon :name="player.playing ? 'pause' : 'play'" :size="30" />
         </button>
         <button class="round lg" aria-label="下一首" @click="player.next()"><Icon name="next" :size="26" /></button>
-        <button class="round sm rate" aria-label="倍速" @click="player.cycleRate()">
-          <Icon name="zap" :size="17" />
-          <i>{{ player.state.rate || 1 }}×</i>
+        <button class="round sm" aria-label="播放队列" @click="openQueue">
+          <Icon name="queue" :size="17" />
         </button>
       </div>
 
-      <!-- 功能图标行 -->
+      <!-- 底部功能条：音效 / 倍速 / 视觉 / 定时（喜欢在主信息行，队列在主控行，其余收进「更多」） -->
       <div class="func-row">
-        <button class="func" :class="{ liked }" @click="toggleLike">
-          <Icon :name="liked ? 'heart-filled' : 'heart'" :size="19" />
-          <span>{{ liked ? '已喜欢' : '喜欢' }}</span>
-        </button>
-        <button class="func" @click="openQueue">
-          <Icon name="queue" :size="19" />
-          <span>队列</span>
+        <button class="func" @click="eqOpen = true">
+          <Icon name="sliders" :size="19" />
+          <span>音效</span>
         </button>
         <button class="func" @click="player.cycleRate()">
           <Icon name="zap" :size="19" />
-          <span>倍速</span>
+          <span>{{ player.state.rate || 1 }}×</span>
+        </button>
+        <button class="func" :class="{ on: stage !== 'cover' }" @click="player.cycleStage()">
+          <Icon :name="STAGE_ICON[stage]" :size="19" />
+          <span>{{ STAGE_LABEL[stage] }}</span>
         </button>
         <button class="func" :class="{ on: sleepOpen || player.sleepUntil > 0 }" @click="toggleSleep">
           <Icon name="clock" :size="19" />
           <span>定时</span>
-        </button>
-        <button class="func" @click="moreOpen = !moreOpen">
-          <Icon name="more" :size="19" />
-          <span>更多</span>
         </button>
       </div>
     </div>
@@ -408,7 +389,6 @@ function toggleSleep(): void {
           <div class="more-list">
             <button @click="openQueue"><Icon name="queue" :size="18" />播放队列</button>
             <button @click="tab = 'lyric'"><Icon name="lyric" :size="18" />查看歌词</button>
-            <button @click="toggleSleep"><Icon name="clock" :size="18" />定时关闭</button>
             <button @click="ui.playlistPickerSong = song"><Icon name="plus" :size="18" />添加到歌单</button>
             <button @click="moreOpen = false"><Icon name="close" :size="18" />取消</button>
           </div>

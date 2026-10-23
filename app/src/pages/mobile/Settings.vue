@@ -112,6 +112,74 @@ async function toggleSource(s: SourceInfo): Promise<void> {
   }
 }
 
+/* ---------------- 插件市场（MusicFree 协议插件） ---------------- */
+/** 官方插件库 manifest 地址（与桌面端保持一致） */
+const OFFICIAL_SUB_URL = 'https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/manifest.json'
+type MarketEntry = {
+  name: string
+  file: string
+  version?: string
+  author?: string
+  platform?: string
+  description?: string
+  types?: string[]
+  url: string
+}
+const marketOpen = ref(false)
+const marketLoading = ref(false)
+const marketError = ref('')
+const marketEntries = ref<MarketEntry[]>([])
+const marketUpdating = ref('')
+const installedFiles = ref<string[]>([])
+/** 已安装插件的名字（清单里 file 可能被导入时改写，名字更稳定） */
+const installedNames = ref<string[]>([])
+
+async function loadInstalledPlugins(): Promise<void> {
+  try {
+    const list = await call<{ file?: string; name?: string }[]>('plugins:list')
+    installedFiles.value = (list || []).map(p => String(p.file || '')).filter(Boolean)
+    installedNames.value = (list || []).map(p => String(p.name || '')).filter(Boolean)
+  } catch {
+    installedFiles.value = []
+    installedNames.value = []
+  }
+}
+
+/** 打开插件市场：拉取在线目录（走 bridge 的 plugins:market，移动端此前缺失该通道） */
+async function loadMarket(): Promise<void> {
+  marketOpen.value = true
+  marketLoading.value = true
+  marketError.value = ''
+  try {
+    const list = await call<MarketEntry[]>('plugins:market', { url: OFFICIAL_SUB_URL })
+    marketEntries.value = list || []
+    if (!marketEntries.value.length) marketError.value = '目录为空，请稍后重试'
+  } catch (e: any) {
+    marketEntries.value = []
+    marketError.value = `插件市场加载失败：${e?.message || e}`
+  } finally {
+    marketLoading.value = false
+  }
+}
+
+function isInstalled(entry: MarketEntry): boolean {
+  if (entry.file && installedFiles.value.includes(entry.file)) return true
+  return installedNames.value.includes(entry.name)
+}
+
+async function installFromMarket(entry: MarketEntry): Promise<void> {
+  marketUpdating.value = entry.file
+  try {
+    await call('plugins:import', { url: entry.url, origin: 'subscribe' })
+    ui.toast(`已安装 ${entry.name}`, 'success', 2000)
+    await Promise.all([loadInstalledPlugins(), loadSources()])
+  } catch (e: any) {
+    ui.toast(`安装失败：${e?.message || e}`, 'error', 4200)
+  } finally {
+    marketUpdating.value = ''
+  }
+}
+
 /* ---------------- 关于与更新 ---------------- */
 const appInfo = ref<any>(null)
 const updateInfo = ref<UpdateInfo | null>(null)
@@ -197,6 +265,7 @@ let offProgress: (() => void) | null = null
 onMounted(() => {
   void loadAppInfo()
   void loadSources()
+  void loadInstalledPlugins()
   offProgress = on('update:progress', (p: any) => {
     dlPercent.value = Number(p?.percent || 0)
     dlReceived.value = Number(p?.received || 0)
@@ -388,7 +457,7 @@ const version = computed(() => String(appInfo.value?.version || __APP_VERSION__)
           <div v-if="!sources.length" class="set-empty">音源列表加载中…</div>
         </div>
         <div class="set-card">
-          <button class="set-item link" @click="router.push('/discover')">
+          <button class="set-item link" @click="loadMarket">
             <div class="it-meta">
               <span class="it-label">插件市场</span>
               <span class="it-desc">安装与更新 MusicFree 协议插件</span>
@@ -512,6 +581,44 @@ const version = computed(() => String(appInfo.value?.version || __APP_VERSION__)
         </div>
       </div>
     </Transition>
+
+    <!-- 插件市场（MusicFree 协议）：紧凑底部抽屉，参照 B 站播放设置面板 -->
+    <div v-if="marketOpen" class="mk-mask" @click.self="marketOpen = false">
+      <div class="mk-card">
+        <div class="mk-head">
+          <b>插件市场</b>
+          <button class="mk-close" @click="marketOpen = false"><Icon name="close" :size="16" /></button>
+        </div>
+        <p class="mk-tip">星河官方插件库 · 在线目录，点击「安装」添加，已安装的可「更新」</p>
+        <div v-if="marketLoading" class="mk-list">
+          <div class="mk-loading">正在拉取插件目录…</div>
+          <div v-for="i in 3" :key="i" class="mk-sk" />
+        </div>
+        <div v-else-if="marketError" class="mk-err">{{ marketError }}</div>
+        <div v-else class="mk-list">
+          <div v-for="m in marketEntries" :key="m.file" class="mk-item">
+            <div class="mk-main">
+              <div class="mk-title">
+                <b>{{ m.name }}</b>
+                <span v-if="m.version" class="mk-ver">v{{ m.version }}</span>
+              </div>
+              <div v-if="m.author || m.description" class="mk-desc">
+                {{ m.author }}<span v-if="m.author && m.description"> · </span>{{ m.description }}
+              </div>
+            </div>
+            <button class="mk-btn" :disabled="marketUpdating === m.file" @click="installFromMarket(m)">
+              {{ marketUpdating === m.file ? '处理中…' : isInstalled(m) ? '更新' : '安装' }}
+            </button>
+          </div>
+          <div v-if="!marketEntries.length" class="mk-empty">目录为空</div>
+        </div>
+        <div class="mk-foot">
+          <button class="mk-btn ghost" :disabled="marketLoading" @click="loadMarket">
+            <Icon name="refresh" :size="14" />刷新
+          </button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -788,5 +895,144 @@ const version = computed(() => String(appInfo.value?.version || __APP_VERSION__)
 .sheet-enter-from,
 .sheet-leave-to {
   opacity: 0;
+}
+
+/* ---------------- 插件市场抽屉 ---------------- */
+.mk-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  display: flex;
+  align-items: flex-end;
+  background: rgba(0, 0, 0, 0.55);
+}
+.mk-card {
+  width: 100%;
+  max-height: 68vh;
+  display: flex;
+  flex-direction: column;
+  padding: 14px 16px calc(16px + env(safe-area-inset-bottom));
+  border-radius: 20px 20px 0 0;
+  background: var(--bg-2);
+  border-top: 1px solid var(--line);
+}
+.mk-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 4px;
+}
+.mk-head b {
+  font-size: 15px;
+}
+.mk-close {
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  border-radius: 15px;
+  background: var(--bg-2);
+  color: var(--text-2);
+}
+.mk-tip {
+  margin: 0 0 10px;
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--text-3);
+}
+.mk-list {
+  flex: 0 1 auto;
+  max-height: 46vh;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.mk-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 11px 12px;
+  border-radius: 12px;
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+}
+.mk-main {
+  flex: 1;
+  min-width: 0;
+}
+.mk-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.mk-title b {
+  font-size: 13.5px;
+}
+.mk-ver {
+  font-size: 10.5px;
+  color: var(--text-3);
+}
+.mk-desc {
+  margin-top: 3px;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--text-3);
+}
+.mk-btn {
+  flex: none;
+  height: 32px;
+  padding: 0 14px;
+  border-radius: 16px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.mk-btn.ghost {
+  background: var(--bg-2);
+  color: var(--text-2);
+  font-weight: 500;
+}
+.mk-btn:disabled {
+  opacity: 0.6;
+}
+.mk-err {
+  padding: 14px 0;
+  font-size: 12px;
+  color: #ff8b9c;
+  word-break: break-all;
+}
+.mk-empty {
+  padding: 22px 0;
+  text-align: center;
+  font-size: 12px;
+  color: var(--text-3);
+}
+.mk-foot {
+  display: flex;
+  justify-content: flex-end;
+  padding-top: 10px;
+}
+.mk-loading {
+  padding: 10px 2px 4px;
+  font-size: 12px;
+  color: var(--text-3);
+}
+.mk-sk {
+  height: 58px;
+  border-radius: 12px;
+  background: var(--bg-3);
+  animation: mk-pulse 1.2s ease-in-out infinite;
+}
+@keyframes mk-pulse {
+  0%,
+  100% {
+    opacity: 0.55;
+  }
+  50% {
+    opacity: 0.85;
+  }
 }
 </style>

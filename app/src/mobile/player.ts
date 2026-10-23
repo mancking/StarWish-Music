@@ -29,6 +29,8 @@ let position = 0
 let duration = 0
 let buffered = 0
 let sleepUntil = 0
+/** 已写入播放历史的歌曲 id（规格书 3.3） */
+let histMarked = ''
 let retryCount = 0
 const MAX_RETRY = 2
 /** 本曲已失败的音源（取链/媒体报错时累计，换源重试时跳过） */
@@ -216,9 +218,15 @@ el.addEventListener('error', () => {
   }
   failCurrent(song, '音频加载失败，可能链接已失效')
 })
-el.addEventListener('ended', () => {
+el.addEventListener('playing', () => {
+  // 规格书 3.3：开始播放即写入历史（同一首只记一次，切歌后重置）
   const song = state().song
-  if (song) addHistory(song, Math.round(position * 1000))
+  if (song && histMarked !== song.id) {
+    histMarked = song.id
+    addHistory(song, 0)
+  }
+})
+el.addEventListener('ended', () => {
   stopTick()
   next(true)
 })

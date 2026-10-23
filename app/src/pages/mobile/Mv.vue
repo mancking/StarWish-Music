@@ -4,6 +4,8 @@ import { useRouter } from 'vue-router'
 import Icon from '@/components/Icon.vue'
 import Cover from '@/components/Cover.vue'
 import { call } from '@/api'
+import QRCode from 'qrcode'
+import { useUiStore } from '@/stores/ui'
 import type { MvItem } from '@shared/types'
 
 /**
@@ -26,6 +28,158 @@ const page = ref(1)
 const hasMore = ref(true)
 
 const HOT = ['周杰伦', '演唱会', 'MV', 'Live', '音乐现场', '新歌', '经典老歌', '粤语']
+
+/* ---------------- 视频源（B 站）登录 ---------------- */
+const ui = useUiStore()
+const bili = ref<{ loggedIn: boolean; uname?: string; mid?: string; avatar?: string }>({ loggedIn: false })
+const loginOpen = ref(false)
+const loginTab = ref<'qr' | 'pwd' | 'cookie'>('qr')
+const qrImg = ref('')
+const qrKey = ref('')
+const qrUrl = ref('')
+const qrStatus = ref('')
+const pwdUser = ref('')
+const pwdPass = ref('')
+const pwdErr = ref('')
+const pwdBusy = ref(false)
+const ckText = ref('')
+const ckErr = ref('')
+const ckBusy = ref(false)
+let qrTimer = 0
+
+async function loadBiliStatus(): Promise<void> {
+  try {
+    bili.value = await call('bili:status')
+  } catch { /* 未登录或通道不可用时保持默认 */ }
+}
+
+function openLogin(): void {
+  loginOpen.value = true
+  if (!bili.value.loggedIn && !qrImg.value) void startQrLogin()
+}
+
+function closeLogin(): void {
+  loginOpen.value = false
+  stopPoll()
+}
+
+function stopPoll(): void {
+  if (qrTimer) {
+    clearInterval(qrTimer)
+    qrTimer = 0
+  }
+}
+
+async function startQrLogin(): Promise<void> {
+  loginTab.value = 'qr'
+  pwdErr.value = ''
+  ckErr.value = ''
+  qrStatus.value = '正在获取二维码…'
+  qrImg.value = ''
+  stopPoll()
+  try {
+    const r = await call<{ url: string; key: string }>('bili:qr')
+    qrKey.value = r.key
+    qrUrl.value = r.url
+    qrImg.value = await QRCode.toDataURL(r.url, { margin: 1, width: 220, color: { dark: '#111827', light: '#ffffff' } })
+    qrStatus.value = '请使用哔哩哔哩 App 扫码，或点下方按钮拉起客户端'
+    qrTimer = window.setInterval(() => void pollQr(), 2000)
+  } catch (e: any) {
+    qrStatus.value = e?.message || '二维码获取失败'
+  }
+}
+
+function switchLoginTab(t: 'qr' | 'pwd' | 'cookie'): void {
+  loginTab.value = t
+  pwdErr.value = ''
+  ckErr.value = ''
+  if (t === 'qr' && !qrImg.value) void startQrLogin()
+}
+
+function openBiliApp(): void {
+  if (!qrUrl.value) {
+    ui.toast('二维码尚未生成', 'info')
+    return
+  }
+  window.location.href = 'bilibili://browser?url=' + encodeURIComponent(qrUrl.value)
+  qrStatus.value = '已尝试拉起哔哩哔哩，请在 App 中点击「确认登录」'
+}
+
+async function pollQr(): Promise<void> {
+  if (!qrKey.value) return
+  try {
+    const r = await call<{ ok: boolean; status: string; message?: string }>('bili:poll', { key: qrKey.value })
+    if (r.status) qrStatus.value = r.message || r.status
+    if (r.ok) {
+      stopPoll()
+      await loadBiliStatus()
+      ui.toast('视频源账号登录成功', 'success')
+      setTimeout(() => (loginOpen.value = false), 600)
+      void search()
+    } else if (r.status === 'expired' || r.status === 'error') {
+      stopPoll()
+    }
+  } catch (e: any) {
+    qrStatus.value = e?.message || '轮询失败'
+    stopPoll()
+  }
+}
+
+async function pwdLogin(): Promise<void> {
+  if (pwdBusy.value) return
+  pwdErr.value = ''
+  if (!pwdUser.value.trim() || !pwdPass.value) {
+    pwdErr.value = '请输入账号与密码'
+    return
+  }
+  pwdBusy.value = true
+  try {
+    await call('bili:passwordLogin', { username: pwdUser.value.trim(), password: pwdPass.value })
+    await loadBiliStatus()
+    ui.toast('视频源账号登录成功', 'success')
+    pwdUser.value = ''
+    pwdPass.value = ''
+    loginOpen.value = false
+    void search()
+  } catch (e: any) {
+    pwdErr.value = e?.message || '登录失败'
+  } finally {
+    pwdBusy.value = false
+  }
+}
+
+async function ckLogin(): Promise<void> {
+  if (ckBusy.value) return
+  ckErr.value = ''
+  if (!ckText.value.trim()) {
+    ckErr.value = '请粘贴 Cookie 内容'
+    return
+  }
+  ckBusy.value = true
+  try {
+    await call('bili:cookieLogin', { cookie: ckText.value.trim() })
+    await loadBiliStatus()
+    ui.toast('视频源账号登录成功', 'success')
+    ckText.value = ''
+    loginOpen.value = false
+    void search()
+  } catch (e: any) {
+    ckErr.value = e?.message || '登录失败'
+  } finally {
+    ckBusy.value = false
+  }
+}
+
+async function biliLogout(): Promise<void> {
+  try {
+    await call('bili:logout')
+    await loadBiliStatus()
+    ui.toast('已退出视频源账号', 'success')
+    loginOpen.value = false
+  } catch (e: any) {
+    ui.toast(e?.message || '退出失败', 'error')
+  }
+}
 
 async function search(): Promise<void> {
   const k = keyword.value.trim() || '音乐'
@@ -106,11 +260,15 @@ const PLACEHOLDER = computed(() => (keyword.value ? keyword.value : '搜索视�
 const HOT_SUGGESTIONS = HOT
 
 onMounted(() => {
+  void loadBiliStatus()
   void search()
   watchSentinel()
 })
 watch(list, () => void nextTick(watchSentinel))
-onBeforeUnmount(() => observer?.disconnect())
+onBeforeUnmount(() => {
+  observer?.disconnect()
+  stopPoll()
+})
 </script>
 
 <template>
@@ -130,6 +288,14 @@ onBeforeUnmount(() => observer?.disconnect())
       </div>
       <div class="mv-hot">
         <button v-for="k in HOT_SUGGESTIONS" :key="k" class="mv-hot-tag" @click="quick(k)">{{ k }}</button>
+      </div>
+      <!-- 视频源登录入口（规格书 2.x：登录后解锁高清晰度；入口常驻视频页顶部） -->
+      <div class="mv-account">
+        <button class="mv-acc-btn" :class="{ on: bili.loggedIn }" @click="openLogin">
+          <Icon :name="bili.loggedIn ? 'user' : 'qr'" :size="14" />
+          <span>{{ bili.loggedIn ? (bili.uname || '已登录') : '登录视频源' }}</span>
+        </button>
+        <span class="mv-acc-tip">{{ bili.loggedIn ? '已解锁高清晰度' : '登录后可解锁更高清晰度' }}</span>
       </div>
     </div>
 
@@ -161,6 +327,56 @@ onBeforeUnmount(() => observer?.disconnect())
       <div v-else-if="!hasMore && list.length" class="mv-more">没有更多了</div>
       <div ref="sentinel" style="height: 1px" />
     </template>
+
+    <!-- 视频源登录面板：扫码 / 账号密码 / Cookie -->
+    <div v-if="loginOpen" class="lg-mask" @click.self="closeLogin">
+      <div class="lg-card">
+        <div class="lg-head">
+          <b>{{ bili.loggedIn ? '视频源账号' : '登录视频源' }}</b>
+          <button class="lg-close" @click="closeLogin"><Icon name="close" :size="16" /></button>
+        </div>
+
+        <div v-if="bili.loggedIn" class="lg-user">
+          <div class="lg-avatar"><Icon name="user" :size="20" /></div>
+          <div class="lg-user-info">
+            <b>{{ bili.uname || '已登录' }}</b>
+            <span>已解锁高清晰度</span>
+          </div>
+          <button class="lg-btn ghost" @click="biliLogout"><Icon name="logout" :size="14" />退出</button>
+        </div>
+
+        <template v-else>
+          <div class="lg-tabs">
+            <button class="lg-tab" :class="{ on: loginTab === 'qr' }" @click="switchLoginTab('qr')">扫码</button>
+            <button class="lg-tab" :class="{ on: loginTab === 'pwd' }" @click="switchLoginTab('pwd')">账号密码</button>
+            <button class="lg-tab" :class="{ on: loginTab === 'cookie' }" @click="switchLoginTab('cookie')">Cookie</button>
+          </div>
+
+          <div v-if="loginTab === 'qr'" class="lg-pane">
+            <div class="lg-qr">
+              <img v-if="qrImg" :src="qrImg" alt="视频源登录二维码" />
+              <div v-else class="lg-qr-sk" />
+            </div>
+            <p class="lg-status">{{ qrStatus }}</p>
+            <button class="lg-btn" @click="openBiliApp"><Icon name="external" :size="14" />拉起哔哩哔哩确认登录</button>
+            <button class="lg-btn ghost" @click="startQrLogin">刷新二维码</button>
+          </div>
+
+          <div v-else-if="loginTab === 'pwd'" class="lg-pane">
+            <input v-model="pwdUser" class="lg-input" placeholder="手机号 / 邮箱" autocomplete="username" />
+            <input v-model="pwdPass" class="lg-input" type="password" placeholder="密码" autocomplete="current-password" />
+            <p v-if="pwdErr" class="lg-err">{{ pwdErr }}</p>
+            <button class="lg-btn" :disabled="pwdBusy" @click="pwdLogin">{{ pwdBusy ? '登录中…' : '登录' }}</button>
+          </div>
+
+          <div v-else class="lg-pane">
+            <textarea v-model="ckText" class="lg-textarea" placeholder="粘贴浏览器 Cookie（含 SESSDATA）" />
+            <p v-if="ckErr" class="lg-err">{{ ckErr }}</p>
+            <button class="lg-btn" :disabled="ckBusy" @click="ckLogin">{{ ckBusy ? '登录中…' : '登录' }}</button>
+          </div>
+        </template>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -290,5 +506,193 @@ onBeforeUnmount(() => observer?.disconnect())
   padding: 18px 0 6px;
   font-size: 12px;
   color: var(--text-3);
+}
+/* 视频源登录入口 */
+.mv-account {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+}
+.mv-acc-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 30px;
+  padding: 0 12px;
+  border-radius: 15px;
+  border: 1px solid var(--line);
+  background: var(--bg-2);
+  color: var(--text-2);
+  font-size: 12.5px;
+}
+.mv-acc-btn.on {
+  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+  color: var(--accent);
+}
+.mv-acc-tip {
+  font-size: 11px;
+  color: var(--text-3);
+}
+/* 登录面板 */
+.lg-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  display: flex;
+  align-items: flex-end;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(2px);
+}
+.lg-card {
+  width: 100%;
+  max-height: 82vh;
+  overflow-y: auto;
+  padding: 16px 18px calc(20px + env(safe-area-inset-bottom));
+  border-radius: 20px 20px 0 0;
+  background: var(--bg-2);
+  border-top: 1px solid var(--line);
+}
+.lg-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+.lg-head b {
+  font-size: 15px;
+}
+.lg-close {
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  border-radius: 15px;
+  background: var(--bg-2);
+  color: var(--text-2);
+}
+.lg-user {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px;
+  border-radius: 14px;
+  background: var(--bg-2);
+}
+.lg-avatar {
+  width: 40px;
+  height: 40px;
+  display: grid;
+  place-items: center;
+  border-radius: 20px;
+  background: var(--bg-3, rgba(255, 255, 255, 0.06));
+  color: var(--text-2);
+}
+.lg-user-info {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+.lg-user-info b {
+  font-size: 14px;
+}
+.lg-user-info span {
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+.lg-tabs {
+  display: flex;
+  gap: 6px;
+  padding: 3px;
+  border-radius: 12px;
+  background: var(--bg-2);
+  margin-bottom: 14px;
+}
+.lg-tab {
+  flex: 1;
+  height: 34px;
+  border-radius: 9px;
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+.lg-tab.on {
+  background: var(--bg-2);
+  color: var(--text);
+  font-weight: 600;
+}
+.lg-pane {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.lg-qr {
+  align-self: center;
+  width: 190px;
+  height: 190px;
+  display: grid;
+  place-items: center;
+  border-radius: 14px;
+  background: #fff;
+  overflow: hidden;
+}
+.lg-qr img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+.lg-qr-sk {
+  width: 100%;
+  height: 100%;
+  background: linear-gradient(110deg, #eee 30%, #f6f6f6 50%, #eee 70%);
+}
+.lg-status {
+  margin: 0;
+  text-align: center;
+  font-size: 12px;
+  color: var(--text-3);
+  line-height: 1.6;
+}
+.lg-input,
+.lg-textarea {
+  width: 100%;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: var(--bg-2);
+  color: var(--text);
+  font-size: 13.5px;
+  padding: 0 12px;
+  height: 44px;
+}
+.lg-textarea {
+  height: 96px;
+  padding: 10px 12px;
+  resize: none;
+}
+.lg-err {
+  margin: 0;
+  font-size: 12px;
+  color: #f87171;
+}
+.lg-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 44px;
+  border-radius: 12px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 13.5px;
+  font-weight: 600;
+}
+.lg-btn.ghost {
+  background: var(--bg-2);
+  color: var(--text-2);
+  font-weight: 500;
+}
+.lg-btn:disabled {
+  opacity: 0.6;
 }
 </style>

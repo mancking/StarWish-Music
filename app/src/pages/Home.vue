@@ -26,15 +26,6 @@ const error = ref('')
 const feed = ref<any>(null)
 const refreshing = ref(false)
 
-/* 首页搜索（规格书 3.1：问候语下方胶囊搜索框，40~48px） */
-const searchText = ref('')
-function submitSearch(): void {
-  const k = searchText.value.trim()
-  if (!k) return
-  router.push({ path: '/search', query: { q: k } })
-  searchText.value = ''
-}
-
 const greeting = computed(() => {
   const h = new Date().getHours()
   if (h < 6) return '夜深了'
@@ -216,17 +207,6 @@ onMounted(() => {
           <div class="kicker">{{ dateText }}</div>
           <h1>{{ greeting }}，欢迎回来</h1>
           <p class="sub">从星河里捞一首歌，陪你度过此刻。</p>
-          <div class="hero-search">
-            <Icon name="search" :size="16" class="hs-icon" />
-            <input
-              v-model="searchText"
-              type="search"
-              placeholder="搜索歌曲、歌手、歌单"
-              enterkeyhint="search"
-              @keydown.enter="submitSearch"
-            />
-            <button class="hs-go" @click="submitSearch">搜索</button>
-          </div>
           <div class="hero-actions">
             <button class="btn primary lg" @click="playDaily">
               <Icon name="play" :size="15" />播放每日推荐

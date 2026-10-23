@@ -394,13 +394,18 @@ watch(bvid, () => void load())
       </div>
     </section>
 
-    <!-- 更多：底部抽屉 -->
+    <!-- 更多：紧凑底部抽屉（参照 B 站：图标网格 + 单行横滑选择，不铺满全屏） -->
     <div v-if="showSheet" class="sheet-mask" @click.self="showSheet = false">
       <div class="sheet">
         <div class="sheet-grip" />
+        <div class="sheet-head">
+          <b>播放设置</b>
+          <button class="sheet-done" @click="showSheet = false">完成</button>
+        </div>
+
         <div class="sheet-sec">
           <div class="sheet-title">画质</div>
-          <div class="sheet-chips">
+          <div class="sheet-scroll">
             <button
               v-for="q in qualities"
               :key="q.qn"
@@ -411,32 +416,35 @@ watch(bvid, () => void load())
             <span v-if="!qualities.length" class="none">当前流无多画质</span>
           </div>
         </div>
+
         <div class="sheet-sec">
           <div class="sheet-title">倍速</div>
-          <div class="sheet-chips">
+          <div class="sheet-scroll">
             <button v-for="r in RATES" :key="r" class="s-chip" :class="{ on: r === rate }" @click="setRate(r)">
               {{ r === 1 ? '正常' : r + 'x' }}
             </button>
           </div>
         </div>
-        <div class="sheet-sec">
-          <div class="sheet-title">播放</div>
-          <div class="sheet-chips">
-            <button class="s-chip" :class="{ on: autoNext }" @click="autoNext = !autoNext">自动连播</button>
-            <button class="s-chip" :class="{ on: loopMode === 'one' }" @click="loopMode = loopMode === 'one' ? 'off' : 'one'">单集循环</button>
-            <button class="s-chip" :class="{ on: loopMode === 'list' }" @click="loopMode = loopMode === 'list' ? 'off' : 'list'">列表循环</button>
-            <button class="s-chip" :class="{ on: abA !== null }" @click="markAB">{{ abLabel }}</button>
-            <button class="s-chip" @click="togglePip">画中画</button>
-            <button class="s-chip" :class="{ on: ui.settings.danmakuEnabled }" @click="toggleDanmaku">弹幕</button>
-            <button class="s-chip" :class="{ on: !muted }" @click="muted = !muted; if (videoEl) videoEl.muted = muted">{{ muted ? '静音中' : '声音' }}</button>
-          </div>
-        </div>
+
         <div class="sheet-sec">
           <div class="sheet-title">画面</div>
-          <div class="sheet-chips">
+          <div class="sheet-scroll">
             <button v-for="m in FILL_MODES" :key="m" class="s-chip" :class="{ on: m === fillMode }" @click="setFill(m)">
               {{ FILL_LABEL[m] }}
             </button>
+          </div>
+        </div>
+
+        <div class="sheet-sec">
+          <div class="sheet-title">播放</div>
+          <div class="sheet-grid">
+            <button class="g-item" :class="{ on: autoNext }" @click="autoNext = !autoNext">自动连播</button>
+            <button class="g-item" :class="{ on: loopMode === 'one' }" @click="loopMode = loopMode === 'one' ? 'off' : 'one'">单集循环</button>
+            <button class="g-item" :class="{ on: loopMode === 'list' }" @click="loopMode = loopMode === 'list' ? 'off' : 'list'">列表循环</button>
+            <button class="g-item" :class="{ on: abA !== null }" @click="markAB">{{ abLabel }}</button>
+            <button class="g-item" @click="togglePip">画中画</button>
+            <button class="g-item" :class="{ on: ui.settings.danmakuEnabled }" @click="toggleDanmaku">弹幕</button>
+            <button class="g-item" :class="{ on: !muted }" @click="muted = !muted; if (videoEl) videoEl.muted = muted">{{ muted ? '已静音' : '声音开' }}</button>
           </div>
         </div>
       </div>
@@ -674,7 +682,7 @@ watch(bvid, () => void load())
   color: var(--text-3);
 }
 
-/* 底部抽屉 */
+/* 底部抽屉（紧凑：横滑单行 + 图标网格） */
 .sheet-mask {
   position: fixed;
   inset: 0;
@@ -685,42 +693,90 @@ watch(bvid, () => void load())
 }
 .sheet {
   width: 100%;
-  max-height: 68vh;
+  max-height: 56vh;
   overflow-y: auto;
-  border-radius: 20px 20px 0 0;
+  border-radius: 18px 18px 0 0;
   background: var(--bg);
   border-top: 1px solid var(--line);
-  padding: 10px 16px calc(16px + env(safe-area-inset-bottom, 0px));
+  padding: 8px 16px calc(14px + env(safe-area-inset-bottom, 0px));
 }
 .sheet-grip {
   width: 40px;
   height: 4px;
   border-radius: 2px;
   background: var(--line);
-  margin: 4px auto 10px;
+  margin: 4px auto 6px;
+}
+.sheet-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 2px 0 6px;
+}
+.sheet-head b {
+  font-size: 14px;
+}
+.sheet-done {
+  height: 28px;
+  padding: 0 12px;
+  border-radius: 14px;
+  background: var(--bg-2);
+  color: var(--text-2);
+  font-size: 12.5px;
 }
 .sheet-sec + .sheet-sec {
-  margin-top: 14px;
+  margin-top: 12px;
 }
 .sheet-title {
-  font-size: 13px;
-  font-weight: 700;
-  color: var(--text-2);
-  margin-bottom: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-3);
+  margin-bottom: 6px;
 }
-.sheet-chips {
+/* 单行横滑，避免选项多时把抽屉撑高 */
+.sheet-scroll {
   display: flex;
-  flex-wrap: wrap;
+  gap: 8px;
+  overflow-x: auto;
+  padding-bottom: 2px;
+  scrollbar-width: none;
+}
+.sheet-scroll::-webkit-scrollbar {
+  display: none;
+}
+.sheet-scroll .s-chip {
+  flex: 0 0 auto;
+}
+.sheet-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
   gap: 8px;
 }
-.s-chip {
-  height: 38px;
-  padding: 0 15px;
-  border-radius: 19px;
+.g-item {
+  height: 46px;
+  border-radius: 12px;
   border: 1px solid var(--line);
   background: var(--bg-2);
   color: var(--text-2);
-  font-size: 13px;
+  font-size: 12px;
+  line-height: 1.25;
+  padding: 0 4px;
+}
+.g-item.on {
+  border-color: color-mix(in srgb, var(--accent) 60%, transparent);
+  background: color-mix(in srgb, var(--accent) 16%, var(--bg-2));
+  color: var(--accent);
+  font-weight: 600;
+}
+.s-chip {
+  height: 34px;
+  padding: 0 14px;
+  border-radius: 17px;
+  border: 1px solid var(--line);
+  background: var(--bg-2);
+  color: var(--text-2);
+  font-size: 12.5px;
+  white-space: nowrap;
   -webkit-tap-highlight-color: transparent;
 }
 .s-chip.on {

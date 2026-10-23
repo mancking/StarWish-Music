@@ -1261,13 +1261,30 @@ export async function toplistSongs(platform: string, id: string): Promise<{ name
 /* ============================ B 站 ============================ */
 
 export async function searchBiliVideo(keyword: string, page = 1): Promise<MvItem[]> {
-  const url = `https://api.bilibili.com/x/web-interface/wbi/search/type?${qs({
-    search_type: 'video',
-    keyword,
-    page,
-  })}`
-  const res = await request(url, { headers: biliHeaders(), timeout: 15000 })
-  const items: any[] = res.body?.data?.result || []
+  // wbi 版接口在某些网络/风控下会返回 code=-412 且 data.result 为空（真机 5G 常见），
+  // 这里先打 wbi 接口，拿不到结果再退回未签名的老接口，两条都空才报出真实原因。
+  const query = qs({ search_type: 'video', keyword, page, page_size: 20 })
+  const endpoints = [
+    `https://api.bilibili.com/x/web-interface/wbi/search/type?${query}`,
+    `https://api.bilibili.com/x/web-interface/search/type?${query}`,
+  ]
+  let lastCode: number | undefined
+  let lastMsg = ''
+  let items: any[] = []
+  for (const url of endpoints) {
+    const res = await request(url, { headers: biliHeaders(), timeout: 15000 })
+    const body = res.body || {}
+    lastCode = typeof body.code === 'number' ? body.code : lastCode
+    lastMsg = String(body.message || lastMsg || '')
+    const got: any[] = body?.data?.result || []
+    if (got.length) {
+      items = got
+      break
+    }
+  }
+  if (!items.length && lastCode && lastCode !== 0) {
+    throw new Error(`B 站视频接口返回 ${lastCode}${lastMsg ? `（${lastMsg}）` : ''}，请检查网络或稍后重试`)
+  }
   return items
     .map(v => ({
       bvid: v.bvid || '',

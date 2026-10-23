@@ -275,6 +275,9 @@ export function createLyricWindow(): BrowserWindow {
     y: usePos ? usePos.y : display.workArea.y + display.workArea.height - height - LYRIC_WIN.margin,
     show: false,
     frame: false,
+    // Windows 上透明无边框窗口默认带 WS_THICKFRAME，系统会把最小高度卡到 63px，
+    // 关掉 thickFrame 才能拿到规格书 1.8 要求的 400×60 精确尺寸。
+    thickFrame: false,
     transparent: true,
     resizable: false,
     movable: true,
@@ -294,6 +297,9 @@ export function createLyricWindow(): BrowserWindow {
     },
   })
   win.setAlwaysOnTop(true, 'screen-saver')
+  // Windows 会在创建时把透明窗口高度向上取整（请求 60 实际得到 63/64），
+  // 创建后显式 setBounds 才能精确落在规格书 1.8 的 400×60。
+  win.setBounds({ width, height })
   // 拖动后记住位置（规格书 1.8「位置写入本地存储」），但坐标要落在可见区域内
   win.on('moved', () => {
     if (win.isDestroyed()) return

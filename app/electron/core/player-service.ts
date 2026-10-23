@@ -45,6 +45,8 @@ class PlayerService {
   private failures = 0
   /** 连续「换源用尽后跳下一首」仍失败的歌曲数，播放成功即清零 */
   private consecutiveFails = 0
+  /** 已写入播放历史的歌曲 id（规格书 3.3：开始播放即记录，切歌后重置） */
+  private histMarked = ''
   private broadcast: Broadcast = () => {}
   private shuffleHistory: number[] = []
   private lastResolved: { url: string; quality: string; matched?: Song } | null = null
@@ -80,7 +82,19 @@ class PlayerService {
         if (st === 'playing' || st === 'paused' || st === 'loading' || st === 'stopped') {
           this.state.status = st as PlayerState['status']
         }
-        if (st === 'playing') this.consecutiveFails = 0
+        if (st === 'playing') {
+          this.consecutiveFails = 0
+          // 规格书 3.3：开始播放即写入历史（同一首只记一次，切歌后重置）
+          const cur = this.state.song
+          if (cur && this.histMarked !== cur.id) {
+            this.histMarked = cur.id
+            try {
+              addHistory(cur, 0)
+            } catch (e) {
+              logger.warn('写入播放历史失败', e)
+            }
+          }
+        }
         if (typeof msg.duration === 'number' && msg.duration > 0) this.state.duration = msg.duration
         if (typeof msg.position === 'number') this.state.position = msg.position
         if (typeof msg.buffered === 'number') this.state.buffered = msg.buffered
@@ -318,7 +332,7 @@ class PlayerService {
 
   private handleEnded(): void {
     if (this.state.song) {
-      addHistory(this.state.song, Math.round(this.state.duration * 1000))
+      // 历史已在「开始播放」时写入（规格书 3.3），这里只负责推进队列
     }
     const mode = this.state.mode
     if (mode === 'repeat-one') {
