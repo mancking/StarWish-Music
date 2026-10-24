@@ -403,7 +403,7 @@ export function applyTitleBarTheme(dark: boolean): void {
 }
 
 export function broadcast(channel: string, payload: any): void {
-  for (const key of ['main', 'lyric'] as const) {
+  for (const key of ['main', 'lyric', 'taskbar'] as const) {
     const w = wins[key]
     if (w && !w.isDestroyed()) {
       try {

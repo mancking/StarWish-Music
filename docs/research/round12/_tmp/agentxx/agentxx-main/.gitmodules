@@ -1,0 +1,69 @@
+[submodule "agent/third_party/cxx_utilxx_base"]
+	path = agent/third_party/cxx_utilxx_base
+	url = https://github.com/coolight7/cxx_utilxx_base
+[submodule "agent/third_party/cxx_utilxx"]
+	path = agent/third_party/cxx_utilxx
+	url = https://github.com/coolight7/cxx_utilxx
+[submodule "agent/third_party/cxx_pluginxx"]
+	path = agent/third_party/cxx_pluginxx
+	url = https://github.com/coolight7/cxx_pluginxx
+[submodule "agent/third_party/cxx_pluginxx_ui"]
+	path = agent/third_party/cxx_pluginxx_ui
+	url = https://github.com/coolight7/cxx_pluginxx_ui
+[submodule "agent/third_party/fmt"]
+	path = agent/third_party/fmt
+	url = https://github.com/fmtlib/fmt
+[submodule "agent/third_party/simdjson"]
+	path = agent/third_party/simdjson
+	url = https://github.com/simdjson/simdjson
+[submodule "agent/third_party/neograph"]
+	path = agent/third_party/neograph
+	url = https://github.com/coolight7/NeoGraph
+[submodule "agent/third_party/html2md"]
+	path = agent/third_party/html2md
+	url = https://github.com/coolight7/html2md
+[submodule "agent/third_party/glob"]
+	path = agent/third_party/glob
+	url = https://github.com/coolight7/glob
+[submodule "agent/third_party/uchardet"]
+	path = agent/third_party/uchardet
+	url = https://github.com/coolight7/uchardet
+[submodule "agent/third_party/yaml-cpp"]
+	path = agent/third_party/yaml-cpp
+	url = https://github.com/jbeder/yaml-cpp
+[submodule "agent/third_party/liburing"]
+	path = agent/third_party/liburing
+	url = https://github.com/axboe/liburing
+[submodule "agent/third_party/codegraph-cpp"]
+	path = agent/third_party/codegraph-cpp
+	url = https://github.com/coolight7/codegraph-cpp
+[submodule "agent/third_party/sqlite3-cmake"]
+	path = agent/third_party/sqlite3-cmake
+	url = https://github.com/coolight7/sqlite3-cmake
+[submodule "agent/third_party/libiconv-native"]
+	path = agent/third_party/libiconv-native
+	url = https://github.com/coolight7/libiconv-native
+[submodule "agent/third_party/curl"]
+	path = agent/third_party/curl
+	url = https://github.com/curl/curl
+[submodule "agent/third_party/hyperscan"]
+	path = agent/third_party/hyperscan
+	url = https://github.com/coolight7/hyperscan
+[submodule "agent/third_party/zlib-ng"]
+	path = agent/third_party/zlib-ng
+	url = https://github.com/zlib-ng/zlib-ng
+[submodule "agent/third_party/ftxui"]
+	path = agent/third_party/ftxui
+	url = https://github.com/coolight7/FTXUI
+[submodule "agent/third_party/markdown_ftxui"]
+	path = agent/third_party/markdown_ftxui
+	url = https://github.com/coolight7/MarkdownFTXUI
+[submodule "agent/third_party/cmark_gfm"]
+	path = agent/third_party/cmark_gfm
+	url = https://github.com/coolight7/cmark-gfm
+[submodule "agent/third_party/quickjs"]
+	path = agent/third_party/quickjs
+	url = https://github.com/quickjs-ng/quickjs
+[submodule "agent/third_party/mimalloc"]
+	path = agent/third_party/mimalloc
+	url = https://github.com/microsoft/mimalloc

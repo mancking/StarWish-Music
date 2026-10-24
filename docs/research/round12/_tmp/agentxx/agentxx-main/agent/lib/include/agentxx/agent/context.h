@@ -1,0 +1,1007 @@
+#pragma once
+
+#include "agentxx/agent/config.h"
+#include "agentxx/agent/conversation_types.h"
+#include "asio/awaitable.hpp"
+#include "asio/thread_pool.hpp"
+#include "utilxx_base/log.h"
+#include <atomic>
+#include <cassert>
+#include <chrono>
+#include <functional>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <neograph/json.h>
+#include <neograph/types.h>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <vector>
+
+namespace agentxx::events {
+class EventBus;
+} // namespace agentxx::events
+
+namespace neograph::graph {
+class CancelToken;
+class GraphRegistry;
+} // namespace neograph::graph
+
+namespace agentxx {
+namespace middleware {
+class MiddlewareContext;
+class SubagentManagerMiddlewareHandle;
+} // namespace middleware
+
+namespace plugin {
+class ToolRegistry;
+class PluginManager;
+} // namespace plugin
+
+namespace feature {
+/// 功能点注册表 (点 / 实现 / 调用; 详见
+/// [feature.h](/agent/lib/include/agentxx/feature/feature.h))
+class Registry;
+} // namespace feature
+
+namespace util {
+class KeyMetrics;
+class TaskScope;
+} // namespace util
+
+namespace tools {
+class SubAgentManagerTool;
+}
+
+namespace agent {
+
+class AgentIOBase;
+class ModelProviderRegistry;
+class SessionStore;
+class AgentHost;
+/// 会话资源应用器 (Skill/Memory/MCP 扩展; 完整定义见
+/// [resource_applier.h](/agent/lib/include/agentxx/agent/resource_applier.h))
+class AgentResourceApplier;
+
+/// 会话绑定的 git worktree (worktree 模式; 由 agentxx_git_worktree 工具维护)
+/// - 绑定后该会话的相对路径基准、权限隔离边界均切换到 worktree
+/// - 底层 git 操作封装见 [worktree.h](/agent/third_party/cxx_utilxx/include/utilxx/worktree.h),
+///   工具实现见 [git_worktree.h](/agent/lib/include/agentxx/tools/git_worktree.h)
+struct WorktreeBinding {
+    /// worktree 名称 (目录名与自动分支名来源)
+    std::string name;
+    /// worktree 绝对路径 ({repoRoot}/.agentxx/agent/worktrees/{name})
+    std::string path;
+    /// 关联分支名 (agentxx/wt-{name})
+    std::string branch;
+    /// 主检出仓库根绝对路径
+    std::string repoRoot;
+};
+
+/// 会话持久化回调 (由 SessionsManager 创建 Session 时注入, 解耦 sqlite 依赖)
+/// - 所有回调仅做"尽力而为"持久化, 内部已捕获异常并记录日志, 不中断主流程
+struct SessionStoreHooks {
+    /// 追加展示历史消息后调用 (msg 已含分配 id; msgIdCounter 为追加后计数,
+    /// 供重启恢复时延续 id 分配; seq 为该消息的持久化序号, 见
+    /// [Session::lastViewSeq], 供重连增量补拉)
+    std::function<void(const ViewMessage&, uint64_t msgIdCounter, uint64_t seq)>
+        onAppendViewMessage;
+
+    /// 更新一条已持久化历史消息后调用 (msg 已含分配 id; 如 tool 结果回填)
+    std::function<void(const ViewMessage&)> onUpdateViewMessage;
+
+    /// 保存 LLM 上下文消息 (每轮对话结束时调用)
+    /// - 传入的是已序列化的 JSON 数组**文本**, 不是 DOM: 落盘只需要文本,
+    ///   会话侧直接给出文本可以少构造一份与上下文等大的 DOM
+    std::function<void(std::string_view)> onSaveLlmMessages;
+};
+
+/// 本会话已消耗的 token 累计量 (供 UI 显示; 与上下文占用不是一回事)
+///
+/// - 与 [ContextStats::contextTokens] 的区别: 后者是"当前装了多少" (随压缩回落),
+///   这里是"累计花掉多少", 只增不减
+/// - 每次模型调用结算时累加 (见 nodes/modelcall.cpp 的用量记账)
+/// - 会话第一次加载时由用量台账 (SessionStore 的 usage 表聚合) 恢复, 因此跨进程
+///   重启后继续累计; 不持久化在本进程内存之外的地方
+/// - 字段含义与 wire 协议 [agentxx::agent::WireContextStats] 的用量段一致
+struct SessionUsageTotals {
+    /// 输入 (prompt) token 累计; 含命中缓存与写入缓存的输入
+    int64_t promptTokens{0};
+
+    /// 输出 (completion) token 累计
+    int64_t completionTokens{0};
+
+    /// 合计 (prompt + completion)
+    int64_t totalTokens{0};
+
+    /// 其中命中 prompt 缓存的 token 累计
+    /// - 缓存命中率 = cachedPromptTokens / promptTokens
+    int64_t cachedPromptTokens{0};
+};
+
+/// 上下文统计 (供 UI 显示上下文占用与已消耗用量)
+/// - 占用由 SummarizationMiddlewareHandle 在每次 modelcall 前更新
+/// - 累计用量由模型调用结算处 (nodes/modelcall.cpp) 累加
+struct ContextStats {
+    /// 当前上下文占用的 token 数
+    size_t contextTokens{0};
+
+    /// 模型支持的最大 token 数
+    size_t maxContextTokens{0};
+
+    /// 当前 ModelCall 的平均生成速度 (token/s, 估算值)
+    /// - 由 EventBridge 在流式期间定时更新推送; 无流式时为 0
+    double tps{0.0};
+
+    /// 本会话已消耗的 token 累计量
+    SessionUsageTotals usage;
+};
+
+/// 会话当前活动状态
+enum class SessionActivity : uint8_t {
+    Idle,
+    Streaming,     /// LLM 正在输出 token
+    ExecutingTool, /// 工具正在执行
+    WaitingInput,  /// 等待用户输入 (中断/权限)
+};
+
+/// 单个会话的独立状态 (按 sessionId 区分)
+/// - 设计目标：单线程/多协程交错执行多会话，会话间状态彼此隔离
+/// - io/bus/contextStats 在 agent 线程 (io_context) 上访问，无需额外同步
+/// - viewMessages/messages(上下文)/chainHash/cancelToken/modelName 仅在 ioContext 线程读写,
+///   通过 bindIoThread() 绑定 io 线程, assertIoThread() 强制校验。
+///   client/UI 不直接读取, 需要时由 io 线程拷贝后经 Wire 消息 (Sync/WireDelta) 传输,
+///   因此无需快照/锁同步
+/// - deltaSeq              (普通 uint64_t, 仅 io 线程递增; EventBridge 分配)
+/// - contextStats          (std::atomic 字段, 跨线程安全)
+/// - UI 线程的取消/切模型操作通过 Wire 消息 (WireCancel/WireSelectModel) 发往 agent 线程处理
+class Session {
+public:
+
+    Session() = default;
+    ~Session();
+    // 成员按对齐/尺寸从大到小排列, 减少结构体内填充字节
+
+    /// 完整历史消息 (append-only, 永不压缩, 用于 client 同步与展示)
+    /// - 仅 ioContext 线程可读写 (写: appendViewMessage), 通过 assertIoThread() 强制
+    std::vector<ViewMessage> viewMessages;
+
+    /// 本会话的 IO
+    std::shared_ptr<AgentIOBase> io = nullptr;
+
+    /// 本会话的事件总线 (会话级事件: interrupt/permission/tool 等)
+    std::shared_ptr<agentxx::events::EventBus> bus = nullptr;
+
+    /// 本会话的上下文统计
+    std::shared_ptr<ContextStats> contextStats = std::make_shared<ContextStats>();
+
+    /// LLM 上下文消息 (可压缩/裁剪, 仅用于调用 LLM API)
+    /// - 本会话是上下文的唯一权威: 图状态通道不再持有上下文, 节点直接经
+    ///   下面的读写接口访问
+    /// - 所有变更经 appendMessages / replaceMessages / truncateMessages 单一入口,
+    ///   保证 messagesVersion 单调递增 (中断/异常快照与回滚依赖该版本号)
+    /// - 仅 ioContext 线程访问 (与 viewMessages 同一约束)
+
+    /// viewMessages 的链式哈希 (用于 client 校验一致性)    /// - 仅 ioContext 线程可读写 (appendViewMessage 内部更新)
+    ChainHash chainHash;
+
+    /// WireDelta 流序号 (单调递增; 仅 io 线程读写)
+    /// - 由 EventBridge / Session::nextDeltaSeq 统一分配, 服务端增量重放缓冲
+    ///   依赖 seq 单调性; 除重放路径外, 新产出的 WireDelta 必须经 nextDeltaSeq 分配
+    uint64_t deltaSeq = 0;
+
+    /// 当前活动状态 (io 通过此字段感知状态变化)
+    SessionActivity activity = SessionActivity::Idle;
+
+    // -------------------------------------------------------------------
+    // 线程绑定: 强制 viewMessages/上下文消息/chainHash 只在 io 线程写入
+    // -------------------------------------------------------------------
+
+    /// 绑定 io 线程 (在 BaseAgent::runTurnAsync 首次使用时调用)
+    /// - 仅首次调用生效, 后续调用为 no-op
+    void bindIoThread() {
+        auto expected = std::thread::id{};
+        ioThreadId_.compare_exchange_strong(expected, std::this_thread::get_id());
+    }
+
+    /// 判断当前线程是否为已绑定的 io 线程
+    /// - 未绑定时 (ioThreadId_ == default) 返回 true, 允许初始化阶段/单线程使用
+    bool isIoThread() const noexcept {
+        auto bound = ioThreadId_.load(std::memory_order_relaxed);
+        return bound == std::thread::id{} || bound == std::this_thread::get_id();
+    }
+
+    /// 断言当前线程为已绑定的 io 线程
+    /// - 未绑定时 (ioThreadId_ == default) 不触发, 允许初始化阶段使用
+    /// - 已绑定后, 非 io 线程调用在 Debug 下 assert 失败, Release 下记录错误并返回
+    void assertIoThread() const {
+        auto bound = ioThreadId_.load(std::memory_order_relaxed);
+        if (bound == std::thread::id{} || bound == std::this_thread::get_id()) {
+            return;
+        }
+#ifndef NDEBUG
+        assert(false && "Session: mutable state must only be accessed on the bound io thread");
+#else
+        XX_LOGE(
+            "Session: mutable state accessed off io thread (bound={}, current={})",
+            bound == std::thread::id{} ? std::string{"unbound"} : std::string{"bound"},
+            std::this_thread::get_id() == std::thread::id{} ? std::string{"unknown"}
+                                                            : std::string{"other"}
+        );
+#endif
+    }
+
+    // -------------------------------------------------------------------
+    // 只读访问接口 (仅 io 线程调用; client 同步由 io 线程拷贝后经 Wire 传输)
+    // -------------------------------------------------------------------
+
+    /// 获取完整历史消息副本
+    /// - 仅 io 线程调用 (assertIoThread 强制校验); 返回拷贝供 Sync 传输
+    std::vector<ViewMessage> getFullViewMessagesCopy() const {
+        assertIoThread();
+        return viewMessages;
+    }
+
+    /// 历史消息总数 (仅 io 线程调用; 历史分页同步用)
+    size_t viewMessageCount() const {
+        assertIoThread();
+        return viewMessages.size();
+    }
+
+    /// 获取 [start, end) 区间的历史消息副本 (历史分页同步用)
+    /// - 仅 io 线程调用 (assertIoThread 强制校验)
+    /// - start/end 自动收敛到有效区间 (end <= start 时返回空), 避免调用方
+    ///   重复做边界裁剪; 相比 getFullViewMessagesCopy 避免了每页请求的
+    ///   全量拷贝 (长会话分页热路径)
+    std::vector<ViewMessage> getViewMessagesRange(size_t start, size_t end) const {
+        assertIoThread();
+        if (end > viewMessages.size()) {
+            end = viewMessages.size();
+        }
+        if (start >= end) {
+            return {};
+        }
+        return std::vector<ViewMessage>(viewMessages.begin() + start, viewMessages.begin() + end);
+    }
+
+    /// 获取链式哈希信息
+    /// - 仅 io 线程调用 (assertIoThread 强制校验)
+    struct HashInfo {
+        size_t      count = 0;
+        std::string tailHex;
+    };
+
+    HashInfo getHashInfo() const {
+        assertIoThread();
+        return HashInfo{chainHash.count(), chainHash.tailHex()};
+    }
+
+    // -------------------------------------------------------------------
+    // LLM 上下文消息 (会话为唯一权威; 仅 io 线程)
+    // -------------------------------------------------------------------
+
+    /// 读取当前 LLM 上下文 (typed 权威)
+    /// - 只读借用: 仅在本次调用/direct 语句内使用, 不得跨 co_await 持有
+    ///   (期间可能有 appendMessages/replaceMessages 使引用失效)
+    const std::vector<neograph::ChatMessage>& messages() const {
+        assertIoThread();
+        return messages_;
+    }
+
+    /// 上下文版本号 (每次变更 +1, 单调递增)
+    /// - 供中断/异常路径记录 O(1) 快照 (版本 + 条数), 回滚时按条数截断
+    uint64_t messagesVersion() const noexcept {
+        return messagesVersion_;
+    }
+
+    /// 上下文条数
+    size_t messagesCount() const noexcept {
+        return messages_.size();
+    }
+
+    /// 追加消息到上下文末尾 (assistant 回复 / tool 结果 / 补充提示)
+    /// - persistThrottled=true 时请求一次节流落盘 (进程中途被杀最多丢一个窗口)
+    void appendMessages(std::vector<neograph::ChatMessage> msgs, bool persistThrottled = true);
+
+    /// 整体替换上下文 (压缩回写 / 会话播种 / 恢复)
+    void replaceMessages(std::vector<neograph::ChatMessage> msgs, bool persistThrottled = true);
+
+    /// 用 Json 形态整体替换上下文 (sqlite 加载 / Wire 边界形态)
+    void replaceMessagesFromJson(const utilxx_base::Json& msgs);
+
+    /// 截断上下文到 [count] 条 (快照回滚用; count >= 当前条数时不变更)
+    void truncateMessages(size_t count, bool persistThrottled = true);
+
+    /// 取 Json 形态的上下文 (惰性生成并缓存)
+    /// - 供 WireGetContext / 子代理播种 / 插件查询等边界形态使用;
+    ///   返回引用在下一次上下文变更前有效
+    const utilxx_base::Json& llmMessagesJson() const;
+
+    /// 取上下文 JSON 数组的**文本**形态 (惰性生成并缓存)
+    ///
+    /// - 与 `llmMessagesJson().dump()` 逐字节一致 (逐条消息 `to_json` 后单独 dump,
+    ///   与整段 dump 的输出相同), 但**不构造整段数组 DOM**
+    /// - 落盘路径专用: 长会话下每轮都要把整段上下文写库, 走 DOM 形态会在每轮同时
+    ///   留下"整段 DOM + 整段文本"两份与上下文等大的临时内存, 并把整段 DOM 长期
+    ///   缓存; 文本形态只保留一份文本
+    /// - 返回引用在下一次上下文变更前有效
+    const std::string& llmMessagesJsonText() const;
+    // -------------------------------------------------------------------
+    // io 线程专用写入接口
+    // -------------------------------------------------------------------
+
+    /// 向 viewMessages 追加一条消息并更新链式哈希，返回分配的 msgId
+    /// - 必须在 ioContext 线程内调用 (assertIoThread 强制校验)
+    /// - 已绑定持久化回调时同步落库 (失败仅记日志)
+    std::string appendViewMessage(ViewMessage msg);
+
+    /// 更新一条已存在的历史消息 (按 msg.id 定位) 并同步持久化
+    /// - 必须在 ioContext 线程内调用 (assertIoThread 强制校验)
+    /// - 不更新链式哈希 (哈希基于消息内容, 历史内容本不应变化;
+    ///   tool 结果回填属于"补齐信息", 与增量 WireDelta 语义一致)
+    /// - 已绑定持久化回调时同步更新库内对应行 (失败仅记日志)
+    void updateViewMessage(ViewMessage msg);
+
+    /// 绑定持久化回调 (由 SessionsManager 创建 Session 时注入; 测试可不绑定)
+    void setStoreHooks(SessionStoreHooks hooks);
+
+    /// 从持久化状态恢复: 重建链式哈希 (对不含 id 的消息内容, 与
+    /// appendViewMessage 语义一致) 并恢复 msgIdCounter
+    /// - 不触发持久化回调 (恢复本身不产生新的写入)
+    /// - [lastViewSeq] 为库内最大展示消息序号 (见 [lastViewSeq]), 供重连
+    ///   增量补拉继续编号; 0 = 老数据未记录 (按 0 起算)
+    void restore(std::vector<ViewMessage> messages, uint64_t msgIdCounter, uint64_t lastViewSeq = 0);
+
+    /// 展示历史持久化序号 (单调递增, 每条消息一个)
+    /// - 与 deltaSeq (WireDelta 流序号) 相互独立: 本序号标识"持久化历史里的第几条"
+    /// - 客户端在 Sync 里记录它, 重连时经 WriteHello.afterViewSeq 请求增量补拉
+    uint64_t lastViewSeq() const {
+        assertIoThread();
+        return viewSeqCounter_;
+    }
+
+    /// 持久化 LLM 上下文消息 (每轮对话结束时由 BaseAgent 调用)
+    /// - 未绑定回调时为 no-op
+    void saveLlmMessages();
+
+    /// 追加一批 Json 形态的已结算消息 (边界形态入口; 等价于 appendMessages + 节流落盘)
+    void appendSettledLlmMessages(const utilxx_base::Json& settledMsgs);
+
+    /// 请求节流保存当前上下文 (首次触发立即落盘, 窗口内合并)
+    /// - 由消息写入方 (节点/中间件) 经 EventBridge 触发: 进程在轮次中途被杀/崩溃
+    ///   时, 已结算的上下文最多丢失一个节流窗口 (kPersistThrottleMs) 而非整轮
+    void requestSaveLlmMessages();
+
+    /// 最近一次已提示的持久化失败原因 (空 = 尚未提示过)
+    /// - 同一原因只提示一次, 避免每次写入失败都刷屏
+    std::string lastPersistWarning() const {
+        assertIoThread();
+        return lastPersistWarning_;
+    }
+
+    /// 记录"已提示"的持久化失败原因 (由持久化回调在推送警告后调用)
+    void setLastPersistWarning(std::string reason) {
+        assertIoThread();
+        lastPersistWarning_ = std::move(reason);
+    }
+
+    // -------------------------------------------------------------------
+    // 稳定提示前缀指纹 (仅 io 线程)
+    //
+    // 请求装配时对"稳定段" (system 消息 + 工具 schema) 取指纹: 连续请求中它不变,
+    // provider 的前缀缓存才有效。变化时计数并记日志, 供排查"缓存命中率突然下降"。
+    // -------------------------------------------------------------------
+
+    /// 记录本次请求的稳定段指纹
+    /// - `return` 是否与上一次不同 (true = 前缀变化, 缓存前缀失效)
+    bool noteStablePrefixHash(uint64_t hash) {
+        assertIoThread();
+        const bool changed = stablePrefixHash_ != 0 && stablePrefixHash_ != hash;
+        if (changed) {
+            ++stablePrefixChanges_;
+        }
+        stablePrefixHash_ = hash;
+        return changed;
+    }
+
+    /// 最近一次请求的稳定段指纹 (0 = 尚未取过)
+    uint64_t stablePrefixHash() const {
+        assertIoThread();
+        return stablePrefixHash_;
+    }
+
+    /// 稳定段变化次数 (诊断/测试)
+    uint64_t stablePrefixChanges() const {
+        assertIoThread();
+        return stablePrefixChanges_;
+    }
+
+    // -------------------------------------------------------------------
+    // 持久化语义分级 (仅 io 线程)
+    //
+    // - persistNow: 用户输入 / 工具结算 / 压缩完成 / 轮次终态等"事实"立即落盘
+    // - persistThrottled: 展示历史与统计保持节流 (默认路径)
+    // 两者都记录原因 (Debug/Trace 日志), 便于排查"磁盘写入从哪里来"
+    // 未启用持久化 (内存模式) 时为 no-op, 不产生日志噪音。
+    // -------------------------------------------------------------------
+
+    /// 立即落盘: LLM 上下文 + 展示历史待落盘操作 (失败由持久化降级提示负责)
+    void persistNow(std::string_view reason);
+
+    /// 节流落盘: 展示历史按既有窗口压队, LLM 上下文超窗口时立即保存
+    void persistThrottled(std::string_view reason);
+
+    /// 立即补存节流窗口内未落盘的 viewMessages 操作 (轮末统一调用)
+    /// - 保证正常结束的轮次其 view 消息全部落库, 与旧有逐条即时落盘语义收敛一致;
+    ///   仅进程异常退出时才可能丢失窗口内 (<3s) 的尾部消息
+    void flushViewMessages();
+
+    /// 设置本会话当前轮次的取消令牌 (仅 io 线程)
+    void setCancelToken(std::shared_ptr<neograph::graph::CancelToken> token);
+
+    /// 获取本会话当前轮次的取消令牌 (仅 io 线程)
+    std::shared_ptr<neograph::graph::CancelToken> getCancelToken();
+
+    /// 设置本会话选择的模型名 (仅 io 线程)
+    /// - 为空表示使用 ModelProviderRegistry 的默认模型
+    void setModelName(std::string_view name);
+
+    /// 获取本会话选择的模型名 (仅 io 线程)
+    std::string getModelName() const;
+
+    /// 分配下一个 WireDelta 流序号 (仅 io 线程调用)
+    /// - 会话级单调递增; EventBridge 与 SessionServerAgentIO 共用此入口,
+    ///   保证所有新产出的 WireDelta 都分配 seq (重放缓冲依赖 seq 单调性,
+    ///   未分配 seq (=0) 的 WireDelta 不会入缓冲, 断线重连增量重放会丢失)
+    uint64_t nextDeltaSeq() {
+        assertIoThread();
+        return ++deltaSeq;
+    }
+
+    // -------------------------------------------------------------------
+    // 待注入输入 (next-step / inject; 仅 io 线程)
+    //
+    // 与消息队列的区别: 队列条目等待"下一个轮次", 待注入输入等待"下一个安全的
+    // modelcall 边界"。两者都不写入上下文, 直到被取用:
+    // - next-step: 取用时作为 user 消息追加到权威上下文与展示历史
+    // - inject:    取用时只作为本次请求的额外消息, 不改写权威上下文
+    // -------------------------------------------------------------------
+
+    /// 登记一条待注入输入 (保持登记顺序; 不唤醒会话, 不进入消息队列)
+    void enqueuePendingInput(SessionPendingInput input);
+
+    /// 取走并清空指定投递模式的待注入输入
+    /// - `return` 按登记顺序返回; 无匹配时为空
+    std::vector<SessionPendingInput> takePendingInputs(std::string_view delivery);
+
+    /// 待注入输入条数 (诊断/测试)
+    size_t pendingInputCount() const {
+        assertIoThread();
+        return pendingInputs_.size();
+    }
+
+    // -------------------------------------------------------------------
+    // worktree 绑定 (worktree 模式; 仅 io 线程读写)
+    // - path 非空表示已绑定: 该会话的相对路径解析基准/权限隔离边界切换到 worktree
+    // -------------------------------------------------------------------
+
+    /// 设置会话绑定的 worktree (仅 io 线程)
+    void setWorktreeBinding(WorktreeBinding binding) {
+        assertIoThread();
+        worktreeBinding_ = std::move(binding);
+    }
+
+    /// 清除绑定 (如删除当前 worktree 后; 仅 io 线程)
+    void clearWorktreeBinding() {
+        assertIoThread();
+        worktreeBinding_ = {};
+    }
+
+    /// 获取当前绑定 (仅 io 线程; path 为空 = 未绑定)
+    const WorktreeBinding& getWorktreeBinding() const {
+        assertIoThread();
+        return worktreeBinding_;
+    }
+
+    /// 设置本会话使用的语言 (仅 io 线程; 不支持 auto, 空或 auto 回退 "en")
+    void setLanguage(std::string_view lang) {
+        assertIoThread();
+        language_ = normalizeLanguage(lang);
+    }
+
+    /// 获取本会话使用的语言 (仅 io 线程, 为空表示未单独设置)
+    std::string getLanguage() const {
+        assertIoThread();
+        return language_;
+    }
+
+private:
+
+    /// 待落盘的 viewMessages 操作 (保持 append/update 混合顺序, 回放即重放写序列)
+    /// - 只记录 viewMessages 下标 (append-only 容器, 下标稳定), 不持有消息副本:
+    ///   节流窗口内可能有成百上千条消息待落盘, 逐条深拷贝会让消息在内存中存在
+    ///   两份 (实测注入 200K token 历史时多占 1.4 MB)
+    /// - 回放时按当下内容落库: 同一消息在窗口内被多次更新只写最新内容, 最终
+    ///   落库结果与逐条拷贝一致 (append 先于其 update 入队)
+    struct PendingViewOp {
+        bool     isAppend = false;
+        size_t   index    = 0; ///< viewMessages 下标 (isAppend/isUpdate 均为该条消息)
+        uint64_t counter  = 0; ///< isAppend 时的 msgIdCounter (与消息同事务提交)
+        uint64_t seq      = 0; ///< isAppend 时的展示历史持久化序号 (见 [lastViewSeq])
+    };
+
+    /// 持久化回调 (可选; 为空时不落库)
+    SessionStoreHooks hooks_;
+
+    /// worktree 绑定 (仅 io 线程读写; path 为空 = 未绑定)
+    WorktreeBinding worktreeBinding_;
+
+    /// viewMessages 的 msgId → 下标索引 (仅 ioContext 线程读写)
+    /// - 供 updateViewMessage 的 O(1) 定位: tool 结果回填按 msgId 更新历史消息,
+    ///   长会话 (数千条) + 大量工具调用时, 每条结果都线性重扫一遍历史开销明显
+    /// - 仅在 appendViewMessage / restore / updateViewMessage 内维护; 索引未命中
+    ///   或与 viewMessages 不一致时回退线性扫描并修复索引 (防御其他直接改动)
+    std::unordered_map<std::string, size_t, std::hash<std::string>, std::equal_to<>> msgIndex_;
+
+    /// 上下文 Json 镜像 (惰性生成: 仅边界形态需要时构造, 避免每次写入都深拷贝)
+    mutable utilxx_base::Json llmMessagesJsonCache_ = utilxx_base::Json::array();
+    /// 上下文 Json 数组文本镜像 (惰性生成; 落盘路径专用, 与上者内容一致但更省内存)
+    mutable std::string llmMessagesJsonTextCache_;
+    std::string         modelName_;
+    std::string                                   language_;
+    /// 最近一次已提示的持久化失败原因 (去重)
+    std::string lastPersistWarning_;
+
+    /// 稳定提示前缀指纹与变化次数 (仅 io 线程)
+    uint64_t stablePrefixHash_    = 0;
+    uint64_t stablePrefixChanges_ = 0;
+
+    // -------------------------------------------------------------------
+    // LLM 上下文 (唯一权威; 仅 io 线程)
+    // -------------------------------------------------------------------
+
+    /// 上下文消息 (typed 权威存储)
+    std::vector<neograph::ChatMessage> messages_;
+
+    /// 待注入输入 (next-step / inject; 仅 io 线程)
+    std::vector<SessionPendingInput> pendingInputs_;
+
+    std::vector<PendingViewOp> pendingViewOps_;
+
+    /// 标记上下文已变更: 版本号递增 + Json 镜像失效
+    void markMessagesChanged();
+
+    std::shared_ptr<neograph::graph::CancelToken> cancelToken_ = nullptr;
+    uint64_t                                      msgIdCounter_ = 0;
+
+    /// 展示历史持久化序号计数 (每次 appendViewMessage 递增)
+    uint64_t viewSeqCounter_ = 0;
+
+    /// 上下文版本号 (每次变更 +1)
+    uint64_t messagesVersion_ = 0;
+
+    // -------------------------------------------------------------------
+    // 持久化节流 (仅 io 线程访问)
+    // - 规则: 首次触发立即落盘; 距上次落盘 < kPersistThrottleMs 的后续触发
+    //   合并 (view 压入待落盘队列 / llm 仅更新内存), 待下次触发或轮末强制
+    //   补存。进程异常退出最多丢失一个窗口内的增量
+    // -------------------------------------------------------------------
+
+    /// 节流窗口 (毫秒)
+    static constexpr int64_t kPersistThrottleMs = 3000;
+
+    /// 上次 viewMessages 实际落盘时刻 (steady ms; 0 = 本进程内尚未落过)
+    int64_t viewLastPersistMs_ = 0;
+    /// 上次 llm 上下文实际落盘时刻 (steady ms; 0 = 本进程内尚未落过)
+    int64_t llmLastSaveMs_ = 0;
+
+    /// 绑定的 io 线程 id (std::thread::id{} 表示未绑定)
+    std::atomic<std::thread::id> ioThreadId_{std::thread::id{}};
+    mutable bool              llmMessagesJsonDirty_ = true;
+    /// 文本镜像的脏标记 (与 Json 镜像独立维护: 两条路径各自惰性生成)
+    mutable bool              llmMessagesJsonTextDirty_ = true;
+
+    /// 压入一条待落盘 view 操作并按节流规则决定是否立即刷出
+    void enqueueViewPersist(PendingViewOp op);
+    /// 回放并清空待落盘队列 (更新节流时间戳)
+    void flushPendingViewOps();
+};
+
+/// 会话存储: 按 sessionId 取/建 Session
+/// - 仅在 agent io_context 线程访问, 无需锁保护
+/// - UI 线程通过 Wire 消息间接操作, 不直接访问此存储
+class SessionsManager {
+public:
+
+    /// 获取或创建指定 sessionId 的会话 (同步版本: 若未加载且有 sessionStore 则同步加载,
+    /// 供非协程上下文兜底)
+    std::shared_ptr<Session> getOrCreate(std::string_view sessionId);
+
+    /// 获取或创建指定 sessionId 的会话 (异步版本: 若未加载且有 pool, 卸载 loadSession 到线程池,
+    /// 避免卡住 io 线程)
+    asio::awaitable<std::shared_ptr<Session>>
+        getOrCreateAsync(std::string_view sessionId, asio::thread_pool* pool = nullptr);
+
+    /// 获取指定 sessionId 的会话; 不存在时返回 nullptr
+    std::shared_ptr<Session> get(std::string_view sessionId);
+
+    /// 遍历全部已加载会话 ({sessionId, session}; 关闭时刷盘用)
+    const std::map<std::string, std::shared_ptr<Session>, std::less<>>& all() const noexcept {
+        return sessions_;
+    }
+
+    void remove(std::string_view sessionId);
+
+    /// 已加载会话数 (诊断/测试用)
+    size_t size() const noexcept {
+        return sessions_.size();
+    }
+
+    /// - 会话 SQLite 持久化 (AgentConfig::enableSessionStore 开启时由
+    /// BaseAgent 创建并注入; 为空表示不持久化)
+    /// - 仅 io 线程读写, 无需锁
+    /// - 数据目录: {dataDir}/sqlite/sessions/{sessionId}/
+    std::shared_ptr<SessionStore> sessionStore = nullptr;
+
+private:
+
+    std::map<std::string, std::shared_ptr<Session>, std::less<>> sessions_;
+};
+
+/// 加载组件信息容器
+struct AgentAppendComponentInfo {
+    /// 已成功加载的 MCP 工具命名空间列表
+    std::vector<std::string> mcpTools;
+
+    /// 成功加载的 Skill 名称列表
+    std::vector<std::string> skills;
+
+    /// 成功加载的 Memory 文件路径列表
+    std::vector<std::string> memoryFiles;
+
+    /// 加载失败的组件记录 (success=false + errorMessage; 供客户端 "Failed"
+    /// 组统计与弹窗详情展示)
+    /// - 与上方成功列表分离: 失败项不参与运行期资源增删 (resource_applier) 管理,
+    ///   仅在启动加载阶段由各加载点写入 (MCP 连接失败 / Skill 目录不存在 /
+    ///   Memory 文件不存在等)
+    std::vector<AppendComponentNotification> failedComponents;
+};
+
+/// 单个工具的装配记录
+///
+/// 记录"装配期看到的事实", 供启动装配快照与诊断输出使用:
+/// 工具是否进入执行图, 来自哪里, 有哪些行为开关;
+/// 被工具白名单过滤掉的工具也保留一条记录 (filtered=true), 便于回答
+/// "为什么模型看不到这个工具"。
+struct ToolAssemblyRecord {
+    /// 工具名 (LLM 请求里看到的名称)
+    std::string name;
+    /// 来源: `builtin` / `middleware:<中间件名>` / `plugin:<插件名>` / `mcp:<命名空间>` / `dynamic`
+    std::string source;
+    /// 是否被工具白名单过滤掉 (未进入执行图)
+    bool filtered = false;
+    /// 过滤原因 (仅 filtered 为 true 时有值)
+    std::string filterReason;
+    /// 工具行为开关 (与 agentxx::tools::XXToolBase 的构造参数对应)
+    bool   autoSummaryOutput = false;
+    bool   canDelayLoad      = false;
+    bool   repeatCallCheck   = false;
+    bool   supportsParallel  = false;
+    size_t maxRetry          = 0;
+};
+
+class AgentContext {
+public:
+
+    AgentContext();
+    ~AgentContext();
+
+    /// 分阶段关闭: 标记"正在关闭"
+    /// - 置位后端点不再受理新的用户输入 (回执给出 `server_stopped`)
+    /// - 只影响新输入, **不等待也不取消正在跑的轮次** (退出时间不被长工具拖住)
+    void markShuttingDown() noexcept {
+        shuttingDown_ = true;
+    }
+
+    /// 是否正在关闭
+    bool isShuttingDown() const noexcept {
+        return shuttingDown_;
+    }
+
+    /// 在所属 IO executor 仍运行时安全关闭本上下文的全部插件。
+    asio::awaitable<bool>
+        shutdownPluginsAsync(std::chrono::milliseconds timeout = std::chrono::seconds{30});
+
+    std::shared_ptr<agentxx::agent::AgentConfig>            agentConfig             = nullptr;
+    std::shared_ptr<agentxx::middleware::MiddlewareContext> middlewareHandleContext = nullptr;
+
+    /// 事件总线
+    /// - 由 BaseAgent 在 init() 中创建并注入; 节点/middleware/tool 经
+    ///   weak_ptr<AgentContext> 取用
+    /// - 完整定义在使用点 ([base_agent.h](/agent/lib/include/agentxx/agent/base_agent.h)) 引入
+    std::shared_ptr<agentxx::events::EventBus> bus = nullptr;
+
+    /// 模型 Provider 注册表 (共享)
+    /// - 由 BaseAgent 在 init() 中创建并注入
+    /// - 含可用模型与默认模型; 各会话的当前选择记录在 Session 中
+    std::shared_ptr<ModelProviderRegistry> modelRegistry = nullptr;
+
+    /// 会话存储：按 sessionId 取/建 Session
+    std::shared_ptr<SessionsManager> sessions = std::make_shared<SessionsManager>();
+
+    /// 组件加载信息
+    AgentAppendComponentInfo appendComponentInfo;
+
+    /// 插件工具注册表 (动态热插拔工具; ToolcallWrapNode 查找优先,
+    /// ModelCallWrapNode 组装 LLM 侧工具 schema)
+    /// - 由 BaseAgent::init 创建并注入
+    std::shared_ptr<plugin::ToolRegistry> toolRegistry = nullptr;
+
+    /// 本 agent 实际装配的工具名列表 (BaseAgent::init 构建执行图时填充)
+    /// - 供子代理"全量继承父 agent 工具" (tools=["*"]) 使用:
+    ///   AgentHost 据此填充子代理的 toolWhitelist
+    std::vector<std::string> toolNames;
+
+    /// 工具装配记录 (含被白名单过滤掉的工具; BaseAgent::init 填充)
+    /// - 供启动装配快照、工具清单诊断与 --dump-config 使用
+    std::vector<ToolAssemblyRecord> toolAssembly;
+
+    /// 工具来源提示 (工具名 → 来源): 装配期由中间件工具收集处写入,
+    /// 创建装配记录时优先取这里的值, 取不到再按插件/MCP/内置推断
+    std::map<std::string, std::string, std::less<>> toolSourceHints;
+
+    /// 插件管理器 (生命周期/热插拔; 全局唯一)
+    /// - 由 BaseAgent::init 创建并注入
+    std::shared_ptr<plugin::PluginManager> pluginManager = nullptr;
+
+    /// 后台任务登记表
+    /// - fire-and-forget 的短后台任务 (事件发布 / 进度通知) 统一登记,
+    ///   关闭时先取消再等待收敛 (见 [agentxx::util::TaskScope])
+    /// - 由 BaseAgent::init 创建并注入; 未创建时这些调用点退化为直接 co_spawn
+    std::shared_ptr<agentxx::util::TaskScope> taskScope = nullptr;
+
+    /// 关键指标: 轮次/首 token 延迟/模型调用与用量/工具终态/压缩次数
+    /// - 由 BaseAgent::init 创建 (与事件总线同一生命周期), 诊断包与装配快照可读
+    /// - 只记"发生了什么"的计数与耗时, 不含任何内容, 因此可安全导出 (见 diagnostics.h)
+    std::shared_ptr<agentxx::util::KeyMetrics> metrics = nullptr;
+
+    /// 功能点注册表 (点 / 实现 / 调用; 见
+    /// [feature.h](/agent/lib/include/agentxx/feature/feature.h))
+    /// - 由 BaseAgent::init 创建 (早于中间件装配, 因此中间件可以声明核心点;
+    ///   也早于插件加载, 因此插件登记实现时点已存在)
+    /// - 随本 AgentContext 一份: 多 agent 实例互不影响, 不使用全局变量
+    std::shared_ptr<agentxx::feature::Registry> features = nullptr;
+
+    /// per-agent 节点注册表 (支持多 Agent 实例, 不依赖全局 NodeFactory)
+    /// - 由 BaseAgent::init 创建并注入; 插件经 graph 接口表注册自定义节点类型
+    /// - 非 const: 插件注册需修改; 图编译后引擎持有内部快照, 运行期不再读取
+    std::shared_ptr<neograph::graph::GraphRegistry> graphRegistry = nullptr;
+
+    /// 当前执行图 JSON 定义 (插件可经 graph 接口表查看/修改)
+    /// - 初始为 BaseAgent::initGraphDefinition() 的默认图 (名称 "agentxx.default");
+    ///   插件加载后可 set_graph_json 覆盖; BaseAgent 在构建 engine 前处理此值,
+    ///   插件修改非法时回退默认图并记日志
+    neograph::json graphDefinitionJson = neograph::json::object();
+
+    /// 会话资源应用器 (插件向主程序贡献 Skill/Memory/MCP 的实现接口)
+    /// - 由 CodeAgent::initMiddleware 构造注入 (单一具体实现,
+    ///   见 [resource_applier.h](/agent/lib/include/agentxx/agent/resource_applier.h));
+    ///   BaseAgent 场景无中间件 → 保持 nullptr,
+    ///   此时插件的资源注册 vtable API 返回非 0 (不支持)
+    /// - 插件声明式资源在 entry 成功后经 PluginManager 调 applyDecls 应用,
+    ///   卸载/禁用时摘除 (所有权语义见
+    ///   [resource_applier.h](/agent/lib/include/agentxx/agent/resource_applier.h))
+    std::shared_ptr<AgentResourceApplier> resourceApplier = nullptr;
+
+    /// agent 节点容器引用 (由 AgentHost attachRoot/派生时注入; 无容器时为空)
+    /// - 节点/工具可经此感知主程序 (如查询子代理模板、发起跨 agent 消息)
+    std::weak_ptr<AgentHost> host;
+
+    /// 线程安全的启动进度通知器包装:
+    /// 允许跨线程安全赋值 (client 线程注册) 与调用 (agent 线程上报),
+    /// 消除数据竞争隐患
+    struct ThreadSafeInitNotifier {
+        mutable std::mutex                    mtx;
+        std::function<void(std::string_view)> fn;
+
+        ThreadSafeInitNotifier() = default;
+
+        ThreadSafeInitNotifier(const ThreadSafeInitNotifier& other) {
+            std::lock_guard<std::mutex> lock(other.mtx);
+            fn = other.fn;
+        }
+
+        ThreadSafeInitNotifier& operator=(const ThreadSafeInitNotifier& other) {
+            if (this != &other) {
+                std::scoped_lock lock(mtx, other.mtx);
+                fn = other.fn;
+            }
+            return *this;
+        }
+
+        ThreadSafeInitNotifier& operator=(std::function<void(std::string_view)> newFn) {
+            std::lock_guard<std::mutex> lock(mtx);
+            fn = std::move(newFn);
+            return *this;
+        }
+
+        void operator()(std::string_view step) const {
+            std::function<void(std::string_view)> copyFn;
+            {
+                std::lock_guard<std::mutex> lock(mtx);
+                copyFn = fn;
+            }
+            if (copyFn) {
+                copyFn(step);
+            }
+        }
+
+        explicit operator bool() const noexcept {
+            std::lock_guard<std::mutex> lock(mtx);
+            return static_cast<bool>(fn);
+        }
+    };
+
+    /// agent 启动进度通知回调 (由客户端端点 (TUI) 注册; 无注册则为空, no-op)
+    /// - 调用方: BaseAgent::init() / CodeAgent::initTools() 各启动阶段
+    ///   (agent 线程, 同步调用, 不阻塞启动流程)
+    /// - 语义: 报告当前正在执行的启动操作 (如 "加载 MCP server: xxx"),
+    ///   供 TUI 在"启动中"banner 中逐步展示
+    /// - 线程安全: 包装为 ThreadSafeInitNotifier, 跨线程读写安全
+    ThreadSafeInitNotifier initNotifier;
+
+    /// 阻塞操作执行线程池 (文件系统遍历、glob、DNS 解析等同步阻塞操作)
+    /// - 通过 utilxx::offloadAsync / offloadCancellableAsync 使用
+    /// - 避免阻塞操作卡住 io_context 事件循环
+    std::shared_ptr<asio::thread_pool> threadPool
+        = std::make_shared<asio::thread_pool>(std::max(2u, std::thread::hardware_concurrency() / 2)
+        );
+
+    /// 便捷方法：获取或创建指定 sessionId 的会话 (同步)
+    std::shared_ptr<Session> getSession(std::string_view sessionId);
+
+    /// 便捷方法：异步获取或创建指定 sessionId 的会话 (自动利用 threadPool 卸载 SQLite 阻塞 IO)
+    asio::awaitable<std::shared_ptr<Session>> getSessionAsync(std::string_view sessionId);
+
+    /// 会话工作目录取值入口 (工具与权限判定的相对路径基准; 全部使用方经此取值,
+    /// 不直接读进程 cwd / AgentConfig::workDir):
+    /// - 会话已绑定 worktree 时返回 worktree 路径 (worktree 模式)
+    /// - 否则同 [getSessionBaseWorkDir] (会话覆写 > agent 配置 / 进程 cwd)
+    /// - 均不可用时返回空串 (调用方自行兜底)
+    /// - 线程约束: worktree 绑定读取沿用 Session 的 io 线程约定 (插件主程序侧
+    ///   经 ioCallSync 投递); 覆写表经 mutex 保护, 任意线程可读写
+    /// - const: 只读取状态 (覆写表/互斥量按 mutable 处理), 供只读场景使用
+    std::string getSessionWorkDir(std::string_view sessionId) const;
+
+    /// 会话工作目录的基准值 (不含 worktree 绑定):
+    /// - 会话工作目录覆写 (setSessionWorkDir 注入, 如 ACP session/new 携带的
+    ///   客户端 cwd) —— 各会话可绑定不同项目目录, 彼此独立
+    /// - 未设置时回退 AgentConfig::resolvedWorkDir() (yaml work_dir / 进程
+    ///   cwd); 兜底语义: 未做任何配置时与旧版行为完全一致
+    /// - 均不可用时返回空串 (调用方自行兜底)
+    /// - 用途: 展示会话"真实所在目录"的位置 —— 系统提示词的工作目录占位符
+    ///   (${work_dir}) 取此值: worktree 绑定是运行期经工具切换的临时状态,
+    ///   进出 worktree 时该值不变, 系统提示词也就不会跟着反复变化
+    /// - 线程安全: 覆写表经 mutex 保护, 任意线程可读
+    std::string getSessionBaseWorkDir(std::string_view sessionId) const;
+
+    /// 会话临时目录: {系统临时目录}/agentxx/{会话 ID}/
+    /// - 系统提示词里的 Temp 目录 (让模型把临时文件写在这里, 不污染工作目录)
+    /// - 目录段复用 [SessionStore::sanitizeSessionId] 的清洗规则, 与会话数据目录
+    ///   命名保持一致 (空 ID 记为 "default"); 取不到系统临时目录时返回空串
+    /// - 只做路径拼装, 不创建目录 (需要时由写入方创建父目录)
+    static std::string sessionTempDir(std::string_view sessionId);
+
+    /// 设置会话工作目录覆写 (会话级独立工作目录):
+    /// - absWorkDir 应为绝对路径 (相对路径/`~` 由调用方按需归一, 如 ACP 侧
+    ///   经 toCurrentSystemAbsolutePath); 空串等价 clearSessionWorkDir
+    /// - 供端点在会话运行前/外注入 (如 ACP session/new), 与 Session 可变状态
+    ///   的 io 线程约束解耦 —— mutex 保护, 任意线程可调用
+    void setSessionWorkDir(std::string_view sessionId, std::string_view absWorkDir);
+
+    /// 清除会话工作目录覆写 (该会话回退 AgentConfig::resolvedWorkDir)
+    void clearSessionWorkDir(std::string_view sessionId);
+
+    /// 获取语言: 优先返回指定 session 的语言, 若为空回退到 agentConfig->language, 最终兜底 "en"
+    std::string getLanguage(std::string_view sessionId = "") const {
+        if (!sessionId.empty() && sessions) {
+            auto sess = sessions->get(sessionId);
+            if (sess) {
+                auto l = sess->getLanguage();
+                if (!l.empty()) {
+                    return l;
+                }
+            }
+        }
+        if (agentConfig && !agentConfig->language.empty()) {
+            return agentConfig->language;
+        }
+        return "en";
+    }
+
+    /// 设置语言: 不支持 auto, 空或 auto 归一化为 "en"
+    /// 若 sessionId 非空则设置会话独立语言, 同时同步更新 agentConfig->language; 若 sessionId
+    /// 为空则仅更新 agentConfig->language
+    void setLanguage(std::string_view lang, std::string_view sessionId = "") {
+        auto norm = normalizeLanguage(lang);
+        if (!sessionId.empty() && sessions) {
+            auto sess = sessions->get(sessionId);
+            if (sess) {
+                sess->setLanguage(norm);
+            }
+        }
+        if (agentConfig) {
+            agentConfig->language = norm;
+        }
+    }
+
+    /// 会话语言是否由配置显式指定 (yaml `language` / FFI 配置 JSON 的 language 键)
+    /// - 为 true 时连接端点不再用客户端界面语言覆盖会话语言 (见
+    ///   SessionServerAgentIO::handleHello); 客户端界面语言是各端本机偏好,
+    ///   会话语言是可分发配置, 两者互不覆盖
+    bool isLanguageExplicit() const {
+        return agentConfig && agentConfig->languageExplicit;
+    }
+
+    std::string getSessionCurrentModelName(std::string_view sessionId) const;
+    // 可能会变，建议仅在同步代码中使用
+    const ModelConfig& getSessionCurrentModelConfig(std::string_view sessionId) const;
+
+    /// 拼装指定会话的完整系统提示词 (systemPrompt + appendSystemPrompts + 动态 appendSystemMessage)
+    /// - 供 modelcall 节点及上下文查看 (WireGetContext / TUI LLMContext) 使用
+    /// - 最后统一替换会话级占位符 (`${work_dir}` / `${temp_dir}` / `${session_id}`,
+    ///   见 AgentPrompt::renderVars), 覆盖自定义 systemPrompt 与各附加段
+    /// - `${work_dir}` 取 [getSessionBaseWorkDir] (不含 worktree 绑定), 使进出
+    ///   worktree 不改变系统提示词
+    std::string buildSystemPrompt(std::string_view sessionId = "") const;
+
+    // -------------------------------------------------------------------
+    // 稳定段 / 动态段分离
+    //
+    // 提示词分两部分, 请求装配时分别放置, 保证连续请求的前缀稳定:
+    // - 稳定段 (`buildSystemPromptStable`): systemPrompt + 静态附加段
+    //   (appendSystemPrompts, 按 order 排序) + 运行时稳定附加段
+    //   (记忆文件内容 / 技能清单, 随配置与插件构造, 不随轮次变化) —— 全部进
+    //   system 消息, 属于稳定前缀, 上游的 KV/前缀缓存可命中 (每轮不重复计费)
+    // - 动态段 (`buildDynamicContextSections`): 每轮都可能变化的片段, 由
+    //   modelcall 作为**请求末尾的独立消息**附加 —— 位置在稳定前缀之外, 每次
+    //   调用都要重新发送且命中不了缓存, 只留给"确实每轮都变"的插件/今后功能
+    // -------------------------------------------------------------------
+
+    /// 稳定段文本 (systemPrompt + 静态附加段 + 运行时稳定附加段; 已做会话级占位符替换)
+    std::string buildSystemPromptStable(std::string_view sessionId = "") const;
+
+    /// 运行时稳定附加段 (来源 → 正文; 按来源键名升序稳定排列)
+    /// - 由中间件经 `graphDataKey_appendSystemMessageStable` 写入 (同来源覆盖, 不累积)
+    /// - 内容随配置/插件构造 (记忆文件 / 技能清单), 会话内不变: 拼进 system 末尾
+    std::vector<std::pair<std::string, std::string>>
+        buildStableContextSections(std::string_view sessionId = "") const;
+
+    /// 动态段片段 (来源 → 正文; 按来源键名升序稳定排列)
+    /// - 由中间件经 `graphDataKey_appendSystemMessage` 写入 (同来源覆盖, 不累积)
+    /// - 由 modelcall 附加在请求末尾, 不写进 system 消息 (会明显降低缓存命中率)
+    std::vector<std::pair<std::string, std::string>>
+        buildDynamicContextSections(std::string_view sessionId = "") const;
+
+    /// 替换提示词里的会话级占位符 (工作目录 / 临时目录 / 会话 ID)
+    std::string renderPromptVars(std::string text, std::string_view sessionId) const;
+
+
+private:
+
+    /// 会话级工作目录覆写 ({sessionId → 绝对路径}; 见 getSessionWorkDir)
+    /// - 与 Session 可变状态的 io 线程约束解耦: 端点线程 (如 ACP HTTP handler)
+    ///   在会话运行前注入, mutex 保护跨线程访问; 不随 Session 销毁自动清理
+    ///   (与 sessions_ 的常驻语义一致, 量级为活跃会话数)
+    /// - mutable: 只读入口 (getSessionWorkDir) 为 const, 仍需加锁读该表
+    mutable std::mutex                                      sessionWorkDirMu_;
+    mutable std::map<std::string, std::string, std::less<>> sessionWorkDirs_;
+
+    /// 正在关闭 (见 markShuttingDown / isShuttingDown)
+    /// - 端点入口可能在任意线程读 (取消/输入受理), 用原子量避免数据竞争
+    std::atomic<bool> shuttingDown_{false};
+};
+
+} // namespace agent
+} // namespace agentxx

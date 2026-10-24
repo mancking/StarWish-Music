@@ -1,0 +1,810 @@
+# TUI 实现与架构 (FTXUI)
+
+> 相关文档: [index.md](index.md) (整体设计) · [plugins.md](plugins.md) (插件系统, 含插件 UI 扩展)
+
+本文整理 client 端 TUI 的实现与分层: 先说明 FTXUI 的机制 (事件/渲染/坐标/命中),
+再说明本项目在其上的分层与约定, 最后给出交互框架 (命中登记表 / 声明式条目列表)
+的使用方法, 以及必须遵守的约束 (每帧重建、reflect 生命周期、模态阻塞)。
+
+代码位置:
+- 入口与主循环: [agent_tui.cpp](/agent/client/src/io/tui/agent_tui.cpp), [agent_tui.h](/agent/client/include/agentxx-client/io/tui/agent_tui.h)
+- 交互框架: [framework/ui_hit.h](/agent/client/include/agentxx-client/io/tui/framework/ui_hit.h),
+  [framework/ui_action_list.h](/agent/client/include/agentxx-client/io/tui/framework/ui_action_list.h)
+- 组件: [components/](/agent/client/include/agentxx-client/io/tui/components/), 面性外框 [surface.h](/agent/client/include/agentxx-client/io/tui/surface.h)
+- 组件描述渲染 (面板/Info/装饰/overlay/中断共用): [ui_components.h](/agent/client/include/agentxx-client/io/tui/ui_components.h)
+- 更新检查: [update_check.h](/agent/client/include/agentxx-client/update_check.h); 打开链接 [util/open_url.h](/agent/client/include/agentxx-client/util/open_url.h)
+
+---
+
+## 1. FTXUI 机制摘要
+
+### 1.1 两层结构: Element (DOM) 与 Component
+
+| 层 | 类型 | 职责 |
+|----|------|------|
+| DOM | `ftxui::Element` (= `std::shared_ptr<Node>`) | 布局与绘制; 每帧重建 |
+| 组件 | `ftxui::Component` (= `std::shared_ptr<ComponentBase>`) | 事件处理 + 焦点; 跨帧存活 |
+
+关键点:
+
+- **Element 是"每帧重建"的一次性对象**: 数据变化 -> 重建 Element 树 -> 布局 (`ComputeRequirement`/`SetBox`) -> 绘制 (`Render`)。
+- **Component 的 `Render()` 每帧产出**新 Element, 事件经 `OnEvent()` 从根节点递归下发。
+- `ComponentBase::Render()` 会把子元素包裹一层 `Wrapper` 节点, 用于把 `Active()`/`Focused()`
+  (焦点态) 传给绘制层 (见 `src/ftxui/component/component.cpp`)。
+- 组件树仅用于**事件路由与焦点**, 与渲染树是分开的: 用 `Renderer(child, lambda)` 时
+  渲染完全由 `lambda` 决定, `child` 只负责事件 (本项目主界面即如此)。
+
+### 1.2 事件路由
+
+- `ComponentBase::OnEvent(event)`: 依次询问每个子组件, 某个子组件返回 `true` 即停止;
+  全部返回 `false` 则事件未被处理。
+- `Container::Vertical/Horizontal`: 键盘事件只给 `ActiveChild()`, 鼠标事件广播给所有子组件;
+  容器自身处理 Up/Down (或 Left/Right) 切换选中子组件。
+- `Container::Tab`: **只**把事件给当前选中的子组件 (隐藏页签收不到事件)。
+- `Container::Stacked`: 渲染时 `dbox` 叠加, 事件按子组件顺序询问, 先处理者优先。
+  本项目用它做"主界面事件路由器" (`messageList_ / sidebar_ / inputBar_ / statusBar_`)。
+- `CatchEvent(child, fn)`: **先**调用 `fn`, 返回 `false` 时才继续给 `child`。
+  本项目用它在组件树之前接管全局快捷键 (Ctrl+C / F2-F4 / F12)、鼠标拖选复制与
+  shell 级按钮点击。
+- `App::HandleTask` 在事件分发前把鼠标坐标从"终端绝对坐标"换算为"屏幕坐标"
+  (减去 `cursor_x_/cursor_y_`), 并在 `handled == false` 时把左键事件转入**文本选择**
+  (`HandleSelection`): 因此"未被任何组件处理的左键拖动"会成为屏幕选中;
+  反之, 组件一旦返回 `true` 表示消费事件, 该次拖动不会产生选择。
+
+### 1.3 坐标与命中检测
+
+- `ftxui::Box{x_min, x_max, y_min, y_max}` 为**闭区间**的屏幕绝对坐标。
+- `reflect(Box&)`: 一个装饰器; 布局 (`SetBox`) 时把该元素的区域写回 `Box`, 绘制时再与
+  `screen.stencil` 求交 (`Box::Intersection`)。注意求交发生在**绘制**阶段: 只有本帧真正
+  `Render()` 到的元素才会被收敛为空区域 —— 本项目自实现的滚动容器
+  ([Scrollable](/agent/client/include/agentxx-client/io/tui/scrollable.h) /
+  [LazyScrollable](/agent/client/include/agentxx-client/io/tui/lazy_scrollable.h))
+  只为视口内的子项做定位与绘制, 视口外子项的 Box 会停在测量阶段写入的"测量用临时大框"
+  (局部坐标, 与屏幕坐标部分重叠, 见 3.1)。
+  因此**滚动容器内的子项命中不要用 `reflect`, 用容器输出的 `visibleBoxes()`**。
+- 命中检测的常规写法是"组件持有 `Box` 成员 + `reflect(box_)` + `OnEvent` 里 `box_.Contain(x,y)`"
+  (FTXUI 内置的 Button/Hoverable/Window 都是这样)。
+  **局限**: `reflect` 只在元素参与布局时写回坐标 ——
+  - 元素**未渲染**(条件分支跳过)时 Box 保留上一帧的值, 于是"已经不显示的按钮"仍在原位置命中;
+  - 默认构造的 `ftxui::Box{}` 四个分量都是 0, `Contain(0, 0)` 为真, 它是**屏幕左上角**而不是"空区域"。
+- `screen.CellAt(x, y)` 可读取单元格 (字符/前景/背景), 离屏测试用它断言配色与布局。
+- **Box 生命周期**: `reflect(Box&)` 只保存引用 (`reflect.cpp`: `Box& reflected_box_`), Box
+  必须比元素活得久。行模型与命中登记的元素常被搬进滚动容器/缓存跨帧存活, 而生成它的
+  `UiRow::box` / 登记项往往随局部结果析构 —— 只搬元素时元素后续布局就会写已释放内存
+  (ASan: heap-use-after-free, 栈顶 `ftxui::Reflect::SetBox`)。这类"元素 + 命中框"的绑定
+  一律用 [OwnedReflect](/agent/client/include/agentxx-client/io/tui/framework/owned_reflect.h)
+  (元素自持 Box, 语义与 `reflect` 相同, 命中仍读同一个 Box):
+  - 行渲染 [ui_components.cpp](/agent/client/src/io/tui/ui_components.cpp) 的 `renderItem`
+    与 `mergeTextButton` (后者直接产出 `UiRow`, 不走 `renderItem`)
+  - 命中登记 [ui_hit.h](/agent/client/include/agentxx-client/io/tui/framework/ui_hit.h) 的
+    `UiHitRegistry::add/addRegions` (登记表每帧清空, 元素可能被缓存到下一帧)
+  消息列表的 decor/中断/附件命中框另走 `LazyBuiltItem::attachments`
+  (`shared_ptr<void>`, 随缓存元素一起释放), 见 [message_list.cpp]。
+
+### 1.4 动画与帧
+
+- 组件在 `OnAnimation(Params&)` 中推进动画, 并调用 `animation::RequestAnimationFrame()` 请求下一帧
+  (由根组件沿组件树转发, 未 `Add()` 进树的组件收不到回调)。
+- `App::RunOnce()` 无任务时不重绘; 本项目用 `Loop::RunOnceBlocking()` + `Event::Custom`
+  显式请求重绘 (贴日志、delta 到达、状态变化等), 空闲时不烧 CPU。
+
+### 1.5 弹窗与滚动
+
+- 内置 `Modal(main, modal, bool*)` 只是 `dbox` 叠加, 不阻塞事件; 本项目使用自实现的
+  [ModalContainer](/agent/client/include/agentxx-client/io/tui/framework/modal_container.h):
+  打开弹窗时**只**把事件给弹窗 (不再下发给被遮挡的主界面), 渲染时也只渲染弹窗。
+- 滚动容器为项目自实现 (FTXUI 的 `frame` 是"焦点跟随"式滚动, 不适用于会话记录):
+  - [Scrollable](/agent/client/include/agentxx-client/io/tui/scrollable.h): 全量构建子项 + 视口局部布局/绘制
+  - [LazyScrollable](/agent/client/include/agentxx-client/io/tui/lazy_scrollable.h): 懒构建 + LRU 缓存 (消息列表用),
+    支持字节预算淘汰、`stickToBottom` 吸附、头部插入; 滚动状态为**锚点**
+    (视口顶行所在条目 + 条目内行偏移), 每帧只处理"锚点到视口底部"这一段,
+    成本与列表长度无关 (见 3.3.2)
+
+---
+
+## 2. 本项目 TUI 分层架构
+
+```
+        client io 线程                                  UI 线程 (FTXUI Loop)
+  ┌──────────────────────────┐               ┌───────────────────────────────────────────┐
+  │ onDelta / onSync / ...   │  sharedState  │  CatchEvent (全局快捷键/拖选/shell 按钮)   │
+  │  → TUISharedState (COW)  │ ───────────▶  │      ↓                                    │
+  │  → enqueueUiAction(...)  │  每帧快照      │  ModalContainer                           │
+  └──────────────────────────┘               │      ├─ 无弹窗: Renderer(Stacked) 主界面   │
+                                             │      └─ 有弹窗: 弹窗组件 (全屏遮挡)         │
+                                             └───────────────────────────────────────────┘
+```
+
+### 2.1 线程模型与状态
+
+- **client io 线程**: 处理 wire 消息 (`onDelta/onSync/onPeerMessage`), 写 `TUISharedState` (COW:
+  短锁 + `mutableState()` 深拷贝), 需要触碰组件树时经 `enqueueUiAction()` 投递到 UI 线程执行。
+- **UI 线程**: 独占组件树; 每帧开头
+  1. `ctx_.frameState = sharedState_.readSnapshot()` (本帧快照),
+  2. `ctx_.refreshFrameSize()` (本帧终端尺寸, 同帧内所有组件读同一份, 且每帧只查一次终端),
+  3. 执行待处理 UI 动作队列,
+  4. `Loop::RunOnceBlocking()` (事件 + 渲染),
+  5. 释放快照 (让 client 线程回到无拷贝的原地写路径)。
+- 组件渲染只读 `ctx_.frameState`; 组件状态 (折叠集合、输入文本、弹窗选中项) 由组件自身持有。
+
+### 2.2 组件清单
+
+| 组件 | 文件 | 说明 |
+|------|------|------|
+| `MessageListComponent` | [components/message_list.h](/agent/client/include/agentxx-client/io/tui/components/message_list.h) | 消息列表 (LazyScrollable), 折叠/中断表单/附件/decor 按钮 |
+| `InputComponent` | [components/input_bar.h](/agent/client/include/agentxx-client/io/tui/components/input_bar.h) | 输入框 + 附件托盘 + 待发队列行 |
+| `StatusBarComponent` | [components/status_bar.h](/agent/client/include/agentxx-client/io/tui/components/status_bar.h) | 状态栏 (模型/上下文/插件项/会话/设置) |
+| `SidebarComponent` | [components/sidebar.h](/agent/client/include/agentxx-client/io/tui/components/sidebar.h) | 侧边栏 (内容区 + tabs 列表 + 宽度拖拽) |
+| 弹窗 | [components/overlays.h](/agent/client/include/agentxx-client/io/tui/components/overlays.h) | 模型/会话/设置/关于/更新提示/待发队列/上下文/mermaid/text/diff/custom/文件选择 (含跨设备标签页, 见 §2.10) |
+| `InterruptView` | [components/interrupt_view.h](/agent/client/include/agentxx-client/io/tui/components/interrupt_view.h) | 中断询问表单 (形态完全由描述数据决定; 控件与提交行复用 `ui_components`) |
+| `SpinnerComponent` | [components/spinner.h](/agent/client/include/agentxx-client/io/tui/components/spinner.h) | 帧序列加载动画 (动画等级低于门槛时静态降级) |
+| `BannerArtComponent` | [components/banner_art.h](/agent/client/include/agentxx-client/io/tui/components/banner_art.h) | 空列表 banner 艺术字 (`AGENT++`): 右侧 `++` 由两个大字 `+` 变形为机器人图案 (见 §2.11) |
+| `ui_components` | [ui_components.h](/agent/client/include/agentxx-client/io/tui/ui_components.h) | **组件渲染唯一实现**: 把界面描述层 (`cxx_pluginxx_ui`) 的组件项渲染为行模型 (元素 + 行数 + 元素内可命中区域) |
+
+`ui_components` 是全部展示描述的唯一渲染实现: 侧边栏面板、Info 段落、工具消息装饰、
+通用 overlay、中断描述**全部块** (内容块 + 扩展组件 + 控件块 + 提交行) 都经它渲染
+(此前面板/Info/装饰各有一份 switch, 中断另有自己的控件布局, 均已收敛)。
+渲染前先按客户端能力适配 (`adaptItems`, 能力见 `tuiUiCapabilities`), 因此渲染层只处理
+本端声明支持的组件; 新增一种组件要改三处: 描述层库的 `schema/ui.def.json`
+(字段与适配规则) → 本端 `ui_components.cpp` (渲染 + 测量) → 能力表 `kTuiBlockNames`;
+行数估算走同一条渲染路径 (`measureItem`), 与真实布局高度一致 (见 3.1)。
+详见 [ui-layer.md](ui-layer.md)。
+
+- 行元素内的 `reflect` 反射框由元素的**自有节点** `OwnedReflect` 持有: 元素被搬进
+  滚动容器/消息块缓存 (可能跨帧存活) 时 Box 不会随局部渲染结果析构而悬空;
+  命中判定仍读同一个 Box (两级判定 = 行元素框 + 行内区域)。
+- `tree` 的折叠态: 上下文提供 `collapseExpanded` (TUI 侧就是主程序维护的展开表) 时,
+  有子节点的行可点击展开/收起, 状态键为"从根到该节点的路径"(如 `src/io/`);
+  未提供时按全展开渲染 (行式前端行为不变)。
+
+弹窗统一用 [surface.h](/agent/client/include/agentxx-client/io/tui/surface.h) 的面性风格外框
+(圆角 + 标题栏/内容区/底栏分区, 不画边框与分割线); 文案统一走
+[tui_i18n.h](/agent/client/include/agentxx-client/io/tui/framework/tui_i18n.h) 的 `tr()/trf()`。
+
+### 2.3 命中检测: 命中登记表
+
+[framework/ui_hit.h](/agent/client/include/agentxx-client/io/tui/framework/ui_hit.h) 提供:
+
+```c++
+namespace agentxx::client {
+/// 空命中区域 (x_min > x_max 且 y_min > y_max): 不要用 ftxui::Box{} 表示"无命中"
+inline constexpr ftxui::Box kNoBox{0, -1, 0, -1};
+
+/// 通用命中登记表: 帧首清空 + 渲染时登记 + 事件时查询
+template <class Payload>
+class UiHitRegistry {
+    struct Entry { Payload payload; std::shared_ptr<ftxui::Box> box; };
+    void            beginFrame();                       // 帧首清空 (必需)
+    ftxui::Element  add(ftxui::Element, Args&&...);     // 登记并 reflect
+    const Entry*    find(int x, int y) const;           // 坐标查询 (拖拽等)
+    const Entry*    findClick(const ftxui::Mouse&) const; // 左键释放命中
+    const std::vector<Entry>& entries() const;          // 遍历 (测试/调试)
+};
+using UiHitMap = UiHitRegistry<UiHitInfo>;              // payload = {id, arg}
+}
+```
+
+**一条规则解决两类问题**: 每帧开头清空, **只有真正渲染出来的元素才登记**。
+于是"未显示的按钮"既不占用点击区域, 也不需要清空成员 Box; 每个按钮也不必各占一个成员变量。
+
+用法:
+
+```c++
+ftxui::Element XxxComponent::OnRender() {
+    hits_.beginFrame();                                     // 帧首
+    return ftxui::hbox({
+        hits_.add(ftxui::text("设置"), std::string{kSettingsHitId}),   // 登记 + reflect
+        hits_.add(ftxui::text("退出"), std::string{kQuitHitId}),
+    });
+}
+
+bool XxxComponent::OnEvent(ftxui::Event event) {
+    if (!event.is_mouse()) {
+        return false;
+    }
+    const auto* hit = hits_.findClick(event.mouse());
+    if (hit == nullptr) {
+        return false;                                       // 未命中 -> 让其它组件处理
+    }
+    if (hit->payload == kSettingsHitId) {
+        config_.onSettings();
+    }
+    return true;
+}
+```
+
+载荷可以是任意类型 (如插件按钮归属 `UiHitTarget`、消息下标 `size_t`、条目归属 `TabHit`),
+用 `UiHitRegistry<Payload>` 表达, 避免为每种按钮再造一个"命中向量 + 成员 Box"。
+
+需要注意: **同一组件的多个命中表各自 `beginFrame()`**, 混用时要保证"清空 -> 渲染登记 ->
+事件查询"的顺序 (查询必须发生在下一帧渲染前)。
+
+### 2.4 声明式条目列表
+
+[framework/ui_action_list.h](/agent/client/include/agentxx-client/io/tui/framework/ui_action_list.h) 把
+"若干可选项 + 上下键 + Enter + 鼠标点击 + 选中高亮" 收敛为一张数据表:
+
+```c++
+struct UiActionItem {
+    std::string           id;          // 命中标识 (唯一, 选中项按它保持)
+    std::string           label;       // 主文本
+    std::string           hint;        // 次级说明 / 当前值 (可选, 见下)
+    std::string           group;       // 所属分组标题 (可选, 变化处插一行标题)
+    bool                  enabled;     // 不可用时弱化且不可激活
+    std::function<void()> onActivate;  // Enter / 点击命中时执行的动作
+};
+```
+
+`UiActionList` 负责: 选中项维护 (`setItems` 后按 id 保持)、键盘导航 (Up/Down/Home/End,
+跳过 disabled)、Enter 激活、鼠标点击命中后"先置选中再激活"、渲染时逐项登记命中、整行高亮;
+默认版式把 `hint` 显示在主文本之后, 需要多行版式时传 `rowBuilder`
+(会话弹窗的名称行 + 时间行就是这样实现的: `label` 占一行, `hint` 占另一行)。
+
+分组标题 ([UiActionItem::group]): 相邻条目分组标题相同时视为同一组, 变化处插入一行
+标题 (标题行不登记命中, 不可点击, 也不占条目下标), 标题色取 [UiActionStyle::groupFg]。
+设置弹窗用它把条目分成 界面 / 显示 / 更新 / 其他 四组 (见 §2.5)。
+
+用法见 `SettingsOverlay` / `LogMenuOverlay` / `ModelSelectorOverlay` /
+`SessionSelectorOverlay` 的实现: 新增一个设置项只需往条目表里加一行,
+不必再改成员变量、渲染分支、键盘分支或鼠标分支。
+
+### 2.5 模态 (弹窗)
+
+- [ModalContainer](/agent/client/include/agentxx-client/io/tui/framework/modal_container.h) 持有
+  `main` 与至多一个 `activeModal`:
+  - `pushModal()/popModal()` 开关; 打开时渲染只渲染弹窗 (全屏蒙版色 + 居中), 主界面整棵树不参与该帧;
+  - 事件只给弹窗: **未处理的事件也不再下发**给被遮挡的主界面
+    (否则字符会落进被遮挡的输入框、滚轮会滚动被遮挡的消息列表);
+  - 全局快捷键由外层 `CatchEvent` 在弹窗之前处理 (Ctrl+C 退出等), 不受影响。
+- 弹窗内的按钮同样走命中登记表; 弹窗 `onClose` 由组件回调触发 (关闭会销毁弹窗对象,
+  因此**不要在条目激活动作内直接关闭** —— 记录"待关闭"标志, 待条目列表事件处理返回后再关闭,
+  见 `ModelSelectorOverlay::flushActivation` / `SessionSelectorOverlay::flushActivation`;
+  需要"动作成功后才关闭"时用 `enqueueUiAction` 延后到下一帧, 见
+  `TUIClientAgentIO::openUpdateNotice` 的"前往下载")。
+- **toast 提示叠在模态层之上**: 提示由根的 `Renderer(modal_, ...)` 经
+  `TUIClientAgentIO::applyToastOverlay` 叠加, 不在主界面树里 —— 弹窗打开时主界面整棵树
+  不参与渲染, 提示画在主界面里会被弹窗盖住 (例如在设置弹窗里点"检查更新"的进行中提示
+  与结果提示)。提示超过 `kToastDuration` (3 秒) 后由渲染帧清除。
+- **设置弹窗** ([SettingsOverlay](/agent/client/include/agentxx-client/io/tui/components/overlays.h))
+  的条目按分组显示 (界面 / 显示 / 更新 / 其他, 见 §2.4), 交互与高亮仍由 `UiActionList`
+  统一实现; 内容超出终端可用高度时**内容区限高并可滚动**, 弹窗本身不会超出终端
+  (条目被裁掉就再也看不到、点不到):
+  - 条目版式为一行 (整行色带, 即命中区域), 条目之间留一空行, 内容区 = `vscroll_indicator |
+    yframe | size(HEIGHT, LESS_THAN, 终端高度 - 外框 6 行)`;
+  - 条目文字取 `settings.*Value` (条目名称 + 当前值 / 动作文案已含在整句里, 如
+    `主题: Dark` / `立即检查`), 不再另起一行重复显示条目名称;
+  - 分组标题行不登记命中 (点了不生效), 只用来分组;
+  - 选中项带 `focus`, 由 `yframe` 自动滚入视口 (与模型选择弹窗同机制), 因此
+    Up/Down/Home/End 选的条目一定可见;
+  - 滚轮 = 上/下移动选中项 (与文件选择弹窗一致), 内容区随之滚动;
+  - 装不下时内容区右侧画滚动条, 装得下时不画。
+
+### 2.6 插件 UI
+
+- **注册入口只在 client 侧**: 面板/Info 段落/状态栏项/装饰/overlay 都由 client 侧插件
+  经 `agentxx.client.ui` 表注册 (插件在 client 进程内, 描述不经网络); agent 侧插件要把
+  数据交给同名 client 插件时走 `plugin_data` 转发, 自己不产生 UI 描述。唯一由 agent 侧
+  产出、client 侧渲染的 UI 结构是**中断描述** (`interrupt_ui.h`)。
+- 描述形态是**界面描述层 `cxx_pluginxx_ui`** 的组件项 JSON (组件树, 见 [plugins.md](plugins.md) §9.1
+  与 [ui-layer.md](ui-layer.md)); client 侧由
+  [ui_components.h](/agent/client/include/agentxx-client/io/tui/ui_components.h)
+  按本端能力适配后统一渲染为 Element, 并把元素内可点位置登记为可命中区域 (按钮/表格单元格/折叠标题/控件)。
+- 命中与派发: 侧边栏内容经 `Scrollable::hitTestItem` 定位子项 + 局部坐标后判定区域
+  (不用子项内的 `reflect`, 见 3.1); 命中后经 `ClientPluginManager::dispatchAction`
+  投递回 io 线程, 二次校验插件存在/启用/实例代次后调用插件回调。
+- 表单: 控件 (checkbox/select/buttons/number/text) 与提交行的状态由主程序维护, 提交经
+  动作通道回传 `__submit` (参数 `{"values":{控件 id: 值}}`), 取消回传 `__cancel`,
+  `commitOnPick` 的候选项点击即提交。插件不接触 UI 线程, 只收结果。
+- 输入类控件 (`text` / `number`) 渲染为**整行输入框** (与主消息输入框同一套形态):
+  整行铺 `inputBgColor` 底色、左右各 1 格内边距、**整行可点** (命中区域延伸到行右边界),
+  点击行内任意位置即聚焦该控件; 控件描述的 `help` 作为输入框的**占位文本**
+  (值为空时用弱化色显示, 一输入就隐藏), 不再单起一行说明; `number` 两端保留
+  `[ - ]` / `[ + ]` 步进按钮, 中间值区域撑满其余宽度 (点击即聚焦)。
+- 中断表单 (`InterruptView`) 与插件表单共用同一实现 (`ui_components` 的控件渲染 +
+  `UiFormState` + 点击/键盘/校验/取值函数), 差别只有结果去处 (中断经结果通道回传
+  `{"values":{...}}`)。中断侧的命中区域记录 "行元素框 + 行内区域" (控件所在行由
+  `ui_components` 登记区域, `InterruptView` 按块记录归属), 与其它接入点的两级判定一致。
+- **定时器与快捷键**: 插件不能自己起线程/定时器, 需要"按时间刷新"或"响应按键"时经
+  `agentxx.client.timer` / `agentxx.client.keybind` 两张表注册 (回调都在 client io
+  线程执行, 插件代码永不进 UI 线程):
+  - 定时器: `pause_when_hidden` 关联的面板/Info 段落不可见时顺延不触发; 主程序动画等级
+    `Disabled` 时拒绝注册; 插件禁用/卸载时主程序全部取消
+  - 快捷键: UI 线程按 `keybindOfEvent(event)` 得到的规范化键位查表
+    (`ClientPluginManager::hasKeybind`) 命中后拦截事件, 经 `postKeybindInvocation`
+    投递回 io 线程执行插件回调; 优先级为"全局快捷键 > 表单控件焦点 > 普通按键",
+    模态弹窗打开时不触发; 无修饰键的可打印字符不参与匹配 (不影响输入框打字)
+  - 快捷键列表 (只读): 设置弹窗的「快捷键」条目显示插件已注册的条数, 激活后打开
+    `KeybindListOverlay` (键位 + 说明 + 归属插件; 抢不到键位的尝试列在"键位冲突"段,
+    见 `ClientKeybindConflict`)。数据来自 UI 注册表快照 (`keybinds` /
+    `keybindConflicts`), UI 线程读取, 不触发任何插件回调; 插件禁用/卸载后条目与
+    冲突记录一起从快照消失
+  - 可见性快照由 UI 每帧上报 (`reportSidebarRegionVisibility`: 面板 = 当前激活 tab,
+    Info 段落 = Info tab 激活), 经 `is_visible` 查询
+- 尺寸感知: 主程序布局后把面板/Info 段落的可用宽高记入快照, 值变化时投递
+  `AGENTXX_CLIENT_EVT_UI_LAYOUT` 事件 (载荷 `{"regions":[{id,w,h}]}`), 并可经
+  `get_client_state().regions` 查询; 插件据此按可用宽度重排内容。
+- 相关 schema 与约束见 [plugins.md](plugins.md) §9.1~§9.6 与
+  [ui_components.h](/agent/client/include/agentxx-client/io/tui/ui_components.h)。
+
+### 2.7 Info 面板: Context 段 (已消耗 token 用量)
+
+Info tab 内容区 (`renderInfoSidebar()`, 见
+[tui_sidebar_content.cpp](/agent/client/src/io/tui/tui_sidebar_content.cpp)) 的**第一段**是
+Context 段, 显示本会话累计消耗的 token 用量; Append 段 (已加载组件) 与插件 Info 段落
+都排在它之后:
+
+```
+Context
+|- 已消耗: 12K
+|- 缓存: 9K
+|- 输入: 10K
+|- 输出: 2K
+|- 缓存命中率: 90.0%
+```
+
+- **"已消耗"与状态栏的上下文占用不是一回事**: 状态栏的 `ctx/max` 是"当前装了多少"
+  (压缩后回落), Context 段是"累计花掉多少", 只增不减。两者数据源同一条线消息
+  (`WireContextStats`), 但字段不同。
+- 数字按 `utilxx_base::formatSize` 折算 (`12K` / `1.5M`): token 数普遍到万级, 完整数字
+  会把侧边栏撑宽。
+- 缓存命中率 = 命中缓存的输入 / 输入 (`cachedPromptTokens / promptTokens`); **输入为 0 时
+  不渲染该行** (0/0 没有意义)。
+- "缓存"数字来自上游 `usage` 里回报的命中缓存输入量, 各家用不同字段名, provider 逐个候选
+  取值: `prompt_tokens_details.cached_tokens` (OpenAI Chat Completions 与多数兼容网关)、
+  `input_tokens_details.cached_tokens` (Responses API)、`prompt_cache_hit_tokens` (DeepSeek
+  官方)、`cache_read_input_tokens` / `cache_creation_input_tokens` (Anthropic 形态经网关
+  转发), 详见 [openai_provider.cpp](/agent/lib/src/protocol/openai_provider.cpp) 的
+  `parseCachedUsage` 与 [anthropic_provider.h](/agent/lib/include/agentxx/protocol/anthropic_provider.h)。
+  **上游不回报这些字段时缓存量恒为 0** —— 界面显示 `缓存: 0` 与 `缓存命中率: 0.0%` 时,
+  先确认该上游是否支持 prompt 缓存并回报命中量, 而不是怀疑本地统计。
+- 服务端尚未推送过用量 (老服务端 / 全新会话) 时只显示一行 `( 无数据 )` (`info.contextEmpty`),
+  而不是一串 0 —— 0 看起来像"统计归零", 无数据与真的没有消耗是两回事。
+- 数据来源与刷新: 服务端每次推送 `WireContextStats` 都带上当前累计值
+  (`promptTokens`/`completionTokens`/`totalTokens`/`cachedPromptTokens`), 客户端
+  `onContextStats` 直接**覆盖**(不是累加) `TUIRenderState` 的
+  `sessionPromptTokens`/`sessionCompletionTokens`/`sessionTotalTokens`/
+  `sessionCachedPromptTokens` + `sessionUsageKnown`。推送时机与上下文占用相同:
+  模型节点结束 (`EventBridge::handleNodeEnd`)、流式期间的 tps 定时推送、
+  握手/切换会话 (`SessionServerAgentIO::sendContextStats`)、压缩完成。
+- agent 侧的累计值由 `Session::contextStats->usage` (`SessionUsageTotals`) 持有,
+  与用量台账 (`SessionStore` 的 `usage` 表) 在**同一处结算** (见
+  [modelcall.cpp](/agent/lib/src/nodes/modelcall.cpp) 的 `recordUsage`), 因此界面数字与
+  落盘记录按同一套规则统计; 会话第一次加载时该累计值由台账聚合恢复
+  (`SessionsManager::getOrCreate*` 里的 `loaded.usage`), 进程重启后继续累计。
+- 文案键: `info.context` / `info.usedTokens` / `info.cacheTokens` / `info.inputTokens` /
+  `info.outputTokens` / `info.cacheHitRate` / `info.contextEmpty`。
+- 回归测试: `agentxx_test tui_widget` 的 `test_info_sidebar_context_section`
+  (无数据形态 / 各项数字与命中率 / Context 段在 Append 之上 / 输入为 0 时不显示命中率);
+  跨进程恢复与统计规则见 `agentxx_test usage_ledger`。
+
+### 2.8 Info 侧边栏底部 (工作目录 / 授权按钮 / 版本信息)
+
+[agent_tui.cpp](/agent/client/src/io/tui/agent_tui.cpp) 的 `renderInfoSidebarFooter()` 渲染
+Info tab 底部三行: 工作目录行、`Agentxx <版本> · 连接方式` 行, 以及 (发现新版本时) 更新提示行。
+
+工作目录行的形态为 `{目录名}  [ 授权按钮 ]  {绝对路径}`:
+
+- 授权按钮显示**当前**授权状态并支持点击切换 (文案随语言表):
+  - 非完全授权: `[ 询问授权 ]` (`info.authAsk`) —— 点击切换为完全授权;
+  - 完全授权: `[ 完全授权 ]` (`info.authFull`) —— 点击恢复询问。
+- 状态本身属于 **agent 侧**权限中间件 (`PermissionMiddlewareHandle::isFullAuthorized`),
+  客户端只持有镜像: 握手 (`WireHelloAck`) 与握手后主动查询 (`WireGetPermissionState`)
+  取初值, 服务端状态变更经 `WirePermissionState` 广播 (含用户在权限询问卡片勾选
+  "完全授权所有权限"), 点击切换经 `WireSetFullAuth` 请求 (本地先乐观更新, 服务端
+  广播回来校准)。
+- 按钮的可点区域登记到 shell 级命中表 (`shellHits_`), 点击经 `handleShellHit` →
+  `toggleFullAuth()` 处理; 未渲染该行 (Info tab 未激活) 时不会占用点击区域 (见 §2.3)。
+- 路径一律以 **UTF-8** 显示 (`utilxx_base::pathToUtf8Generic`): Windows 下
+  `std::filesystem::path::string()` 返回本地代码页, 中文目录会显示为乱码。
+
+### 2.9 更新检查 (GitHub Release)
+
+可选地查询项目最新发布版本, 有更新才提示:
+
+- 实现在 [update_check.h](/agent/client/include/agentxx-client/update_check.h) /
+  `update_check.cpp`: 对 `https://github.com/coolight7/agentxx/releases/latest` 发一次
+  GET, **不跟随重定向**并读 302 的 `Location` (即 `.../releases/tag/<tag>`) 取出最新
+  版本标签与发布页链接; 对端直接返回 JSON (GitHub API 形态) 时回退读 `tag_name` /
+  `html_url`。连接与读块超时各 8 秒; 任何失败都返回 `ok=false` + `error`, 不抛异常。
+- 版本比较只按三段数字 (`major.minor.patch`), 忽略 `-rc1` 之类后缀; 仅当最新版本
+  **大于**当前编译版本 (`agentxx::kVersion`) 才算"有更新" (两侧任一解析失败都按无更新
+  处理, 宁可漏报不误报)。
+- 触发方式两种, 共用上面的探测实现:
+  1. **启动检查**: `TUIClientAgentIO::start()` → `startUpdateCheck()` (client io 线程
+     协程, 启动后延迟 3 秒再请求, 不阻塞 UI 线程); 受设置弹窗"更新"组的
+     `启动时检查更新` 开关条目 (`settings.updateValue`, 文案为 `启动时检查更新: 开/关`,
+     持久化键 `tui.checkUpdateOnStartup`, default 开) 控制,
+     关闭时不发起; 属**附加提示**, 失败只记日志 (不打扰用户); 结果经
+     `applyUpdateCheckResult` 写入共享状态 `availableUpdateTag/Url` 并 toast。
+  2. **即时检查**: 设置弹窗"更新"组内的"立即检查"条目 (`settings.checkUpdateValue`;
+     同组还有上面的启动检查开关, 两者各占一条条目) →
+     `TUIClientAgentIO::requestUpdateCheckNow()`
+     (UI 线程): 先 toast "正在检查更新" 作为点击反馈, 再在 client io 线程
+     `co_spawn` 一次探测 (不受启动开关影响; 已有检查在跑时按 `updateChecking_`
+     原子标志去重, 不重复发请求)。结果是**用户要求的动作**, 因此必须有反馈:
+     `applyManualUpdateCheckResult` (io 线程, 顺带写共享状态) →
+     `enqueueUiAction` → `showUpdateCheckResult` (UI 线程):
+        - 有新版本 -> 打开更新提示弹窗 `UpdateNoticeOverlay`;
+        - 无更新 -> toast "已经是最新版本" (`toast.updateLatest`);
+        - 检查失败 -> toast 失败原因 (`toast.updateCheckFailed`)。
+- 展示 (启动检查): Info 侧边栏底部多一行 `[ 新版本 {tag} ]` + 点击提示
+  (`info.updateNotice` / `info.updateHint`), 点击复制发布页链接 (经 shell 级命中表
+  `kUpdateNoticeHitId`); 无更新时不渲染该行。即时检查发现新版本时同样写入该状态,
+  因此两个触发方式在 Info 栏共用同一提示行。
+- 更新提示弹窗 (`UpdateNoticeOverlay`, 内容短, 不需要滚动容器): 版式为
+  `新版本 {当前} -> {新版本}` / `· {发布页链接}` / `[ 前往下载 ]` (链接行用
+  `paragraph` 按可用宽度换行, 长链接不截断, 可拖选复制); 内容行的文案键为
+  `update.title` / `update.versionLine` / `update.download` / `update.hint`。
+  点击按钮或 Enter 触发主程序的 `onDownload`: 经
+  [open_url.h](/agent/client/include/agentxx-client/util/open_url.h) 的
+  `openUrlInBrowser` 交给系统默认程序打开浏览器 (Windows `ShellExecuteW` /
+  macOS `open` / Android `termux-open-url` 回退 `xdg-open` / 其它 `xdg-open`,
+  后台线程执行不阻塞 UI); 打开成功则弹窗关闭
+  (关闭经 UI 动作队列延后到事件处理返回后, 避免在弹窗自己的事件处理里析构弹窗),
+  链接未通过校验 (非 http/https 或含可注入 shell 的字符) 时保留弹窗并 toast。
+  与"关于"弹窗一样是**替换**当前模态 (打开时设置弹窗关闭, 关闭后回到主界面)。
+- 测试: 版本解析/比较、失败路径与链接校验 `agentxx_test update_check`; 本地 HTTP
+  服务端到端 (302 / JSON / 404 / 旧版本) 在 `agentxx_test http`; 设置条目、更新提示
+  弹窗 (版式/点击/Enter/Esc/窄终端换行) 与结果状态在 `agentxx_test tui_settings`。
+
+### 2.10 文件选择弹窗 (跨设备附件)
+
+[FilePickerOverlay](/agent/client/include/agentxx-client/io/tui/components/overlays.h) (类声明在
+`overlays.h`, 实现单独在
+[file_picker_overlay.cpp](/agent/client/src/io/tui/components/file_picker_overlay.cpp))
+由输入栏右侧 [ @︎ ] 按钮打开 (仅当前模型支持任一多模态输入时渲染该按钮), 按模型能力过滤
+可选类型 (非媒体文件不展示, 当前模型不支持的类型灰显不可选)。
+
+- **同一设备** (内置直连模式, 或远程但两端 deviceId 相同): 只有一份目录列表 (客户端本地),
+  选中的文件由客户端读取、按大小预检并 Base64 编码为 Data URL 挂到附件托盘。
+- **跨设备** (远程模式且 `ctx_.isServerDifferentDevice()` 为真): 顶部多出「本地 / 服务端」
+  两个标签页 (Tab 键或点击切换), 两个标签页各自持有目录、选中项、加载中与错误状态;
+  服务端页经 `ctx_.requestServerListDir` 请求列举 (WireListDir → 服务端线程池扫描目录 →
+  WireListDirResult), 初始目录为服务端会话工作目录 (由 HelloAck 携带)。选中服务端文件时
+  只构造 `pathOrUrl` 附件 (`dataUrl` 留空), 由服务端自行读取并编码, 大文件不经客户端中转。
+- 命中登记仍走 `UiHitMap`: 标签页按钮只在跨设备时渲染并登记 (同设备下不会被误点);
+  条目命中 id 带标签页归属 (`item/local/<i>` / `item/server/<i>`), 两个标签页的同名条目
+  互不干扰。
+- 路径字符串在界面、wire 与文件系统访问之间一律 UTF-8 (`utilxx_base::pathToUtf8Generic` /
+  `utilxx_base::utf8ToPath`), Windows 下中文目录不会显示为乱码。
+- 模态行为与其它弹窗一致: 未命中的鼠标事件同样吞掉 (滚轮不会滚动被遮挡的消息列表)。
+
+### 2.11 空状态艺术字动画 (`AGENT++`)
+
+消息列表为空时展示的 banner 艺术字由
+[components/banner_art.h](/agent/client/include/agentxx-client/io/tui/components/banner_art.h)
+提供: 左侧 "AGENT" 固定不变, 右侧 "++" 在启动阶段先画成两个与 AGENT 同风格的大字 "+",
+再通过动画变形为机器人图案 (机器人眼睛里的 `++` 就是这两个加号)。
+
+- 帧序列在首次访问时生成一次
+  ([banner_art.cpp](/agent/client/src/io/tui/components/banner_art.cpp)):
+  5 帧加号保持 + 16 帧变形 = 21 帧 (每帧 70ms, 合计约 1.5 秒)。
+  每帧 6 行、每行补齐到 68 列 (44 列 "AGENT" + 24 列图案框), 各帧块宽一致 —— FTXUI
+  的多行 `text()` 按最宽行定块宽, 各帧等宽才能保证居中的艺术字不左右跳动。
+- 变形规则 (`p` = 变形进度, `dn` = 该格到最近一个加号中心的归一化距离):
+  加号格在 `p >= 0.45 * (1 - dn)` 时清空 (由外端向中心收回),
+  机器人格在 `p >= 0.45 + 0.55 * dn` 时写入 (由中间两只眼睛向外长出);
+  两阶段不重叠, 不会出现两种图案挤在同一处。末帧与改动前的静态艺术字逐字符一致。
+- 播放由 `BannerArtComponent` 完成 (与 `SpinnerComponent` 同一套 FTXUI 动画机制):
+  首次渲染时经 `RequestAnimationFrame()` 启动帧循环, 每次动画回调按累计时长推进一帧,
+  到末帧停止并停止续约 —— 一次性播放, 不重播 (banner 再次出现时直接展示机器人图案)。
+- 动画等级门槛为 `High` (与 banner 内的启动加载点阵、运行中的旋转点阵一致);
+  等级不足时组件内部直接渲染末帧, 不进入动画。
+- 播放期间 banner 子项**不可跨帧缓存** (`MessageListComponent::buildItem` 置
+  `cacheable = false`): 缓存命中的旧 Element 会停在动画中的某一帧, 不再随帧推进。
+- 测试: `agentxx_test banner_art` (帧结构/前缀不变/末帧一致/逐帧收敛 + 播放与空列表接入)。
+
+### 2.12 添加模型配置 (选择模型弹窗 → 表单 → 线消息 → 服务端落盘)
+
+模型列表来自服务端 (`WireModelInfo`), 模型本身是服务端配置 (`model.list`), 因此
+"添加模型" 由 **界面收集输入 + 服务端落盘并注册** 两段组成, 界面侧不写任何配置文件。
+
+- 入口: **选择模型弹窗 (F2 / 状态栏模型名) 顶部固定条目「+ 添加模型配置」**
+  (`ModelSelectorOverlay::kAddModelId`)。条目表 = 该固定条目 + 服务端模型列表
+  (§2.4 的 `UiActionList`); 激活它只调用 `onAddModel` 回调, 不置 `closeRequested_`
+  (弹窗保持选中当前位置, 便于取消后回到列表)。
+- 表单弹窗
+  [ModelConfigOverlay](/agent/client/include/agentxx-client/io/tui/components/overlays.h)
+  (模态只有一个, 因此它**替换**选择模型弹窗, 取消/提交后由
+  `TUIClientAgentIO::openModelConfigForm` 经 `enqueueUiAction` 重新打开列表):
+  - 字段: `name`(必填, 唯一) / `type`(openai / openai-responses / anthropic) /
+    `base_url` / `api_path` / `api_key` / `model_name` +
+    高级项 (`model_context_max_token` / 连接与读取超时 / 最大并发连接 /
+    `send_thinking` / `request_reasoning_summary` / 三态 `ssl_verify` /
+    图片·音频·视频输入 / `extra_headers` / `extra_api_config`);
+  - 输入框为整行形态 (见 §2.6): 整行底色 + 整行可点聚焦, 字段的 `help` 作为占位文本
+    (空值时显示, 一输入就隐藏, 与主消息输入框一致);
+  - 控件树用组件描述层的构建器 (`pluginxx::ui::build::control`) 拼出, 渲染/命中/键盘
+    输入全部走 §2.6 的同一套表单实现 (`renderItems` + `handleFormControlHit` +
+    `handleFormKeyInput`), 提交行是 `__submit` / `__cancel` 两个按钮;
+  - 字段级校验 (必填、JSON 对象文本、数值范围) 在
+    `ModelConfigOverlay::configOfValues` 完成, 失败时把错误文本显示在表单底部并保持打开;
+  - 取值 → `agentxx::agent::ModelConfig` 由 `configOfValues` 负责 (空 API Key 归一为
+    `EMPTY`, `ssl_verify` 三态映射为 `std::nullopt`/`true`/`false`)。
+- 提交路径: `WireAddModel` (客户端 → 服务端, 见 wire_protocol.h) →
+  `SessionServerAgentIO::handleAddModel`:
+  1. 校验 (`agentxx::agent::validateNewModelConfig`, 与客户端同一份规则 → 重名/类型/
+     地址/数值范围);
+  2. 写入 `{data_dir}/agentxx-config.yaml` 的 `model.list`
+     (`agentxx::agent::appendModelConfigToYamlFile`, 文件不存在则创建;
+     按行文本插入, **保留原文件注释与写法**; 写入前先在内存里回读校验, 失败不落盘);
+  3. 注册到 `ModelProviderRegistry` 与 `AgentConfig::availableModels`
+     (立即出现在模型列表里, 可切换; 无需重启);
+  4. 先把配置落盘再注册: 写盘失败则不注册, 避免"本次能用、重启后消失"的半生效状态;
+  5. 回执 `WireAddModelResult` (失败带原因文本) + 回推 `WireModelInfo` 刷新列表。
+- 保存成功即生效: 回执成功时客户端 `setPendingModel`(状态栏显示新模型, 下一条消息携带);
+  重新打开的列表会选中它 (回执先到时按 `cachedModelName`, 后到时按
+  `ModelSelectorOverlay::selectModelAfterLoad`)。失败时 toast 显示服务端原因,
+  列表与当前模型不变。
+- 测试: `agentxx_test config_loader` (写回/校验规则/CRLF/重名与不支持结构)、
+  `tui_settings` (顶部条目与表单取值映射)、`util_misc` (线消息往返)、
+  `remote_agent` (端到端: 校验 → 落盘 → 注册 → 立即切换 + 非法/重名分支)。
+
+### 2.13 客户端模型层 (历史窗口 / 队列镜像) 与输入栏光标
+
+**模型层**: 与"数据从哪来、怎么画"无关的两块状态抽成独立模型, 放在
+`agentxx-client/io/tui/model/` 下, **不依赖 FTXUI / 端点 / 网络 / 插件管理器**, 因此可脱离
+终端直接单测 (`agentxx_test tui_model`, 边界条件全部在无终端环境跑):
+
+| 模型 | 文件 | 负责 |
+|------|------|------|
+| `HistoryWindow` | [model/history_window.h](/agent/client/include/agentxx-client/io/tui/model/history_window.h) | 展示历史的已加载区间 `[windowStart, +loadedCount)`, "上方是否还有更早历史", 分页请求的去重与进行中标记; 页响应判定 (接受 / 空页 / 迟到会话 / 不连续页); 断线增量补拉的尾部**序号连续性** (首个/连续/断号/重复) |
+| `MessageQueueMirror` | [model/queue_mirror.h](/agent/client/include/agentxx-client/io/tui/model/queue_mirror.h) | 服务端排队输入的镜像 (整体快照 = 唯一权威), 按 id 删除/查找, 队列状态 (idle/running/paused/draining, 未知文本按 idle), **投递回执记账** (同一 requestId 只记一次, 容量上限按最旧淘汰) |
+
+两者都是**可拷贝的值类型**, 随渲染快照 (`TUIRenderState`) 一起复制, 因此 UI 线程读到的
+是本帧一致的一份状态; 端点只负责"发请求 / 渲染 / 提示"。
+
+- 历史窗口: 页响应必须紧贴当前窗口首条 (`startIndex + count == windowStart`) 才被接受,
+  否则视为窗口已被整体替换后的过期响应; `windowStart == 0` 表示上方没有更早历史
+  (全量同步、或已拉到会话开头)。切换会话时 `resetForSession` 使旧会话的迟到响应失效。
+- 队列镜像: 快照应用时保留**界面展开态** (按条目 id/文本为键), 队列整体刷新不会把用户
+  正展开的条目折回; 投递回执的重复/迟到不会重复提示用户。
+- 边界纪律: 模型层不得包含 FTXUI/组件/端点头 (`boundaries` 测试模块有专门规则, 目录为空
+  也判失败), 需要镜像的协议结构直接依赖 `agentxx/agent/io/*` 的数据定义。
+
+**输入栏光标**: 输入元素聚焦时使用**可见光标形状** (竖条/方块), 终端据此把
+系统光标画在光标格上 —— 中文/日文输入法的候选框因此跟随真实光标位置, 而不是跑到屏幕角落。
+终端对光标处理有已知问题 (FTXUI 的终端特性检测 `Quirks::CursorHiding()` 为假, 例如部分老
+终端会把光标下的字符吃掉) 时, 本端**不请求**硬件光标, 由输入栏自绘的光标格 (反色空格)
+承担指示作用: 功能不受影响, 只是看不到系统光标。该判定是能力段
+`terminal.hardware_cursor` 的唯一来源 (`tuiHardwareCursorSupported()`), 插件读到的值与
+本端实际行为不会分叉。
+
+### 2.14 生成占位提示 (等待响应 / 正在调用工具)
+
+模型节点开始执行到首个可见输出之间常有一段空档 (请求排队、上游 prefill、推理模型出思考前),
+期间界面若没有任何提示, 用户无法区分"正在生成"与"卡住了"。占位提示就是填这段空档,
+并在真实内容到达时让位:
+
+- 来源: agent 侧 `WireDelta::Type::GenStatus` (`genPhase` = Waiting / ToolCall / Done)
+  - `Waiting`: 模型调用节点发出请求后下发 (见
+    [provider_common.h](/agent/lib/include/agentxx/protocol/provider_common.h) 的
+    `chunk_type::kGenerationStart`)
+  - `ToolCall`: Provider 收到工具调用的**首个分片**后下发 (`chunk_type::kToolCallStart`),
+    `toolName` 为已解析出的工具名 (可能为空)。工具调用参数按增量分片传输, 接收完成前
+    JSON 不完整、无法展示, 因此该阶段只提示"正在调用工具"; 接收完成后照常发
+    `ToolStart` (完整参数 + 工具消息)
+  - `Done`: 节点结束/出错时下发 (兜底清除)
+- 渲染: [MessageListComponent::buildGenPlaceholderItem](/agent/client/include/agentxx-client/io/tui/components/message_list.h)
+  在列表末尾渲染单行占位项 (`- [思考] 等待响应...` / `- [工具] read_file 正在调用工具...`),
+  位置 = 消息与流式内容之后 (`genPlaceholderIndex`); 生成中头部用加载动画, 该子项不跨帧缓存
+  - 工具名按正常工具消息的同一套解析换成特化显示名 (`genPlaceholderToolDisplayName`
+    经 `queryToolRender`, 如 `agentxx_filesystem_list` -> `List`); 该阶段参数/结果尚未
+    接收完, 因此只查显示名不查摘要, 未命中渲染器/模版时回退原始工具名
+- 子项间距的统一约定: 列表内**所有**子项都自带尾部空行 (消息块 `buildMessageItem`、
+  增量稳定块 `buildStreamingStable`、流式区末尾项 `buildStreamingFrontier`/降级
+  `buildStreamingItem`、占位项本身), 因此下一项直接接排即可, 渲染与高度估算都不必
+  再判断"上方是哪类子项"。唯一不带尾部空行的是流式 thinking 的头部行 (`buildStreamingHeader`
+  的 `[Think]` 行): 它是紧随其后的正文的标题行, 加了空行会把标签与正文分开; 该行只在
+  增量模式下出现, 而增量模式成立要求 token 非空 -> 渲染器文本非空 -> 其后必有尾部块或
+  稳定块, 故它不会是列表最后一项
+- `quickHeight` 的流式估算必须与实测一致: 上述尾部空行都要计入 (尾部块 +1、降级整段 +1),
+  漏掉一项就会总高度偏低 -> 吸附底部的偏移偏小 -> 底部最新内容被推出视口
+- 加载动画的帧循环由 `hasRunningToolOrThink()` 维持, 占位提示出现时它必然为真 ——
+  该时刻既没有流式思考输出也没有未完成的工具消息, 漏掉占位判定会让点阵停在首帧
+- 清除: 首个正文/思考 token、ToolStart、NodeEnd、TurnEnd 到达时由 client 线程清除
+  (`TUIClientAgentIO::onDelta` 的 `clearGenPlaceholder`), 占位位置由真实内容接替 ——
+  因此占位是**瞬态渲染态** (`TUIRenderState::genPhase` / `genToolName`), 不进消息列表、
+  不落历史、不参与上下文统计
+- 空状态 banner 判定 (`showEmptyBanner`) 把占位提示也算作"有内容":
+  itemCount/itemKey/quickHeight/buildItem/fillViewport/OnRender 必须用同一判定, 否则
+  子项下标错位
+- 占位项的判定必须排在"流式区"各分支之前 (四个回调一致): 占位提示出现时流式区
+  还没有 token (`currentToken` 为空, 且 `streamUseIncremental_` 可能为假), 若先走
+  流式降级分支, 占位项下标会落到流式子项分支上解引空的 `currentToken` (崩溃)
+- 流结束 (无 token) 的帧里 `OnRender` 要把流式区子项数归零
+  (`streamUseIncremental_` / `streamHeaderCount_`): 无 token 时 `itemCount` 不会调用
+  `syncStream`, 这两个值会停留在上一流的状态 (增量模式的思考流留下头部项),
+  使占位项的下标被推到列表末尾之外 —— 占位提示不显示, 该位置留下上一流的空头部行
+
+---
+
+## 3. 必须遵守的约束
+
+### 3.1 命中区域与元素生命周期
+
+- 命中表 `beginFrame()` 会释放上一帧的 `Box`。**若持有旧 Element 的容器跨帧缓存该元素**,
+  其 `reflect` 节点仍引用已释放的 `Box` (悬空引用), 再次布局即非法访问。
+  因此:
+  - 登记了命中的元素**不要**放进跨帧缓存 (消息列表把"含 decor 按钮/中断控件"的消息标记为
+    `cacheable = false` 正是为此);
+  - 或者像 banner 的 [重试] 按钮那样**不每帧清空** (`MessageListComponent::bannerHits_`):
+    缓存命中时命中项与元素一起跨帧存活 (Box 由同一 Element 的 `reflect` 每帧更新),
+    仅在"元素重建"或"元素离开列表"时清空;
+  - 清空登记表后, 旧元素必须在本帧**重新渲染前**被替换 (本项目各组件都是
+    "OnRender 帧首清空 -> 同帧重新构建元素", 次序天然满足)。
+- 组件"消失"的判定以**是否渲染**为准, 不要再用 `Box{}` 之类的"清零"表达
+  (它等于屏幕左上角, 会造成 (0,0) 处误触)。
+- **滚动容器内的可点击子项用 `Scrollable::hitTestItem` (或 `visibleBoxes()`), 不要用子项
+  元素内的 `reflect`**: [Scrollable](/agent/client/include/agentxx-client/io/tui/scrollable.h) /
+  [LazyScrollable](/agent/client/include/agentxx-client/io/tui/lazy_scrollable.h)
+  测量子项高度时会以"测量用临时大框" (局部坐标: x = 0..内容宽, y = 0..很大) 调用 `SetBox`,
+  之后只有视口内的子项会被重新定位到真实屏幕坐标, 视口外 (上方/下方) 的子项会残留该大框。
+  大框的局部 `x` 与屏幕坐标的左侧区域重叠, 于是按 `reflect` 框命中的点击会命中到
+  **看不见的子项** (通常是列表中靠前的那条), 且横向点击位置不同命中结果还不同。
+  正确做法 (侧边栏面板/Info 段落/overlay 已按此实现):
+  - 渲染子项时把可点位置写入 `ScrollItem::hits` (`UiHitRegion`: 相对子项左上角的局部矩形
+    + 类型 + 标识 + 参数; `w <= 0` 表示延伸到子项右边界);
+  - 事件里用 `hitTestItem(x, y, itemIndex, localX, localY)` 定位到**可见**子项并取局部坐标
+    (子项被视口上边缘裁剪时仍按子项顶边换算), 再与 `hits` 比对;
+  - `Scrollable` 会在子项离开视口时清空它的布局框, 避免残留命中区。
+  [ContextOverlay](/agent/client/src/io/tui/components/overlays.cpp) 的 `headerMessageAt`
+  与 `MessageListComponent` 的可见区域命中登记是同一做法的其它形态。
+- **测量与渲染必须同源**: 组件描述的行数由 `ui_components.cpp` 的 `measureItem` 得出
+  (内部渲染一次统计行数), 不要另写一套"估算行数"的判定 —— 两套判定漂移会让滚动位置与
+  高度计算错位。回归保护见 `agentxx_test tui_ui_items` (估算行数 == 元素真实布局高度)。
+- 滚动定位一律以**实测高度**为准 (`layoutAndMeasure`): 未进入视口的条目用
+  `MessageListComponent::quickHeight` 的粗略值 (O(1) 或轻量文本扫描, 不做任何渲染/
+  插件查询), 进入视口后由布局实测修正; 因此估算偏差只影响滚动条长度, 不影响
+  视口内内容 (见 3.3.2)。
+
+### 3.2 事件消费
+
+- 组件只在**真正处理**了事件时返回 `true`; 鼠标事件未命中任何登记项时应返回 `false`,
+  让其它组件或全局处理继续 (否则会吞掉别人/全局的点击)。
+- 弹窗组件例外: 作为遮挡层, 未处理的事件也应 `return true` 吞掉 (见 2.5)。
+- **拖选复制与高亮**: 左键拖动由 FTXUI 的 `Selection` 处理 (`App` 只在没有任何组件
+  消费事件时把它转入选择); 每个文本节点在 `Select(selection)` 里既取走选中文本, 也
+  记录"哪些单元格被选中"用于绘制高亮 —— 自绘节点 (`FlowText`/`FlowCodeBlock`) 必须
+  两者都做, 否则表现为"能复制但拖动时没有反色高亮"。`Select` 只在选择非空时被调用,
+  所以高亮状态由 `ComputeRequirement` 复位; 懒构建列表跳过每帧 `ComputeRequirement`,
+  拖选松开复制完成后须显式调 `resetSelectionHighlight()` 清掉残留反色。
+  自绘节点的列有两种含义: 字形位置是**行内列** (相对自身盒左缘, 从 0 起算),
+  而 `Selection` 给的是**屏幕列**; 取文本与画高亮都要先换算成屏幕列
+  (`盒左缘 + 行内列`, 见 `FlowText::Render`/`FlowText::Select` 的 `cellX`)。
+  两者混用不会报错, 只会让复制结果每行开头少掉"盒左缘列数"个字符
+  (消息列表正文左侧有 3 列留白, 表现为拖选复制每行都缺头几个字符)。
+- **逐行区间按"文本流"算, 且用根选择的原始端点**: `SaturateHorizontal`/
+  `SaturateVertical` 会把端点夹到容器边缘, 夹取后的端点落在**行内空白列** (列表项
+  续行的悬挂缩进、面板留白 —— 没有任何节点绘制的列) 上时会被当成"整行都被选中":
+  复制与高亮都会多出没选中的整行文本, 同时行首的缩进又取不出来 (表现为"复制结果
+  缺开头、多出末尾之后的字符")。取文本的节点 (`ftxui::Text` / `FlowText` /
+  `FlowCodeBlock`) 因此不用 `GetBox()`, 而是经 `Selection::Root()` 取**用户拖出的
+  原始端点**, 按 [Selection::RowRange] 得到每行的选中列区间:
+  - 起点行: 从起点列到行尾; 终点行: 从行首到终点列; 两者之间的行: 整行
+  - 反向拖选 (自下而上) 时方向相反
+  再与自身列范围求交 —— 端点落在行内空白列上时该行自然取不到本节点的列, 不会把整行
+  带出来。参与判定同样用根选择的原始矩形 (夹取后的矩形可能被收窄, 会漏掉同一行里
+  其它节点的文本), 懒列表的 `Select` 覆写也按此判断。
+- **行内空白列按空白格取出**: 列表项内容节点左缘在项目符号之后, 续行左端若干列
+  (项目符号所占的列) 是空白格 —— 构建时给内容节点记下**悬挂缩进列数**
+  (markdown 列表见 `FlowText::setHangIndent`), 选中范围内的这些列按空格进复制结果
+  并补画高亮, 复制结果与所见一致 (续行保留与正文对齐的缩进)。
+  纯版面留白 (消息列表左右各 3 列) 相反: 它们用 `filler()` 而不是 `text("   ")`
+  表达 —— 留白不是内容, 用文本节点会让它进入复制结果, 且只有一个节点行的高度
+  (即消息在视口内的位置) 会让结果随滚动漂移。
+
+### 3.3 渲染性能
+
+#### 3.3.1 渲染基元 (消息正文)
+
+- **紧凑文本节点** (`ftxui::text`): FTXUI 的 `Text` 节点保存**原文 + 各行起始字节
+  偏移**, 渲染时按行解码直写单元格 (全角占两格且第二格为占位空串, 组合字符并入
+  前一格, 控制字符不占列)。旧实现为每个字素保存一个 `std::string`, 渲染树是所
+  显示文本的 30~60 倍; 现在纯文本节点约 ×1.4 (实测: 100 条 1KB 文本节点 137KB)。
+- **自绘折行节点** [markdown::FlowText](/agent/third_party/markdown_ftxui/markdown/include/markdown/flow.hpp):
+  markdown 段落/行内内容不再"每词一个元素", 而是**一个节点包含整段文本**:
+  - 折行规则: 空格为词边界 (行首空格丢弃), 超宽单词按列硬拆 (不丢字符), `'\n'`
+    为硬换行; 词间空格与该词合并写入同一片段, 通常一行只剩 1 个片段
+  - **折行结果按宽度缓存**: 宽度不变时 `SetBox` 只更新盒位置 (流式输出/滚动时
+    盒位置每帧都在动, 但宽度不变 -> 重排成本接近 0)
+  - 行内样式 (`CellStyle`) 逐单元格应用, 未设置的通道保留外层装饰器颜色
+  - 实现 `Select` (拖选复制) 与链接点击区段登记 (`linkBoxes()`); 选中高亮与
+    `ftxui::Text` 同一套协议: `Select` 记录行/列区间, 绘制时对区间内单元格执行
+    `Screen::GetSelectionStyle()` (默认反色), `ComputeRequirement` 清空该状态 ——
+    自绘节点不会自己复位, 跳过每帧 `ComputeRequirement` 的懒列表在"拖选复制完成"
+    后须调 [LazyScrollable::resetSelectionHighlight] 显式清除残留高亮
+  - 列区间取文本与高亮都按屏幕列判定 (行内列 + 盒左缘), 每行的选中列区间由
+    `Selection::RowRange` 给出 (见 3.2); 列表项内容节点另记悬挂缩进列数
+    (`setHangIndent`), 续行左端的空白列按空白格取出并补画高亮
+  - 迭代布局与 `ftxui::flexbox` 同一套做法 (`asked_` + `need_iteration`), 上报高度
+    即该盒宽下的实测高度
+- **自绘代码块** (`markdown::FlowCodeBlock`): 语言标签行 + 上下内边距 + 按盒宽
+  折行的代码行 (一个节点); 背景/文字色仍由外层 `theme.code_block` 装饰器铺满。
+- 行内样式来自主题的**逐格样式字段** (`Theme::link_style` / `link_focus_style` /
+  `code_inline_style`), 与装饰器字段并存: 装饰器只能整块套用, 一条折行文本内
+  需要按片段区分样式 (两处应保持一致, 见 `TUITheme::markdownTheme`)。
+- 内存标定: 渲染树存活字节 ≈ 每条消息固定 2KB + 源字节 × 24 (实测用例见
+  `agentxx_test ftxui_text` 的 "markdown render tree": 929B 源 -> 32KB, ×35;
+  基线旧实现 ×112), `LazyScrollable` 的缓存预算按此折算
+  (`MessageListComponent::buildMessageItem`)。
+
+#### 3.3.2 懒构建列表 (`LazyScrollable`) 的每帧成本
+
+**滚动模型: 锚点即主状态**
+
+- **唯一滚动状态是锚点** `(anchorIndex_, anchorRow_)`: 视口顶行所在条目与其条目内
+  行偏移 (0 <= 行偏移 < 该条目高度)。`scrollOffset()` 是由锚点**派生**的值
+  (锚点以上条目高度和 + 行偏移, 夹取到 `[0, 总高 - 视口高]`), 只服务滚动条长度/
+  位置与历史分页预取判定 —— 它不代表视口内容对应的高度 (视口上方未实测条目在其中
+  按粗略估算计入)。
+- **窗口发现**: 吸附底部 (默认) 时从尾部向前累计到一屏 (边走边实测); 内容不足一屏
+  时顶部对齐。非吸附 (用户上滚后) 时锚点就是视口顶行, 只从锚点向后逐条实测定位 ——
+  锚点以上条目本帧**完全不参与计算** (不构建/不测量/不读高度)。
+- **定位只用实测高度**: 每个条目先测量 (key 变化则重建重测) 再落到屏幕坐标, 不存在
+  "先按估算定位、下一帧再修正"的抖动窗口; 锚点以上未实测条目的估算再离谱也不会把
+  内容推出视口或让视口空白 (实测用例: 估算少报 4 倍时顶行/末行仍严格正确, 只有总高
+  与滚动条长度不同)。
+- **高度和增量维护**: `totalHeight_` 与锚点以上高度和由 `setItemHeight` 增量更新,
+  不做每帧全量求和; 宽度变化时按 O(1) 粗略值全部重算 (不触发渲染), 锚点条目保持不变
+  (行偏移按新高度夹取)。
+- **key 惰性校验**: 条目内容变化经 `itemKey` 体现; 每帧只校验窗口 + 下方预取带内
+  的条目 (按帧标记), 视口外条目的失效延迟到它重新进入窗口时 —— 避免每帧对全列表
+  计算 key (含插件缓存加锁查字符串)。
+- **滚轮 (每次 1 行)**: 事件只累积行数 (`pendingScrollRows_`), 下一帧布局时落实为
+  "视口顶行上/下移 N 行": 上滚跨条目时先实测目标条目 (它即将进入视口), 顶行落在它
+  的最后一行; 内容底部已进入视口时下滚恢复吸附底部, 上滚即解除吸附。
+  **不在事件里构建元素**: 构建会登记命中区 (decor 按钮/中断控件), 而每帧 `OnRender`
+  会清空登记表, 事件期构建的元素其命中区会丢 (同一元素不再重建) -> 按钮点击失效。
+- **前插 (历史分页)**: `notifyPrepended` 把并行数组与锚点索引一起平移, 视口内容零
+  跳变, 不需要任何"偏移校正"状态; 新增区高度在下一帧按新快照补齐 (位于锚点上方,
+  只影响滚动条长度)。
+- **内容收缩后回夹到底部窗口**: 内容变短 (典型: 展开的长消息被折叠) 后可能出现
+  "从视口顶行到内容末尾不足一屏" —— 屏幕下半全是空白。定位阶段发现该情形时按尾部
+  窗口重取锚点 (= 把滚动位置夹到 `totalHeight - viewportHeight`), 保证视口被内容
+  填满; 回夹不改动吸附开关 (用户上滚的意图保留, 内容继续增长时不自动跟随底部),
+  下一次下滚因"内容末尾已在视口内"恢复吸附。锚点已在内容开头时无需重算 (短内容
+  每帧零成本)。回归保护: `tui_lazy_view` 的"内容收缩后回夹"用例 (折叠末条长消息
+  后逐行都是内容, 末行是折叠条目的最后一行)。
+- **高度估算 (`quickHeight`) 必须廉价**: 不得解析 markdown 之外的内容、不得查
+  插件语义渲染 (`queryToolRender`)、不得 `measureItems`/`layoutForm` 真渲染 ——
+  这些成本只发生在条目真正进入视口被构建时 (布局即测量)。估算值只服务滚动条长度。
+- 回归保护: `agentxx_test tui_lazy_view` (每帧构建/校验次数有界且与条数无关、顶行
+  严格由锚点决定、定位只用实测高度、前插零校正、宽度变化锚点不变、估算只影响滚动条、
+  内容收缩后回夹不留白) 与 `tui_scroll` (历史回归场景 1~17)。
+
+#### 3.3.3 其它
+
+- 只渲染需要渲染的内容: 主界面在弹窗打开时不渲染 (ModalContainer 已处理);
+  侧边栏 tab 未激活时不渲染其内容; 日志 tab 未激活时日志更新不触发重绘。
+- 大列表使用 `LazyScrollable`, 让不可见项零成本, 并把"渲染结果的内存估算"用于缓存预算。
+- 流式增量渲染 (`markdown::IncrementalRenderer`) 的稳定块元素按预算 LRU 保留
+  (`setElementBudget`, 默认 16 块 / 256KB 源字节): 超预算按最久未上屏释放
+  element+builder (源码文本保留, 需要时按块重建), 渲染树内存与流长解耦。
+- 每帧只查一次终端尺寸 (`ctx_.terminalSize()`), 不直接调用 `ftxui::Terminal::Size()`
+  (Linux 上是 `ioctl` 系统调用), 同时保证同帧内布局方式一致。
+
+### 3.4 文案与样式
+
+- 界面文案一律经 `tr()/trf()` 取; 技术字段 (tone/args 等) 不翻译。
+- 弹窗一律用 `tuiSurfacePopup/tuiSurfaceFrame/tuiSurfaceToast` 组装; 不要自行拼边框。
+- `bgcolor(ftxui::Color::Default)` 会把单元格背景重置为终端默认色 (抹掉父级背景),
+  需要"不着色"时用 `UiActionStyle` 的默认值语义 (框架内部已跳过 Default)。
+
+---
+
+## 4. 曾出现的交互问题与现在的做法 (回归测试见 `agentxx_test tui_widget`)
+
+| 问题 | 位置 | 处理 |
+|------|------|------|
+| "未显示的按钮仍能点中" | 各弹窗/状态栏/输入栏的成员 `Box` | 改为命中登记表: 帧首清空 + 渲染时登记 |
+| `Box{}` 被当成"无命中区域" | 输入栏"待发队列"、banner 重试按钮等 | 空区域统一用 `kNoBox`/`IsEmpty()`, 并加回归测试 |
+| 每个按钮一个成员变量 + `OnEvent` 里逐项 `Contain` | 设置/日志菜单/模型/会话/待发队列/文件选择弹窗 | 收敛到 `UiActionList` (条目表) 与 `UiHitMap` |
+| 条目索引魔法数字 (`selectedIndex_ == 2` 之类) 与 4 处同步修改 | 设置弹窗等 | 条目即数据 (`id/label/value/onActivate`), 新增条目只改一处 |
+| 模态打开时事件漏到被遮挡的主界面 (字符落进输入框、滚轮滚动消息列表) | `ModalContainer` + `FilePickerOverlay` | 模态阻塞事件; 弹窗自身也吞掉未处理事件 |
+| 模态打开时仍每帧渲染主界面整棵树 | `ModalContainer` | 弹窗打开时不渲染主界面 |
+| 每帧多次 `Terminal::Size()` (ioctl), 帧中途 resize 可能造成组件间尺寸不一致 | 各组件 | `TUICtx::refreshFrameSize()` 帧首刷新 + `terminalSize()` |
+| 侧边栏 tab 列表维护"可见下标 -> tab 下标"映射表 | `SidebarComponent` | 命中载荷直接携带条目归属 |
+| 状态栏/输入栏/消息列表的按钮点击散落在全局事件处理里 | `agent_tui.cpp` | 各组件自行处理自身区域内点击 (回调在装配时注入) |
+| 上下文弹窗点击消息, 展开/折叠的是"别的消息" (消息多、滚动后尤其明显) | `ContextOverlay` 折叠头命中框 (子项元素内的 `reflect`: 视口外子项残留测量大框) | 改为按 `Scrollable::visibleBoxes()` + 子项->消息下标映射命中 (回归测试见 `agentxx_test tui_context_overlay`) |
+| 设置条目变多或终端过矮时, 末尾条目被裁掉 (看不到也点不到); 之前靠压缩条目间距回避 | `SettingsOverlay` | 条目改为分组显示 (标题只占一行), 内容区限高 + `vscroll_indicator \| yframe` 滚动 (选中项带 `focus` 自动滚入视口, 滚轮 = 上/下移动选中项); 回归测试见 `agentxx_test tui_settings` |

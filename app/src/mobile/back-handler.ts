@@ -12,6 +12,8 @@
 import type { Router } from 'vue-router'
 import { usePlayerStore } from '@/stores/player'
 import { useUiStore } from '@/stores/ui'
+import { platform } from '@/platform'
+import { closeTopPopup } from './popup-stack'
 
 let lastBackAt = 0
 
@@ -31,7 +33,7 @@ export function handleBack(router: Router): void {
   const player = usePlayerStore()
   const ui = useUiStore()
 
-  // 1) 弹层优先关闭
+  // 1) 弹层优先关闭（Bug 39）：页面弹层经 popup-stack 登记，返回键先关最上层
   if (player.queueOpen) {
     player.queueOpen = false
     return
@@ -40,6 +42,7 @@ export function handleBack(router: Router): void {
     ui.playlistPickerSong = null
     return
   }
+  if (closeTopPopup()) return
 
   // 2) 全屏路由（播放页等）：直接回栈
   // 3) 路由栈可回退 → 回退
@@ -49,7 +52,15 @@ export function handleBack(router: Router): void {
     return
   }
 
-  // 4) 根页：双击确认，退到后台（不退出）
+  // 4) 根页：车机先回推荐首页兜底（Bug 70：返回栈空不黑屏）；其余双击退后台
+  if (platform.value.kind === 'car') {
+    if (router.currentRoute.value.path !== '/') {
+      void router.replace('/')
+      return
+    }
+    minimizeApp()
+    return
+  }
   const now = Date.now()
   if (now - lastBackAt < 2200) {
     minimizeApp()

@@ -1,0 +1,77 @@
+/*
+ * 自动生成: 内置插件清单由 plugins/CMakeLists.txt 经 configure_file 生成, 编译进 libagentxx
+ *
+ * - 每个内置插件的源文件在编译时经 CMake per-source 编译定义把入口符号
+ *   改名 (agentxx_plugin_agent_create → agentxx_plugin_agent_builtin_create_<插件名> 等,
+ *   见各插件子目录 CMakeLists.txt 的 内置编译分支),
+ *   避免多插件合并编译时符号冲突
+ * - 本清单汇总全部启用插件的改名入口符号, 经 agentxx::plugin::get_builtin_plugins()
+ *   暴露给 PluginManager (loadBuiltinAsync / loadPluginAsync 回退路径)
+ * - 框架内核 (cxx_pluginxx) 不引用宿主符号: 本文件在静态初始化期把上述两个函数
+ *   注册给 pluginxx::setBuiltinPluginProvider, 使内核侧的 findBuiltinPlugin /
+ *   parseBuiltinManifest 可用 (见 pluginxx/host/manifest.h)
+ */
+#include "agentxx/plugin/api/plugin_api.h"
+#include "agentxx/plugin/plugin_manager.h"
+#include "pluginxx/host/manifest.h"
+
+/* 内置插件入口符号声明 (各插件子目录内置分支生成; 符号为编译期改名后的
+ * agentxx_plugin_builtin_*_<插件名>) */
+@AGENTXX_BUILTIN_PLUGIN_MANIFEST_DECLS@
+
+#if @AGENTXX_BUILTIN_PLUGIN_COUNT@ > 0
+static const PluginxxBuiltinInfo kAgentxxBuiltinPlugins[] = {
+@AGENTXX_BUILTIN_PLUGIN_MANIFEST_ENTRIES@
+};
+#else
+/* 无内置插件 (全部 AGENTXX_ENABLE_PLUGIN_*=OFF): 空表占位 */
+static const PluginxxBuiltinInfo kAgentxxBuiltinPlugins[] = {
+    {PluginxxStringView{}, nullptr, nullptr, nullptr},
+};
+#endif
+
+const PluginxxBuiltinInfo* agentxx::plugin::get_builtin_plugins(uint64_t* count) {
+    if (count) {
+        *count = sizeof(kAgentxxBuiltinPlugins) / sizeof(kAgentxxBuiltinPlugins[0]);
+    }
+    return kAgentxxBuiltinPlugins;
+}
+
+/* ── 内嵌 plugin.yaml 原文 (与上表一一对应) ── */
+const PluginxxBuiltinManifest* agentxx::plugin::get_builtin_manifests(uint64_t* count) {
+#if @AGENTXX_BUILTIN_PLUGIN_COUNT@ > 0
+    static const PluginxxBuiltinManifest kManifests[] = {
+@AGENTXX_BUILTIN_PLUGIN_MANIFEST_YAML_ARRAY@
+    };
+    if (count) {
+        *count = sizeof(kManifests) / sizeof(kManifests[0]);
+    }
+    return kManifests;
+#else
+    static const PluginxxBuiltinManifest kEmptyManifests[] = {
+        {PluginxxStringView{}, PluginxxStringView{}},
+    };
+    if (count) {
+        *count = 1;
+    }
+    return kEmptyManifests;
+#endif
+}
+
+/* ── 向框架内核登记内置清单提供者 ── */
+namespace {
+/// 静态初始化期登记 (在 main 之前完成), 使 pluginxx::findBuiltinPlugin /
+/// pluginxx::parseBuiltinManifest 可查询本宿主的内置插件表
+struct BuiltinProviderRegistrar {
+    BuiltinProviderRegistrar() {
+        pluginxx::setBuiltinPluginProvider(
+            pluginxx::BuiltinPluginProvider{
+                &agentxx::plugin::get_builtin_plugins,
+                &agentxx::plugin::get_builtin_manifests
+            }
+        );
+    }
+};
+
+const BuiltinProviderRegistrar kBuiltinProviderRegistrar{};
+} // namespace

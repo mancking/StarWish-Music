@@ -16,6 +16,49 @@ const filter = ref('')
 /** 手机/平板走系统媒体库（MediaStore），桌面走目录扫描 */
 const mobile = computed(() => platform.value.kind === 'phone' || platform.value.kind === 'pad')
 
+/** 规格书 3.4 / Bug 18：歌曲 / 歌手 / 专辑 三分组 Tab */
+type GroupTab = 'songs' | 'artists' | 'albums'
+const group = ref<GroupTab>('songs')
+/** 分组视图里被选中的歌手 / 专辑（null = 聚合列表） */
+const picked = ref<{ kind: 'artist' | 'album'; name: string } | null>(null)
+
+const artists = computed(() => {
+  const map = new Map<string, { name: string; count: number; pic: string }>()
+  for (const s of library.localSongs) {
+    const k = s.singer || '未知歌手'
+    const cur = map.get(k)
+    if (cur) cur.count++
+    else map.set(k, { name: k, count: 1, pic: s.pic || '' })
+  }
+  const f = filter.value.trim().toLowerCase()
+  const all = [...map.values()].sort((a, b) => b.count - a.count)
+  return f ? all.filter(x => x.name.toLowerCase().includes(f)) : all
+})
+
+const albums = computed(() => {
+  const map = new Map<string, { name: string; count: number; pic: string; singer: string }>()
+  for (const s of library.localSongs) {
+    const k = s.album || '未知专辑'
+    const cur = map.get(k)
+    if (cur) cur.count++
+    else map.set(k, { name: k, count: 1, pic: s.pic || '', singer: s.singer || '' })
+  }
+  const f = filter.value.trim().toLowerCase()
+  const all = [...map.values()].sort((a, b) => b.count - a.count)
+  return f ? all.filter(x => x.name.toLowerCase().includes(f)) : all
+})
+
+/** 分组视图点进某歌手/专辑后的歌曲列表 */
+const pickedSongs = computed(() => {
+  if (!picked.value) return []
+  const k = picked.value.name.toLowerCase()
+  return library.localSongs.filter(s =>
+    picked.value!.kind === 'artist'
+      ? (s.singer || '未知歌手').toLowerCase() === k
+      : (s.album || '未知专辑').toLowerCase() === k
+  )
+})
+
 const songs = computed(() => {
   const k = filter.value.trim().toLowerCase()
   if (!k) return library.localSongs
@@ -120,11 +163,49 @@ async function rescan(): Promise<void> {
       </div>
     </div>
 
-    <SongList
-      :songs="songs"
-      empty-text="本地曲库还是空的"
-      empty-desc="点击右上角「添加文件夹并扫描」，支持 MP3 / FLAC / M4A / OGG / WAV 等格式，会自动读取内嵌封面与标签"
-    />
+    <nav class="gtabs">
+      <button :class="{ on: group === 'songs' }" @click="group = 'songs'; picked = null">歌曲</button>
+      <button :class="{ on: group === 'artists' }" @click="group = 'artists'; picked = null">歌手 {{ artists.length || '' }}</button>
+      <button :class="{ on: group === 'albums' }" @click="group = 'albums'; picked = null">专辑 {{ albums.length || '' }}</button>
+    </nav>
+
+    <template v-if="group === 'songs'">
+      <SongList
+        :songs="songs"
+        empty-text="本地曲库还是空的"
+        empty-desc="点击右上角「添加文件夹并扫描」，支持 MP3 / FLAC / M4A / OGG / WAV 等格式，会自动读取内嵌封面与标签"
+      />
+    </template>
+
+    <template v-else>
+      <!-- 歌手/专辑详情：沿用 SongList，标题行可返回聚合 -->
+      <div v-if="picked" class="picked-head">
+        <button class="btn sm" @click="picked = null"><Icon name="chevron-left" :size="13" />返回</button>
+        <b>{{ picked.name }}</b>
+        <span class="count">{{ pickedSongs.length }} 首</span>
+        <span class="flex1" />
+        <button class="btn sm primary" :disabled="!pickedSongs.length" @click="player.playSongs(pickedSongs, 0)">
+          <Icon name="play" :size="13" />播放全部
+        </button>
+      </div>
+      <SongList
+        v-if="picked"
+        :songs="pickedSongs"
+        :empty-text="`该${picked.kind === 'artist' ? '歌手' : '专辑'}下暂无曲目`"
+      />
+      <div v-else class="ggrid">
+        <button v-for="g in group === 'artists' ? artists : albums" :key="g.name" class="gcard" @click="picked = { kind: group === 'artists' ? 'artist' : 'album', name: g.name }">
+          <span class="gpic" :class="{ round: group === 'artists' }" :style="g.pic ? { backgroundImage: `url(${g.pic})` } : undefined">
+            <Icon v-if="!g.pic" :name="group === 'artists' ? 'artist' : 'disc'" :size="20" />
+          </span>
+          <span class="gmeta">
+            <b class="ellipsis">{{ g.name }}</b>
+            <i>{{ g.count }} 首</i>
+          </span>
+        </button>
+        <div v-if="!(group === 'artists' ? artists : albums).length" class="empty-group">暂无数据</div>
+      </div>
+    </template>
 
     <!-- 规格书 4.1：分页懒加载，避免一次渲染上千条 -->
     <div v-if="hasMore" class="more">
@@ -266,5 +347,91 @@ h1 {
   display: flex;
   justify-content: center;
   padding: 18px 0 8px;
+}
+.gtabs {
+  display: flex;
+  gap: 4px;
+  margin: 0 0 12px;
+  border-bottom: 1px solid var(--line);
+}
+.gtabs button {
+  border: 0;
+  background: transparent;
+  color: var(--text-3);
+  font-size: 13px;
+  padding: 8px 12px;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+}
+.gtabs button.on {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+}
+.ggrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 10px;
+}
+.gcard {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel);
+  color: var(--text);
+  cursor: pointer;
+  text-align: left;
+}
+.gcard:hover {
+  background: var(--hover);
+}
+.gpic {
+  width: 44px;
+  height: 44px;
+  flex: none;
+  border-radius: 8px;
+  background: var(--panel-3) center / cover no-repeat;
+  display: grid;
+  place-items: center;
+  color: var(--text-3);
+}
+.gpic.round {
+  border-radius: 50%;
+}
+.gmeta {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.gmeta b {
+  font-size: 13px;
+  font-weight: 600;
+}
+.gmeta i {
+  font-style: normal;
+  font-size: 11px;
+  color: var(--text-3);
+}
+.picked-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+.picked-head b {
+  font-size: 15px;
+}
+.flex1 {
+  flex: 1;
+}
+.empty-group {
+  grid-column: 1 / -1;
+  text-align: center;
+  color: var(--text-3);
+  font-size: 13px;
+  padding: 40px 0;
 }
 </style>

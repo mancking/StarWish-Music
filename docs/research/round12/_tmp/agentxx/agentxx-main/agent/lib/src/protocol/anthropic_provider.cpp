@@ -1,0 +1,709 @@
+#include "agentxx/protocol/anthropic_provider.h"
+#include "agentxx/protocol/openai_provider.h"
+#include "agentxx/protocol/provider_common.h"
+#include "agentxx/util/exception.h"
+#include "agentxx/util/neograph_json_bridge.h"
+#include "fmt/format.h"
+#include "utilxx/http_header.h"
+#include "utilxx_base/json.h"
+#include <chrono>
+
+namespace agentxx {
+namespace protocol {
+
+namespace {
+
+/// 本协议的空响应判定 (加密思考内容键固定)
+/// - 带 signature 的 thinking 块存于 message.extra[kThinkingBlocksKey], 属于有效
+///   思考内容 (回传上下文时需要), 不视为空; 数组非空即存在有效内容
+/// - 判定实现与 OpenAI 等协议共用, 见 [isEmptyResponse]
+bool isEmptyResponse(const neograph::ChatCompletion& completion) {
+    return agentxx::protocol::isEmptyResponse(completion, AnthropicProvider::kThinkingBlocksKey);
+}
+
+} // namespace
+
+std::unique_ptr<AnthropicProvider>
+    AnthropicProvider::create(const agentxx::agent::ModelConfig& config) {
+    return std::unique_ptr<AnthropicProvider>(new AnthropicProvider(config));
+}
+
+std::shared_ptr<neograph::Provider>
+    AnthropicProvider::create_shared(const agentxx::agent::ModelConfig& config) {
+    return std::shared_ptr<neograph::Provider>(new AnthropicProvider(config));
+}
+
+std::string AnthropicProvider::get_name() const {
+    return "anthropic";
+}
+
+asio::awaitable<neograph::ChatCompletion> AnthropicProvider::invoke(
+    const neograph::CompletionParams& params,
+    neograph::StreamCallback          on_chunk
+) {
+    if (!on_chunk) {
+        co_return co_await invoke_format_data(params, nullptr);
+    }
+    co_return co_await invoke_format_data(
+        params,
+        [on_chunk](const neograph::ChatStreamChunk& chunk) {
+            switch (chunk.type) {
+                case neograph::ChatStreamChunk::TYPE_CONTENT:
+                    on_chunk(chunk.data);
+                    break;
+                case neograph::ChatStreamChunk::TYPE_THINKING:
+                    break;
+            }
+        }
+    );
+}
+
+asio::awaitable<neograph::ChatCompletion> AnthropicProvider::invoke_format_data(
+    const neograph::CompletionParams&  params,
+    neograph::FormatDataStreamCallback on_chunk
+) {
+    if (on_chunk) {
+        auto body      = buildBody(params);
+        body["stream"] = true;
+        auto result    = co_await doStream(params, body, on_chunk);
+        co_return result;
+    }
+    co_return co_await completeAsync(params);
+}
+
+std::pair<std::string, utilxx_base::Json> AnthropicProvider::convertMessages(
+    const std::vector<neograph::ChatMessage>& messages,
+    bool                                      sendThinking
+) {
+    std::string       system;
+    utilxx_base::Json arr = utilxx_base::Json::array();
+
+    // 是否携带从 Anthropic 响应中捕获的带 signature 的 thinking 块
+    // (extra 为 neograph::json: 经 bridge 快照为 utilxx_base::Json 后判断)
+    auto hasThinkingBlocks = [](const neograph::ChatMessage& msg) {
+        auto extra = agentxx::util::fromNeographJson(msg.extra);
+        return extra.contains(kThinkingBlocksKey) && extra[kThinkingBlocksKey].is_array()
+               && !extra[kThinkingBlocksKey].empty();
+    };
+    // 追加 thinking 相关块: 优先使用响应中捕获的原始块 (含 signature, Anthropic 要求回传
+    // thinking 时携带原始 signature); 无捕获时降级使用 reasoning_content (跨 provider/旧历史)
+    auto appendThinkingBlocks
+        = [&](utilxx_base::Json& contentArr, const neograph::ChatMessage& msg) {
+              if (!sendThinking) {
+                  return;
+              }
+              if (hasThinkingBlocks(msg)) {
+                  auto extra = agentxx::util::fromNeographJson(msg.extra);
+                  for (const auto& b : extra[kThinkingBlocksKey]) {
+                      contentArr.push_back(b);
+                  }
+                  return;
+              }
+              if (!msg.reasoning_content.empty()) {
+                  contentArr.push_back({
+                      {"type",     "thinking"           },
+                      {"thinking", msg.reasoning_content}
+                  });
+              }
+          };
+
+    for (const auto& msg : messages) {
+        if (msg.role == "system") {
+            if (!system.empty()) {
+                system += "\n";
+            }
+            system += msg.content;
+            continue;
+        }
+
+        if (msg.role == "tool") {
+            utilxx_base::Json j;
+            j["role"]                     = "user";
+            utilxx_base::Json content_arr = utilxx_base::Json::array();
+            utilxx_base::Json tool_result;
+            tool_result["type"]        = "tool_result";
+            tool_result["tool_use_id"] = msg.tool_call_id;
+            tool_result["content"]     = msg.content;
+            content_arr.push_back(std::move(tool_result));
+            j["content"] = std::move(content_arr);
+            arr.push_back(std::move(j));
+        } else if (msg.role == "assistant" && !msg.tool_calls.empty()) {
+            utilxx_base::Json j;
+            j["role"]                     = "assistant";
+            utilxx_base::Json content_arr = utilxx_base::Json::array();
+            appendThinkingBlocks(content_arr, msg);
+            if (!msg.content.empty()) {
+                content_arr.push_back({
+                    {"type", "text"     },
+                    {"text", msg.content}
+                });
+            }
+            for (const auto& tc : msg.tool_calls) {
+                utilxx_base::Json tool_use;
+                tool_use["type"] = "tool_use";
+                tool_use["id"]   = tc.id;
+                tool_use["name"] = tc.name;
+                // 参数非法 JSON 时回退为空对象, 不中断整条消息转换
+                agentxx::util::catchError<bool>(
+                    [&]() -> bool {
+                        tool_use["input"] = utilxx_base::Json::parse(tc.arguments);
+                        return true;
+                    },
+                    [&](std::string) -> bool {
+                        tool_use["input"] = utilxx_base::Json::object();
+                        return false;
+                    }
+                );
+                content_arr.push_back(std::move(tool_use));
+            }
+            j["content"] = std::move(content_arr);
+            arr.push_back(std::move(j));
+        } else if (sendThinking && msg.role == "assistant"
+                   && (!msg.reasoning_content.empty() || hasThinkingBlocks(msg))) {
+            utilxx_base::Json j;
+            j["role"]                     = "assistant";
+            utilxx_base::Json content_arr = utilxx_base::Json::array();
+            appendThinkingBlocks(content_arr, msg);
+            if (!msg.content.empty()) {
+                content_arr.push_back({
+                    {"type", "text"     },
+                    {"text", msg.content}
+                });
+            }
+            j["content"] = std::move(content_arr);
+            arr.push_back(std::move(j));
+        } else if (!msg.image_urls.empty() || !msg.audio_urls.empty() || !msg.video_urls.empty()) {
+            // 多模态消息: text + image/audio/video 块
+            //   - 图片: {"type":"image","source":{base64|url}}
+            //   - 音频: {"type":"audio","source":{"type":"base64",...}} (Anthropic 仅支持 base64)
+            //   - 视频: {"type":"video","source":{base64|url}}
+            // data URL 解析为 base64 源 (自动推导 media_type); HTTP URL 使用 url 源
+            utilxx_base::Json j;
+            j["role"]                      = msg.role;
+            utilxx_base::Json content_arr  = utilxx_base::Json::array();
+            auto              appendSource = [&](const std::string& url, const std::string& kind) {
+                if (auto parsed = neograph::parse_data_url(url)) {
+                    content_arr.push_back({
+                        {"type",   kind            },
+                        {"source",
+                         {{"type", "base64"},
+                          {"media_type", parsed->first},
+                          {"data", parsed->second}}},
+                    });
+                } else {
+                    // HTTP URL 或无法解析的 data URL: 使用 url 源 (Anthropic 图片/视频支持)
+                    content_arr.push_back({
+                        {"type",   kind                           },
+                        {"source", {{"type", "url"}, {"url", url}}},
+                    });
+                }
+            };
+            if (!msg.content.empty()) {
+                content_arr.push_back({
+                    {"type", "text"     },
+                    {"text", msg.content}
+                });
+            }
+            for (const auto& url : msg.image_urls) {
+                appendSource(url, "image");
+            }
+            for (const auto& url : msg.audio_urls) {
+                appendSource(url, "audio");
+            }
+            for (const auto& url : msg.video_urls) {
+                appendSource(url, "video");
+            }
+            j["content"] = std::move(content_arr);
+            arr.push_back(std::move(j));
+        } else {
+            utilxx_base::Json j;
+            j["role"]    = msg.role;
+            j["content"] = msg.content;
+            arr.push_back(std::move(j));
+        }
+    }
+
+    // Anthropic 要求 user/assistant 严格交替出现: "tool" 消息映射为 user 后可能出现连续
+    // 同 role (如多个连续 tool 结果、user 后紧跟 tool 结果), 合并相邻同 role 消息,
+    // 合并时将 content 统一规范化为 block 数组再拼接。
+    // 注: utilxx_base::Json 为值语义 (back()/迭代返回深拷贝), 用 pending 暂存待合并消息
+    auto normalizeContent = [](utilxx_base::Json m) -> utilxx_base::Json {
+        if (!m["content"].is_array()) {
+            std::string text
+                = m["content"].is_string() ? m["content"].get<std::string>() : m["content"].dump();
+            m["content"] = utilxx_base::Json::array();
+            if (!text.empty()) {
+                m["content"].push_back({
+                    {"type", "text"},
+                    {"text", text  }
+                });
+            }
+        }
+        return m;
+    };
+    utilxx_base::Json merged     = utilxx_base::Json::array();
+    bool              hasPending = false;
+    utilxx_base::Json pending;
+    auto              flushPending = [&]() {
+        if (hasPending) {
+            merged.push_back(std::move(pending));
+            hasPending = false;
+        }
+    };
+    for (auto msg : arr) {
+        auto role = msg["role"].get<std::string>();
+        if (hasPending && pending["role"].get<std::string>() == role) {
+            pending = normalizeContent(std::move(pending));
+            msg     = normalizeContent(std::move(msg));
+            for (auto block : msg["content"]) {
+                pending["content"].push_back(std::move(block));
+            }
+        } else {
+            flushPending();
+            pending    = std::move(msg);
+            hasPending = true;
+        }
+    }
+    flushPending();
+
+    return {system, std::move(merged)};
+}
+
+utilxx_base::Json AnthropicProvider::convertTools(const std::vector<neograph::ChatTool>& tools) {
+    utilxx_base::Json arr = utilxx_base::Json::array();
+    for (const auto& tool : tools) {
+        utilxx_base::Json t;
+        t["name"]         = tool.name;
+        t["description"]  = tool.description;
+        t["input_schema"] = agentxx::util::fromNeographJson(tool.parameters);
+        arr.push_back(std::move(t));
+    }
+    return arr;
+}
+
+/// 是否为请求末尾的动态段内容块 (`<dynamic_context ...>`)
+/// - 动态段由 modelcall 每轮按当前来源拼装 (记忆/技能等), 内容可能变化,
+///   因此它不属于稳定前缀: 缓存断点必须落在它之前的消息上
+bool AnthropicProvider::isDynamicContextBlock(const utilxx_base::Json& block) {
+    if (!block.is_object() || block.value("type", std::string{}) != "text") {
+        return false;
+    }
+    return block.value("text", std::string{}).starts_with("<dynamic_context");
+}
+
+/// 在一段内容 (字符串或内容块数组) 的末尾可缓存块上加断点; 无可加块返回 false
+bool AnthropicProvider::markCacheBreakpoint(utilxx_base::Json& content) {
+    static const utilxx_base::Json kBreakpoint{
+        {"type", "ephemeral"}
+    };
+    // 纯字符串内容: 转成文本块数组后加断点 (Anthropic 两种形态都接受)
+    if (content.is_string()) {
+        utilxx_base::Json block;
+        block["type"]          = "text";
+        block["text"]          = content.get<std::string>();
+        block["cache_control"] = kBreakpoint;
+        content                = utilxx_base::Json::array({std::move(block)});
+        return true;
+    }
+    if (!content.is_array() || content.empty()) {
+        return false;
+    }
+    // 从末尾往前找第一个可带断点的块: thinking 块 (带 signature) 不接受
+    // cache_control, 命中时继续往前找
+    for (size_t i = content.size(); i > 0; --i) {
+        auto& block = content[i - 1];
+        if (!block.is_object()) {
+            continue;
+        }
+        const auto type = block.value("type", std::string{});
+        if (type == "text" || type == "tool_use" || type == "tool_result" || type == "image"
+            || type == "document") {
+            block["cache_control"] = kBreakpoint;
+            return true;
+        }
+    }
+    return false;
+}
+
+void AnthropicProvider::applyCacheBreakpoints(utilxx_base::Json& body) {
+    // ① 系统提示: 字符串 → 内容块数组 (末块带断点)
+    if (body.contains("system")) {
+        markCacheBreakpoint(body["system"]);
+    }
+
+    // ② 工具定义: 最后一个工具带断点 (工具 schema 是稳定的最大固定段之一)
+    if (body.contains("tools") && body["tools"].is_array() && !body["tools"].empty()) {
+        body["tools"].back()["cache_control"] = utilxx_base::Json{{"type", "ephemeral"}};
+    }
+
+    // ③ 消息: 断点落在"最后一条非动态段消息"的末尾可缓存块上
+    if (!body.contains("messages") || !body["messages"].is_array() || body["messages"].empty()) {
+        return;
+    }
+    auto&  messages = body["messages"];
+    size_t idx      = messages.size();
+    // 末尾消息若只保存动态段, 则它不是稳定前缀的一部分, 往前退一条
+    // (动态段与工具应答被合并到同一条消息时, 整条跳过: 该条里含动态段内容)
+    while (idx > 0) {
+        const auto& msg = messages[idx - 1];
+        if (!msg.is_object() || !msg.contains("content")) {
+            break;
+        }
+        const auto& content = msg["content"];
+        bool        dynamic = false;
+        if (content.is_array() && !content.empty()) {
+            dynamic = isDynamicContextBlock(content.back());
+        } else if (content.is_string()) {
+            dynamic = content.get<std::string>().starts_with("<dynamic_context");
+        }
+        if (!dynamic) {
+            break;
+        }
+        --idx;
+    }
+    if (idx == 0) {
+        return;
+    }
+    markCacheBreakpoint(messages[idx - 1]["content"]);
+}
+
+void AnthropicProvider::appendThinkingBlock(
+    neograph::ChatCompletion& completion,
+    const utilxx_base::Json&  block
+) {
+    // extra 为 neograph::json (图边界类型): 经 bridge 转入
+    auto neo = agentxx::util::toNeographJson(block);
+    if (!completion.message.extra.contains(kThinkingBlocksKey)) {
+        completion.message.extra[kThinkingBlocksKey] = neograph::json::array();
+    }
+    completion.message.extra[kThinkingBlocksKey].push_back(std::move(neo));
+}
+
+neograph::ChatCompletion AnthropicProvider::parseResponse(const utilxx_base::Json& resp) {
+    neograph::ChatCompletion completion;
+    completion.message.role = "assistant";
+
+    if (resp.contains("content") && resp["content"].is_array()) {
+        for (const auto& block : resp["content"]) {
+            auto type = block.value("type", std::string{});
+            if (type == "text") {
+                completion.message.content += block.value("text", std::string{});
+            } else if (type == "tool_use") {
+                neograph::ToolCall tc;
+                tc.id   = block.value("id", std::string{});
+                tc.name = block.value("name", std::string{});
+                if (block.contains("input")) {
+                    tc.arguments = block["input"].dump();
+                }
+                completion.message.tool_calls.push_back(std::move(tc));
+            } else if (type == "thinking") {
+                completion.message.reasoning_content += block.value("thinking", std::string{});
+                // 记录带 signature 的原始块, 多轮对话时原样回传 (Anthropic 要求携带 signature)
+                if (block.contains("signature") && block["signature"].is_string()
+                    && !block["signature"].get<std::string>().empty()) {
+                    appendThinkingBlock(completion, block);
+                }
+            } else if (type == "redacted_thinking") {
+                // redacted_thinking 块必须原样回传
+                appendThinkingBlock(completion, block);
+            }
+        }
+    }
+
+    if (resp.contains("usage")) {
+        auto u = resp["usage"];
+        // 用量计算方式: input_tokens 只含未命中缓存的输入, 缓存读/写量
+        // 单独回报; 统一折算成整段 prompt 规模, 并把缓存写入量放进额外字段供用量记录使用
+        applyUsage(
+            completion,
+            u.value("input_tokens", 0),
+            u.value("cache_read_input_tokens", 0),
+            u.value("cache_creation_input_tokens", 0),
+            u.value("output_tokens", 0)
+        );
+    }
+
+    return completion;
+}
+
+AnthropicProvider::AnthropicProvider(agentxx::agent::ModelConfig config) :
+    config_(std::move(config)) {
+    if (config_.baseUrl.empty()) {
+        config_.baseUrl = kDefaultBaseUrl;
+    }
+}
+
+utilxx_base::Json AnthropicProvider::buildBody(const neograph::CompletionParams& params) const {
+    utilxx_base::Json body;
+    body["model"] = params.model.empty() ? config_.modelName : params.model;
+    if (config_.modelContextMaxToken > 0) {
+        body["max_tokens"] = config_.modelContextMaxToken;
+    }
+
+    auto [system, messages] = convertMessages(params.messages, config_.sendThinking);
+    body["messages"]        = std::move(messages);
+    if (!system.empty()) {
+        body["system"] = system;
+    }
+
+    if (!params.tools.empty()) {
+        body["tools"] = convertTools(params.tools);
+    }
+
+    // prompt 缓存断点: 默认关闭, 由 model.list 条目的 `cache_control` 打开
+    if (config_.cacheControl) {
+        applyCacheBreakpoints(body);
+    }
+
+    if (params.temperature >= 0.0f) {
+        body["temperature"] = params.temperature;
+    }
+
+    if (params.max_tokens > 0) {
+        body["max_tokens"] = params.max_tokens;
+    }
+
+    if (config_.extraConfig.is_object()) {
+        for (const auto& [key, val] : config_.extraConfig.items()) {
+            if (!body.contains(key)) {
+                body[key] = val;
+            }
+        }
+    }
+
+    if (!params.extra_fields.empty()) {
+        for (const auto& [key, val] : params.extra_fields.items()) {
+            if (isInternalExtraField(key)) {
+                continue;
+            }
+            body[key] = agentxx::util::fromNeographJson(val);
+        }
+    }
+
+    // Anthropic 强制要求 max_tokens, 缺失会返回 400; config/params/extra 均未指定时使用保守默认值
+    if (!body.contains("max_tokens")) {
+        body["max_tokens"] = 8192;
+    }
+
+    return body;
+}
+
+void AnthropicProvider::applyHeaders(
+    utilxx::HeaderMap&                headers,
+    const neograph::CompletionParams& params
+) const {
+    if (!config_.apiKey.empty()) {
+        headers.set("x-api-key", config_.apiKey);
+    }
+    if (!config_.anthropicVersion.empty()) {
+        headers.set("anthropic-version", config_.anthropicVersion);
+    }
+    for (const auto& [k, v] : config_.extraHeaders) {
+        headers.set(k, v);
+    }
+    applySessionHeaders(headers, params);
+}
+
+asio::awaitable<neograph::ChatCompletion>
+    AnthropicProvider::completeAsync(const neograph::CompletionParams& params) {
+    // 原 agentxx::util 已拆分: 基础件在 utilxx_base, 重依赖工具在 utilxx
+    using namespace utilxx_base;
+    using namespace utilxx;
+
+    auto bodyJson = buildBody(params);
+    auto bodyStr  = bodyJson.dump();
+
+    HeaderMap headers;
+    applyHeaders(headers, params);
+
+    auto resp = co_await HttpClient::postAsync(
+        fmt::format("{}/v1/messages", config_.baseUrl),
+        bodyStr,
+        "application/json",
+        headers,
+        HttpClient::RequestConfig{
+            .connectTimeout           = std::chrono::seconds{config_.connectTimeoutSeconds},
+            .readChunkTimeout         = std::chrono::seconds{config_.readChunkTimeoutSeconds},
+            .sslVerify                = config_.sslVerify,
+            .keepAlive                = true,
+            .maxConcurrentConnections = config_.maxConcurrentConnections,
+        }
+    );
+
+    if (!resp.has_value()) {
+        throw std::runtime_error(fmt::format("HTTP request failed: {}", resp.error()));
+    }
+
+    auto& r = resp.value();
+
+    if (r.status == 429) {
+        auto raw        = r.findHeader("retry-after");
+        int  retryAfter = -1;
+        if (!raw.empty()) {
+            int seconds    = 0;
+            auto [ptr, ec] = utilxx_base::parseNumberFromString(raw, seconds);
+            if (ec == std::errc{} && seconds >= 0) {
+                retryAfter = seconds;
+            }
+        }
+        throw neograph::RateLimitError(fmt::format("API error (HTTP 429): {}", r.body), retryAfter);
+    }
+
+    if (r.status != 200) {
+        throw std::runtime_error(fmt::format("API error (HTTP {}): {}", r.status, r.body));
+    }
+
+    auto respJson   = utilxx_base::Json::parse(r.body);
+    auto completion = parseResponse(respJson);
+
+    // 空响应视为生成失败, 抛异常交由 modelcall 重试流程处理 (与流式路径行为一致)
+    if (isEmptyResponse(completion)) {
+        throw std::runtime_error(fmt::format(
+            "LLM response is empty | model={} usage={}/{}/{}",
+            params.model.empty() ? config_.modelName : params.model,
+            completion.usage.prompt_tokens,
+            completion.usage.completion_tokens,
+            completion.usage.total_tokens
+        ));
+    }
+
+    co_return completion;
+}
+
+asio::awaitable<neograph::ChatCompletion> AnthropicProvider::doStream(
+    const neograph::CompletionParams&  params,
+    const utilxx_base::Json&           body,
+    neograph::FormatDataStreamCallback on_chunk
+) {
+    // 原 agentxx::util 已拆分: 基础件在 utilxx_base, 重依赖工具在 utilxx
+    using namespace utilxx_base;
+    using namespace utilxx;
+
+    auto bodyStr = body.dump();
+
+    HeaderMap headers;
+    applyHeaders(headers, params);
+
+    neograph::ChatCompletion completion;
+    completion.message.role = "assistant";
+    std::string                       fullContent;
+    std::string                       fullThinking;
+    std::map<int, neograph::ToolCall> tcMap;
+    std::map<int, std::string>        blockTypes;
+    std::map<int, std::string>        thinkingTexts;
+    std::map<int, std::string>        blockSignatures;
+    std::string                       lineBuffer;
+    // 是否收到 Anthropic SSE 结束事件 "message_stop", 用于检测流截断
+    bool messageStopReceived = false;
+
+    // catchErrorAsync: 已收到 message_stop 说明消息已结束、业务数据已全部送达,
+    // 连接层在收尾阶段的错误 (如 ssl stream_truncated: 对端未发 close_notify 就
+    // 关闭连接) 不应使请求失败; 未收到则原样抛出 (取消类异常同理保持抛出)
+    co_await agentxx::util::catchErrorAsync<bool>(
+        [&]() -> asio::awaitable<bool> {
+            co_await HttpClient::requestSseAsync(
+                "POST",
+                fmt::format("{}/v1/messages", config_.baseUrl),
+                bodyStr,
+                "application/json",
+                headers,
+                HttpClient::RequestConfig{
+                    .connectTimeout   = std::chrono::seconds{config_.connectTimeoutSeconds},
+                    .readChunkTimeout = std::chrono::seconds{config_.readChunkTimeoutSeconds},
+                    .sslVerify        = config_.sslVerify,
+                    .keepAlive        = true,
+                    .maxConcurrentConnections = config_.maxConcurrentConnections,
+                },
+                // 返回 true 通知 http 层流已结束 (收到 message_stop): 立即断开连接停止读取,
+                // 避免对端 keep-alive 不关闭时白等 readChunkTimeout
+                [&](std::string_view chunk) -> bool {
+                    lineBuffer += chunk;
+                    if (processSseBuffer(
+                            lineBuffer,
+                            completion,
+                            fullContent,
+                            fullThinking,
+                            tcMap,
+                            blockTypes,
+                            thinkingTexts,
+                            blockSignatures,
+                            on_chunk
+                        )) {
+                        messageStopReceived = true;
+                        return true;
+                    }
+                    return false;
+                }
+            );
+            co_return true;
+        },
+        [&](std::string errmsg) -> asio::awaitable<bool> {
+            if (!messageStopReceived) {
+                throw std::runtime_error(std::move(errmsg));
+            }
+            XX_LOGW(
+                "LLM stream transport error after message_stop, ignored | model={} err={}",
+                params.model.empty() ? config_.modelName : params.model,
+                errmsg
+            );
+            co_return false;
+        }
+    );
+
+    if (!lineBuffer.empty()) {
+        if (processSseBuffer(
+                lineBuffer,
+                completion,
+                fullContent,
+                fullThinking,
+                tcMap,
+                blockTypes,
+                thinkingTexts,
+                blockSignatures,
+                on_chunk,
+                /*finalFlush=*/true
+            )) {
+            messageStopReceived = true;
+        }
+    }
+
+    // 未收到 message_stop 即视为流被截断: 长连接被中间代理/网关中断、或对端提前关闭
+    // connection-close 定长的响应时, HTTP 层可能仍判定"完整", 必须在 SSE 协议层检测,
+    // 否则会把截断的响应静默当作正常结果返回
+    if (!messageStopReceived) {
+        throw std::runtime_error(fmt::format(
+            "SSE stream truncated: missing message_stop event | model={} content_chars={}",
+            params.model.empty() ? config_.modelName : params.model,
+            fullContent.size()
+        ));
+    }
+
+    completion.message.content           = fullContent;
+    completion.message.reasoning_content = fullThinking;
+    // 回填缺失的 tool_call id: 时间戳+随机数生成, 天然唯一, 无需与已有 id 比较
+    size_t index = 0;
+    for (auto& [idx, tc] : tcMap) {
+        if (tc.id.empty()) {
+            tc.id = makeUniqueToolCallId(++index);
+        }
+        completion.message.tool_calls.push_back(std::move(tc));
+    }
+
+    // 流正常结束但无任何有效输出 (content/明文思考/加密思考块/tool_calls 全空):
+    // 视为本次生成失败, 抛异常交由 modelcall 重试流程处理 (UI 警告提示 + 自动重试),
+    // 避免空 assistant 消息静默结束本轮会话
+    if (isEmptyResponse(completion)) {
+        throw std::runtime_error(fmt::format(
+            "LLM stream completed with empty response | model={} content_chars={} "
+            "thinking_chars={}",
+            params.model.empty() ? config_.modelName : params.model,
+            fullContent.size(),
+            fullThinking.size()
+        ));
+    }
+
+    co_return completion;
+}
+
+} // namespace protocol
+} // namespace agentxx

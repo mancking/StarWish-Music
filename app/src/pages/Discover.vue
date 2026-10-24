@@ -65,6 +65,7 @@ const newLoading = ref(true)
 const TAG_GROUPS = ref<PlaylistTagGroup[]>([])
 const DEFAULT_PL_TAGS = [
   { name: '热门标签', tags: ['全部', '流行', '摇滚', '民谣', '电子', '说唱', '轻音乐', '爵士', '古典', '乡村'] },
+  { name: '语种', tags: ['全部', '华语', '欧美', '日语', '韩语', '粤语', '小语种'] },
   { name: '专区', tags: ['影视原声', 'ACG', '怀旧', '儿童', '校园', '游戏', 'KTV', 'DJ', '器乐', '新世纪'] },
   { name: '主题', tags: ['伤感', '治愈', '励志', '甜蜜', '兴奋', '安静', '思念', '怀旧金曲', '翻唱', '现场'] },
   { name: '心情', tags: ['运动', '夜晚', '学习', '浪漫', '减压', '通勤', '派对', '咖啡', '驾车', '午后'] },
@@ -75,7 +76,16 @@ TAG_GROUPS.value = DEFAULT_PL_TAGS.map(g => ({
   tags: g.tags.map(t => ({ n: t, id: t })),
 }))
 
-/** 落雪式折叠标签弹层（TagList）：点触发器展开，点外部 / Esc 收起 */
+/** Bug 25：内嵌 chips 当前组（默认第一组） */
+const chipsGroup = ref(0)
+function switchChipsGroup(i: number): void {
+  chipsGroup.value = i
+  // 切组重置「全部」（规格 4.9）
+  const g = TAG_GROUPS.value[i]
+  if (g?.tags?.length) selectCat(g.tags[0]!.n)
+}
+
+/** 落雪式折叠标签弹层（保留变量兼容旧引用；chips 已内嵌） */
 const tagOpen = ref(false)
 const tagPopupWidth = ref(645)
 /** 该音源是否有标签体系（酷我/酷狗/咪咕无分类标签，隐藏入口） */
@@ -777,6 +787,60 @@ onBeforeUnmount(() => {
   color: var(--accent);
   background: var(--accent-soft);
   font-weight: 500;
+}
+.chips-strip {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  background: var(--bg);
+  border-bottom: 1px solid var(--line);
+  padding: 8px 0 6px;
+  margin-bottom: 12px;
+}
+.chips-groups {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+.chips-group {
+  height: 28px;
+  padding: 0 10px;
+  border-radius: 14px;
+  border: 0;
+  background: transparent;
+  color: var(--text-3);
+  font-size: 12px;
+  cursor: pointer;
+}
+.chips-group.on {
+  background: var(--accent-soft, rgba(167, 139, 250, 0.14));
+  color: var(--accent);
+}
+.chips-tags {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  scrollbar-width: none;
+  padding: 0 16px;
+}
+.chips-tags::-webkit-scrollbar {
+  display: none;
+}
+.chips-tag {
+  flex: none;
+  height: 32px;
+  padding: 0 12px;
+  border-radius: 16px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 13px;
+  cursor: pointer;
+}
+.chips-tag.active {
+  background: var(--accent-soft, rgba(167, 139, 250, 0.12));
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 30%, transparent);
 }
 .pl-grid {
   display: grid;

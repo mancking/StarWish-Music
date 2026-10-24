@@ -22,7 +22,7 @@ const uaVersion = ref('')
 const router = useRouter()
 const ui = useUiStore()
 
-const KEY = 'sw.engineWarned'
+const KEY = 'xinyuan_engine_warned'
 
 function chromeVersion(): number {
   const m = /Chrome\/(\d+)/.exec(navigator.userAgent || '')

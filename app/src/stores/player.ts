@@ -72,6 +72,8 @@ export const usePlayerStore = defineStore('player', () => {
   let baseAt = performance.now()
   let raf = 0
   let lyricToken = 0
+  /** Bug 78：无歌词歌曲的负缓存（key → 时间戳） */
+  const lyricNegative = new Map<string, number>()
   let lastSongId = ''
   let lastAccentSrc = ''
 
@@ -183,8 +185,16 @@ export const usePlayerStore = defineStore('player', () => {
     }
 
     try {
+      // Bug 78：空歌词负缓存（30 分钟内同一首不再重复 IPC）
+      const key = `${s.source}:${s.songId || s.id}`
+      const negAt = lyricNegative.get(key)
+      if (negAt && Date.now() - negAt < 30 * 60_000) {
+        if (token === lyricToken) lyricLoading.value = false
+        return
+      }
       const res = await call<LyricResult>('music:lyric', { song: s })
       if (token === lyricToken) lyric.value = res
+      if (res && !res.lines.length) lyricNegative.set(key, Date.now())
     } catch {
       if (token === lyricToken) lyric.value = null
     } finally {

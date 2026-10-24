@@ -1,0 +1,753 @@
+import { windowSizeList } from '@any-listen/common/constants'
+import type { Component } from 'svelte'
+
+import { showNotify } from '@/components/apis/notify'
+import { appEvent } from '@/modules/app/store/event'
+import { appState } from '@/modules/app/store/state'
+import { updateSetting } from '@/modules/setting/store/action'
+import { settingState } from '@/modules/setting/store/state'
+import { getThemeList } from '@/modules/theme/store/action'
+import { i18n, langList, type Message } from '@/plugins/i18n'
+
+import About from './About.svelte'
+import Font from './Font.svelte'
+
+interface SettingBase<T = unknown> {
+  field: keyof AnyListen.AppSetting
+  name: keyof Message
+  id?: string
+  description?: keyof Message
+  onChnaged?: (value: T) => void
+  onUpdate?: (value: T) => void
+}
+export interface EnumItem {
+  name: keyof Message
+  disabled?: boolean
+  value: string | number
+}
+interface SettingHr {
+  type: 'hr'
+  id?: string
+  name: keyof Message
+}
+export interface SettingListComponentItem {
+  name?: keyof Message
+  id?: string
+  description?: keyof Message
+  type: 'component'
+  component: () => Promise<{ default: Component }> | Component
+}
+interface SettingInput extends SettingBase<string> {
+  type: 'input'
+  textarea?: boolean
+}
+interface SettingBoolean extends SettingBase<boolean> {
+  type: 'boolean'
+}
+interface SettingRadio extends SettingBase<EnumItem['value']> {
+  type: 'radio'
+  asyncEnum?: () => Promise<EnumItem[]>
+  enum?: EnumItem[]
+  enumUpdated?: (updated: (newEnum: EnumItem[]) => void) => undefined | (() => void)
+}
+interface SettingSelection extends SettingBase<EnumItem['value']> {
+  type: 'selection'
+  enum: EnumItem[]
+}
+export type SettingListCommonItem = SettingInput | SettingBoolean | SettingSelection | SettingRadio
+export type SettingListItem = SettingListCommonItem | SettingListComponentItem | SettingHr
+
+export interface SettingListSection {
+  id: string
+  name: keyof Message
+  list: Array<SettingListItem | null>
+}
+export const settings: SettingListSection[] = [
+  {
+    id: 'basic',
+    name: 'settings__basic',
+    list: [
+      import.meta.env.VITE_IS_DESKTOP
+        ? {
+            field: 'tray.enable',
+            name: 'settings__basic_tray',
+            type: 'boolean',
+          }
+        : null,
+      {
+        field: 'common.isShowAnimation',
+        name: 'settings__basic_animate',
+        type: 'boolean',
+      },
+      {
+        field: 'theme.id',
+        name: 'settings__basic_theme',
+        type: 'radio',
+        async asyncEnum() {
+          // t('settings__basic_theme_auto_desc')
+          const themeList = (await getThemeList()).themes.map((t) => ({ name: `theme_${t.id}` as keyof Message, value: t.id }))
+          // console.log(themeList)
+          return [...themeList, { name: 'theme_auto', value: 'auto' }]
+        },
+        onUpdate(value) {
+          if (value === 'auto') {
+            void updateSetting({
+              'theme.id': value,
+              'theme.lightId': settingState.setting['theme.id'] === 'black' ? undefined : settingState.setting['theme.id'],
+            })
+            showNotify(i18n.t('settings__basic_theme_auto_desc'))
+          } else {
+            void updateSetting({
+              'theme.id': value as string,
+              'theme.lightId': value === 'black' ? undefined : (value as string),
+            })
+          }
+        },
+      },
+      {
+        field: 'common.windowSizeId',
+        name: 'settings__basic_window_size',
+        type: 'radio',
+        enum: (import.meta.env.VITE_IS_WEB ? windowSizeList.slice(0, 4) : windowSizeList).map((w) => ({
+          value: w.id,
+          name: `settings__basic_window_size_${w.name}` as keyof Message,
+        })),
+        enumUpdated: (updated) => {
+          const handleUpdate = (isFullScreen: boolean) => {
+            updated(
+              (import.meta.env.VITE_IS_WEB ? windowSizeList.slice(0, 4) : windowSizeList).map((w) => ({
+                value: w.id,
+                disabled: isFullScreen,
+                name: `settings__basic_window_size_${w.name}` as keyof Message,
+              }))
+            )
+          }
+          if (appState.isFullscreen) handleUpdate(true)
+          return appEvent.on('fullscreen', handleUpdate)
+        },
+        onChnaged: import.meta.env.VITE_IS_WEB
+          ? () => {
+              if (window.os === 'mac') {
+                showNotify(i18n.t('settings__basic_window_size_tip_mac'))
+              } else {
+                showNotify(i18n.t('settings__basic_window_size_tip'))
+              }
+            }
+          : undefined,
+      },
+      {
+        name: 'settings.basic.font',
+        type: 'component',
+        component: () => Font,
+      },
+      {
+        field: 'common.langId',
+        name: 'settings__basic_lang',
+        type: 'radio',
+        enum: langList.map((l) => ({ value: l.locale, name: l.name as keyof Message })),
+      },
+      // t('settings.basic.play_bar_style_center_control_btn')
+      // t('settings.basic.play_bar_style_center_control_middle_btn')
+      // t('settings.basic.play_bar_style_center_control_full_btn')
+      {
+        field: 'common.playBarProgressStyle',
+        name: 'settings.basic.play_bar_style',
+        type: 'radio',
+        enum: [
+          { value: 'mini', name: 'settings.basic.play_bar_style_mini' },
+          { value: 'middle', name: 'settings.basic.play_bar_style_middle' },
+          { value: 'full', name: 'settings.basic.play_bar_style_full' },
+          { value: 'centerControl', name: 'settings.basic.play_bar_style_center_control_btn' },
+          { value: 'centerControlMiddle', name: 'settings.basic.play_bar_style_center_control_middle_btn' },
+          { value: 'centerControlFull', name: 'settings.basic.play_bar_style_center_control_full_btn' },
+        ] satisfies Array<{ value: AnyListen.AppSetting['common.playBarProgressStyle']; name: keyof Message }>,
+      },
+    ],
+  },
+  {
+    id: 'player',
+    name: 'settings__player',
+    list: [
+      import.meta.env.VITE_IS_DESKTOP
+        ? {
+            field: 'player.startupAutoPlay',
+            name: 'settings__play_startup_auto_play',
+            type: 'boolean',
+          }
+        : null,
+      {
+        field: 'player.isSavePlayTime',
+        name: 'settings__play_save_play_time',
+        type: 'boolean',
+      },
+      {
+        field: 'player.isShowLyricTranslation',
+        name: 'settings.player.lyric_transition',
+        type: 'boolean',
+      },
+      {
+        field: 'player.isShowLyricRoma',
+        name: 'settings.player.lyric_roma',
+        type: 'boolean',
+      },
+      {
+        field: 'player.isSwapLyricTranslationAndRoma',
+        name: 'settings.player.lyric_trans_roma_swap',
+        type: 'boolean',
+      },
+      {
+        field: 'player.isPlayAwlrc',
+        name: 'settings.player.play_awlrc',
+        type: 'boolean',
+      },
+      {
+        field: 'player.isShowTitleLyric',
+        name: 'settings.player.title_lyric',
+        type: 'boolean',
+      },
+      {
+        field: 'player.isShowMediaSessionLyric',
+        name: 'settings.player.media_session_lyric',
+        type: 'boolean',
+      },
+      // t('settings.player.s2t')
+      {
+        field: 'player.isS2t',
+        name: 'settings.player.s2t',
+        type: 'boolean',
+      },
+      {
+        field: 'player.ignoreLocalLyrics',
+        name: 'settings.player.ignore_local_lyrics',
+        type: 'boolean',
+      },
+      {
+        field: 'player.isMediaDeviceChangedPausePlay',
+        name: 'settings.player.media_device_changed_pause_play',
+        type: 'boolean',
+      },
+      {
+        field: 'player.isShowTaskProgess',
+        name: 'settings.player.show_task_progress',
+        type: 'boolean',
+      },
+      import.meta.env.VITE_IS_MAC
+        ? {
+            field: 'player.isShowStatusBarLyric',
+            name: 'settings.player.status_bar_lyric',
+            type: 'boolean',
+          }
+        : null,
+      // t('settings.player.show_task_progress')
+      {
+        field: 'player.playQuality',
+        name: 'settings.player.music_quality',
+        type: 'radio',
+        enum: (
+          ['128k', '320k', 'flac', 'flac24bit', 'dolby', 'master'] satisfies Array<
+            Exclude<AnyListen.Music.Quality, 'wav' | '192k'>
+          >
+        ).map((l) => ({
+          value: l,
+          name: `settings.player.music_quality_${l}`,
+        })),
+      },
+      {
+        name: 'settings.player.media_device',
+        type: 'component',
+        component: async () => import('./MediaDevice.svelte'),
+      },
+    ],
+  },
+  {
+    id: 'playDetail',
+    name: 'settings.play_detail',
+    list: [
+      // t('settings.play_detail.cover_style_square')
+      {
+        field: 'playDetail.isDynamicBackground',
+        name: 'settings.play_detail.dynamic_background',
+        type: 'boolean',
+      },
+      {
+        field: 'playDetail.isDelayScroll',
+        name: 'settings.play_detail.delay_scroll',
+        type: 'boolean',
+      },
+      {
+        field: 'playDetail.isZoomActiveLrc',
+        name: 'settings.play_detail.zoom_active_lrc',
+        type: 'boolean',
+      },
+      {
+        field: 'playDetail.style.fontWeight',
+        name: 'settings.play_detail.style_font_weight',
+        type: 'boolean',
+      },
+      {
+        field: 'playDetail.coverStyle',
+        name: 'settings.play_detail.cover_style',
+        type: 'radio',
+        enum: [
+          { value: 'cd', name: 'settings.play_detail.cover_style_cd' },
+          { value: 'square', name: 'settings.play_detail.cover_style_square' },
+        ] satisfies Array<{ value: AnyListen.AppSetting['playDetail.coverStyle']; name: keyof Message }>,
+      },
+      {
+        field: 'playDetail.style.align',
+        name: 'settings.play_detail.style_align',
+        type: 'radio',
+        enum: [
+          { value: 'left', name: 'settings.play_detail.style_align_left' },
+          { value: 'center', name: 'settings.play_detail.style_align_center' },
+          { value: 'right', name: 'settings.play_detail.style_align_right' },
+        ] satisfies Array<{ value: AnyListen.AppSetting['playDetail.style.align']; name: keyof Message }>,
+      },
+    ],
+  },
+  {
+    id: 'list',
+    name: 'settings.list',
+    // t('settings.list.is_show_action_btn_desc')
+    list: [
+      {
+        field: 'list.isShowActionBtn',
+        name: 'settings.list.is_show_action_btn',
+        description: 'settings.list.is_show_action_btn_desc',
+        type: 'boolean',
+      },
+      {
+        field: 'list.addMusicLocationType',
+        name: 'settings.list.add_music_location_type',
+        type: 'radio',
+        enum: [
+          { value: 'top', name: 'settings.list.add_music_location_type_top' },
+          { value: 'bottom', name: 'settings.list.add_music_location_type_bottom' },
+        ] satisfies Array<{ value: AnyListen.AppSetting['list.addMusicLocationType']; name: keyof Message }>,
+      },
+    ],
+  },
+  {
+    id: 'hotkey',
+    name: 'settings.hotkey',
+    // t('settings.hotkey')
+    list: [
+      {
+        type: 'component',
+        name: 'settings.hotkey.local',
+        component: async () => import('./Hotkey/HotkeyLocal.svelte'),
+      },
+      import.meta.env.VITE_IS_DESKTOP
+        ? {
+            type: 'component',
+            name: 'settings.hotkey.global',
+            component: async () => import('./Hotkey/HotkeyGlobal.svelte'),
+          }
+        : null,
+    ],
+  },
+  {
+    id: 'extension',
+    // t('settings.extension')
+    name: 'settings.extension',
+    list: [
+      {
+        name: 'settings.extension.gh_mirror_hosts',
+        type: 'component',
+        component: async () => import('./ExtensionGHMirrorHosts.svelte'),
+      },
+    ],
+  },
+  {
+    id: 'onlineResource',
+    // t('settings.online_resource.enable_desc')
+    name: 'settings.online_resource',
+    list: [
+      {
+        field: 'onlineResource.enable',
+        name: 'settings.online_resource.enable',
+        description: 'settings.online_resource.enable_desc',
+        type: 'boolean',
+      },
+    ],
+  },
+  {
+    id: 'network',
+    // t('settings.network.proxy_all_resources_desc')
+    name: 'settings.network',
+    list: [
+      import.meta.env.VITE_IS_WEB
+        ? {
+            field: 'network.proxyAllResources',
+            name: 'settings.network.proxy_all_resources',
+            description: 'settings.network.proxy_all_resources_desc',
+            type: 'boolean',
+          }
+        : null,
+      {
+        name: 'settings.network.proxy',
+        type: 'component',
+        component: async () => import('./Network.svelte'),
+      },
+    ],
+  },
+  {
+    id: 'dataSync',
+    // t('settings.dataSync')
+    name: 'settings.dataSync',
+    list: [
+      {
+        id: 'settings.dataSync.webdav',
+        type: 'component',
+        component: async () => import('./DataSyncWebdav.svelte'),
+      },
+    ],
+  },
+  {
+    id: 'backup',
+    // t('settings.backup')
+    name: 'settings.backup',
+    list: [
+      {
+        id: 'settings.backup.backup',
+        type: 'component',
+        component: async () => import('./Backup/Backup.svelte'),
+      },
+      {
+        id: 'settings.backup.export_other',
+        type: 'component',
+        component: async () => import('./Backup/ExportOther.svelte'),
+      },
+      {
+        id: 'settings.backup.auto_backup',
+        type: 'component',
+        component: async () => import('./Backup/AutoBackup.svelte'),
+      },
+    ],
+  },
+  {
+    id: 'other',
+    name: 'settings.other',
+    list: [
+      // t('settings.common.enable_debug_desc')
+      {
+        field: 'common.enableDebug',
+        name: 'settings.common.enable_debug',
+        description: 'settings.common.enable_debug_desc',
+        type: 'boolean',
+      },
+      (import.meta.env.VITE_IS_DESKTOP && import.meta.env.VITE_IS_MAC) || import.meta.env.VITE_IS_WEB
+        ? null
+        : {
+            field: 'common.transparentWindow',
+            name: 'settings.common.transparent_window',
+            description: 'settings.common.transparent_window_desc',
+            type: 'boolean',
+          },
+      // t('settings.tray.theme_id_auto')
+      import.meta.env.VITE_IS_DESKTOP
+        ? {
+            field: 'common.enableTrash',
+            name: 'settings.common.enable_trash',
+            description: 'settings.common.enable_trash_desc',
+            type: 'boolean',
+          }
+        : null,
+      import.meta.env.VITE_IS_DESKTOP
+        ? {
+            field: 'tray.themeId',
+            name: 'settings.tray.theme_id',
+            type: 'radio',
+            enum: [
+              { value: 0, name: 'settings.tray.theme_id_light' },
+              { value: 2, name: 'settings.tray.theme_id_dark' },
+              { value: 1, name: 'settings.tray.theme_id_origin' },
+              { value: -1, name: 'settings.tray.theme_id_auto' },
+            ] satisfies Array<{ value: AnyListen.AppSetting['tray.themeId']; name: keyof Message }>,
+          }
+        : null,
+      {
+        name: 'settings.other.resource_cache',
+        type: 'component',
+        component: async () => import('./ResourceCache.svelte'),
+      },
+      {
+        name: 'settings.other.music_cache',
+        type: 'component',
+        component: async () => import('./MusicCache.svelte'),
+      },
+      {
+        name: 'settings.other.dislike_list',
+        type: 'component',
+        component: async () => import('./DislikedList.svelte'),
+      },
+    ],
+  },
+  {
+    id: 'update',
+    name: 'settings.update',
+    list: [
+      // t('settings.update.try_auto_update')
+      {
+        field: 'common.tryAutoUpdate',
+        name: 'settings.update.try_auto_update',
+        description: 'settings.update.try_auto_update_desc',
+        type: 'boolean',
+      },
+      {
+        field: 'common.allowPreRelease',
+        name: 'settings.update.allow_pre_release',
+        description: 'settings.update.allow_pre_release_desc',
+        type: 'boolean',
+      },
+      {
+        field: 'common.showChangeLog',
+        name: 'settings.update.show_change_log',
+        description: 'settings.update.show_change_log_desc',
+        type: 'boolean',
+      },
+      {
+        name: 'settings.update',
+        type: 'component',
+        component: async () => import('./Update.svelte'),
+      },
+    ],
+  },
+  {
+    id: 'about',
+    name: 'settings__about',
+    list: [
+      {
+        name: 'settings__about',
+        type: 'component',
+        component: () => About,
+      },
+    ],
+  },
+]
+
+if (import.meta.env.VITE_IS_DESKTOP) {
+  settings.splice(4, 0, {
+    id: 'desktopLyric',
+    // t('settings.desktop_lyric.style_font_weight_extended')
+    name: 'settings.desktop_lyric',
+    list: [
+      {
+        field: 'desktopLyric.enable',
+        name: 'settings.desktop_lyric.enable',
+        type: 'boolean',
+      },
+      {
+        field: 'desktopLyric.isLock',
+        name: 'settings.desktop_lyric.lock',
+        type: 'boolean',
+      },
+      {
+        field: 'desktopLyric.fullscreenHide',
+        name: 'settings.desktop_lyric.fullscreen_hide',
+        type: 'boolean',
+      },
+      {
+        field: 'desktopLyric.pauseHide',
+        name: 'settings.desktop_lyric.pause_hide',
+        type: 'boolean',
+      },
+      {
+        field: 'desktopLyric.isLockScreen',
+        name: 'settings.desktop_lyric.lock_screen',
+        type: 'boolean',
+      },
+      {
+        field: 'desktopLyric.isAlwaysOnTop',
+        name: 'settings.desktop_lyric.always_on_top',
+        type: 'boolean',
+      },
+      {
+        field: 'desktopLyric.isAlwaysOnTopLoop',
+        name: 'settings.desktop_lyric.always_on_top_loop',
+        description: 'settings.desktop_lyric.always_on_top_loop_tip',
+        type: 'boolean',
+      },
+      {
+        field: 'desktopLyric.isHoverHide',
+        name: 'settings.desktop_lyric.hover_hide',
+        description: 'settings.desktop_lyric.hover_hide_tip',
+        type: 'boolean',
+      },
+      {
+        field: 'desktopLyric.isShowTaskbar',
+        name: 'settings.desktop_lyric.show_taskbar',
+        description: 'settings.desktop_lyric.show_taskbar_tip',
+        type: 'boolean',
+      },
+      {
+        field: 'desktopLyric.mode',
+        id: 'desktopLyric.mode',
+        name: 'settings.desktop_lyric.mode',
+        type: 'radio',
+        enum: [
+          { value: 'classic', name: 'settings.desktop_lyric.classic_mode' },
+          { value: 'multiLine', name: 'settings.desktop_lyric.multiLine_mode' },
+        ] satisfies Array<{ value: AnyListen.AppSetting['desktopLyric.mode']; name: keyof Message }>,
+      },
+
+      {
+        type: 'hr',
+        name: 'settings.desktop_lyric.classic',
+      },
+      // t('settings.desktop_lyric.show_extended_lyrics')
+      {
+        field: 'desktopLyric.classic.showExtendedLyrics',
+        id: 'desktopLyric.classic.showExtendedLyrics',
+        name: 'settings.desktop_lyric.show_extended_lyrics',
+        type: 'boolean',
+      },
+      {
+        field: 'desktopLyric.classic.style.isFontWeightFont',
+        id: 'desktopLyric.classic.style.isFontWeightFont',
+        name: 'settings.desktop_lyric.style_font_weight_font',
+        type: 'boolean',
+      },
+      {
+        field: 'desktopLyric.classic.style.isFontWeightLine',
+        id: 'desktopLyric.classic.style.isFontWeightLine',
+        name: 'settings.desktop_lyric.style_font_weight_line',
+        type: 'boolean',
+      },
+      {
+        field: 'desktopLyric.classic.style.isFontWeightExtended',
+        id: 'desktopLyric.classic.style.isFontWeightExtended',
+        name: 'settings.desktop_lyric.style_font_weight_extended',
+        type: 'boolean',
+      },
+      {
+        field: 'desktopLyric.classic.style.align',
+        id: 'desktopLyric.classic.style.align',
+        name: 'settings.desktop_lyric.style_align',
+        type: 'radio',
+        enum: [
+          { value: 'top', name: 'settings.desktop_lyric.style_align_top' },
+          { value: 'bottom', name: 'settings.desktop_lyric.style_align_bottom' },
+        ] satisfies Array<{ value: AnyListen.AppSetting['desktopLyric.classic.style.align']; name: keyof Message }>,
+      },
+      // t('settings.desktop_lyric.style_align_x_right')
+      {
+        field: 'desktopLyric.classic.style.alignX',
+        id: 'desktopLyric.classic.style.alignX',
+        name: 'settings.desktop_lyric.style_align_x',
+        type: 'radio',
+        enum: [
+          { value: 'default', name: 'settings.desktop_lyric.style_align_x_default' },
+          { value: 'left', name: 'settings.desktop_lyric.style_align_x_left' },
+          { value: 'right', name: 'settings.desktop_lyric.style_align_x_right' },
+        ] satisfies Array<{ value: AnyListen.AppSetting['desktopLyric.classic.style.alignX']; name: keyof Message }>,
+      },
+      {
+        name: 'settings.desktop_lyric.font',
+        id: 'desktopLyric.classic.style.font',
+        type: 'component',
+        component: async () => import('./DesktopLyricFontClassic.svelte'),
+      },
+      import.meta.env.VITE_IS_DESKTOP
+        ? {
+            id: 'desktopLyric.classic.width',
+            type: 'component',
+            component: async () => import('./DesktopLyricWidthClassic.svelte'),
+          }
+        : null,
+      {
+        name: 'settings.desktop_lyric.color',
+        id: 'desktopLyric.classic.style.lyricPlayedColor',
+        type: 'component',
+        component: async () => import('./DesktopLyricThemeClassic.svelte'),
+      },
+
+      {
+        type: 'hr',
+        name: 'settings.desktop_lyric.multiLine',
+      },
+      {
+        field: 'desktopLyric.multiLine.style.isZoomActiveLrc',
+        name: 'desktop_lyric.lrc_active_zoom_on',
+        type: 'boolean',
+      },
+      {
+        field: 'desktopLyric.multiLine.isDelayScroll',
+        name: 'settings.desktop_lyric.delay_scroll',
+        type: 'boolean',
+      },
+      {
+        field: 'desktopLyric.multiLine.style.isFontWeightFont',
+        name: 'settings.desktop_lyric.style_font_weight_font',
+        type: 'boolean',
+      },
+      {
+        field: 'desktopLyric.multiLine.style.isFontWeightLine',
+        name: 'settings.desktop_lyric.style_font_weight_line',
+        type: 'boolean',
+      },
+      {
+        field: 'desktopLyric.multiLine.style.isFontWeightExtended',
+        name: 'settings.desktop_lyric.style_font_weight_extended',
+        type: 'boolean',
+      },
+      {
+        field: 'desktopLyric.multiLine.direction',
+        name: 'settings.desktop_lyric.direction',
+        type: 'radio',
+        enum: [
+          { value: 'horizontal', name: 'settings.desktop_lyric.direction_horizontal' },
+          { value: 'vertical', name: 'settings.desktop_lyric.direction_vertical' },
+        ] satisfies Array<{ value: AnyListen.AppSetting['desktopLyric.multiLine.direction']; name: keyof Message }>,
+      },
+      {
+        field: 'desktopLyric.multiLine.style.align',
+        name: 'settings.desktop_lyric.style_align',
+        type: 'radio',
+        enum: [
+          { value: 'left', name: 'settings.desktop_lyric.style_align_left' },
+          { value: 'center', name: 'settings.desktop_lyric.style_align_center' },
+          { value: 'right', name: 'settings.desktop_lyric.style_align_right' },
+        ] satisfies Array<{ value: AnyListen.AppSetting['desktopLyric.multiLine.style.align']; name: keyof Message }>,
+      },
+      {
+        field: 'desktopLyric.multiLine.scrollAlign',
+        name: 'settings.desktop_lyric.scroll_align',
+        type: 'radio',
+        enum: [
+          { value: 'top', name: 'settings.desktop_lyric.scroll_align_top' },
+          { value: 'center', name: 'settings.desktop_lyric.scroll_align_center' },
+        ] satisfies Array<{ value: AnyListen.AppSetting['desktopLyric.multiLine.scrollAlign']; name: keyof Message }>,
+      },
+      {
+        name: 'settings.desktop_lyric.line_gap',
+        type: 'component',
+        component: async () => import('./DesktopLyricGap.svelte'),
+      },
+      {
+        name: 'settings.desktop_lyric.font',
+        type: 'component',
+        component: async () => import('./DesktopLyricFont.svelte'),
+      },
+      {
+        name: 'settings.desktop_lyric.color',
+        type: 'component',
+        component: async () => import('./DesktopLyricTheme.svelte'),
+      },
+    ],
+  })
+}
+
+if (import.meta.env.VITE_IS_WEB) {
+  settings.splice(settings.length - 2, 0, {
+    id: 'security',
+    name: 'settings__security',
+    list: [
+      {
+        name: 'settings__security_login_devices',
+        type: 'component',
+        component: async () => import('./LoginDevices.svelte'),
+      },
+    ],
+  })
+}

@@ -1,0 +1,54 @@
+#pragma once
+
+#include <chrono>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <string>
+#include <vector>
+
+namespace agentxx_audio_stream_plugin {
+
+enum class AudioDataSource {
+    SystemOutput,
+    ProgramOutput,
+    MicrophoneInput,
+};
+
+struct AudioData {
+    // 成员按对齐/尺寸从大到小排列, 减少结构体内填充字节
+    std::string                           processName;
+    std::vector<uint8_t>                  data;
+    std::chrono::steady_clock::time_point timestamp;
+    uint32_t                              sampleRate    = 0;
+    AudioDataSource                       source        = AudioDataSource::SystemOutput;
+    uint32_t                              processId = 0;
+    uint16_t                              channels      = 0;
+    uint16_t                              bitsPerSample = 0;
+};
+
+using AudioStreamListener = std::function<void(const AudioData& data)>;
+
+class AudioStream {
+public:
+
+    AudioStream();
+    ~AudioStream();
+
+    AudioStream(const AudioStream&)            = delete;
+    AudioStream& operator=(const AudioStream&) = delete;
+
+    bool start(AudioDataSource source, uint32_t targetProcessId = 0);
+    void stop();
+    bool isRunning() const;
+
+    void addListener(AudioStreamListener listener);
+    void removeAllListeners();
+
+private:
+
+    class Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+} // namespace agentxx_audio_stream_plugin

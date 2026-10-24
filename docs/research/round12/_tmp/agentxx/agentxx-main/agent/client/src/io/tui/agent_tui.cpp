@@ -1,0 +1,3201 @@
+#include "agentxx-client/io/tui/agent_tui.h"
+#include "agentxx-client/io/tui/components/input_bar.h"
+#include "agentxx-client/io/tui/components/message_list.h"
+#include "agentxx-client/io/tui/components/overlays.h"
+#include "agentxx-client/io/tui/components/sidebar.h"
+#include "agentxx-client/io/tui/components/status_bar.h"
+#include "agentxx-client/io/tui/framework/tui_i18n.h"
+#include "agentxx-client/io/tui/framework/tui_settings.h"
+#include "agentxx-client/io/tui/plugin_ui_items.h"
+#include "agentxx-client/io/tui/surface.h"
+#include "agentxx-client/io/tui/tui_keybind.h"
+#include "agentxx-client/mode_runners.h"
+#include "agentxx-client/update_check.h"
+#include "agentxx-client/util/clipboard.h"
+#include "agentxx-client/util/open_url.h"
+#include "agentxx/agent/config_static.h"
+#include "agentxx/agent/config_writer.h"
+#include "agentxx/agent/io/wire_protocol.h"
+#include "agentxx/agent/model_registry.h"
+#include "agentxx/middlewares/middleware.h"
+#include "agentxx/middlewares/permission.h"
+#include "agentxx/util/exception.h"
+#include "asio/as_tuple.hpp"
+#include "asio/co_spawn.hpp"
+#include "asio/detached.hpp"
+#include "asio/io_context.hpp"
+#include "asio/steady_timer.hpp"
+#include "asio/use_awaitable.hpp"
+#include "fmt/format.h"
+#include "ftxui/component/event.hpp"
+#include "ftxui/component/loop.hpp"
+#include "ftxui/dom/elements.hpp"
+#include "ftxui/screen/terminal.hpp"
+#include "neograph/graph/cancel.h"
+#include "utilxx/crypto.h"
+#include "utilxx_base/log.h"
+#include "utilxx_base/string_util.h"
+#include <algorithm>
+#include <atomic>
+#include <charconv>
+#include <cstdint>
+#include <filesystem>
+#include <format>
+#include <fstream>
+#include <iostream>
+#include <memory>
+#include <set>
+
+namespace agentxx::client {
+
+using namespace ftxui;
+
+namespace {
+
+/// 文本消息的正文是否无可见内容 (空串或仅空白字符, 如 `""` / `" "` / `"\n"`)
+///
+/// 用于过滤"空 content 消息": 这类消息在列表中渲染为一个空块 (只占一行空白),
+/// 直接不进入消息列表 (TUI 忽略其渲染)。
+/// - 仅适用于正文类角色 (User/Assistant/System/Tip): Tool 消息的正文是工具参数、
+///   Think 消息可为空思考内容 (仍有 "[Think] 时长" 头部)、Interrupt 消息内嵌
+///   交互控件, 均不按正文过滤
+/// - 带附件的消息视为有内容 (纯附件消息无正文但需渲染附件卡片)
+bool isBlankContentMessage(const TUIMessage& msg) {
+    if (!msg.attachments.empty()) {
+        return false;
+    }
+    switch (msg.role) {
+        case TUIMessage::Role::User:
+        case TUIMessage::Role::Assistant:
+        case TUIMessage::Role::System:
+        case TUIMessage::Role::Tip:
+            break;
+        default:
+            return false;
+    }
+    for (char c : msg.text) {
+        if (!utilxx_base::charIsSpace(c)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+} // namespace
+
+// ---------------------------------------------------------------------------
+// 构造 / 析构
+// ---------------------------------------------------------------------------
+
+TUIClientAgentIO::TUIClientAgentIO(
+    asio::any_io_executor ex,
+    std::string           sessionId,
+    TUITheme              theme
+) :
+    theme_(theme),
+    sessionId_(std::move(sessionId)),
+    ex_(ex),
+    inputChannel_(std::make_shared<LineChannel>(ex, 64)),
+    logSink_(std::make_shared<TUILogSink>()) {
+    clientDeviceId_ = utilxx::getDeviceId();
+    // 注意: TUI 是纯 client 端点, 不持有 AgentContext/Session (属于 server-io
+    // 线程); 模型名/上下文统计等所有 agent 侧信息均经 Wire 消息 (WireModelInfo /
+    // WireContextStats) 由服务端推送获取, cachedModelName 初始为空,
+    // 收到 WireModelInfo 后更新 (调用方在连接建立后发送 WireGetModel 请求)
+}
+
+TUIClientAgentIO::~TUIClientAgentIO() {
+    stop();
+}
+
+// ---------------------------------------------------------------------------
+// postRedraw / enqueueUiAction
+// ---------------------------------------------------------------------------
+
+Element TUIClientAgentIO::applyToastOverlay(Element content) {
+    // 无提示: 原样返回 (不产生任何额外元素, 不影响布局)
+    if (toastText_.empty()) {
+        return content;
+    }
+    // 渲染时检查超时: 超过 kToastDuration 清除提示
+    // (toastText_/toastShownAt_ 为 UI 线程独占, 仅在本帧渲染中读写, 无跨线程竞争)
+    if (std::chrono::steady_clock::now() - toastShownAt_ >= kToastDuration) {
+        toastText_.clear();
+        return content;
+    }
+    const auto surfaceStyle = TuiSurfaceStyle::fromTheme(theme_);
+    // 仿照弹窗背景面性风格: 上下左右各 1 格内边距, 四角为 '+' 角标,
+    // 以弹窗内容区背景色 (theme_.surfaceColor) 显示提示文字;
+    // 显示期间以 dbox 叠加在整棵树之上, 水平居中、垂直靠顶
+    // (vbox 顶部 + filler 撑满), 与主界面一致加粗
+    return dbox({
+        std::move(content),
+        vbox({
+            text(" "),
+            hbox({
+                filler(),
+                tuiSurfaceToast(surfaceStyle, toastText_),
+                filler(),
+            }),
+            filler(),
+        }) | bold,
+    });
+}
+
+void TUIClientAgentIO::enqueueUiAction(std::function<void()> fn) {
+    if (!fn) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(uiActionsMutex_);
+        uiActions_.push_back(std::move(fn));
+    }
+    postRedraw();
+}
+
+void TUIClientAgentIO::postRedraw() {
+    // 合并同一时刻的多次重绘请求: 流式输出时 client 线程每 token 调用一次,
+    // 若每次 Post 都触发完整渲染, 渲染成本被 token 到达频率放大。
+    // - redrawPosted_: 合并标记, 仅当无待处理 Custom 事件时才 Post
+    // - redrawSeq_: 请求计数, UI 线程在帧结束时据此补帧 (见 start() 帧循环):
+    //   帧期间到达的请求可能被合并进本帧渲染, 而本帧 frameState 快照取自帧开头,
+    //   渲染结果可能未反映其状态变更, 需要补一帧以最新快照重绘
+    redrawSeq_.fetch_add(1, std::memory_order_acq_rel);
+    if (redrawPosted_.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+    std::shared_ptr<ScreenInteractive> s;
+    {
+        std::lock_guard<std::mutex> lock(screenMutex_);
+        s = screen_;
+    }
+    if (s) {
+        s->Post(Event::Custom);
+    }
+}
+
+void TUIClientAgentIO::showToast(std::string text) {
+    // UI 线程独占状态 (openSessionSelector 等 UI 事件处理中调用):
+    // 设置文本与起始时刻, 由渲染帧检查超时并清除 (见 start() 主渲染器)
+    toastText_    = std::move(text);
+    toastShownAt_ = std::chrono::steady_clock::now();
+    if (!toastTimer_) {
+        toastTimer_ = std::make_shared<asio::steady_timer>(ex_);
+    }
+    // 取消上一次挂起的等待 (连续提示时以最后一次为准重新计时)
+    toastTimer_->cancel();
+    toastTimer_->expires_after(kToastDuration);
+    // 回调仅触发重绘, 不写 UI 状态 (toastText_ 为 UI 线程独占, 无锁);
+    // 超时清除由 UI 线程下一帧渲染时执行, 避免跨线程数据竞争
+    toastTimer_->async_wait([this](utilxx_base::AsioErrorCode ec) {
+        if (!ec) {
+            postRedraw();
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// 插件适配器接口 (TuiPluginAdapter 调用; 任意线程安全)
+// ---------------------------------------------------------------------------
+
+void TUIClientAgentIO::uiToast(std::string text, int level) {
+    (void)level; // 一期统一样式; 后续可按级别着色
+    // toastText_/toastShownAt_ 为 UI 线程独占, 投递到 UI 线程执行
+    enqueueUiAction([this, text = std::move(text)]() {
+        showToast(std::move(text));
+    });
+}
+
+void TUIClientAgentIO::sendPluginUserInput(std::string text) {
+    if (text.empty()) {
+        return;
+    }
+    // 与用户输入同排队语义 (见 start() 中 inputCfg.onSend 的分支逻辑):
+    // - 中断等待输入: 直接投递到输入通道 (由中断流程处理)
+    // - 未连接 (Connecting/Failed): 进待发送队列
+    // - 流式中: 进待发送队列 (轮次结束后分发)
+    // - 空闲: 立即发送
+    {
+        std::lock_guard<std::mutex> lock(sharedState_.mutex());
+        auto&                       st = sharedState_.mutableState();
+        if (awaitingInterruptInput_.load(std::memory_order_acquire)) {
+            pushCurrentTokenLocked(st);
+            resetTrailingRunningToolsLocked(st);
+            st.messages.push_back(
+                std::make_shared<TUIMessage>(TUIMessage::makeText(TUIMessage::Role::User, text))
+            );
+            // messageList_ 为 UI 线程独占组件, 投递到 UI 线程执行
+            enqueueUiAction([this]() {
+                if (messageList_) {
+                    messageList_->setStickToBottom(true);
+                }
+            });
+            inputChannel_->async_send(
+                utilxx_base::AsioErrorCode{},
+                std::move(text),
+                [](utilxx_base::AsioErrorCode) {}
+            );
+            return; // 中断输入不触发事件接收器 (属于中断响应, 非用户消息)
+        }
+        if (st.connState != ConnState::Connected) {
+            XX_LOGW("[tui] sendPluginUserInput dropped: server-io not connected");
+            return;
+        }
+        sendUserInputLocked(st, std::move(text)); // 内部通知事件接收器
+    }
+    postRedraw();
+}
+
+bool TUIClientAgentIO::sendPluginDataUp(
+    const std::string& plugin,
+    const std::string& event,
+    const std::string& json
+) {
+    // client io 线程调用 (adapter); 未连接时 sendToPeer 丢弃并记日志
+    if (!transport_ || !transport_->alive()) {
+        XX_LOGW("[tui] sendPluginDataUp dropped (no transport): {}.{}", plugin, event);
+        return false;
+    }
+    agentxx::agent::WirePluginDataUp up;
+    up.plugin = plugin;
+    up.event  = event;
+    up.data   = json;
+    sendToPeer(std::move(up));
+    return true;
+}
+
+void TUIClientAgentIO::notifyUserInputSent(const std::string& sessionId, const std::string& text) {
+    // 事件接收器回调须在 client io 线程 (ClientEventSink 约定):
+    // - 本函数可能被 client 线程 (sendUserInputLocked ← dispatchNextPendingInput)
+    //   或 UI 线程 (inputCfg.onSend) 调用; 统一 post 到 io 线程执行
+    //   (低频事件, post 延迟一个事件循环 tick 可接受)
+    auto self = shared_from_this();
+    asio::post(ex_, [self, tid = sessionId, t = text]() mutable {
+        self->emitEventSink([&](agentxx::agent::ClientEventSink& sink) {
+            sink.onUserInput(tid, t);
+        });
+    });
+}
+
+void TUIClientAgentIO::reportSidebarRegionVisibility() {
+    auto mgr = pluginManager_;
+    if (!mgr || !sidebar_) {
+        return;
+    }
+    auto reg = mgr->uiRegistrySnapshot();
+    if (!reg) {
+        return;
+    }
+    // 面板: 只有当前激活 tab 的内容被渲染 (其余"不可见" → 关联定时器暂停)
+    for (const auto& p : reg->panels) {
+        mgr->reportRegionVisible(p.id, sidebar_->isTabActive(p.id));
+    }
+    // Info 段落: 侧边栏 Info tab 激活时整体可见
+    const bool infoVisible = sidebar_->isTabActive(kInfoTabId);
+    for (const auto& s : reg->infoSections) {
+        mgr->reportRegionVisible(s.id, infoVisible);
+    }
+}
+
+void TUIClientAgentIO::refreshRenderContext() {
+    ctx_.state      = &sharedState_;
+    ctx_.frameState = sharedState_.readSnapshot();
+    if (ctx_.frameState) {
+        // client 插件 UI 注册表快照 (面板/Info/状态栏/工具消息装饰; 渲染期无锁读)
+        ctx_.frameState->pluginRegistry
+            = pluginManager_ ? pluginManager_->uiRegistrySnapshot() : nullptr;
+    }
+}
+
+void TUIClientAgentIO::reportOverlayVisible(bool visible) {
+    auto mgr = pluginManager_;
+    if (!mgr) {
+        return;
+    }
+    mgr->reportRegionVisible(std::string{AGENTXX_CLIENT_OVERLAY_OWNER}, visible);
+}
+
+void TUIClientAgentIO::addPluginPanelTab(const std::string& id, const std::string& title) {
+    // UI 线程调用 (适配器经 postToUi 投递); sidebar_ 为 UI 线程独占组件
+    if (!sidebar_ || sidebar_->hasTab(id)) {
+        return;
+    }
+    sidebar_->addTab(id, title, [this, id]() {
+        return renderPluginPanel(id);
+    });
+    postRedraw();
+}
+
+void TUIClientAgentIO::removePluginPanelTab(const std::string& id) {
+    // UI 线程调用 (适配器经 postToUi 投递); sidebar_ 为 UI 线程独占组件
+    if (!sidebar_) {
+        return;
+    }
+    sidebar_->removeTab(id);
+    postRedraw();
+}
+
+namespace {} // namespace
+
+std::vector<ScrollItem> TUIClientAgentIO::renderPluginPanel(const std::string& panelId) {
+    // UI 线程调用 (侧边栏 tab render 回调); 读取注册表快照 (短锁拷贝 shared_ptr)
+    // 内容渲染统一走共享组件层 (ui_components.h): 面板与 Info 段落/装饰/overlay/
+    // 中断内容块使用同一实现, 新增组件只需改那一处
+    std::vector<ScrollItem> out;
+    auto                    mgr = pluginManager_;
+    if (!mgr) {
+        return out;
+    }
+    auto reg = mgr->uiRegistrySnapshot();
+    if (!reg) {
+        return out;
+    }
+    const agentxx::plugin::ClientPanel* panel = nullptr;
+    for (const auto& p : reg->panels) {
+        if (p.id == panelId) {
+            panel = &p;
+            break;
+        }
+    }
+    if (!panel) {
+        return out;
+    }
+
+    // 可用宽度: 内容区宽度 (已扣除侧边栏内边距与滚动条占位)
+    int avail = 0;
+    if (sidebar_) {
+        if (auto* scroll = sidebar_->contentScrollable(); scroll != nullptr) {
+            avail = scroll->contentWidth();
+        }
+    }
+    if (avail <= 0) {
+        avail = sidebar_ ? sidebar_->width() - 4 : 40;
+    }
+
+    // 表单状态: 按最新描述初始化并保留用户已编辑的值 (含控件状态清理)
+    auto  parsed = pluginxx::ui::parseBlocks(panel->items);
+    auto& form   = formFor(panel->id, panel->plugin, std::move(parsed));
+
+    agentxx::client::UiRenderCtx rc;
+    rc.theme            = &theme_;
+    rc.width            = avail;
+    rc.indent           = 0;
+    rc.plugin           = panel->plugin;
+    rc.ownerId          = panel->id;
+    rc.registry         = reg.get();
+    rc.form             = &form.state;
+    rc.collapseExpanded = [this, ownerId = panel->id](const std::string& id, bool defaultValue) {
+        return collapseExpanded(ownerId, id, defaultValue);
+    };
+
+    agentxx::client::UiRenderResult res;
+    renderItems(form.items, rc, res);
+
+    out.reserve(res.rows.size());
+    if (!res.builders.empty()) {
+        sidebarMdBuilders_.push_back(std::move(res.builders));
+    }
+    size_t lines = 0;
+    for (auto& row : res.rows) {
+        lines += std::max<size_t>(1, row.lines);
+        ScrollItem item;
+        item.element = std::move(row.element);
+        item.hits    = std::move(row.regions);
+        out.push_back(std::move(item));
+    }
+    // 上报可用尺寸: 值变化时主程序会向插件投递 UI_LAYOUT 事件 (插件按宽度重排)
+    if (mgr) {
+        mgr->reportRegionSize(panel->id, avail, static_cast<int>(lines));
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// 复制鼠标选中的文本
+// ---------------------------------------------------------------------------
+
+bool TUIClientAgentIO::copySelectionToClipboard() {
+    std::shared_ptr<ScreenInteractive> s;
+    {
+        std::lock_guard<std::mutex> lock(screenMutex_);
+        s = screen_;
+    }
+    if (!s) {
+        return false;
+    }
+    // GetSelection(): 返回上一次绘制帧中累积的选中文本 (FTXUI 在每帧
+    // Render 时按当前 Selection 收集各文本节点选中的部分);
+    // TUI 为全屏模式, selection 坐标为屏幕绝对坐标, 无需校正
+    const std::string text = s->GetSelection();
+    if (text.empty()) {
+        return false;
+    }
+    const bool ok = agentxx::client::copyTextToSystemClipboard(text);
+    if (ok) {
+        showToast(trf("toast.copied", text.size()));
+    } else {
+        showToast(std::string(tr("toast.copyFailed")));
+    }
+    postRedraw();
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// start / stop
+// ---------------------------------------------------------------------------
+
+void TUIClientAgentIO::start() {
+    running_ = true;
+    if (logSink_) {
+        utilxx_base::LogDispatcher::instance().addSink(logSink_);
+    }
+
+    uiThread_ = std::thread([this]() {
+        auto screen = std::make_shared<ScreenInteractive>(ScreenInteractive::Fullscreen());
+        {
+            std::lock_guard<std::mutex> lock(screenMutex_);
+            screen_ = screen;
+        }
+
+        // 构建组件共享上下文
+        ctx_.state      = &sharedState_;
+        ctx_.frameState = sharedState_.readSnapshot();
+        ctx_.postRedraw = [this] {
+            postRedraw();
+        };
+        // 历史分页钩子: MessageListComponent 滚动接近窗口顶部时触发
+        // (requestOlderHistory 内部做请求去重与边界判断; sendToPeer 经
+        // transport 写队列投递, 线程安全)
+        ctx_.requestMoreHistory = [this] {
+            requestOlderHistory();
+        };
+        // 会话列表分页钩子: SessionSelectorOverlay 选择项接近已加载列表末尾时
+        // 触发预取下一页 (requestNextSessionListPage 内部做请求去重与边界判断)
+        ctx_.requestMoreSessions = [this] {
+            requestNextSessionListPage();
+        };
+        // 会话改名钩子: 弹窗内确认改名后发送 WireRenameSession, 结果经
+        // onSessionRenameResult 回填列表标题/提示
+        ctx_.renameSession = [this](std::string sessionId, std::string title) {
+            requestRenameSession(std::move(sessionId), std::move(title));
+        };
+        ctx_.requestServerListDir
+            = [this](
+                  std::string                                                   path,
+                  std::vector<std::string>                                      allowedExtensions,
+                  std::function<void(const agentxx::agent::WireListDirResult&)> callback
+              ) {
+                  requestServerListDir(
+                      std::move(path),
+                      std::move(allowedExtensions),
+                      std::move(callback)
+                  );
+              };
+        ctx_.showToast = [this](std::string msg) {
+            showToast(std::move(msg));
+        };
+        ctx_.theme          = &theme_;
+        ctx_.sessionId      = currentSessionId();
+        ctx_.remoteUrl      = remoteUrl_;
+        ctx_.dataDir        = dataDir_;
+        ctx_.workDir        = workDir_;
+        ctx_.clientDeviceId = clientDeviceId_;
+        ctx_.serverDeviceId = serverDeviceId_;
+        ctx_.serverWorkDir  = serverWorkDir_;
+        ctx_.pluginManager  = pluginManager_;
+        // 注意: 不设置 ctx_.session —— TUI 不持有 Session (属于 server-io 线程),
+        // 上下文统计经 WireContextStats → onContextStats → sharedState_ 更新,
+        // 状态栏等组件从 frameState 读取 (见
+        // [status_bar.cpp](/agent/client/src/io/tui/components/status_bar.cpp))
+
+        // 创建组件
+        messageList_ = std::make_shared<MessageListComponent>(ctx_);
+        // 连接失败 banner 的 [重试] 按钮: 点击重新发起连接 (同 requestRetry)
+        messageList_->setOnRetryClick([this] {
+            requestRetry();
+        });
+        statusBar_ = std::make_shared<StatusBarComponent>(
+            ctx_,
+            // 状态栏点击动作 (与 F2/F3/F4 快捷键同一实现)
+            StatusBarComponent::Config{
+                .onModelClick =
+                    [this] {
+                        openModelSelector();
+                    },
+                .onSessionsClick =
+                    [this] {
+                        openSessionSelector();
+                    },
+                .onSettingsClick =
+                    [this] {
+                        openSettings();
+                    },
+            }
+        );
+        sidebar_ = std::make_shared<SidebarComponent>(ctx_);
+
+        // tabs 竖向列表的常驻标签: Info/Logs 始终显示 (对应 tab 未创建时点击经
+        // ensure 回调创建并激活; 已激活再点一次取消激活隐藏内容区)
+        // 标题随界面语言变化 (语言切换时经 refreshLanguage 重新设置)
+        sidebar_->setPinnedTabs({
+            {std::string(kInfoTabId),
+             std::string(tr("sidebar.info")),
+             [this]() {
+                 ensureInfoSidebarTab();
+             }},
+            {std::string(kLogTabId),
+             std::string(tr("sidebar.logs")),
+             [this]() {
+                 ensureLogSidebarTab();
+             }},
+        });
+
+        InputComponent::Config inputCfg;
+        inputCfg.onSend = [this](
+                              std::string                                  text,
+                              std::vector<agentxx::agent::MediaAttachment> attachments
+                          ) -> bool {
+            // ---- 插件命令拦截 (UI 线程) ----
+            // 输入以 "/" 开头且匹配插件注册的命令时, 拦截并投递到 client io
+            // 线程执行命令回调 (execute 返回动作 JSON, 由主程序解释执行);
+            // 未命中命令照常作为普通消息发送
+            if (pluginManager_ && !text.empty() && text[0] == '/') {
+                const auto spacePos = text.find(' ');
+                const auto cmdName  = text.substr(
+                    1,
+                    spacePos == std::string::npos ? std::string::npos : spacePos - 1
+                );
+                if (!cmdName.empty() && pluginManager_->hasCommand(cmdName)) {
+                    // 参数: 剩余部分整体作为 {"text": "..."} 传入 (语义由插件定义)
+                    std::string argsText
+                        = spacePos == std::string::npos ? std::string{} : text.substr(spacePos + 1);
+                    utilxx_base::Json args = utilxx_base::Json::object();
+                    args["text"]           = argsText;
+                    pluginManager_->postCommandInvocation(cmdName, args.dump());
+                    return true;
+                }
+            }
+            std::lock_guard<std::mutex> lock(sharedState_.mutex());
+            auto&                       st = sharedState_.mutableState();
+            if (awaitingInterruptInput_.load(std::memory_order_acquire)) {
+                pushCurrentTokenLocked(st);
+                resetTrailingRunningToolsLocked(st);
+                st.messages.push_back(
+                    std::make_shared<TUIMessage>(TUIMessage::makeText(TUIMessage::Role::User, text))
+                );
+                messageList_->setStickToBottom(true);
+                inputChannel_->async_send(
+                    utilxx_base::AsioErrorCode{},
+                    std::move(text),
+                    [](utilxx_base::AsioErrorCode) {}
+                );
+                return true;
+            } else if (st.connState != ConnState::Connected) {
+                // server-io 未初始化完成前不允许发送消息, 且不清空输入框
+                showToast(std::string(tr("toast.notReady")));
+                postRedraw();
+                return false;
+            } else {
+                sendUserInputLocked(st, std::move(text), std::move(attachments));
+                return true;
+            }
+        };
+        inputCfg.isAwaitingInterrupt = [this] {
+            return awaitingInterruptInput_.load(std::memory_order_acquire);
+        };
+        inputCfg.isStreaming = [this] {
+            return ctx_.frameState && ctx_.frameState->isStreaming;
+        };
+        inputCfg.canAttach = [this] {
+            if (!ctx_.frameState) {
+                return false;
+            }
+            return ctx_.frameState->currentModelCapability().hasMultimodalInput();
+        };
+        inputCfg.onOpenAttachPicker = [this] {
+            openFilePickerOverlay();
+        };
+        // 待发队列计数点击 → 打开待发送队列弹窗 (清空 / 删除 / 展开)
+        inputCfg.onOpenPendingQueue = [this] {
+            auto overlay = std::make_shared<PendingInputsOverlay>(ctx_);
+            overlay->onClear([this] {
+                if (transport_) {
+                    sendToPeer(agentxx::agent::WireClearMessageQueue{currentSessionId()});
+                }
+            });
+            overlay->onDeleteItem([this](std::string itemId) {
+                if (transport_) {
+                    sendToPeer(
+                        agentxx::agent::WireRemoveQueueItem{currentSessionId(), std::move(itemId)}
+                    );
+                }
+            });
+            overlay->onClose([this] {
+                modal_->popModal();
+            });
+            modal_->pushModal(overlay);
+            postRedraw();
+        };
+        // 待发队列 [立即发送] → 中断当前轮次并让队列下一条立即执行
+        inputCfg.onRunNextPending = [this] {
+            if (transport_) {
+                sendToPeer(agentxx::agent::WireInterruptAndRunNext{currentSessionId()});
+            }
+            std::lock_guard<std::mutex> lock(sharedState_.mutex());
+            auto&                       st = sharedState_.mutableState();
+            if (st.isStreaming) {
+                pushCurrentTokenLocked(st);
+            }
+            postRedraw();
+        };
+        inputBar_ = std::make_shared<InputComponent>(ctx_, std::move(inputCfg));
+
+        // 屏幕足够宽时默认展开信息侧边栏
+        // (Info/Logs 标签无论如何都常驻显示于 tabs 竖向列表)
+        if (Terminal::Size().dimx >= kInfoSidebarMinWidth) {
+            ensureInfoSidebarTab();
+        }
+
+        // 侧边栏底部 [Menu] 按钮与 Info 侧边栏 [view] 按钮属于 shell 级动作
+        // (跨组件, 动作实现需要访问 transport/modal): 渲染期登记到 shellHits_,
+        // 点击由全局鼠标事件经 handleShellHit 分发 (见下方 CatchEvent)
+
+        // 主布局: Stacked 让子组件接收事件, Renderer 组合渲染
+        auto       stacked = Container::Stacked({messageList_, sidebar_, inputBar_, statusBar_});
+        const bool collectFrameStats = agentxx::agent::AgentConfigStatic::benchmarkEnabled();
+        auto       mainRenderer      = Renderer(stacked, [&]() -> Element {
+            // 帧统计只在启用 [AgentConfigStatic::enableBenchmark] 时采集:
+            // 关闭时 (正常使用) 不读时钟、不累加计数, 渲染路径零额外开销
+            const auto frameBegin = collectFrameStats ? std::chrono::steady_clock::now()
+                                                                 : std::chrono::steady_clock::time_point{};
+            // 本帧状态快照 + client 插件 UI 注册表快照 (渲染期无锁读)
+            refreshRenderContext();
+            // 本帧终端尺寸: 同帧内所有组件读同一尺寸 (避免帧中途 resize 造成布局错位),
+            // 且每帧只查询一次 (Terminal::Size 在 Linux 上是 ioctl)
+            ctx_.refreshFrameSize();
+            // 插件展示区域可见性上报 (面板/Info 段落: 供 is_visible 与"不可见时
+            // 暂停的定时器"门控; 管理器按值变化去重, 无变化时零开销)
+            reportSidebarRegionVisibility();
+            // 命中表: 每帧重建 (渲染期登记, 仅存本帧真正渲染出来的可点项;
+            // 缩放/滚动/伸缩/隐藏导致坐标与可见性每帧变动)
+            shellHits_.beginFrame();
+            // 侧边栏 (面板/Info 段落) 的 markdown 生命周期: 轮换到本帧的新容器,
+            // 保留上一代 (上一帧元素可能仍在滚动容器缓存中)
+            if (sidebarMdBuilders_.size() >= 2) {
+                sidebarMdBuilders_.erase(sidebarMdBuilders_.begin());
+            }
+            sidebarMdBuilders_.emplace_back();
+
+            auto mainWidget = vbox({
+                messageList_->Render() | flex,
+                inputBar_->Render(),
+                statusBar_->Render(),
+                text(" "),
+            });
+
+            // 侧边栏 tabs 竖向列表常驻显示 (Info/Logs 固定标签),
+            // 故始终参与布局; 无激活 tab 时其内容区自动隐藏、仅显示列表
+            Element body = hbox({
+                mainWidget | flex,
+                sidebar_->Render(),
+            });
+            // toast 提示不在此叠加: 它在模态层之上 (见 applyToastOverlay) ——
+            // 弹窗打开时主界面整棵树不参与渲染, 画在这里会被弹窗盖住
+            auto rendered = body | bold | bgcolor(theme_.backgroundColor);
+            // 帧统计: 组件树构建耗时 (不含终端输出), 供性能基准/诊断读取
+            if (collectFrameStats) {
+                recordFrameStats(std::chrono::steady_clock::now() - frameBegin);
+            }
+            return rendered;
+        });
+
+        // 模态容器: 主布局 + 弹窗层
+        // 背景色用 surfaceScrimColor: 弹窗打开时铺满屏幕, 衬托弹窗表面
+        modal_ = ModalContainer::Create(mainRenderer);
+        modal_->setBgColor(theme_.surfaceScrimColor);
+
+        // 根组件: 模态层之上再叠一层 toast 提示
+        // 提示不能画在主界面里 —— 弹窗打开时主界面整棵树不参与渲染 (见
+        // ModalContainer), 提示会被弹窗盖住 (如设置弹窗里点"检查更新"的进行中
+        // 与结果提示); 叠在模态层之上后任何界面状态下提示都可见
+        auto root = Renderer(modal_, [this]() -> Element {
+            return applyToastOverlay(modal_->Render());
+        });
+
+        // 全局快捷键 + 鼠标 (F2/F3/F4/F12/Escape/点击): 组件未处理的事件到此处理
+        auto handler = CatchEvent(root, [&](Event event) -> bool {
+            // 全局退出快捷键: 优先处理, 弹窗打开时也放行 (否则模态期间 Ctrl+C 被
+            // 弹窗 OnEvent 无条件处理, 无法退出程序)
+            if (event == Event::CtrlC) {
+                running_ = false;
+                // 关闭 transport 以打断可能阻塞中的 connect/重连/recv 循环,
+                // 使主协程能尽快走到退出分支 (尤其远程模式 server 不可达时 connect 会无限重连)
+                if (transport_) {
+                    transport_->close();
+                }
+                screen->Exit();
+                return true;
+            }
+            // 鼠标事件: 拖选跟踪在任何状态下生效 (弹窗内文本同样支持拖选复制)
+            if (event.is_mouse()) {
+                const auto& mouse = event.mouse();
+                // ---- 拖选跟踪 (松开即复制) ----
+                // Windows Terminal 等终端会拦截 Ctrl+Insert 作为终端复制 (不转发给
+                // 应用), 故以"左键按下并拖动后松开"作为主要复制入口:
+                // - Pressed:   记录按下 (单击判定起点)
+                // - Moved:     SGR 拖动事件仅在按键按下并移动时上报, 出现即视为拖选
+                // - Released:  发生过拖动 -> 自动复制选中文本 (GetSelection 取上一
+                //               绘制帧累积的选择, 已含本次拖动终点) + toast 提示
+                // - 单击 (无拖动): 不复制, 保持原有的点击交互 (按钮/折叠/拖拽条等)
+                if (mouse.button == Mouse::Left) {
+                    if (mouse.motion == Mouse::Pressed) {
+                        mouseDown_    = true;
+                        mouseDragged_ = false;
+                    } else if (mouse.motion == Mouse::Moved) {
+                        if (mouseDown_) {
+                            mouseDragged_ = true;
+                        }
+                    } else if (mouse.motion == Mouse::Released) {
+                        const bool wasDrag = mouseDragged_;
+                        mouseDown_         = false;
+                        mouseDragged_      = false;
+                        if (wasDrag && copySelectionToClipboard()) {
+                            // 清除选中高亮: 复制已完成; 懒加载列表跳过 FTXUI
+                            // 每帧 ComputeRequirement, Text 节点的选中反色不会
+                            // 自动复位, 需显式清除 (见 resetSelectionHighlight)
+                            if (messageList_) {
+                                messageList_->clearSelectionHighlight();
+                            }
+                            if (sidebar_) {
+                                sidebar_->clearSelectionHighlight();
+                            }
+                            // 处理事件: 拖选释放不应触发下方按钮/折叠点击;
+                            // (handleSelection(handled=true) 将清除选择高亮,
+                            // 复制已完成, 符合"松开即复制"语义)
+                            return true;
+                        }
+                    }
+                }
+                // 模态弹窗打开时: 主界面不可见 (命中 box 为残留值), 跳过主界面
+                // 按钮点击检测, 事件交予弹窗组件处理
+                if (modal_->hasModal()) {
+                    return false;
+                }
+                if (mouse.button == Mouse::Left && mouse.motion == Mouse::Released) {
+                    // shell 级按钮 (Info 侧边栏 [view] / Logs 底部 [Menu]):
+                    // 由渲染期登记的命中表定位, 未渲染的按钮不在表中
+                    if (const auto* hit = shellHits_.findClick(mouse)) {
+                        handleShellHit(hit->payload.id);
+                        return true;
+                    }
+                    // 插件注册的本地渲染器与通用动作派发, 见 [ClientPluginManager]
+                    if (handleSidebarRegionClick(mouse)) {
+                        return true;
+                    }
+                    // 其余主界面按钮由各组件自身在组件树中处理
+                    // (消息列表: 折叠/装饰按钮/中断控件/重试; 输入栏: 附件/待发队列;
+                    //  状态栏: 模型/会话/设置; 侧边栏: tab 与拖拽), 此处不再按坐标判定
+                }
+                return false;
+            }
+            // 模态弹窗打开时: 键盘优先让弹窗处理 (Escape 关闭弹窗等), 不拦截
+            if (modal_->hasModal()) {
+                return false;
+            }
+            // 插件全局快捷键 (agentxx.client.keybind): 全局优先级最高, 有注册时
+            // 拦截按键并投递到 client io 线程执行插件回调。无修饰键的可打印字符
+            // 不参与匹配 (见 tui_keybind.h), 因此不影响输入框打字。
+            if (pluginManager_) {
+                const std::string keys = agentxx::client::keybindOfEvent(event);
+                if (!keys.empty() && pluginManager_->hasKeybind(keys)) {
+                    pluginManager_->postKeybindInvocation(keys);
+                    return true;
+                }
+            }
+            // 侧边栏表单焦点 (面板/Info 段落内的控件): 有焦点时输入先进入表单,
+            // 避免字符被输入栏抢走; 未消费再走全局快捷键与输入栏
+            if (formFocusedOwner_.size() > 0 && handleSidebarFormKey(event)) {
+                return true;
+            }
+            if (event == Event::F2) {
+                openModelSelector();
+                return true;
+            }
+            if (event == Event::F3) {
+                openSessionSelector();
+                return true;
+            }
+            if (event == Event::F4) {
+                openSettings();
+                return true;
+            }
+            if (event == Event::F12) {
+                toggleLogWindow();
+                return true;
+            }
+            if (event == Event::Escape) {
+                std::lock_guard<std::mutex> lock(sharedState_.mutex());
+                auto                        snap = sharedState_.snapshot();
+                if (snap->isStreaming) {
+                    auto& st = sharedState_.mutableState();
+                    cancelCurrentRunLocked(st);
+                    postRedraw();
+                    return true;
+                }
+            }
+            return false;
+        });
+
+        // 自定义 Loop: 每帧 pump 日志
+        {
+            Loop loop(screen.get(), handler);
+            // 启用括号粘贴 (bracketed paste, \x1B[?2004h): 终端将粘贴内容包裹于
+            // \x1B[200~ ... \x1B[201~ 之间, InputComponent 据此拦截多行粘贴,
+            // 粘贴的换行不会触发发送。与 FTXUI 的 Install() 一致, 控制序列
+            // 无条件发送 (其自身亦不判断 stdout 是否为 tty)。
+            std::cout << "\x1B[?2004h" << std::flush;
+            while (!loop.HasQuitted()) {
+                // 本帧请求基线: 帧期间到达 (被合并进本帧渲染) 的重绘请求在帧结束后补帧,
+                // 保证用最新 frameState 重绘。必须在帧开头记录 —— 若在 RunOnceBlocking
+                // 之后才记录, 帧开头到记录点之间到达的请求会丢失。
+                const uint64_t frameBaseline = redrawSeq_.load(std::memory_order_acquire);
+                // 每帧开头获取状态快照: 事件处理 (CatchEvent/组件 OnEvent) 与渲染
+                // 期间 frameState 始终有效 (含 client 插件 UI 注册表快照)
+                refreshRenderContext();
+                // 处理 client 线程投递的 UI 动作 (弹窗开关/消息列表吸附等):
+                // 必须在渲染之前执行, 使本帧渲染反映其效果;
+                // 动作仅访问 UI 线程独占组件 (modal_/messageList_), 不依赖本帧快照
+                {
+                    std::vector<std::function<void()>> actions;
+                    {
+                        std::lock_guard<std::mutex> lock(uiActionsMutex_);
+                        actions.swap(uiActions_);
+                    }
+                    for (auto& fn : actions) {
+                        fn();
+                    }
+                }
+                // 日志 sink 排空 (丢弃防护: 不处理则生产者可能丢弃新日志):
+                // 仅当 Logs tab 存在且为当前激活 tab 时才触发重绘 —— agent 运行时
+                // 日志量很大, 若 tab 未打开, 日志变化不影响任何可见 UI, 每批日志
+                // 都触发整帧渲染 (布局 + 全屏 ToString + stdout 写) 是纯浪费
+                if (logSink_ && logSink_->pump() > 0 && sidebar_
+                    && sidebar_->isTabActive(kLogTabId)) {
+                    screen->Post(Event::Custom);
+                }
+                loop.RunOnceBlocking();
+                // 整帧渲染/事件处理完成: 释放本帧状态快照。
+                // 关键性能点: 若帧间隙持续持有快照, client 线程 (onDelta 流式追加)
+                // 每次 mutableState() 都会 COW 深拷贝整个 TUIRenderState (use_count>1),
+                // 每 token 一次全量拷贝; 释放后渲染间隙 use_count==1,
+                // client 线程可原地修改 state, 拷贝成本降为零。
+                // Element 树在 OnRender 中已自包含 (文本已复制), 布局/绘制不依赖快照。
+                ctx_.frameState.reset();
+                // 帧完成: 本帧处理的待处理 Custom 已对应一次渲染 (frameState 为本帧开头快照)。
+                // 清除待处理标记, 使新的 postRedraw 能重新 Post;
+                // 若帧期间有新请求被合并 (计数 != 帧基线), 说明本帧渲染可能未反映其
+                // 状态变更 (快照取于帧开头), 补 Post 一帧, 保证以最新快照重绘。
+                // 注意: 不能在帧开头 reset —— FTXUI 的 RunUntilIdle 会在同一帧内处理
+                // 事件处理期间 Post 的 Custom, 帧开头 reset 后帧中到达的请求会因合并
+                // 标记为真而被丢弃且无待处理事件, 导致重绘丢失 (如模型弹窗列表不刷新)。
+                redrawPosted_.store(false, std::memory_order_release);
+                if (redrawSeq_.load(std::memory_order_acquire) != frameBaseline
+                    && !redrawPosted_.exchange(true, std::memory_order_acq_rel)) {
+                    screen->Post(Event::Custom);
+                }
+            }
+        }
+        // Loop 析构已触发 PostMain/Uninstall 恢复终端 (termios);
+        // 但 2004 括号粘贴模式是终端模拟器状态而非 termios, 需在此显式关闭,
+        // 否则残留模式会使后续程序粘贴时收到 \x1B[200~ 标记。
+        std::cout << "\x1B[?2004l" << std::flush;
+        {
+            std::lock_guard<std::mutex> lock(screenMutex_);
+            screen_ = nullptr;
+        }
+    });
+
+    // 启动更新检查 (设置项 `启动时检查更新` 关闭时不发起):
+    // - 在 client io 线程的协程中延迟若干秒后发一次请求, 不阻塞 UI 线程
+    // - 结果经 applyUpdateCheckResult 记录到共享状态并在 Info 侧边栏底部提示
+    startUpdateCheck();
+}
+
+TUIClientAgentIO::FrameStats TUIClientAgentIO::frameStats() const {
+    FrameStats out;
+    out.frames        = frameCount_.load(std::memory_order_relaxed);
+    out.totalRenderMs = static_cast<double>(frameTotalNs_.load(std::memory_order_relaxed)) / 1e6;
+    out.maxRenderMs   = static_cast<double>(frameMaxNs_.load(std::memory_order_relaxed)) / 1e6;
+    return out;
+}
+
+void TUIClientAgentIO::recordFrameStats(std::chrono::steady_clock::duration elapsed) noexcept {
+    const auto ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()
+    );
+    frameCount_.fetch_add(1, std::memory_order_relaxed);
+    frameTotalNs_.fetch_add(ns, std::memory_order_relaxed);
+    // 最大帧耗时: 仅在新值更大时替换 (比较与写入之间可能有其他线程/帧更新,
+    // 失败则带上最新值重试, 避免丢掉真正的最大值)
+    uint64_t prevMax = frameMaxNs_.load(std::memory_order_relaxed);
+    while (ns > prevMax && !frameMaxNs_.compare_exchange_weak(prevMax, ns)) {
+    }
+}
+
+void TUIClientAgentIO::resetFrameStats() {
+    frameCount_.store(0, std::memory_order_relaxed);
+    frameTotalNs_.store(0, std::memory_order_relaxed);
+    frameMaxNs_.store(0, std::memory_order_relaxed);
+}
+
+void TUIClientAgentIO::stop() {
+    if (logSink_) {
+        utilxx_base::LogDispatcher::instance().removeSink(logSink_);
+    }
+    running_ = false;
+    // 关闭 transport, 使 runTransportLoop/connect/重连循环退出, io_context 得以排空
+    if (transport_) {
+        transport_->close();
+    }
+    // 关闭输入通道: 打断 handleInterrupt 中挂起在 getInput() 上的
+    // async_receive, 使其尽快返回并结束协程 —— 否则中断等待输入期间退出时,
+    // detached 协程残留挂起操作会阻塞 client io_context 的 run(), 进程无法退出。
+    // (close 幂等; 之后 async_send/async_receive 以 channel_closed 错误返回)
+    inputChannel_->close();
+    // 同上: 关闭所有进行中中断的结果回传通道, 打断 handleInterrupt 中挂起在
+    // async_receive 上的等待, 避免退出时残留挂起操作阻塞 io_context
+    for (auto& [id, ch] : activeInterrupts_) {
+        ch->close();
+    }
+    activeInterrupts_.clear();
+    std::shared_ptr<ScreenInteractive> s;
+    {
+        std::lock_guard<std::mutex> lock(screenMutex_);
+        s = std::move(screen_);
+        screen_.reset();
+    }
+    if (s) {
+        s->Exit();
+    }
+    if (uiThread_.joinable()) {
+        uiThread_.join();
+    }
+    // 取消 toast 超时定时器: 避免退出后残留挂起等待触发 use-after-free
+    // (回调捕获 this; cancel 后回调以 operation_aborted 返回, 不访问 this)
+    if (toastTimer_) {
+        toastTimer_->cancel();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// agent-io 连接状态管理
+//
+// 覆盖场景:
+// - 本地一体模式: TUI 启动后 agent 线程仍在 init() (MCP 连接等可能耗时数秒),
+//   期间 connState=Connecting, banner 显示"启动中", 用户输入进入待发送队列;
+//   SessionServerAgentIO 会话驱动循环启动前经 onServerReady() 置 Connected 并刷新队列
+// - 远程模式: WS 连接握手期间 connState=Connecting; 连接失败置 Failed,
+//   banner 显示失败 + [重试] 按钮, 用户点击后 requestRetry() 唤醒连接协程重试
+// ---------------------------------------------------------------------------
+
+void TUIClientAgentIO::setConnState(ConnState state) {
+    {
+        std::lock_guard<std::mutex> lock(sharedState_.mutex());
+        auto&                       st = sharedState_.mutableState();
+        st.connState                   = state;
+    }
+    postRedraw();
+    // 通知事件接收器 (client 插件系统订阅连接状态事件)
+    const char* stateName = state == ConnState::Connected
+                                ? "connected"
+                                : (state == ConnState::Failed ? "failed" : "connecting");
+    emitEventSink([&](agentxx::agent::ClientEventSink& sink) {
+        sink.onConnStateChanged(stateName, {});
+    });
+}
+
+void TUIClientAgentIO::onServerReady() {
+    {
+        std::lock_guard<std::mutex> lock(sharedState_.mutex());
+        auto&                       st = sharedState_.mutableState();
+        st.connState                   = ConnState::Connected;
+        // 启动完成: 清空进行中的启动步骤 (banner 切换到"启动完成 + 按键提示")
+        st.startupProgress.clear();
+    }
+    postRedraw();
+    // 通知事件接收器: 服务端就绪 (基类默认实现)
+    agentxx::agent::AgentIOBase::onServerReady();
+}
+
+void TUIClientAgentIO::onServerProgress(std::string_view step) {
+    // agent 线程同步调用 (initNotifier → onServerProgress):
+    // 只更新当前步骤文本, 不触碰其他字段; 经 sharedState 锁避免与 UI 快照竞争
+    std::string stepCopy{step};
+    {
+        std::lock_guard<std::mutex> lock(sharedState_.mutex());
+        auto&                       st = sharedState_.mutableState();
+        st.startupProgress             = stepCopy;
+    }
+    postRedraw();
+    // 通知事件接收器 (agent 线程 → post 到 client io 线程)
+    auto self = shared_from_this();
+    asio::post(ex_, [self, step = std::move(stepCopy)]() mutable {
+        self->emitEventSink([&](agentxx::agent::ClientEventSink& sink) {
+            sink.onConnStateChanged("connecting", step);
+        });
+    });
+}
+
+void TUIClientAgentIO::requestRetry() {
+    retryRequested_.store(true, std::memory_order_release);
+    // 立即回到"启动中"提示: 连接协程 waitRetry 返回后会重新发起连接
+    setConnState(ConnState::Connecting);
+}
+
+asio::awaitable<void> TUIClientAgentIO::waitRetry() {
+    // 轮询等待用户点击 banner 的"重试"按钮 (requestRetry 置 retryRequested_):
+    // - 100ms 轮询间隔, 点击延迟不可感知
+    // - 每次轮询检查 running_: 连接失败期间用户可能退出 TUI, 等待协程须尽快
+    //   返回, 否则 runner 协程永久挂起会阻塞 client io_context 的 run() 使进程无法退出
+    asio::steady_timer timer(ex_);
+    for (;;) {
+        if (retryRequested_.exchange(false, std::memory_order_acq_rel)) {
+            co_return;
+        }
+        if (!running_.load(std::memory_order_acquire)) {
+            co_return;
+        }
+        timer.expires_after(std::chrono::milliseconds(100));
+        auto [ec] = co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
+        (void)ec;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 模态管理
+// ---------------------------------------------------------------------------
+
+void TUIClientAgentIO::openModelSelector() {
+    // server-io 未就绪时请求会被 transport 丢弃 (远程模式写队列未创建/
+    // 本地模式服务尚未启动), 弹窗将永远显示 loading; 提示用户等待连接完成
+    if (ctx_.frameState && ctx_.frameState->connState != ConnState::Connected) {
+        showToast(std::string(tr("toast.notReady")));
+        postRedraw();
+        return;
+    }
+    if (transport_) {
+        sendToPeer(agentxx::agent::WireGetModel{currentSessionId()});
+    }
+    // 弹窗自身会把选中项对齐到当前使用中的模型 (首次渲染时按 cachedModelName)
+    auto overlay = std::make_shared<ModelSelectorOverlay>(ctx_);
+    // 刚提交过新增模型时: 该模型已出现在列表里就选中它 (回执先到时
+    // cachedModelName 已更新, 由弹窗自身的对齐逻辑选中)
+    overlay->selectModelAfterLoad(pendingNewModel_);
+    // 顶部条目「添加模型配置」: 打开表单模态 (替换本弹窗; 取消后重新打开列表)
+    overlay->onAddModel([this] {
+        openModelConfigForm();
+    });
+    // 确认选择: 记录为待应用选择 (setPendingModel), 同时立即向服务端发送
+    // WireSelectModel 同步当前会话的模型设定。
+    // 状态栏显示已由弹窗确认时更新 cachedModelName
+    overlay->onConfirm([this](std::string model) {
+        setPendingModel(model);
+        if (transport_) {
+            sendToPeer(agentxx::agent::WireSelectModel{currentSessionId(), std::move(model)});
+        }
+    });
+    overlay->onClose([this] {
+        modal_->popModal();
+    });
+    modal_->pushModal(overlay);
+    postRedraw();
+}
+
+void TUIClientAgentIO::openModelConfigForm() {
+    // server-io 未就绪时无法把配置交给 agent 侧 (边填边等更糟): 先提示再打开
+    if (ctx_.frameState && ctx_.frameState->connState != ConnState::Connected) {
+        showToast(std::string(tr("toast.notReady")));
+        postRedraw();
+        return;
+    }
+    auto overlay = std::make_shared<ModelConfigOverlay>(ctx_);
+    // 提交: 与 agent 侧同一套校验规则 (重名/类型/地址/数值范围) 先在本端拦一遍,
+    // 通过后发 WireAddModel —— 由 agent 侧落盘到 {data_dir}/agentxx-config.yaml、
+    // 注册到模型列表并让当前会话立即切换使用; 结果经 WireAddModelResult 回来
+    overlay->onSubmit([this](const agentxx::agent::ModelConfig& mc) -> std::string {
+        if (!transport_) {
+            return std::string{tr("model.form.errSend")};
+        }
+        std::set<std::string, std::less<>> names;
+        {
+            auto snap = sharedState_.readSnapshot();
+            for (const auto& name : snap->modelNames) {
+                names.insert(name);
+            }
+        }
+        if (auto check = agentxx::agent::validateNewModelConfig(mc, names); !check.has_value()) {
+            return check.error();
+        }
+        pendingNewModel_ = mc.name;
+        sendToPeer(agentxx::agent::io::addModelOfConfig(currentSessionId(), mc));
+        return {};
+    });
+    // 关闭 (保存成功或取消) 后回到模型选择弹窗: 重开在下一帧执行, 不在当前
+    // 弹窗的事件回调里重建模态栈
+    overlay->onClose([this] {
+        modal_->popModal();
+        enqueueUiAction([this] {
+            openModelSelector();
+        });
+    });
+    modal_->pushModal(overlay);
+    postRedraw();
+}
+
+void TUIClientAgentIO::openSettings() {
+    auto overlay = std::make_shared<SettingsOverlay>(ctx_);
+    overlay->onClose([this] {
+        modal_->popModal();
+    });
+    // 主题变化后清空消息缓存与日志行缓存 (设置弹窗保持打开, 主题立即生效)。
+    // 注意: 必须在 popModal() 之前访问成员 —— popModal() 会释放 overlay,
+    // 而当前闭包存储在该 overlay 内, pop 之后闭包已析构, 再访问捕获变量属于 use-after-free。
+    overlay->onThemeChange([this] {
+        if (messageList_) {
+            messageList_->invalidateCache();
+        }
+        // 日志行缓存: 已按旧主题着色, 整体清空并重置计数,
+        // 使 renderLogWindow 下次渲染时按新主题重建全部日志行
+        // (仅 clear 不清计数会因行数未变跳过重建, 导致日志侧边栏显示 [Empty])
+        logLineCache_.clear();
+        logCacheLineCount_   = 0;
+        logCachePoppedCount_ = 0;
+        // 模态容器背景色: setBgColor 仅在 start() 时设置一次, 主题切换后
+        // 若不更新, 设置弹窗背景仍是旧主题背景色 (弹窗内部元素每帧重建,
+        // 已自动使用新主题; 背景由 ModalContainer 的 bgColor_ 提供)
+        if (modal_) {
+            modal_->setBgColor(theme_.surfaceScrimColor);
+        }
+    });
+    // 日志等级变化: 清空已收集日志行 (重新按新等级收集);
+    // logLineCache_ 因行数骤减在下次渲染时自动整体失效
+    overlay->onLogLevelChange([this] {
+        if (logSink_) {
+            logSink_->clear();
+        }
+    });
+    // 动画等级变化: 同步插件定时器门控 (Disabled 时新的定时器不再注册)
+    overlay->onAnimationLevelChange([this] {
+        if (pluginManager_) {
+            pluginManager_->setAnimationEnabled(
+                TUISettings::instance().isAnimationEnabled(AnimationLevel::Low)
+            );
+        }
+    });
+    // 界面语言变化: 刷新随语言缓存的静态文本/缓存 (消息列表 banner 缓存、
+    // 日志缓存、侧边栏标签、输入框占位符), 语言立即生效
+    overlay->onLanguageChange([this] {
+        refreshLanguage();
+    });
+    overlay->onAbout([this] {
+        openAbout();
+    });
+    overlay->onKeybindList([this] {
+        openKeybindList();
+    });
+    // "检查更新"条目: 立即检查一次 (client io 线程协程; 结果回 UI 线程弹窗/toast)
+    overlay->onCheckUpdate([this] {
+        requestUpdateCheckNow();
+    });
+    modal_->pushModal(overlay);
+    postRedraw();
+}
+
+void TUIClientAgentIO::openAbout() {
+    auto overlay = std::make_shared<AboutOverlay>(ctx_);
+    overlay->onClose([this] {
+        modal_->popModal();
+    });
+    modal_->pushModal(overlay);
+    postRedraw();
+}
+
+void TUIClientAgentIO::openKeybindList() {
+    auto overlay = std::make_shared<KeybindListOverlay>(ctx_);
+    overlay->onClose([this] {
+        modal_->popModal();
+    });
+    modal_->pushModal(overlay);
+    postRedraw();
+}
+
+void TUIClientAgentIO::openLogsMenu() {
+    if (!modal_ || modal_->hasModal()) {
+        return;
+    }
+    auto menu = std::make_shared<LogMenuOverlay>(ctx_);
+    menu->onClose([this] {
+        modal_->popModal();
+    });
+    menu->onLlmContext([this] {
+        modal_->popModal();
+        if (transport_) {
+            sendToPeer(agentxx::agent::WireGetContext{currentSessionId()});
+        }
+        if (modal_ && !modal_->hasModal()) {
+            auto overlay = std::make_shared<ContextOverlay>(ctx_);
+            overlay->onClose([this] {
+                modal_->popModal();
+            });
+            modal_->pushModal(overlay);
+        }
+    });
+    menu->onSummyContext([this] {
+        if (ctx_.frameState && ctx_.frameState->connState != ConnState::Connected) {
+            showToast(std::string(tr("toast.notReady")));
+            postRedraw();
+            return;
+        }
+        const bool busy = (ctx_.frameState && ctx_.frameState->isStreaming)
+                          || awaitingInterruptInput_.load(std::memory_order_acquire);
+        if (busy) {
+            showToast(std::string(tr("toast.stopCurrent")));
+            postRedraw();
+            return;
+        }
+
+        modal_->popModal();
+        if (transport_) {
+            sendToPeer(agentxx::agent::WireCompactContext{currentSessionId()});
+        }
+    });
+    menu->onClearLogs([this] {
+        modal_->popModal();
+        if (logSink_) {
+            logSink_->clear();
+        }
+        logLineCache_.clear();
+        postRedraw();
+    });
+    modal_->pushModal(menu);
+    postRedraw();
+}
+
+void TUIClientAgentIO::handleShellHit(std::string_view id) {
+    // shell 级按钮 (跨组件; 命中表由渲染期登记, 见 mainRenderer)
+    if (id == kFailedViewHitId) {
+        openFailedAppendComponents();
+        return;
+    }
+    if (id == kLogsMenuHitId) {
+        openLogsMenu();
+        return;
+    }
+    if (id == kAuthToggleHitId) {
+        toggleFullAuth();
+        return;
+    }
+    if (id == kUpdateNoticeHitId) {
+        // 点击"发现新版本"提示行: 复制发布页链接 (TUI 不便直接打开浏览器)
+        const std::string url
+            = (ctx_.frameState != nullptr) ? ctx_.frameState->availableUpdateUrl : std::string{};
+        if (url.empty()) {
+            return;
+        }
+        if (agentxx::client::copyTextToSystemClipboard(url)) {
+            showToast(trf("toast.copied", url));
+        } else {
+            showToast(std::string(tr("toast.copyFailed")));
+        }
+        postRedraw();
+        return;
+    }
+}
+
+void TUIClientAgentIO::ensureInfoSidebarTab() {
+    if (!sidebar_->hasTab(kInfoTabId)) {
+        sidebar_->addTab(
+            kInfoTabId,
+            tr("sidebar.info"),
+            [this]() {
+                return renderInfoSidebar();
+            },
+            [this]() {
+                return renderInfoSidebarFooter();
+            }
+        );
+    }
+}
+
+void TUIClientAgentIO::ensureLogSidebarTab() {
+    if (!sidebar_->hasTab(kLogTabId)) {
+        sidebar_->addTab(
+            kLogTabId,
+            tr("sidebar.logs"),
+            [this]() {
+                return renderLogWindow();
+            },
+            [this]() {
+                return renderLogSidebarFooter();
+            }
+        );
+    }
+}
+
+void TUIClientAgentIO::toggleLogWindow() {
+    if (sidebar_->hasTab(kLogTabId)) {
+        sidebar_->removeTab(kLogTabId);
+    } else {
+        ensureLogSidebarTab();
+    }
+    postRedraw();
+}
+
+void TUIClientAgentIO::refreshLanguage() {
+    // 界面语言切换: 静态文本按语言缓存的位置逐项刷新 (语言切换频率极低,
+    // 全量清理成本可忽略; 其余组件文本在渲染时实时查翻译表, 无需处理)
+    if (messageList_) {
+        // banner (空状态) 文本随语言缓存: 失效后下次渲染按新语言重建
+        messageList_->invalidateCache();
+    }
+    // 日志行缓存: 与语言无关 (行内容为日志原文), 但 [Empty] 等空状态标签
+    // 随语言变化; 行数未变时缓存不会自动重建, 故整体清空
+    logLineCache_.clear();
+    logCacheLineCount_   = 0;
+    logCachePoppedCount_ = 0;
+    // 侧边栏常驻标签 (Info/Logs) 与已建 tab 标题
+    refreshSidebarTabTitles();
+    // 输入框占位符 (绑定引用, 内部即时刷新)
+    if (inputBar_) {
+        inputBar_->refreshLanguage();
+    }
+    postRedraw();
+}
+
+void TUIClientAgentIO::refreshSidebarTabTitles() {
+    if (!sidebar_) {
+        return;
+    }
+    // 常驻标签标题 (tabs 竖向列表顶部固定按钮): 语言切换后重新设置
+    sidebar_->setPinnedTabs({
+        {std::string(kInfoTabId),
+         std::string(tr("sidebar.info")),
+         [this]() {
+             ensureInfoSidebarTab();
+         }},
+        {std::string(kLogTabId),
+         std::string(tr("sidebar.logs")),
+         [this]() {
+             ensureLogSidebarTab();
+         }},
+    });
+    // 已创建 tab 的标题同步更新 (未创建时由 ensure 回调按新语言创建)
+    if (sidebar_->hasTab(kInfoTabId)) {
+        sidebar_->setTabTitle(kInfoTabId, tr("sidebar.info"));
+    }
+    if (sidebar_->hasTab(kLogTabId)) {
+        sidebar_->setTabTitle(kLogTabId, tr("sidebar.logs"));
+    }
+}
+
+void TUIClientAgentIO::openFailedAppendComponents() {
+    if (modal_ && !modal_->hasModal()) {
+        auto overlay = std::make_shared<FailedComponentsOverlay>(ctx_);
+        overlay->onClose([this] {
+            modal_->popModal();
+        });
+        modal_->pushModal(overlay);
+    }
+    postRedraw();
+}
+
+bool TUIClientAgentIO::collapseExpanded(
+    const std::string& ownerId,
+    const std::string& id,
+    bool               defaultValue
+) {
+    const std::string key = ownerId + ":" + id;
+    auto              it  = collapseStates_.find(key);
+    if (it != collapseStates_.end()) {
+        return it->second;
+    }
+    // 首次渲染时按描述缺省值登记 (点击切换后以登记值为准)
+    collapseStates_.emplace(key, defaultValue);
+    return defaultValue;
+}
+
+TUIClientAgentIO::PluginFormData& TUIClientAgentIO::formFor(
+    const std::string&             ownerId,
+    const std::string&             plugin,
+    std::vector<pluginxx::ui::Item> items
+) {
+    auto& data  = pluginForms_[ownerId];
+    data.plugin = plugin;
+    data.items  = std::move(items);
+    // 按描述补齐控件状态 (已初始化的控件保留用户输入)
+    agentxx::client::initFormState(data.state, data.items);
+    // 清理描述中已不存在的控件状态 (内容更新后不残留)
+    const auto ids = agentxx::client::collectControlIds(data.items);
+    for (auto it = data.state.controls.begin(); it != data.state.controls.end();) {
+        const bool exists = std::find(ids.begin(), ids.end(), it->first) != ids.end();
+        it                = exists ? std::next(it) : data.state.controls.erase(it);
+    }
+    if (!data.state.focusedId.empty()
+        && std::find(ids.begin(), ids.end(), data.state.focusedId) == ids.end()) {
+        data.state.focusedId.clear();
+    }
+    return data;
+}
+
+bool TUIClientAgentIO::submitSidebarForm(const std::string& ownerId, const std::string& plugin) {
+    auto it = pluginForms_.find(ownerId);
+    if (it == pluginForms_.end()) {
+        return false;
+    }
+    auto& form = it->second;
+    if (!agentxx::client::validateForm(form.items, form.state)) {
+        postRedraw();
+        return true;
+    }
+    const std::string values = agentxx::client::formValues(form.items, form.state).dump();
+    if (auto mgr = pluginManager_) {
+        auto           reg = mgr->uiRegistrySnapshot();
+        const uint64_t gen = reg ? reg->generationOf(plugin) : 0;
+        mgr->dispatchAction(
+            plugin,
+            ownerId,
+            std::string{agentxx::client::kFormSubmitActionId},
+            values,
+            gen
+        );
+    }
+    return true;
+}
+
+bool TUIClientAgentIO::cancelSidebarForm(const std::string& ownerId, const std::string& plugin) {
+    if (auto mgr = pluginManager_) {
+        auto           reg = mgr->uiRegistrySnapshot();
+        const uint64_t gen = reg ? reg->generationOf(plugin) : 0;
+        mgr->dispatchAction(
+            plugin,
+            ownerId,
+            std::string{agentxx::client::kFormCancelActionId},
+            "{}",
+            gen
+        );
+    }
+    return true;
+}
+
+bool TUIClientAgentIO::handleSidebarFormKey(const ftxui::Event& event) {
+    if (formFocusedOwner_.empty()) {
+        return false;
+    }
+    auto it = pluginForms_.find(formFocusedOwner_);
+    if (it == pluginForms_.end() || it->second.state.focusedId.empty()) {
+        formFocusedOwner_.clear();
+        return false;
+    }
+    auto& form = it->second;
+    // 回车: 焦点在控件上时视为提交整份表单
+    if (event == Event::Return) {
+        const std::string owner  = formFocusedOwner_;
+        const std::string plugin = form.plugin;
+        formFocusedOwner_.clear();
+        submitSidebarForm(owner, plugin);
+        postRedraw();
+        return true;
+    }
+    if (agentxx::client::handleFormKeyInput(form.items, form.state, event)) {
+        if (form.state.focusedId.empty()) {
+            formFocusedOwner_.clear();
+        }
+        postRedraw();
+        return true;
+    }
+    return false;
+}
+
+bool TUIClientAgentIO::handleSidebarRegionClick(const ftxui::Mouse& mouse) {
+    if (!sidebar_) {
+        return false;
+    }
+    auto* scroll = sidebar_->contentScrollable();
+    if (scroll == nullptr) {
+        return false;
+    }
+    size_t index  = 0;
+    int    localX = 0;
+    int    localY = 0;
+    if (!scroll->hitTestItem(mouse.x, mouse.y, index, localX, localY)) {
+        return false;
+    }
+    const auto& items = scroll->items();
+    if (index >= items.size()) {
+        return false;
+    }
+    const auto* region = matchUiHitRegion(items[index].hits, localX, localY);
+    if (region == nullptr) {
+        return false;
+    }
+    if (region->kind == UiHitRegionKind::Collapse) {
+        // 折叠标题: 翻转主程序维护的展开状态, 下一帧按新状态渲染
+        const std::string key = region->ownerId + ":" + region->id;
+        auto              it  = collapseStates_.find(key);
+        const bool        cur = (it == collapseStates_.end()) ? true : it->second;
+        collapseStates_[key]  = !cur;
+        postRedraw();
+        return true;
+    }
+    if (region->kind == UiHitRegionKind::Action) {
+        if (auto mgr = pluginManager_) {
+            // 实例代次从当前快照复查: 插件重载后旧点击被丢弃
+            auto           reg = mgr->uiRegistrySnapshot();
+            const uint64_t gen = reg ? reg->generationOf(region->plugin) : 0;
+            mgr->dispatchAction(region->plugin, region->ownerId, region->id, region->arg, gen);
+        }
+        return true;
+    }
+    // 表单控件与提交行: 状态由主程序维护, 结果经动作通道回传
+    auto formIt = pluginForms_.find(region->ownerId);
+    if (formIt == pluginForms_.end()) {
+        return false;
+    }
+    auto& form = formIt->second;
+    if (region->kind == UiHitRegionKind::Form) {
+        const auto action = agentxx::client::handleFormControlHit(
+            form.items,
+            form.state,
+            region->id,
+            region->sub
+        );
+        if (action == agentxx::client::UiFormAction::None) {
+            return false;
+        }
+        formFocusedOwner_ = region->ownerId;
+        if (action == agentxx::client::UiFormAction::Submit) {
+            // 点击即提交 (commitOnPick): 先校验再回传
+            submitSidebarForm(region->ownerId, region->plugin);
+        }
+        postRedraw();
+        return true;
+    }
+    if (region->kind == UiHitRegionKind::FormSubmit) {
+        const auto action = agentxx::client::handleFormSubmitHit(region->id);
+        formFocusedOwner_.clear();
+        if (action == agentxx::client::UiFormAction::Submit) {
+            submitSidebarForm(region->ownerId, region->plugin);
+        } else if (action == agentxx::client::UiFormAction::Cancel) {
+            cancelSidebarForm(region->ownerId, region->plugin);
+        }
+        postRedraw();
+        return true;
+    }
+    return false;
+}
+
+void TUIClientAgentIO::openOverlay(
+    int         type,
+    std::string title,
+    std::string payload,
+    std::string extraJson,
+    std::string ownerPlugin
+) {
+    // UI 线程调用 (适配器经 postToUi 投递)
+    // 已有 overlay/核心弹窗时的策略由 extra_json 的 `stack` 决定 (见 plan/overlays.h):
+    // - 缺省 (stack=false): 替换当前 overlay (last-wins, 与接口注释一致)
+    // - stack=true: 保留现有 overlay, 丢弃本次请求 (TUI 无排队语义, 记日志)
+    const auto options = agentxx::client::OverlayOptions::fromJson(extraJson);
+    if (!modal_) {
+        return;
+    }
+    if (modal_->hasModal()) {
+        if (options.stack) {
+            XX_LOGW("[tui] open_overlay ignored (modal already open, stack=true)");
+            return;
+        }
+        modal_->popModal();
+    }
+    overlayOwnerPlugin_ = std::move(ownerPlugin);
+    auto overlay        = createUniversalOverlay(
+        ctx_,
+        type,
+        title,
+        payload,
+        extraJson,
+        overlayOwnerPlugin_,
+        [this] {
+            modal_->popModal();
+            // Esc/底栏关闭同样要撤销 overlay 区域的可见性 (插件定时器据此恢复暂停)
+            overlayOwnerPlugin_.clear();
+            reportOverlayVisible(false);
+        }
+    );
+    if (overlay) {
+        modal_->pushModal(std::move(overlay));
+        // overlay 已上屏: 关联区域视为可见 (插件可据 `is_visible` 决定是否刷新内容)
+        reportOverlayVisible(true);
+    }
+    postRedraw();
+}
+
+void TUIClientAgentIO::closeOverlay() {
+    // UI 线程调用 (适配器经 postToUi 投递)
+    if (modal_ && modal_->hasModal()) {
+        modal_->popModal();
+    }
+    overlayOwnerPlugin_.clear();
+    reportOverlayVisible(false);
+    postRedraw();
+}
+
+void TUIClientAgentIO::openSessionSelector() {
+    if (!modal_ || modal_->hasModal()) {
+        return;
+    }
+    // server-io 未就绪时 WireListSessions/WireSwitchSession 无法送达,
+    // 会话列表将永远显示 loading; 提示用户等待连接完成
+    if (ctx_.frameState && ctx_.frameState->connState != ConnState::Connected) {
+        showToast(std::string(tr("toast.notReady")));
+        postRedraw();
+        return;
+    }
+    // 仅当前会话非运行状态时可切换: 轮次进行中切换会话会使 WireDelta/输入错投,
+    // 请先停止当前会话 (Esc 或点击停止)
+    // 提示以屏幕上方 toast 展示 (3 秒自动消失), 不插入消息列表
+    const bool busy = (ctx_.frameState && ctx_.frameState->isStreaming)
+                      || awaitingInterruptInput_.load(std::memory_order_acquire);
+    if (busy) {
+        showToast(std::string(tr("toast.stopToSwitch")));
+        postRedraw();
+        return;
+    }
+    // 请求服务端持久化会话列表首页 (WireSessionList 异步回填 sharedState);
+    // 重置分页状态使弹窗先显示 loading; keyset 游标 beforeMs=0 表示从最新开始,
+    // 仅取 kSessionListPageSize 条, 浏览到末尾时经 ctx.requestMoreSessions 续取
+    sharedState_.mutate([](TUIRenderState& st) {
+        st.sessionList.clear();
+        st.sessionListLoaded      = false;
+        st.sessionListHasMore     = false;
+        st.sessionListLoadingMore = false;
+        st.sessionListTotalCount  = 0;
+    });
+    requestSessionListPage(0, "", kSessionListPageSize);
+
+    auto overlay = std::make_shared<SessionSelectorOverlay>(ctx_);
+    overlay->onClose([this] {
+        modal_->popModal();
+    });
+    overlay->onSelect([this](std::string sessionId) {
+        switchToSession(std::move(sessionId));
+    });
+    overlay->onNewSession([this] {
+        // 新建会话: 生成全新 sessionId 并切换 (无历史, 服务端回推空 Sync)
+        const auto newThreadId = agentxx::client::generateUniqueSessionId();
+        XX_LOGI("[tui] new session: {}", newThreadId);
+        switchToSession(newThreadId);
+    });
+    // 会话改名: 发 WireRenameSession, 结果经 onSessionRenameResult 回填
+    overlay->onRename([this](std::string sessionId, std::string title) {
+        requestRenameSession(std::move(sessionId), std::move(title));
+    });
+    modal_->pushModal(overlay);
+    postRedraw();
+}
+
+void TUIClientAgentIO::openFilePickerOverlay() {
+    if (!modal_ || modal_->hasModal()) {
+        return;
+    }
+    // 获取当前模型多模态能力
+    agentxx::agent::ModelCapabilityInfo cap;
+    if (ctx_.frameState) {
+        cap = ctx_.frameState->currentModelCapability();
+    }
+    if (!cap.hasMultimodalInput()) {
+        showToast(std::string(tr("toast.attachNotSupported")));
+        postRedraw();
+        return;
+    }
+    // 检查附件数量限制
+    if (inputBar_ && inputBar_->attachments().size() >= agentxx::agent::kMaxAttachmentsPerMessage) {
+        showToast(std::string(tr("toast.attachLimit")));
+        postRedraw();
+        return;
+    }
+
+    auto overlay = std::make_shared<FilePickerOverlay>(ctx_, cap);
+    overlay->onClose([this] {
+        modal_->popModal();
+    });
+    overlay->onSelectAttachment([this](agentxx::agent::MediaAttachment att) {
+        if (inputBar_) {
+            inputBar_->addAttachment(std::move(att));
+        }
+        postRedraw();
+    });
+    modal_->pushModal(overlay);
+    postRedraw();
+}
+
+void TUIClientAgentIO::switchToSession(std::string newThreadId) {
+    if (newThreadId.empty() || newThreadId == currentSessionId()) {
+        return;
+    }
+    XX_LOGI("[tui] switching session: {} -> {}", currentSessionId(), newThreadId);
+    setCurrentSessionId(newThreadId);
+    // 更新组件共享上下文: 状态栏/会话弹窗据此标记 current 会话
+    ctx_.sessionId = newThreadId;
+    // 注意: TUI 不持有 Session (属于 server-io 线程), 切换后服务端回推
+    // 新会话的全量 Sync + WireModelInfo + WireContextStats (WireSwitchSession
+    // 处理路径), 客户端界面 (消息历史/模型名/上下文统计) 随之整体更新
+    // 清理上一会话遗留的消息列表吸附/中断 UI 状态;
+    // 消息历史由服务端回推的全量 Sync 整体替换 (onSync)
+    if (messageList_) {
+        messageList_->setStickToBottom(true);
+        messageList_->clearInterruptUiState();
+    }
+    awaitingInterruptInput_.store(false, std::memory_order_release);
+    // 清理上一会话遗留的排队输入与上下文弹窗数据 (正常路径下切换前
+    // isStreaming == false 时排队输入已清空, 此处兜底防御), 避免串扰新会话;
+    // 保持当前选定模型不变 (不随会话切换自动重置), 记录为新会话的 pendingModel
+    std::string currentModel;
+    sharedState_.mutate([&](TUIRenderState& st) {
+        // 历史窗口与队列镜像随会话切换作废 (旧会话的迟到响应/快照据此被丢弃)
+        st.history.resetForSession(newThreadId);
+        st.queue.clear();
+        st.pendingInputs.clear();
+        st.contextMessages.reset();
+        st.showContextOverlay = false;
+        currentModel          = st.cachedModelName;
+        if (!currentModel.empty()) {
+            st.pendingModel = currentModel;
+        }
+    });
+    // WS 模式: 更新重连握手 sessionId 并复位增量重放状态 (新会话 delta seq 独立编号);
+    // Channel/进程内模式为 no-op
+    if (transport_) {
+        transport_->updateReconnectSessionId(newThreadId);
+        sendToPeer(agentxx::agent::WireSwitchSession{newThreadId});
+        if (!currentModel.empty()) {
+            sendToPeer(agentxx::agent::WireSelectModel{newThreadId, currentModel});
+        }
+    }
+    postRedraw();
+    // 通知事件接收器: 会话切换 (post 到 client io 线程)
+    {
+        auto self = shared_from_this();
+        asio::post(ex_, [self, tid = newThreadId]() mutable {
+            self->emitEventSink([&](agentxx::agent::ClientEventSink& sink) {
+                sink.onSessionSwitched(tid);
+            });
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// requestCancel / setPendingModel
+// ---------------------------------------------------------------------------
+
+void TUIClientAgentIO::requestCancel(std::string sessionId) {
+    if (transport_) {
+        sendToPeer(agentxx::agent::WireCancel{std::move(sessionId)});
+    }
+}
+
+void TUIClientAgentIO::setPendingModel(std::string model) {
+    if (model.empty()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(sharedState_.mutex());
+    auto&                       st = sharedState_.mutableState();
+    st.cachedModelName             = model;
+    st.pendingModel                = std::move(model);
+}
+
+// ---------------------------------------------------------------------------
+// onPeerMessage (client 线程)
+// ---------------------------------------------------------------------------
+
+void TUIClientAgentIO::onPeerMessage(agentxx::agent::WireMessage msg) {
+    std::visit(
+        [this](auto&& m) {
+            using T = std::decay_t<decltype(m)>;
+            if constexpr (std::is_same_v<T, agentxx::agent::WireDelta>) {
+                // 通知事件接收器 (client 插件系统订阅 delta 事件)
+                emitEventSink([&](agentxx::agent::ClientEventSink& sink) {
+                    sink.onDelta(m);
+                });
+                onDelta(m);
+            } else if constexpr (std::is_same_v<T, agentxx::agent::WireSyncPayload>) {
+                onSync(m);
+            } else if constexpr (std::is_same_v<T, agentxx::agent::WireTurnResult>) {
+                // 通知事件接收器 (client 插件系统订阅轮次结束事件)
+                emitEventSink([&](agentxx::agent::ClientEventSink& sink) {
+                    sink.onTurnResult(m);
+                });
+                onTurnResult(m);
+            } else if constexpr (std::is_same_v<T, agentxx::agent::WireContextStats>) {
+                onContextStats(m);
+            } else if constexpr (std::is_same_v<T, agentxx::agent::WireInterruptRequest>) {
+                auto self = shared_from_this();
+                asio::co_spawn(
+                    ex_,
+                    [self, req = std::move(m)]() mutable -> asio::awaitable<void> {
+                        // 记录 wire id 供 handleInterrupt 使用 (同线程顺序执行);
+                        // 过期通知 (WireInterruptExpired) 按该 id 匹配并终止等待
+                        self->interruptWireId_ = req.id;
+                        auto result            = co_await self->handleInterrupt(
+                            req.sessionId,
+                            req.node,
+                            req.value,
+                            req.argJson
+                        );
+                        self->sendToPeer(agentxx::agent::WireInterruptResponse{req.id, result});
+                    },
+                    asio::detached
+                );
+            } else if constexpr (std::is_same_v<T, agentxx::agent::WireInterruptExpired>) {
+                // server 通知中断已过期 (超时/会话取消): 将对应未操作的中断消息
+                // 标记为过期, 并关闭结果回传通道终止 handleInterrupt 的等待
+                // (其返回已收集的结果, 不再等待用户操作)
+                const auto expiredId = m.id;
+                {
+                    std::lock_guard<std::mutex> lock(sharedState_.mutex());
+                    auto&                       st = sharedState_.mutableState();
+                    for (size_t i = 0; i < st.messages.size(); ++i) {
+                        const auto& msg = *st.messages[i];
+                        if (msg.role == TUIMessage::Role::Interrupt && msg.interrupt
+                            && msg.interrupt->interruptId == expiredId
+                            && msg.interrupt->interruptStatus
+                                   == TUIMessage::InterruptStatus::Waiting) {
+                            auto& mm                      = sharedState_.mutableMessage(st, i);
+                            mm.interrupt->interruptStatus = TUIMessage::InterruptStatus::Expired;
+                        }
+                    }
+                }
+                auto it = activeInterrupts_.find(expiredId);
+                if (it != activeInterrupts_.end()) {
+                    it->second->close();
+                }
+                postRedraw();
+            } else if constexpr (std::is_same_v<T, agentxx::agent::WireLog>) {
+                utilxx_base::LogDispatcher::instance().dispatch(
+                    static_cast<utilxx_base::LogLevel>(m.level),
+                    m.message
+                );
+            } else if constexpr (std::is_same_v<T, agentxx::agent::WireModelInfo>) {
+                {
+                    std::lock_guard<std::mutex> lock(sharedState_.mutex());
+                    auto&                       st = sharedState_.mutableState();
+                    if (!m.models.empty()) {
+                        st.modelNames = m.models;
+                    }
+                    // 仅当客户端尚未记录任何模型 (初始加载) 时才从服务端填充;
+                    // 若客户端已有选定模型 (无论是默认初始还是用户手动选择),
+                    // 不被服务端推送的模型信息覆盖 (避免弹窗打开/关闭或切换会话时自动变回默认模型)
+                    if (!m.currentModel.empty() && st.cachedModelName.empty()) {
+                        st.cachedModelName = m.currentModel;
+                    }
+                    for (const auto& cap : m.capabilities) {
+                        st.modelCapabilities[cap.name] = cap;
+                    }
+                    st.modelInfoLoaded = true;
+                }
+                postRedraw();
+            } else if constexpr (std::is_same_v<T, agentxx::agent::WireAppendComponentInfo>) {
+                {
+                    std::lock_guard<std::mutex> lock(sharedState_.mutex());
+                    auto&                       st = sharedState_.mutableState();
+                    for (const auto& notif : m.notifications) {
+                        st.appendComponents.push_back(notif);
+                    }
+                }
+                postRedraw();
+            } else if constexpr (std::is_same_v<T, agentxx::agent::WirePluginData>) {
+                // 插件事件转发 (WirePluginData): 原样通知事件接收器 (client
+                // 插件系统订阅跨端插件数据事件)。渲染由各插件的 client 侧
+                // 入口完成 (如 agentxx_codegraph 经订阅更新侧边栏面板、
+                // agentxx_system_monitor 周期采集的 usage 事件更新状态栏项),
+                // TUI 不再解析/保存插件载荷
+                emitEventSink([&](agentxx::agent::ClientEventSink& sink) {
+                    sink.onPluginData(m);
+                });
+                postRedraw();
+            } else if constexpr (std::is_same_v<T, agentxx::agent::WireContextMessages>) {
+                {
+                    std::lock_guard<std::mutex> lock(sharedState_.mutex());
+                    auto&                       st = sharedState_.mutableState();
+                    st.contextMessages = std::make_shared<utilxx_base::Json>(std::move(m.messages));
+                    st.showContextOverlay = true;
+                }
+                // 打开上下文弹窗: 组件树由 UI 线程独占, 须投递到 UI 线程执行
+                enqueueUiAction([this]() {
+                    if (modal_ && !modal_->hasModal()) {
+                        auto overlay = std::make_shared<ContextOverlay>(ctx_);
+                        overlay->onClose([this] {
+                            modal_->popModal();
+                        });
+                        modal_->pushModal(overlay);
+                    }
+                });
+                postRedraw();
+            } else if constexpr (std::is_same_v<T, agentxx::agent::WireHelloAck>) {
+                onHelloAck(m);
+            } else if constexpr (std::is_same_v<T, agentxx::agent::WireSessionList>) {
+                // 会话选择弹窗数据源: 分页响应回填/追加到已加载会话列表
+                onSessionListPage(m);
+            } else if constexpr (std::is_same_v<T, agentxx::agent::WireRenameSessionResult>) {
+                // 会话改名结果: 成功则就地更新本地列表标题, 失败提示原因
+                onSessionRenameResult(m);
+            } else if constexpr (std::is_same_v<T, agentxx::agent::WireMessageQueueUpdate>) {
+                onMessageQueueUpdate(m);
+            } else if constexpr (std::is_same_v<T, agentxx::agent::WireViewMessagesPage>) {
+                // 历史分页响应: 前插到已加载窗口上方 (向上滚动加载更早历史)
+                onViewMessagesPage(m);
+            } else if constexpr (std::is_same_v<T, agentxx::agent::WireListDirResult>) {
+                std::function<void(const agentxx::agent::WireListDirResult&)> cb;
+                {
+                    std::lock_guard<std::mutex> lock(listDirMutex_);
+                    auto                        it = pendingListDirCallbacks_.find(m.reqId);
+                    if (it != pendingListDirCallbacks_.end()) {
+                        cb = std::move(it->second);
+                        pendingListDirCallbacks_.erase(it);
+                    }
+                }
+                if (cb) {
+                    enqueueUiAction([cb = std::move(cb), resp = std::move(m)]() {
+                        cb(resp);
+                    });
+                }
+            } else if constexpr (std::is_same_v<T, agentxx::agent::WirePermissionState>) {
+                // 权限状态: 查询响应 / 切换后广播 / 服务端侧状态变更广播
+                // (用户在权限询问卡片勾选"完全授权所有权限"时也会收到)
+                std::lock_guard<std::mutex> lock(sharedState_.mutex());
+                auto&                       st = sharedState_.mutableState();
+                if (st.fullAuthorized != m.fullAuth) {
+                    st.fullAuthorized = m.fullAuth;
+                    postRedraw();
+                }
+            } else if constexpr (std::is_same_v<T, agentxx::agent::WireInputAck>) {
+                // 输入受理回执: 被拒绝时明确提示, 不再从 delta 猜测
+                onInputAck(m);
+            } else if constexpr (std::is_same_v<T, agentxx::agent::WireAddModelResult>) {
+                // 新增模型配置的回执: 成功时立即使用该模型 (状态栏 + 下一条消息携带;
+                // 与 WireSelectModel 同一机制), 失败时把 agent 侧的原因提示给用户
+                if (m.ok) {
+                    setPendingModel(m.name);
+                }
+                const bool        ok   = m.ok;
+                const std::string name = m.name;
+                const std::string err  = m.error;
+                // 提示与"待选中模型"清理属 UI 线程独占状态: 投递到 UI 线程执行
+                enqueueUiAction([this, ok, name, err] {
+                    pendingNewModel_.clear();
+                    if (ok) {
+                        showToast(trf("toast.modelAdded", name));
+                    } else {
+                        showToast(trf("toast.modelAddFailed", err));
+                    }
+                });
+                postRedraw();
+            }
+        },
+        std::move(msg)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 协议处理辅助 (调用方须持有 sharedState_.mutex())
+// ---------------------------------------------------------------------------
+
+void TUIClientAgentIO::resetTrailingRunningToolsLocked(TUIRenderState& st) {
+    for (size_t i = st.messages.size(); i > 0; --i) {
+        const auto& msg = *st.messages[i - 1];
+        if (msg.role != TUIMessage::Role::Tool) {
+            break;
+        }
+        if (msg.tool && !msg.tool->toolFinished) {
+            auto& m              = sharedState_.mutableMessage(st, i - 1);
+            m.tool->toolFinished = true;
+        }
+    }
+}
+
+void TUIClientAgentIO::pushCurrentTokenLocked(TUIRenderState& st) {
+    if (!st.hasPendingToken()) {
+        return;
+    }
+    resetTrailingRunningToolsLocked(st);
+    auto msg  = std::make_shared<TUIMessage>();
+    msg->role = st.currentTokenRole;
+    if (st.currentToken && !st.currentToken->empty()) {
+        msg->text = *st.currentToken;
+    }
+    if (st.currentTokenRole == TUIMessage::Role::Think) {
+        // 折叠态跟随用户对流式思考的手动点击: 用户点击展开过则提交后保持展开
+        // (思考结束不自动折回), 未点击/点击折叠时维持默认折叠。
+        // 覆盖态说明见 TUIRenderState::streamThinkOverride
+        msg->collapsed = (st.streamThinkOverride != 1);
+        if (st.pendingTokenThink.has_value()) {
+            msg->think = *st.pendingTokenThink;
+        }
+    }
+    msg->durationMs  = st.pendingTokenDurationMs;
+    msg->startTimeMs = st.pendingTokenStartTimeMs;
+    // 空 content 消息过滤: 流式正文 (Assistant) 全为空白时不落入消息列表
+    // (如模型只输出了空格/换行); Think 消息仍保留 (头部显示思考时长)
+    if (!isBlankContentMessage(*msg)) {
+        st.messages.push_back(std::move(msg));
+    }
+    st.pendingTokenDurationMs  = 0;
+    st.pendingTokenStartTimeMs = 0;
+    st.pendingTokenThink.reset();
+    st.currentToken.reset();
+    // 当前流的折叠覆盖态已随本次提交生效并按消息落盘, 就此失效:
+    // 下一次思考 (新流) 回到设置模式 (TailThinkingMode) 的默认展示
+    st.streamThinkOverride = -1;
+}
+
+void TUIClientAgentIO::cancelCurrentRunLocked(TUIRenderState& st) {
+    requestCancel(currentSessionId());
+    pushCurrentTokenLocked(st);
+    resetTrailingRunningToolsLocked(st);
+    // 取消提示由 agent 线程确认取消后经 MessageTip WireDelta 插入 (原在此处
+    // 即时插入 "[Cancel Request]", 迁移后由 agent 端统一插入保证历史一致)
+    st.isStreaming = false;
+}
+
+void TUIClientAgentIO::sendUserInputLocked(
+    TUIRenderState&                              st,
+    std::string                                  text,
+    std::vector<agentxx::agent::MediaAttachment> attachments
+) {
+    resetTrailingRunningToolsLocked(st);
+    // 事件接收器通知用原文 (inputChannel 分支会 move text, 提前拷贝)
+    const std::string notifyText = text;
+    // 待应用模型选择: 取走后随本条消息携带给 server-io (WireUserInput.model),
+    // BaseAgent 执行新一轮会话时自动切换; 清空使模型选择仅对"选择之后发送的
+    // 下一条消息"生效
+    std::string pendingModel = std::move(st.pendingModel);
+    st.pendingModel.clear();
+    if (transport_) {
+        sendToPeer(agentxx::agent::WireUserInput{
+            currentSessionId(),
+            text,
+            std::move(pendingModel),
+            std::move(attachments),
+            std::string{agentxx::agent::InputDelivery::NextTurn},
+            ++nextInputRequestId_
+        });
+    } else {
+        // 无 transport (遗留直连模式): 输入经本地 channel 送达, 无法携带
+        // 模型选择, 已取走的 pendingModel 直接丢弃 (该模式下不切换模型)
+        inputChannel_->async_send(
+            utilxx_base::AsioErrorCode{},
+            std::move(text),
+            [](utilxx_base::AsioErrorCode) {}
+        );
+    }
+    // 通知事件接收器 (用户输入事件; 任意线程安全, 内部按需 post 到 io 线程)
+    notifyUserInputSent(currentSessionId(), notifyText);
+}
+
+void TUIClientAgentIO::onMessageQueueUpdate(const agentxx::agent::WireMessageQueueUpdate& update) {
+    {
+        std::lock_guard<std::mutex> lock(sharedState_.mutex());
+        auto&                       st = sharedState_.mutableState();
+        if (st.pendingInputs.empty() && update.items.empty()) {
+            return;
+        }
+        // 界面展开态按"条目 id(空则文本)"保留: 队列快照整体替换时不能让用户
+        // 正在查看的条目被折回
+        std::map<std::string, bool> expandedMap;
+        for (const auto& pi : st.pendingInputs) {
+            auto key         = pi.id.empty() ? pi.text : pi.id;
+            expandedMap[key] = pi.expanded;
+        }
+        // 服务端队列是唯一权威: 先应用快照 (含队列状态), 展示列表由镜像派生
+        std::vector<agentxx::client::MessageQueueMirror::Entry> entries;
+        entries.reserve(update.items.size());
+        for (const auto& item : update.items) {
+            entries.push_back(agentxx::client::MessageQueueMirror::Entry{
+                item.id,
+                item.text,
+                item.model,
+                item.attachments,
+                item.createdAtMs,
+            });
+        }
+        st.queue.applySnapshot(entries, update.state);
+        st.pendingInputs.clear();
+        for (const auto& entry : st.queue.entries()) {
+            TUIPendingInput pi;
+            pi.id          = entry.id;
+            pi.text        = entry.text;
+            pi.model       = entry.model;
+            pi.attachments = entry.attachments;
+            pi.createdAtMs = entry.createdAtMs;
+            auto key       = pi.id.empty() ? pi.text : pi.id;
+            if (expandedMap.count(key)) {
+                pi.expanded = expandedMap[key];
+            }
+            st.pendingInputs.push_back(std::move(pi));
+        }
+    }
+    postRedraw();
+}
+
+// ---------------------------------------------------------------------------
+// 历史分页 (client 线程)
+//
+// 长会话恢复时服务端仅同步末尾窗口 (WireSyncPayload.fromIndex = 窗口起始绝对
+// 下标), 用户向上滚动到已加载窗口顶部时经 WireGetViewMessages 分页拉取
+// 更早历史; 页响应在此前插到本地窗口上方并做滚动锚定。
+// viewMessages 为 append-only, 绝对下标恒定, 前插不影响既有下标。
+// ---------------------------------------------------------------------------
+
+void TUIClientAgentIO::onViewMessagesPage(const agentxx::agent::WireViewMessagesPage& page) {
+    size_t prependedCount = 0;
+    bool   anchored       = false;
+    {
+        std::lock_guard<std::mutex> lock(sharedState_.mutex());
+        auto& st = sharedState_.mutableState();
+        // 页响应判定集中在窗口模型 (迟到会话/空页/不连续页/重复响应)
+        const auto outcome = st.history.applyPage(
+            page.sessionId,
+            page.startIndex,
+            page.messages.size(),
+            page.totalCount
+        );
+        if (outcome == agentxx::client::HistoryWindow::PageOutcome::StaleSession) {
+            XX_LOGW(
+                "[tui] drop stale history page (session {} != {})",
+                page.sessionId,
+                currentSessionId()
+            );
+            return;
+        }
+        if (outcome == agentxx::client::HistoryWindow::PageOutcome::Empty) {
+            return;
+        }
+        if (outcome == agentxx::client::HistoryWindow::PageOutcome::NonContiguous) {
+            XX_LOGW(
+                "[tui] drop non-contiguous history page (start={}, count={}, window start={})",
+                page.startIndex,
+                page.messages.size(),
+                st.history.windowStart()
+            );
+            return;
+        }
+        prependedCount = page.messages.size();
+        prependedCount = page.messages.size();
+        anchored       = !st.messages.empty();
+        // ViewMessage → TUIMessage (shared_ptr) 转换后按页内顺序整体前插
+        // (空 content 消息过滤: 不入列表, 前插条数按实际插入项计数,
+        //  滚动锚定依赖该条数估算新增行数)
+        std::vector<std::shared_ptr<TUIMessage>> converted;
+        converted.reserve(page.messages.size());
+        for (const auto& vm : page.messages) {
+            auto msg = std::make_shared<TUIMessage>(vm);
+            if (isBlankContentMessage(*msg)) {
+                continue;
+            }
+            converted.push_back(std::move(msg));
+        }
+        prependedCount = converted.size();
+        st.messages.insert(st.messages.begin(), converted.begin(), converted.end());
+        // 窗口起点左移到本页起始下标, 条数按实际入列表条数累加
+        st.history.notePrepended(page.startIndex, prependedCount);
+    }
+    // 滚动锚定: LazyScrollable 为 UI 线程独占, 经动作队列在帧间执行。
+    // anchored=false 表示首屏填充 (前插前无消息), 无需稳定旧视口内容
+    enqueueUiAction([this, prependedCount, anchored]() {
+        if (messageList_ && anchored) {
+            messageList_->onHistoryPrepended(prependedCount);
+        }
+    });
+    postRedraw();
+}
+
+void TUIClientAgentIO::requestOlderHistory() {
+    uint64_t beforeIndex = 0;
+    {
+        std::lock_guard<std::mutex> lock(sharedState_.mutex());
+        auto&                       st = sharedState_.mutableState();
+        // 边界判断 + 请求去重 (UI 线程滚动事件可能高频触发)
+        if (!st.history.beginOlderPageRequest()) {
+            return;
+        }
+        beforeIndex = st.history.windowStart();
+    }
+    requestViewMessagesPage(currentSessionId(), beforeIndex, kHistoryPageSize);
+}
+
+void TUIClientAgentIO::onHelloAck(const agentxx::agent::WireHelloAck& ack) {
+    serverDeviceId_     = ack.deviceId;
+    serverWorkDir_      = ack.workDir;
+    ctx_.serverDeviceId = serverDeviceId_;
+    ctx_.serverWorkDir  = serverWorkDir_;
+    XX_LOGI(
+        "[tui] hello ack: serverDeviceId={}, isServerDifferentDevice={}",
+        serverDeviceId_,
+        ctx_.isServerDifferentDevice()
+    );
+    // 权限状态: 握手后主动查询一次 (Info 侧边栏授权按钮初值; 服务端多数也会
+    // 随握手主动下发, 重复无害 —— 状态消息幂等)
+    sendToPeer(agentxx::agent::WireGetPermissionState{});
+}
+
+void TUIClientAgentIO::toggleFullAuth() {
+    const bool next = !(ctx_.frameState && ctx_.frameState->fullAuthorized);
+    // 乐观更新本地界面: 按钮即刻切换 (服务端应用后经 WirePermissionState
+    // 广播真实状态, 二者一致)
+    {
+        std::lock_guard<std::mutex> lock(sharedState_.mutex());
+        auto&                       st = sharedState_.mutableState();
+        st.fullAuthorized              = next;
+    }
+    if (transport_) {
+        sendToPeer(agentxx::agent::WireSetFullAuth{.fullAuth = next});
+    }
+    uiToast(next ? std::string{tr("toast.fullAuthOn")} : std::string{tr("toast.fullAuthOff")}, 0);
+    postRedraw();
+}
+
+// ---------------------------------------------------------------------------
+// 启动更新检查 (GitHub Release)
+// ---------------------------------------------------------------------------
+
+namespace {
+/// 启动后到发起更新请求的等待时长: 不与首屏渲染/agent 初始化争抢网络与 CPU
+/// (检查只为附加提示, 晚几秒到达无影响)
+constexpr auto kUpdateCheckDelay = std::chrono::seconds{3};
+} // namespace
+
+void TUIClientAgentIO::startUpdateCheck() {
+    if (!TUISettings::instance().checkUpdateOnStartup()) {
+        XX_LOGD("[tui] update check disabled by settings (启动时检查更新: 关)");
+        return;
+    }
+    auto weak = weak_from_this();
+    asio::co_spawn(
+        ex_,
+        [weak]() -> asio::awaitable<void> {
+            auto self = weak.lock();
+            if (!self) {
+                co_return;
+            }
+            asio::steady_timer timer(co_await asio::this_coro::executor);
+            timer.expires_after(kUpdateCheckDelay);
+            co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
+
+            auto result = co_await agentxx::client::checkLatestReleaseForCurrentVersion();
+
+            // 结果应用 (须在 UI 线程): 期间 TUI 可能已退出, 退出后不再改动界面
+            auto keepAlive = weak.lock();
+            if (!keepAlive || !keepAlive->running()) {
+                co_return;
+            }
+            keepAlive->applyUpdateCheckResult(std::move(result));
+            co_return;
+        },
+        asio::detached
+    );
+}
+
+void TUIClientAgentIO::applyUpdateCheckResult(agentxx::client::UpdateCheckResult result) {
+    if (!result.ok) {
+        // 附加提示: 检查失败 (无网络/超时/端点变更) 只记日志, 不打扰用户
+        XX_LOGD("[tui] update check failed: {}", result.error);
+        return;
+    }
+    XX_LOGI(
+        "[tui] update check: current={} latest={} hasUpdate={}",
+        kAgentxxVersion,
+        result.latestTag,
+        result.hasUpdate
+    );
+    if (!result.hasUpdate) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(sharedState_.mutex());
+        auto&                       st = sharedState_.mutableState();
+        st.availableUpdateTag          = result.latestTag;
+        st.availableUpdateUrl          = result.url;
+    }
+    uiToast(trf("toast.updateAvailable", result.latestTag, std::string{kAgentxxVersion}), 0);
+    postRedraw();
+}
+
+// ---------------------------------------------------------------------------
+// 即时更新检查 (设置弹窗"检查更新"条目)
+//
+// 与启动检查共用同一个探测实现, 差别在触发方式与结果呈现:
+// - 启动检查是附加提示 (失败静默, 只在界面角落留一行提示);
+// - 即时检查是用户明确要求的动作, 无论成功/无更新/失败都必须有反馈:
+//   有新版本直接弹窗 (含发布页链接与"前往下载"按钮), 无更新/失败用 toast 说明。
+// ---------------------------------------------------------------------------
+
+void TUIClientAgentIO::requestUpdateCheckNow() {
+    // 点击反馈: 探测最长可能耗到连接/读块超时 (各 8 秒), 期间必须有提示
+    showToast(std::string{tr("toast.updateChecking")});
+    if (updateChecking_.exchange(true, std::memory_order_acq_rel)) {
+        // 已有检查在跑: 不重复发请求 (结果仍在路上, 到达时照常提示)
+        XX_LOGD("[tui] update check already in flight, skip duplicate request");
+        return;
+    }
+    auto weak = weak_from_this();
+    asio::co_spawn(
+        ex_,
+        [weak]() -> asio::awaitable<void> {
+            auto self = weak.lock();
+            if (!self) {
+                co_return;
+            }
+            auto result = co_await agentxx::client::checkLatestReleaseForCurrentVersion();
+
+            // 结果处理留在 client io 线程 (弹窗/toast 由 applyManualUpdateCheckResult
+            // 投递到 UI 线程); 期间 TUI 可能已退出, 退出后只复位标志
+            auto keepAlive = weak.lock();
+            if (!keepAlive) {
+                co_return;
+            }
+            keepAlive->applyManualUpdateCheckResult(std::move(result));
+            co_return;
+        },
+        asio::detached
+    );
+}
+
+void TUIClientAgentIO::applyManualUpdateCheckResult(agentxx::client::UpdateCheckResult result) {
+    // 先复位进行中标志: 用户可在结果提示后立即再点一次"检查更新"
+    updateChecking_.store(false, std::memory_order_release);
+
+    if (result.ok && result.hasUpdate) {
+        // 与启动检查共用同一状态: Info 侧边栏底部的"发现新版本"提示行
+        std::lock_guard<std::mutex> lock(sharedState_.mutex());
+        auto&                       st = sharedState_.mutableState();
+        st.availableUpdateTag          = result.latestTag;
+        st.availableUpdateUrl          = result.url;
+    }
+    XX_LOGI(
+        "[tui] manual update check: ok={} current={} latest={} hasUpdate={} error={}",
+        result.ok,
+        kAgentxxVersion,
+        result.latestTag,
+        result.hasUpdate,
+        result.error
+    );
+
+    // 结果呈现 (弹窗/toast) 与组件树一样属于 UI 线程独占操作
+    enqueueUiAction([this, result = std::move(result)]() {
+        showUpdateCheckResult(result);
+    });
+}
+
+void TUIClientAgentIO::showUpdateCheckResult(const agentxx::client::UpdateCheckResult& result) {
+    if (!result.ok) {
+        showToast(trf("toast.updateCheckFailed", result.error));
+        return;
+    }
+    if (!result.hasUpdate) {
+        showToast(std::string{tr("toast.updateLatest")});
+        return;
+    }
+    XX_LOGI("[tui] update available: {} -> {}", kAgentxxVersion, result.latestTag);
+    openUpdateNotice(result.latestTag, result.url);
+}
+
+void TUIClientAgentIO::openUpdateNotice(std::string latestTag, std::string url) {
+    if (!modal_) {
+        // 无模态容器 (TUI 未启动或已退出): 结果已写入共享状态与日志, 不再弹窗
+        XX_LOGW("[tui] skip update notice overlay: modal container unavailable");
+        return;
+    }
+    // 打开浏览器用的链接副本: 弹窗持有的是形参 move 后的值, 动作闭包存在弹窗内,
+    // 因此按值捕获即可 (生命周期随弹窗)
+    const std::string target = url;
+    auto              overlay = std::make_shared<UpdateNoticeOverlay>(
+        ctx_,
+        std::string{kAgentxxVersion},
+        std::move(latestTag),
+        std::move(url)
+    );
+    overlay->onClose([this] {
+        modal_->popModal();
+    });
+    // 打开动作由主程序实现 (弹窗只负责展示与命中)
+    overlay->onDownload([this, target] {
+        if (!agentxx::client::openUrlInBrowser(target)) {
+            // 链接未通过校验 (不会发起任何命令): 保留弹窗 (链接可拖选复制) 并提示
+            showToast(std::string{tr("toast.updateOpenFail")});
+            return;
+        }
+        // 已交给系统默认程序打开: 关闭弹窗。关闭经 UI 动作队列延后到本次事件
+        // 处理返回之后执行 —— 在弹窗自己的事件处理中 popModal() 会析构正在执行
+        // 的弹窗对象 (见 ModalContainer::OnEvent 的说明)
+        enqueueUiAction([this] {
+            if (modal_) {
+                modal_->popModal();
+            }
+            postRedraw();
+        });
+    });
+    modal_->pushModal(overlay);
+    postRedraw();
+}
+
+void TUIClientAgentIO::requestServerListDir(
+    std::string                                                   path,
+    std::vector<std::string>                                      allowedExtensions,
+    std::function<void(const agentxx::agent::WireListDirResult&)> callback
+) {
+    uint64_t reqId = ++nextListDirReqId_;
+    if (callback) {
+        std::lock_guard<std::mutex> lock(listDirMutex_);
+        pendingListDirCallbacks_[reqId] = std::move(callback);
+    }
+    sendToPeer(agentxx::agent::WireListDir{
+        .reqId             = reqId,
+        .path              = std::move(path),
+        .allowedExtensions = std::move(allowedExtensions),
+    });
+}
+
+// ---------------------------------------------------------------------------
+// 会话列表分页 (client 线程)
+//
+// 会话选择弹窗数据源按 keyset 游标分页加载: 打开弹窗时请求最新一页, 用户浏览
+// 到已加载列表末尾时以上一页最后一条为游标续取 (SessionSelectorOverlay 经
+// ctx_.requestMoreSessions 触发), 避免会话很多时一次性加载/渲染全量。
+// ---------------------------------------------------------------------------
+
+void TUIClientAgentIO::onSessionListPage(const agentxx::agent::WireSessionList& resp) {
+    {
+        std::lock_guard<std::mutex> lock(sharedState_.mutex());
+        auto&                       st = sharedState_.mutableState();
+        // 加载标志复位 (无论本页是否可用, 请求生命周期已结束)
+        st.sessionListLoadingMore = false;
+        // 兼容: 响应无分页元数据 (totalCount==0 && !hasMore) 时视为
+        // 全量列表, 直接替换本地列表
+        const bool legacyFullList = (resp.totalCount == 0 && !resp.hasMore);
+        if (!st.sessionListLoaded || legacyFullList || st.sessionList.empty()) {
+            // 首页 / 全量响应: 替换
+            st.sessionList = resp.sessions;
+        } else {
+            // 后续页: 追加 (服务端保证不与已收页重叠; 双重防御跳过重复项)
+            for (const auto& s : resp.sessions) {
+                bool dup = false;
+                for (const auto& e : st.sessionList) {
+                    if (e.sessionId == s.sessionId) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (!dup) {
+                    st.sessionList.push_back(s);
+                }
+            }
+        }
+        st.sessionListLoaded = true;
+        if (resp.totalCount > 0) {
+            st.sessionListTotalCount = resp.totalCount;
+        }
+        // hasMore 边界: 服务端标志 + 空页防御 (keyset 边界处可能多给一页空响应,
+        // 此时终止续取) + 已加载数达到总数时收敛
+        st.sessionListHasMore = resp.hasMore && !resp.sessions.empty()
+                                && (st.sessionListTotalCount == 0
+                                    || st.sessionList.size() < st.sessionListTotalCount);
+    }
+    postRedraw();
+}
+
+void TUIClientAgentIO::requestNextSessionListPage() {
+    int64_t     beforeMs = 0;
+    std::string beforeId;
+    {
+        std::lock_guard<std::mutex> lock(sharedState_.mutex());
+        auto&                       st = sharedState_.mutableState();
+        // 边界判断 + 请求去重 (UI 线程滚动事件可能高频触发)
+        if (!st.sessionListLoaded || !st.sessionListHasMore || st.sessionListLoadingMore
+            || st.sessionList.empty()) {
+            return;
+        }
+        st.sessionListLoadingMore = true;
+        // 游标取已加载列表最后一条 (排序最旧), 服务端返回严格排在其后的至多一页
+        beforeMs = st.sessionList.back().lastActiveMs;
+        beforeId = st.sessionList.back().sessionId;
+    }
+    requestSessionListPage(beforeMs, std::move(beforeId), kSessionListPageSize);
+}
+
+void TUIClientAgentIO::onSessionRenameResult(
+    const agentxx::agent::WireRenameSessionResult& resp
+) {
+    {
+        std::lock_guard<std::mutex> lock(sharedState_.mutex());
+        auto&                       st = sharedState_.mutableState();
+        if (resp.ok) {
+            // 就地更新标题: 列表项与状态栏随下一帧刷新 (无需重新请求列表)
+            for (auto& s : st.sessionList) {
+                if (s.sessionId == resp.sessionId) {
+                    s.title = resp.title;
+                    break;
+                }
+            }
+        }
+    }
+    if (!resp.ok) {
+        // 失败原因来自服务端 (空标题/会话不存在/无持久化), 直接提示给用户
+        const std::string msg = resp.error.empty() ? std::string{tr("session.renameFailed")}
+                                                   : resp.error;
+        enqueueUiAction([this, msg] {
+            showToast(msg);
+        });
+    }
+    postRedraw();
+}
+
+// ---------------------------------------------------------------------------
+// onDelta (client 线程)
+// ---------------------------------------------------------------------------
+
+void TUIClientAgentIO::onDelta(const agentxx::agent::WireDelta& delta) {
+    using Type = agentxx::agent::WireDelta::Type;
+    {
+        std::lock_guard<std::mutex> lock(sharedState_.mutex());
+        auto&                       st = sharedState_.mutableState();
+        // 清除生成占位提示 (等待响应 / 正在调用工具):
+        // 真实输出 (正文/思考/工具消息) 到达或生成结束时调用 —— 占位项所在位置
+        // 被真实内容取代 (见 TUIRenderState::genPhase 注释)
+        auto clearGenPlaceholder = [&st]() {
+            st.genPhase = agentxx::agent::WireDelta::GenPhase::Done;
+            st.genToolName.clear();
+        };
+        switch (delta.type) {
+            case Type::TextToken:
+            case Type::ThinkToken: {
+                clearGenPlaceholder();
+                if (delta.type == Type::ThinkToken && delta.text.empty()) {
+                    // 空文本 ThinkToken: 加密思考内容或思考元数据更新 (如
+                    // reasoning_tokens/duration) 若当前正在累积明文 Think 流 (尚未收到正文
+                    // TextToken / ToolStart), 先将已累积的思考文本落盘到 messages
+                    if (st.currentTokenRole == TUIMessage::Role::Think && st.hasPendingToken()) {
+                        pushCurrentTokenLocked(st);
+                    }
+
+                    bool updatedExisting = false;
+                    for (size_t i = st.messages.size(); i > 0; --i) {
+                        const auto r = st.messages[i - 1]->role;
+                        if (r == TUIMessage::Role::User || r == TUIMessage::Role::Tool
+                            || r == TUIMessage::Role::Assistant) {
+                            break; // 遇到用户输入、工具执行或正文回答边界，不得跨越更新前序动作的
+                                   // Think
+                        }
+                        if (r == TUIMessage::Role::Think) {
+                            auto& m = sharedState_.mutableMessage(st, i - 1);
+                            if (delta.think) {
+                                if (!m.think) {
+                                    m.think = *delta.think;
+                                } else {
+                                    if (delta.think->reasoningTokens > 0) {
+                                        m.think->reasoningTokens = delta.think->reasoningTokens;
+                                    }
+                                    if (delta.think->isEncrypted) {
+                                        m.think->isEncrypted = true;
+                                    }
+                                }
+                            }
+                            if (delta.durationMs > 0) {
+                                m.durationMs = delta.durationMs;
+                            }
+                            if (delta.startTimeMs > 0 && m.startTimeMs == 0) {
+                                m.startTimeMs = delta.startTimeMs;
+                            }
+                            updatedExisting = true;
+                            break;
+                        }
+                    }
+                    if (updatedExisting) {
+                        st.isStreaming = true;
+                        break;
+                    }
+                    // 当前轮次/步骤尚无 Think 消息 (如加密思考首包): 开始思考时立即在消息列表中创建
+                    // Think 消息展示
+                    pushCurrentTokenLocked(st);
+                    resetTrailingRunningToolsLocked(st);
+                    auto msg       = std::make_shared<TUIMessage>();
+                    msg->role      = TUIMessage::Role::Think;
+                    msg->collapsed = true;
+                    if (delta.think) {
+                        msg->think = *delta.think;
+                    } else {
+                        msg->think = TUIMessage::ThinkData{
+                            .reasoningTokens = 0,
+                            .isEncrypted     = true,
+                        };
+                    }
+                    msg->startTimeMs
+                        = delta.startTimeMs > 0 ? delta.startTimeMs : st.pendingTokenStartTimeMs;
+                    msg->durationMs = delta.durationMs;
+                    st.messages.push_back(std::move(msg));
+                    st.currentTokenRole = TUIMessage::Role::Assistant;
+                    st.isStreaming      = true;
+                    break;
+                }
+
+                auto role = (delta.type == Type::ThinkToken) ? TUIMessage::Role::Think
+                                                             : TUIMessage::Role::Assistant;
+                if (st.currentTokenRole != role && st.hasPendingToken()) {
+                    // 先 push 再更新时间戳: pushCurrentTokenLocked 使用
+                    // st.pendingToken* 的当前值构造消息, 若先覆盖成新角色的
+                    // 时间戳, 旧 token 的时长/开始时间会丢失 (修复)
+                    pushCurrentTokenLocked(st);
+                    st.pendingTokenStartTimeMs = delta.startTimeMs;
+                    st.pendingTokenDurationMs  = delta.durationMs;
+                }
+                st.currentTokenRole = role;
+                if (delta.type == Type::ThinkToken && delta.think.has_value()) {
+                    st.pendingTokenThink = delta.think;
+                }
+                if (delta.startTimeMs > 0 && st.pendingTokenStartTimeMs == 0) {
+                    st.pendingTokenStartTimeMs = delta.startTimeMs;
+                }
+                if (delta.durationMs > 0) {
+                    st.pendingTokenDurationMs = delta.durationMs;
+                }
+                // 按需 COW: 仅当字符串被 UI 快照共享 (渲染期间) 才复制本体,
+                // 避免每 token 深拷贝整个已累积文本 (O(n²) -> O(n))
+                if (!st.currentToken) {
+                    resetTrailingRunningToolsLocked(st);
+                    st.currentToken = std::make_shared<std::string>();
+                    // 新流开始: 递增流身份 (COW 复制不递增, 见 currentTokenEpoch 注释)
+                    ++st.currentTokenEpoch;
+                    // 同时清除上一流的思考折叠覆盖态 (流提交落盘时已生效过;
+                    // 此处兜底覆盖未走提交的流结束路径): 新流回到设置模式默认展示
+                    st.streamThinkOverride = -1;
+                } else if (st.currentToken.use_count() > 1) {
+                    st.currentToken = std::make_shared<std::string>(*st.currentToken);
+                }
+                if (!delta.text.empty()) {
+                    st.currentToken->append(delta.text);
+                }
+                st.isStreaming = true;
+            } break;
+            case Type::ToolStart: {
+                // 工具消息到达: 占位提示 (等待响应/正在调用工具) 由真实工具消息取代
+                clearGenPlaceholder();
+                pushCurrentTokenLocked(st);
+                auto m                = std::make_shared<TUIMessage>();
+                m->role               = TUIMessage::Role::Tool;
+                m->tool               = TUIMessage::ToolData{};
+                m->tool->toolName     = delta.toolName;
+                m->tool->toolCallId   = delta.toolCallId;
+                m->text               = delta.arguments;
+                m->tool->toolFinished = false;
+                m->collapsed          = true;
+                m->startTimeMs        = delta.startTimeMs > 0
+                                            ? delta.startTimeMs
+                                            : static_cast<int64_t>(
+                                         std::chrono::duration_cast<std::chrono::milliseconds>(
+                                             std::chrono::system_clock::now().time_since_epoch()
+                                         )
+                                             .count()
+                                     );
+                st.messages.push_back(std::move(m));
+                st.isStreaming = true;
+            } break;
+            case Type::ToolEnd: {
+                bool found = false;
+                for (size_t i = st.messages.size(); i > 0; --i) {
+                    auto& msg = *st.messages[i - 1];
+                    if (msg.role == TUIMessage::Role::Tool && msg.tool
+                        && msg.tool->toolCallId == delta.toolCallId && !msg.tool->toolFinished) {
+                        auto& m              = sharedState_.mutableMessage(st, i - 1);
+                        m.tool->toolResult   = delta.result;
+                        m.tool->toolFinished = true;
+                        m.collapsed          = true;
+                        if (delta.startTimeMs > 0) {
+                            m.startTimeMs = delta.startTimeMs;
+                        }
+                        if (delta.durationMs > 0) {
+                            m.durationMs = delta.durationMs;
+                        } else if (m.startTimeMs > 0) {
+                            const int64_t nowMs = static_cast<int64_t>(
+                                std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::system_clock::now().time_since_epoch()
+                                )
+                                    .count()
+                            );
+                            m.durationMs = std::max(int64_t{0}, nowMs - m.startTimeMs);
+                        }
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    auto m                = std::make_shared<TUIMessage>();
+                    m->role               = TUIMessage::Role::Tool;
+                    m->tool               = TUIMessage::ToolData{};
+                    m->tool->toolName     = delta.toolName;
+                    m->tool->toolCallId   = delta.toolCallId;
+                    m->tool->toolResult   = delta.result;
+                    m->tool->toolFinished = true;
+                    m->startTimeMs        = delta.startTimeMs;
+                    m->durationMs         = delta.durationMs;
+                    m->collapsed          = true;
+                    st.messages.push_back(std::move(m));
+                }
+            } break;
+            case Type::NodeStart: {
+                st.currentNodeName = delta.nodeName;
+            } break;
+            case Type::NodeEnd: {
+                // 节点结束即该节点的生成结束: 兜底清除占位提示 (正常已由首个
+                // 正文/思考 token 或工具消息清除; agent 侧同时会下发 GenStatus::Done)
+                clearGenPlaceholder();
+                if (st.currentNodeName == delta.nodeName) {
+                    st.currentNodeName.clear();
+                }
+                // 节点级计时不回填 Think 流: 节点耗时聚合了思考+正文等多个消息,
+                // 直接覆盖会破坏单条消息的准确时长; Think 的耗时由 agent 端在
+                // 思考流完成时经空文本 ThinkToken 结算包 (durationMs) 回填
+                if (st.hasPendingToken()) {
+                    if (st.currentTokenRole != TUIMessage::Role::Think) {
+                        st.pendingTokenStartTimeMs = delta.startTimeMs;
+                        st.pendingTokenDurationMs  = delta.durationMs;
+                    }
+                } else if (!st.messages.empty() && st.messages.back()->role != TUIMessage::Role::Think) {
+                    auto& m       = sharedState_.mutableMessage(st, st.messages.size() - 1);
+                    m.startTimeMs = delta.startTimeMs;
+                    m.durationMs  = delta.durationMs;
+                }
+            } break;
+            case Type::MessageUITip: {
+                // 通用提示消息: 插入提示消息 (按级别区分显示);
+                // 默认折叠展示 (提示类消息, 与 makeText 的 System 默认折叠语义一致)
+                pushCurrentTokenLocked(st);
+                resetTrailingRunningToolsLocked(st);
+                auto msg       = std::make_shared<TUIMessage>();
+                msg->role      = TUIMessage::Role::Tip;
+                msg->text      = delta.text;
+                msg->tip       = TUIMessage::TipData{};
+                msg->collapsed = true;
+                switch (delta.tipType) {
+                    case agentxx::agent::WireDelta::TipType::Info:
+                        msg->tip->tipLevel = TUIMessage::TipLevel::Info;
+                        break;
+                    case agentxx::agent::WireDelta::TipType::Warning:
+                        msg->tip->tipLevel = TUIMessage::TipLevel::Warning;
+                        break;
+                    case agentxx::agent::WireDelta::TipType::Error:
+                        msg->tip->tipLevel = TUIMessage::TipLevel::Error;
+                        break;
+                }
+                // 空 content 消息过滤 (提示文本为空/全空白时无展示意义)
+                if (!isBlankContentMessage(*msg)) {
+                    st.messages.push_back(std::move(msg));
+                }
+                st.isStreaming = true;
+            } break;
+            case Type::InsertMessage: {
+                // 完整 ViewMessage 消息插入 (轮次统计、系统提示、中断头等):
+                // 服务端已完成 appendViewMessage 与持久化, 客户端直接加载展示
+                pushCurrentTokenLocked(st);
+                resetTrailingRunningToolsLocked(st);
+                // 空 content 消息过滤 (如正文为空/全空白的 assistant 消息)
+                if (delta.message && false == isBlankContentMessage(*delta.message)) {
+                    st.messages.push_back(delta.message);
+                }
+            } break;
+            case Type::UpdateMessage: {
+                // 完整 ViewMessage 消息更新 (按 id 定位已插入的历史消息):
+                pushCurrentTokenLocked(st);
+                resetTrailingRunningToolsLocked(st);
+                if (delta.message && !delta.message->id.empty()) {
+                    for (size_t i = 0; i < st.messages.size(); ++i) {
+                        if (st.messages[i]->id == delta.message->id) {
+                            if (isBlankContentMessage(*delta.message)) {
+                                // 更新后变为空 content: 从列表中移除 (不保留空块)
+                                st.messages.erase(st.messages.begin() + static_cast<int64_t>(i));
+                            } else {
+                                st.messages[i] = delta.message;
+                            }
+                            break;
+                        }
+                    }
+                }
+            } break;
+            case Type::GenStatus: {
+                // 生成阶段提示 (agent 侧 GenStatus 增量): 模型节点开始执行但尚无
+                // 可见输出时, 消息列表末尾展示占位项; 首个正文/思考 token 或工具
+                // 消息到达即由本函数清除 (见 TUIRenderState::genPhase 注释)
+                st.genPhase    = delta.genPhase;
+                st.genToolName = delta.genPhase == agentxx::agent::WireDelta::GenPhase::ToolCall
+                                     ? delta.toolName
+                                     : std::string{};
+                if (delta.genPhase != agentxx::agent::WireDelta::GenPhase::Done) {
+                    st.isStreaming = true;
+                }
+            } break;
+            case Type::TurnStart: {
+                clearGenPlaceholder();
+                pushCurrentTokenLocked(st);
+                resetTrailingRunningToolsLocked(st);
+                // 空文本+有附件的纯附件消息也需回显（此前 !text.empty() 会吞掉）;
+                // 正文为空/全空白且无附件的用户消息不入列表 (TUI 忽略空 content)
+                {
+                    auto msg = std::make_shared<TUIMessage>(
+                        TUIMessage::makeText(TUIMessage::Role::User, delta.text, delta.startTimeMs)
+                    );
+                    msg->id          = delta.msgId;
+                    msg->attachments = delta.attachments;
+                    if (false == isBlankContentMessage(*msg)) {
+                        st.messages.push_back(std::move(msg));
+                        enqueueUiAction([this]() {
+                            if (messageList_) {
+                                messageList_->setStickToBottom(true);
+                            }
+                        });
+                    }
+                }
+                st.isStreaming = true;
+            } break;
+            case Type::TurnEnd: {
+                clearGenPlaceholder();
+                st.currentNodeName.clear();
+                pushCurrentTokenLocked(st);
+                resetTrailingRunningToolsLocked(st);
+                st.isStreaming = false;
+            } break;
+        }
+    }
+    postRedraw();
+}
+
+// ---------------------------------------------------------------------------
+// onSync (client 线程)
+// ---------------------------------------------------------------------------
+
+void TUIClientAgentIO::onSync(const agentxx::agent::WireSyncPayload& payload) {
+    // 增量补拉: 服务端只回补"客户端已持有序号之后"的消息,
+    // 按 msg.id 去重后追加到本地历史尾部, 不重置本地窗口 (也不清空待输入等状态)
+    if (payload.incremental) {
+        onIncrementalSync(payload);
+        return;
+    }
+    {
+        // 单次 mutate (内部加锁): 不得在持锁状态下再调 mutate() ——
+        // 如果先 lock_guard 再调 mutate() 会对同一非递归 mutex 二次加锁,
+        // 造成客户端线程死锁 (TUI 启动握手即触发, 界面冻结)
+        sharedState_.mutate([&](TUIRenderState& cur) {
+            auto st              = std::make_shared<TUIRenderState>();
+            auto prev            = sharedState_.snapshot();
+            st->cachedModelName  = prev->cachedModelName;
+            st->modelNames       = prev->modelNames;
+            st->appendComponents = prev->appendComponents;
+            st->contextMessages  = prev->contextMessages;
+            st->isStreaming      = false;
+            // 模型能力表 (多模态输入支持) 与会话无关, 来自 agent 配置的
+            // availableModels, 不随 Sync 重置: 切换会话时服务端先回推 Sync
+            // 再回推 WireModelInfo, 若此处清空, 重置后能力表为空 ->
+            // 输入栏的附件按钮消失 (直到客户端再次拉取模型信息才恢复)
+            st->modelCapabilities = prev->modelCapabilities;
+            // 模型列表加载标志同理: 已收到过服务端模型信息就不应退回"加载中"
+            st->modelInfoLoaded = prev->modelInfoLoaded;
+            // 连接状态不随 Sync 重置: 握手后服务端回推全量 Sync 时若被重置回
+            // Connecting (默认值), banner 会错误地回到"启动中"
+            st->connState = prev->connState;
+            // 启动进度不随 Sync 重置: 本地模式下握手后 init 仍在进行,
+            // 期间服务端回推的早期 Sync 不应清空正在展示的启动步骤
+            st->startupProgress = prev->startupProgress;
+
+            // 消息队列同步 (服务端排队消息镜像)
+            st->pendingInputs.clear();
+            for (const auto& item : payload.messageQueue) {
+                TUIPendingInput pi;
+                pi.id          = item.id;
+                pi.text        = item.text;
+                pi.model       = item.model;
+                pi.attachments = item.attachments;
+                pi.createdAtMs = item.createdAtMs;
+                st->pendingInputs.push_back(std::move(pi));
+            }
+
+            // 历史消息与 server viewMessages 同型 (ViewMessage), 直接拷贝;
+            // 原 json→TUIMessage 解析逻辑已下沉到 server (event_stream 展开)
+            // - 空 content 消息 (正文为空/全空白) 不入列表 (TUI 忽略其渲染);
+            //   历史分页的窗口下标/总数仍按服务端 viewMessages 计数,
+            //   与本地列表条数解耦 (见 historyWindowStart/historyTotal)
+            st->messages.reserve(payload.messages.size());
+            for (const auto& vm : payload.messages) {
+                auto msg = std::make_shared<TUIMessage>(vm);
+                if (isBlankContentMessage(*msg)) {
+                    continue;
+                }
+                st->messages.push_back(std::move(msg));
+            }
+            // 历史分页窗口元数据: fromIndex = 本批消息的起始绝对下标
+            // (尾窗同步时 > 0, 上方还有更早历史待分页拉取; 全量同步时为 0);
+            // 未返回的分页请求随整体替换作废 (loading 复位), 尾部序号作为新基线
+            st->history.resetForSession(std::string{currentSessionId()});
+            st->history.reset(
+                payload.fromIndex,
+                payload.totalMessages != 0 ? payload.totalMessages : payload.messages.size(),
+                st->messages.size()
+            );
+            st->history.observeTailSeq(payload.lastViewSeq);
+            // 队列镜像同步 (服务端排队消息镜像; 队列状态随快照到达)
+            {
+                std::vector<agentxx::client::MessageQueueMirror::Entry> entries;
+                entries.reserve(payload.messageQueue.size());
+                for (const auto& item : payload.messageQueue) {
+                    entries.push_back(agentxx::client::MessageQueueMirror::Entry{
+                        item.id,
+                        item.text,
+                        item.model,
+                        item.attachments,
+                        item.createdAtMs,
+                    });
+                }
+                st->queue.applySnapshot(entries, payload.queueState);
+            }
+            // 直接替换 (旧快照由 UI 线程持有, 自然释放)
+            cur = std::move(*st);
+        });
+    }
+    // 消息列表吸附到底部 + 清理中断 UI 状态 + 重置历史分页锚定 (消息整体
+    // 替换, 旧状态随之失效): 组件由 UI 线程独占, 经动作队列投递
+    enqueueUiAction([this]() {
+        if (messageList_) {
+            messageList_->setStickToBottom(true);
+            messageList_->clearInterruptUiState();
+            messageList_->resetHistoryPagination();
+        }
+    });
+    postRedraw();
+}
+
+// ---------------------------------------------------------------------------
+// onTurnResult / onContextStats (client 线程)
+// ---------------------------------------------------------------------------
+
+/// 增量补拉: 追加服务端回补的展示消息
+///
+/// - 按 msg.id 去重 (既有历史里已存在则跳过): 断线期间经 delta 已收到的消息
+///   不会重复插入
+/// - 历史窗口起点保持不变 (只追加), 总数按服务端给出的值更新
+/// - 若本地历史为空 (如首次接入即拿到增量, 不应发生), 退化为整体替换语义,
+///   由调用方按普通 Sync 处理
+void TUIClientAgentIO::onIncrementalSync(const agentxx::agent::WireSyncPayload& payload) {
+    bool applied = false;
+    {
+        std::lock_guard<std::mutex> lock(sharedState_.mutex());
+        auto&                       st = sharedState_.mutableState();
+        if (!st.messages.empty()) {
+            const size_t messagesBefore = st.messages.size();
+            std::set<std::string> knownIds;
+            for (const auto& m : st.messages) {
+                if (m && !m->id.empty()) {
+                    knownIds.insert(m->id);
+                }
+            }
+            for (const auto& vm : payload.messages) {
+                if (!vm.id.empty() && knownIds.count(vm.id) != 0) {
+                    continue;
+                }
+                auto msg = std::make_shared<TUIMessage>(vm);
+                if (isBlankContentMessage(*msg)) {
+                    continue;
+                }
+                st.messages.push_back(std::move(msg));
+            }
+            // 序号连续性: 增量补拉的尾部序号应当接着上次观察到的值
+            // (断号说明中间还有未收到的消息; 下一次重连的 afterViewSeq 补拉会补齐,
+            //  这里先记警告并把序号基线推进到新值, 供诊断与后续判断使用)
+            const auto seqOutcome = st.history.observeTailSeq(payload.lastViewSeq);
+            if (seqOutcome == agentxx::client::HistoryWindow::SeqOutcome::Gap) {
+                XX_LOGW(
+                    "[tui] incremental sync seq gap: received {}, expected {}",
+                    payload.lastViewSeq,
+                    st.history.lastSeq()
+                );
+            }
+            st.history.noteTailAppended(
+                st.messages.size() - messagesBefore,
+                payload.totalMessages
+            );
+            applied = true;
+        }
+    }
+    if (applied) {
+        postRedraw();
+        return;
+    }
+    // 本地无历史 (异常组合): 按普通 Sync 的整体替换语义处理
+    agentxx::agent::WireSyncPayload full = payload;
+    full.incremental                     = false;
+    onSync(full);
+}
+
+void TUIClientAgentIO::onTurnResult(const agentxx::agent::WireTurnResult& /*result*/) {
+    {
+        std::lock_guard<std::mutex> lock(sharedState_.mutex());
+        auto&                       st = sharedState_.mutableState();
+        pushCurrentTokenLocked(st);
+        resetTrailingRunningToolsLocked(st);
+        st.isStreaming = false;
+    }
+    postRedraw();
+}
+
+void TUIClientAgentIO::onInputAck(const agentxx::agent::WireInputAck& ack) {
+    // 输入受理回执: 界面不再从 delta 猜测投递结果
+    // - rejected: 明确提示用户 (文本/原因由服务端给出)
+    // - started/queued/steered: 正常路径 (排队状态由 MessageQueueUpdate 展示)
+    if (ack.status != agentxx::agent::InputStatus::Rejected) {
+        return;
+    }
+    const std::string detail = ack.detail.empty() ? ack.reason : ack.detail;
+    enqueueUiAction([this, detail] {
+        showToast(trf("toast.inputRejected", detail));
+    });
+    postRedraw();
+}
+
+void TUIClientAgentIO::onContextStats(const agentxx::agent::WireContextStats& stats) {
+    // 上下文统计写入 sharedState_ (而非 Session::contextStats —— TUI 不持有
+    // Session, 属于 server-io 线程); 状态栏/Info 侧边栏等组件从 frameState 读取。
+    // 会话切换后服务端推送新会话的 WireContextStats (#switchSession 路径),
+    // 显示自动跟随新会话
+    {
+        std::lock_guard<std::mutex> lock(sharedState_.mutex());
+        auto&                       st = sharedState_.mutableState();
+        st.contextTokens               = stats.contextTokens;
+        st.maxContextTokens            = stats.maxContextTokens;
+        st.tps                         = stats.tps;
+        // 会话累计用量 (Info 侧边栏 Context 段): 服务端每次推送都是"当前累计值",
+        // 直接覆盖; 老服务端不带这些字段时四个值恒为 0, 记为"无数据"
+        st.sessionPromptTokens       = stats.promptTokens;
+        st.sessionCompletionTokens   = stats.completionTokens;
+        st.sessionTotalTokens        = stats.totalTokens;
+        st.sessionCachedPromptTokens = stats.cachedPromptTokens;
+        st.sessionUsageKnown = (stats.promptTokens > 0 || stats.completionTokens > 0
+                                || stats.totalTokens > 0 || stats.cachedPromptTokens > 0);
+    }
+    postRedraw();
+}
+
+// ---------------------------------------------------------------------------
+// handleInterrupt (client 线程, co_spawn)
+//
+// 中断表单直接渲染在消息列表中 (Role::Interrupt 消息内嵌交互控件), 不弹窗:
+// - 一条中断请求 = 一条消息 = 一份表单 (描述 ui.items 内可含多个输入控件),
+//   结果经通道回传 (经 MessageListComponent attachInterruptChannel 注入 UI 线程)
+// - 消息携带 agent 侧声明的 UI 描述 (InterruptHandleArg.ui): 控件形态
+//   (值按钮/输入框/枚举/勾选项/确认行) 完全由描述数据决定, 客户端不含任何
+//   具体询问 (含权限) 的特化分支
+// - UI 线程提交/取消后经通道回传 InterruptFormSubmit {cancelled, values, options};
+//   规则注册等业务语义由 agent 侧消费结果完成 (客户端只回传表单值/选项)
+// - 本协程等待一次提交或取消; 通道关闭 (server 过期通知 / TUI 退出) 时终止,
+//   返回已收集结果 (空 values = 未应答)
+// ---------------------------------------------------------------------------
+
+asio::awaitable<utilxx_base::Json> TUIClientAgentIO::handleInterrupt(
+    std::string_view sessionId,
+    std::string_view /*interruptNode*/,
+    std::string_view /*interruptValue*/,
+    std::string_view interruptArgJson
+) {
+    std::optional<agentxx::middleware::InterruptHandleArg> argOpt;
+    agentxx::util::catchError<bool>(
+        [&]() -> bool {
+            argOpt = agentxx::middleware::InterruptHandleArg::fromJson(
+                utilxx_base::Json::parse(interruptArgJson)
+            );
+            return true;
+        },
+        [](std::string errinfo) -> bool {
+            XX_LOGE("TUIClientAgentIO::handleInterrupt json::parse failed: {}", errinfo);
+            return true;
+        }
+    );
+    if (!argOpt.has_value()) {
+        co_return utilxx_base::Json::object();
+    }
+    const auto& handleArg = argOpt.value();
+    // 中断 UI 描述 (HIL 中断必填, 见 InterruptHandleArg::ui): 一份描述对应
+    // 一份表单 (一条消息); 缺失/非法时留空, 客户端渲染诊断行且不可交互
+    const utilxx_base::Json uiJson
+        = handleArg.ui.empty() ? utilxx_base::Json{} : handleArg.ui.toJson();
+
+    awaitingInterruptInput_.store(true, std::memory_order_release);
+
+    // 中断头消息已由 agent 线程插入会话历史并经 MessageTip WireDelta 送达
+    // (在发起中断请求前插入, 顺序先于本函数的中断表单消息), 此处不再构造
+
+    // 一条中断请求 = 一条消息 = 一份表单 (共享结果通道)
+    const int64_t wireId      = interruptWireId_;
+    auto          ch          = std::make_shared<InterruptResultChannel>(ex_, 64);
+    activeInterrupts_[wireId] = ch;
+
+    // 结果回传通道注入 UI 线程 (MessageListComponent 中断视图):
+    // 通道由 client 线程创建, UI 线程交互 (提交/取消) 需经其发送结果
+    enqueueUiAction([this, wireId, ch]() {
+        if (messageList_) {
+            messageList_->attachInterruptChannel(wireId, ch);
+        }
+    });
+
+    {
+        auto m                    = std::make_shared<TUIMessage>();
+        m->role                   = TUIMessage::Role::Interrupt;
+        m->interrupt              = TUIMessage::InterruptData{};
+        m->interrupt->interruptId = wireId;
+        // 表单形态完全由描述数据决定 (各控件字段自包含); 编辑文本/选中项/
+        // 勾选项等纯 UI 状态由 InterruptView 按描述惰性初始化, 不存于消息
+        m->interrupt->ui = uiJson;
+        std::lock_guard<std::mutex> lock(sharedState_.mutex());
+        auto&                       st = sharedState_.mutableState();
+        st.messages.push_back(std::move(m));
+    }
+    postRedraw();
+
+    // 等待一次提交或取消 (通道关闭 = server 过期通知 / TUI 退出 → 按未应答返回)
+    auto values          = utilxx_base::Json::object();
+    auto [ec, gotSubmit] = co_await ch->async_receive(asio::as_tuple(asio::use_awaitable));
+    if (!ec && !gotSubmit.cancelled) {
+        // 一次提交: values 为控件 id → 值 的对象 (控件形态决定值类型);
+        // 语义由 agent 侧消费 (客户端只回传表单值, 不解释业务含义)
+        if (gotSubmit.values.is_object()) {
+            values = std::move(gotSubmit.values);
+        }
+    }
+
+    // 结果形态: 恒为对象 {"values": {控件 id: 值}} (见 makeInterruptResult;
+    // 未提交/取消 = 空对象 —— 消费端按未应答处理)
+    const utilxx_base::Json result = agentxx::middleware::makeInterruptResult(values);
+
+    activeInterrupts_.erase(wireId);
+    awaitingInterruptInput_.store(false, std::memory_order_release);
+    // 中断流程结束 (提交/取消/过期): 清理 UI 线程的 channel 映射与该请求的
+    // 表单状态 (消息已固定为 Confirmed/Cancelled/Expired)
+    enqueueUiAction([this, wireId]() {
+        if (messageList_) {
+            messageList_->releaseInterruptChannel(wireId);
+        }
+    });
+    co_return result;
+}
+
+asio::awaitable<std::optional<std::string>> TUIClientAgentIO::getInput() {
+    auto [ec, line] = co_await inputChannel_->async_receive(asio::as_tuple(asio::use_awaitable));
+    if (ec) {
+        co_return std::nullopt;
+    }
+    co_return std::optional<std::string>(std::move(line));
+}
+
+} // namespace agentxx::client

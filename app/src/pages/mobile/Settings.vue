@@ -96,6 +96,66 @@ async function pickOption(v: any): Promise<void> {
 
 /* ---------------- 音源 ---------------- */
 const sources = ref<SourceInfo[]>([])
+/* F-22/F-23：移动端音源管理动作 */
+async function importSourceUrl(): Promise<void> {
+  const url = window.prompt('粘贴音源 .js 的 http(s) 直链')
+  if (!url) return
+  try {
+    await call('sources:import', { url })
+    sources.value = await call<SourceInfo[]>('sources:list')
+    ui.toast('音源导入成功', 'success', 1800)
+  } catch (e: any) {
+    ui.toast(e?.message || '导入失败', 'error', 2400)
+  }
+}
+
+async function importSourceLocal(): Promise<void> {
+  try {
+    const input = document.createElement('input')
+    input.type = 'file'
+    input.accept = '.js,text/javascript'
+    input.onchange = async () => {
+      const f = input.files?.[0]
+      if (!f) return
+      try {
+        const content = await f.text()
+        await call('sources:import', { content })
+        sources.value = await call<SourceInfo[]>('sources:list')
+        ui.toast('音源导入成功', 'success', 1800)
+      } catch (e: any) {
+        ui.toast(e?.message || '导入失败', 'error', 2400)
+      }
+    }
+    input.click()
+  } catch (e: any) {
+    ui.toast(e?.message || '选择文件失败', 'error', 2000)
+  }
+}
+
+async function restoreSources(): Promise<void> {
+  try {
+    sources.value = await call<SourceInfo[]>('sources:restore')
+    ui.toast('已恢复内置音源', 'success', 1600)
+  } catch (e: any) {
+    ui.toast(e?.message || '恢复失败', 'error', 2000)
+  }
+}
+
+async function removeSource(s: SourceInfo): Promise<void> {
+  if (!window.confirm(`删除音源「${s.name}」？`)) return
+  try {
+    sources.value = await call<SourceInfo[]>('sources:delete', { file: s.file })
+    ui.toast('已删除', 'info', 1400)
+  } catch (e: any) {
+    ui.toast(e?.message || '删除失败', 'error', 2000)
+  }
+}
+
+function showSource(s: SourceInfo): void {
+  window.alert(`${s.name}
+${s.description || ''}
+平台：${(s.platforms || []).map((p: any) => p.name || p.platform).join('、') || '无'}`)
+}
 async function loadSources(): Promise<void> {
   try {
     sources.value = await call<SourceInfo[]>('sources:list')
@@ -116,13 +176,16 @@ async function toggleSource(s: SourceInfo): Promise<void> {
 /** 官方插件库 manifest 地址（与桌面端保持一致） */
 const OFFICIAL_SUB_URL = 'https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/manifest.json'
 type MarketEntry = {
+  kind?: 'lx-source' | 'musicfree-plugin' | 'video-source'
   name: string
-  file: string
+  file?: string
   version?: string
   author?: string
   platform?: string
   description?: string
   types?: string[]
+  canUpdate?: boolean
+  installed?: boolean
   url: string
 }
 const marketOpen = ref(false)
@@ -167,16 +230,57 @@ function isInstalled(entry: MarketEntry): boolean {
   return installedNames.value.includes(entry.name)
 }
 
+/** F-31：统一安装/更新（kind 路由），装完刷新市场条目状态 */
 async function installFromMarket(entry: MarketEntry): Promise<void> {
-  marketUpdating.value = entry.file
+  marketUpdating.value = entry.url
   try {
-    await call('plugins:import', { url: entry.url, origin: 'subscribe' })
-    ui.toast(`已安装 ${entry.name}`, 'success', 2000)
+    await call(entry.installed ? 'market:update' : 'market:install', { item: entry })
+    ui.toast(`${entry.installed ? '已更新' : '已安装'} ${entry.name}`, 'success', 2000)
     await Promise.all([loadInstalledPlugins(), loadSources()])
+    await loadMarket()
   } catch (e: any) {
     ui.toast(`安装失败：${e?.message || e}`, 'error', 4200)
   } finally {
     marketUpdating.value = ''
+  }
+}
+
+/** 卸载（按 sourceUrl 匹配，Bug 126） */
+async function uninstallFromMarket(entry: MarketEntry): Promise<void> {
+  marketUpdating.value = entry.url
+  try {
+    await call('market:uninstall', { item: entry })
+    ui.toast(`已卸载 ${entry.name}`, 'info', 1600)
+    await Promise.all([loadInstalledPlugins(), loadSources()])
+    await loadMarket()
+  } catch (e: any) {
+    ui.toast(`卸载失败：${e?.message || e}`, 'error', 3000)
+  } finally {
+    marketUpdating.value = ''
+  }
+}
+
+/* ---------------- 4.8 局域网同步（客户端） ---------------- */
+const lanIp = ref('')
+const lanPin = ref('')
+const lanBusy = ref(false)
+const lanResult = ref('')
+async function lanSyncNow(): Promise<void> {
+  if (lanBusy.value) return
+  if (!lanIp.value.trim()) {
+    ui.toast('请输入桌面端 IP:端口', 'info', 1800)
+    return
+  }
+  lanBusy.value = true
+  try {
+    const r = await call<any>('lan:sync', { ip: lanIp.value.trim(), pin: lanPin.value.trim() })
+    lanResult.value = `完成：推送 ${r.applied?.favorites || 0} 收藏 / ${r.applied?.history || 0} 记录，拉取 ${r.pulled?.favorites || 0} 收藏 / ${r.pulled?.history || 0} 记录`
+    ui.toast('局域网同步完成', 'success', 2000)
+  } catch (e: any) {
+    lanResult.value = e?.message || '同步失败'
+    ui.toast(lanResult.value, 'error', 2600)
+  } finally {
+    lanBusy.value = false
   }
 }
 
@@ -444,23 +548,48 @@ const version = computed(() => String(appInfo.value?.version || __APP_VERSION__)
         </div>
       </section>
 
-      <!-- 音源与插件 -->
+      <!-- 音源与插件（F-22/F-23：与桌面对等 —— 导入 URL/本地 JS、订阅、恢复内置、删除） -->
       <section v-else-if="group === 'sources'" class="set-group">
         <div class="set-card">
           <div v-for="s in sources" :key="s.file" class="set-item">
-            <div class="it-meta">
+            <div class="it-meta" @click="showSource(s)">
               <span class="it-label">{{ s.name }}</span>
               <span class="it-desc">{{ s.loadError ? s.loadError : s.description || s.platforms?.join(' · ') || '音源脚本' }}</span>
             </div>
-            <Toggle :model-value="s.enabled" @update:model-value="() => toggleSource(s)" />
+            <div class="it-acts">
+              <button v-if="!s.builtin" class="mini-act" @click="removeSource(s)">删除</button>
+              <Toggle :model-value="s.enabled" @update:model-value="() => toggleSource(s)" />
+            </div>
           </div>
-          <div v-if="!sources.length" class="set-empty">音源列表加载中…</div>
+          <!-- 空态即引导（0.9.3） -->
+          <div v-if="!sources.length" class="set-empty">无可用音源，点下方「导入音源」添加</div>
         </div>
         <div class="set-card">
+          <button class="set-item link" @click="importSourceUrl">
+            <div class="it-meta">
+              <span class="it-label">导入音源（URL）</span>
+              <span class="it-desc">粘贴 lx 协议音源 .js 直链</span>
+            </div>
+            <Icon name="chevron-right" :size="16" class="set-arrow" />
+          </button>
+          <button class="set-item link" @click="importSourceLocal">
+            <div class="it-meta">
+              <span class="it-label">导入音源（本地 JS）</span>
+              <span class="it-desc">从文件选择 .js 音源脚本</span>
+            </div>
+            <Icon name="chevron-right" :size="16" class="set-arrow" />
+          </button>
+          <button class="set-item link" @click="restoreSources">
+            <div class="it-meta">
+              <span class="it-label">恢复内置音源</span>
+              <span class="it-desc">重新加载随包音源（保留禁用选择）</span>
+            </div>
+            <Icon name="chevron-right" :size="16" class="set-arrow" />
+          </button>
           <button class="set-item link" @click="loadMarket">
             <div class="it-meta">
-              <span class="it-label">插件市场</span>
-              <span class="it-desc">安装与更新 MusicFree 协议插件</span>
+              <span class="it-label">源市场</span>
+              <span class="it-desc">安装与更新插件 / 音源 / 视频源</span>
             </div>
             <Icon name="chevron-right" :size="16" class="set-arrow" />
           </button>
@@ -483,6 +612,20 @@ const version = computed(() => String(appInfo.value?.version || __APP_VERSION__)
 
       <!-- 网络与缓存 -->
       <section v-else-if="group === 'network'" class="set-group">
+        <div class="set-card">
+          <div class="set-item" style="flex-direction: column; align-items: stretch; gap: 8px">
+            <div class="it-meta">
+              <span class="it-label">局域网同步</span>
+              <span class="it-desc">与同一 Wi-Fi 下的桌面端互同步收藏/最近播放/设置（4.8）</span>
+            </div>
+            <input v-model="lanIp" placeholder="桌面端 IP:端口（如 192.168.1.8:42717）" />
+            <input v-model="lanPin" placeholder="桌面端配对码（6 位数字）" inputmode="numeric" maxlength="6" />
+            <button class="btn primary" style="width: 100%" :disabled="lanBusy" @click="lanSyncNow">
+              {{ lanBusy ? '同步中…' : '连接并同步' }}
+            </button>
+            <span v-if="lanResult" class="it-desc">{{ lanResult }}</span>
+          </div>
+        </div>
         <div class="set-card">
           <div v-for="d in defsOfGroup('network')" :key="d.key" class="set-item">
             <div class="it-meta">
@@ -589,7 +732,7 @@ const version = computed(() => String(appInfo.value?.version || __APP_VERSION__)
           <b>插件市场</b>
           <button class="mk-close" @click="marketOpen = false"><Icon name="close" :size="16" /></button>
         </div>
-        <p class="mk-tip">星河官方插件库 · 在线目录，点击「安装」添加，已安装的可「更新」</p>
+        <p class="mk-tip">统一源市场：音源 / 插件 / 视频源，一键安装与更新</p>
         <div v-if="marketLoading" class="mk-list">
           <div class="mk-loading">正在拉取插件目录…</div>
           <div v-for="i in 3" :key="i" class="mk-sk" />
@@ -601,14 +744,20 @@ const version = computed(() => String(appInfo.value?.version || __APP_VERSION__)
               <div class="mk-title">
                 <b>{{ m.name }}</b>
                 <span v-if="m.version" class="mk-ver">v{{ m.version }}</span>
+                <span v-if="m.canUpdate" class="mk-ver upd">可更新</span>
               </div>
               <div v-if="m.author || m.description" class="mk-desc">
                 {{ m.author }}<span v-if="m.author && m.description"> · </span>{{ m.description }}
               </div>
             </div>
-            <button class="mk-btn" :disabled="marketUpdating === m.file" @click="installFromMarket(m)">
-              {{ marketUpdating === m.file ? '处理中…' : isInstalled(m) ? '更新' : '安装' }}
-            </button>
+            <div class="mk-acts">
+              <button class="mk-btn" :disabled="marketUpdating === m.url" @click="installFromMarket(m)">
+                {{ marketUpdating === m.url ? '处理中…' : m.installed ? (m.canUpdate ? '更新' : '已装') : '安装' }}
+              </button>
+              <button v-if="m.installed" class="mk-btn ghost" :disabled="marketUpdating === m.url" @click="uninstallFromMarket(m)">
+                卸载
+              </button>
+            </div>
           </div>
           <div v-if="!marketEntries.length" class="mk-empty">目录为空</div>
         </div>
@@ -780,6 +929,23 @@ const version = computed(() => String(appInfo.value?.version || __APP_VERSION__)
 }
 .it-value.static {
   color: var(--text-3);
+}
+.it-acts {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.mini-act {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-3);
+  font-size: 12px;
+  padding: 4px 10px;
+}
+.mini-act:active {
+  color: #f87171;
+  border-color: #f87171;
 }
 .set-empty {
   padding: 20px 14px;
@@ -969,6 +1135,14 @@ const version = computed(() => String(appInfo.value?.version || __APP_VERSION__)
 }
 .mk-title b {
   font-size: 13.5px;
+}
+.mk-ver.upd {
+  color: #34d399;
+}
+.mk-acts {
+  display: flex;
+  gap: 6px;
+  flex: none;
 }
 .mk-ver {
   font-size: 10.5px;

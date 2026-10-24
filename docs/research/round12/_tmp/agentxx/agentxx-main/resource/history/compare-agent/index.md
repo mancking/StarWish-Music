@@ -1,0 +1,31 @@
+# 不同 Agent 项目对比和借鉴
+- 难度: SSS
+- 类型: 重构优化
+- 基于commit: f6a89ff9e0e76bb3d3b025ead23797c4a2bea503
+- 时间: 2026-09-27 17:42
+- 需求:
+```md
+- 对比当前项目 agentxx 和 codex D:\0Acoolight\Program\js\codex 的架构设计，仔细思考分析两者的一些设计上的对比优缺点，以及有哪些设计适合迁移到 agentxx 实现的；应当分模块仔细通读对比两个项目源码、结合测试和文档，了解整体的架构设计，分模块逐步更新写入到文档
+resource\history\compare-agent\compare-codex.md，并在最后整理一下整个 compare-codex.md 文档
+
+- 对比当前项目 agentxx 和 opencode D:\0Acoolight\Program\js\opencode 的架构设计，仔细思考分析两者的一些设计上的对比优缺点，以及有哪些设计适合迁移到 agentxx 实现的；应当分模块仔细通读对比两个项目源码、结合测试和文档，了解整体的架构设计，分模块逐步更新写入到文档
+resource\history\compare-agent\compare-opencode.md，并在最后整理一下整个 compare-opencode.md 文档
+
+- 对比当前项目 agentxx 和 pi D:\0Acoolight\Program\js\pi 的架构设计，仔细思考分析两者的一些设计上的对比优缺点，以及有哪些设计适合迁移到 agentxx 实现的；应当分模块仔细通读对比两个项目源码、结合测试和文档，了解整体的架构设计，分模块逐步更新写入到文档
+resource\history\compare-agent\compare-pi.md，并在最后整理一下整个 compare-pi.md 文档
+
+- 对比当前项目 agentxx 和 dsh D:\0Acoolight\Program\js\deepseek-harness 的架构设计，仔细思考分析两者的一些设计上的对比优缺点，以及有哪些设计适合迁移到 agentxx 实现的；应当分模块仔细通读对比两个项目源码、结合测试和文档，了解整体的架构设计，分模块逐步更新写入到文档
+resource\history\compare-agent\compare-dsh.md，并在最后整理一下整个 compare-dsh.md 文档
+
+- 对比当前项目 agentxx 和 openclaw D:\0Acoolight\Program\js\openclaw 的架构设计，仔细思考分析两者的一些设计上的对比优缺点，以及有哪些设计适合迁移到 agentxx 实现的；应当分模块仔细通读对比两个项目源码、结合测试和文档，了解整体的架构设计，分模块逐步更新写入到文档
+resource\history\compare-agent\compare-openclaw.md，并在最后整理一下整个 compare-openclaw.md 文档
+
+- 对比当前项目 agentxx 和 harness D:\0Acoolight\Program\js\harness 的架构设计，仔细思考分析两者的一些设计上的对比优缺点，以及有哪些设计适合迁移到 agentxx 实现的；应当分模块仔细通读对比两个项目源码、结合测试和文档，了解整体的架构设计，分模块逐步更新写入到文档
+resource\history\compare-agent\compare-harness.md，并在最后整理一下整个 compare-harness.md 文档
+
+- 请完整通读 resource\history\compare-agent\compare-*.md 多个架构设计比较，可结合读取多个项目源码，仔细思考分析，最终整理出每个模块中较好的、适合迁移融合进 agentxx 实现的设计，分模块写入到文件 resource\history\compare-agent\plan.md，最终再仔细思考整体整理一下 plan.md
+
+- 请完整通读 功能融合计划 resource\history\compare-agent\plan.md，此前已经完成了一部分任务，记录在
+resource\history\compare-agent\work.md，现在请逐步实现 plan.md 中人工核定可行、待实施的设计，并逐步更新任务执行状态到
+work.md，在每完成一定任务内容后自行提交git
+```

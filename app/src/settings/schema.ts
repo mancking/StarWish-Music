@@ -371,6 +371,7 @@ export const SETTING_SCHEMA: SettingDef[] = [
   },
   { key: 'danmakuAntiSubtitle', cat: 'video', label: '防挡字幕', desc: '底部区域不投放滚动弹幕', kw: 'subtitle 字幕 遮挡', type: 'toggle' },
   { key: 'danmakuBlockWords', cat: 'video', label: '屏蔽词', desc: '每行一个，包含该词的弹幕不显示', kw: 'block 屏蔽 过滤 关键词', type: 'textarea' },
+  { key: 'sourceDebug', cat: 'sources', label: '音源调试日志', desc: '开启后按源记录请求明细到 logs/sources/', kw: 'debug 调试 日志 音源 source log', type: 'toggle' },
 
   /* ---------------- 下载 ---------------- */
   { key: 'downloadQuality', cat: 'download', label: '下载音质', desc: '跟随音质则与播放音质一致', kw: 'download quality 音质 下载 无损 flac 320', type: 'select', options: [

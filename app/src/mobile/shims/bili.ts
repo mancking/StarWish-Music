@@ -6,8 +6,8 @@
  * `<userData>/bili-login.json` 读；移动端没有 userData 目录，
  * 存 localStorage（不追求隐蔽，登录态本来就只是本机缓存）。
  */
-const KEY = 'starwish.bili-login'
-const BUV_KEY = 'starwish.buvid'
+const KEY = 'xinyuan_bili_login'
+const BUV_KEY = 'xinyuan_bili_buvid'
 
 type Login = { sessdata: string; mid?: string; uname?: string; avatar?: string; at?: number; buvid: string }
 

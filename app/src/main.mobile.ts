@@ -16,13 +16,14 @@ import { useUiStore } from './stores/ui'
 import { usePlayerStore } from './stores/player'
 import { useLibraryStore } from './stores/library'
 import './styles/main.css'
+import './styles/car.css'
 import './styles/mobile.css'
 import { installBridge } from './mobile/bridge'
 import { installPullRefresh } from './mobile/pull-refresh'
 import { installBackHandler } from './mobile/back-handler'
 import { initPlatform } from './platform'
-import { registerEqBackend } from './audio/eq'
-import { feedSpectrum, registerLocalSpectrumSource } from './audio/spectrum'
+import { registerEqBackend } from './player-core/eq'
+import { feedSpectrum, registerLocalSpectrumSource } from './player-core/spectrum'
 import { player as mobileAudio } from './mobile/player'
 
 async function bootstrap(): Promise<void> {
@@ -86,14 +87,19 @@ async function bootstrap(): Promise<void> {
   // 系统返回（含手势）：MainActivity 统一转 backButton 事件，这里接管
   // ——关弹层 → 回退 → 根页双击退后台，不再直接退出应用
   installBackHandler(router)
+  // Bug 55：splash 8s 超时兜底（任一 init 挂起时强制淡出）
+  const mobileSplash = document.getElementById('splash')
+  const mobileSplashOut = (): void => {
+    if (!mobileSplash || mobileSplash.classList.contains('splash-out')) return
+    mobileSplash.classList.add('splash-out')
+    setTimeout(() => mobileSplash.remove(), 450)
+  }
+  const splashGuard = window.setTimeout(mobileSplashOut, 8000)
   void Promise.all([ui.init(), player.init(), library.init()])
     .catch(err => console.error('[renderer] 启动初始化失败', err))
     .finally(() => {
-      const splash = document.getElementById('splash')
-      if (splash) {
-        splash.classList.add('splash-out')
-        setTimeout(() => splash.remove(), 450)
-      }
+      window.clearTimeout(splashGuard)
+      mobileSplashOut()
     })
 }
 

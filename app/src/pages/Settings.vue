@@ -103,8 +103,40 @@ const marketOpen = ref(false)
 const marketLoading = ref(false)
 const marketError = ref('')
 const marketUpdating = ref('')
-type MarketEntry = { name: string; file: string; version?: string; author?: string; platform?: string; description?: string; types?: string[]; url: string }
-const marketEntries = ref<MarketEntry[]>([])
+/** 统一源市场条目（规格书 0.10 / MarketItem v2，kind 路由三类源） */
+type MarketItem = {
+  kind: 'lx-source' | 'musicfree-plugin' | 'video-source'
+  id: string
+  name: string
+  version?: string
+  author?: string
+  description?: string
+  url: string
+  changelog?: string
+  compat?: string
+  commitSha?: string
+  canUpdate?: boolean
+  installed?: boolean
+}
+const marketEntries = ref<MarketItem[]>([])
+const marketKind = ref<'all' | 'lx-source' | 'musicfree-plugin' | 'video-source'>('all')
+const marketKeyword = ref('')
+const marketDetailId = ref('')
+const KIND_TABS = [
+  { key: 'all', label: '全部' },
+  { key: 'lx-source', label: '音源' },
+  { key: 'musicfree-plugin', label: '插件' },
+  { key: 'video-source', label: '视频源' },
+] as const
+const KIND_LABEL: Record<string, string> = { 'lx-source': '音源', 'musicfree-plugin': '插件', 'video-source': '视频源' }
+const marketFiltered = computed(() => {
+  const kw = marketKeyword.value.trim().toLowerCase()
+  return marketEntries.value.filter(
+    m =>
+      (marketKind.value === 'all' || m.kind === marketKind.value) &&
+      (!kw || `${m.name} ${m.description || ''} ${m.author || ''}`.toLowerCase().includes(kw))
+  )
+})
 /** 数据目录改过之后，存下重启后的目标路径，用于提示横幅 */
 const dataRestart = ref('')
 
@@ -134,6 +166,51 @@ const qualityOptions: { value: AppSettings['quality']; label: string }[] = [
 ]
 
 const setting = computed(() => ui.settings)
+
+/* Bug 66：车机模式退出入口 + c10：手机粒子开关真实生效（写 xinyuan_particle_phone） */
+import { clearCarMode, isCarDevice, lsGet, lsSet } from '@/platform'
+const carMode = ref(isCarDevice())
+/* 4.8 局域网同步（桌面主机端） */
+const lanInfo = ref<{ active: boolean; port: number; pin: string; ips: string[]; lastSyncAt: number }>({
+  active: false,
+  port: 42717,
+  pin: '',
+  ips: [],
+  lastSyncAt: 0,
+})
+const lanBusy = ref(false)
+async function lanStart(): Promise<void> {
+  lanBusy.value = true
+  try {
+    lanInfo.value = await call<any>('lan:start')
+    ui.toast('同步主机已开启', 'success', 1600)
+  } catch (e: any) {
+    ui.toast(e?.message || '开启失败', 'error', 2000)
+  } finally {
+    lanBusy.value = false
+  }
+}
+async function lanStop(): Promise<void> {
+  await call('lan:stop').catch(() => undefined)
+  lanInfo.value = { active: false, port: 42717, pin: '', ips: [], lastSyncAt: 0 }
+}
+onMounted(() => {
+  void call<any>('lan:info').then(r => {
+    if (r?.active) lanInfo.value = r
+  })
+})
+const particlePhone = ref(lsGet('particle_phone') === '1')
+function setParticlePhone(on: boolean): void {
+  particlePhone.value = on
+  lsSet('particle_phone', on ? '1' : '0')
+  void patch({ particle: on })
+}
+function exitCarMode(): void {
+  clearCarMode()
+  carMode.value = false
+  ui.toast('已退出车机模式', 'success', 1800)
+  window.setTimeout(() => location.reload(), 600)
+}
 
 async function patch(p: Partial<AppSettings>): Promise<void> {
   await ui.patch(p)
@@ -438,17 +515,17 @@ async function togglePlugin(p: PluginInfo): Promise<void> {
   }
 }
 
-/** 打开插件市场：拉取在线目录 manifest */
+/** 打开源市场（0.10）：统一 manifest，kind 分发三类源；自定义市场 URL（N29） */
 async function loadMarket(): Promise<void> {
   marketOpen.value = true
   marketLoading.value = true
   marketError.value = ''
   try {
-    // 走后端 request（net.fetch + 代理），避免渲染层直连 raw.githubusercontent 触发 fetch failed
-    marketEntries.value = await call<MarketEntry[]>('plugins:market', { url: OFFICIAL_SUB_URL })
+    const url = String(setting.value.marketUrl || '').trim() || OFFICIAL_SUB_URL
+    marketEntries.value = await call<MarketItem[]>('market:list', { url })
     if (!marketEntries.value.length) marketError.value = '目录为空'
   } catch (e: any) {
-    marketError.value = `插件市场加载失败：${e.message}`
+    marketError.value = `源市场加载失败：${e.message}`
   } finally {
     marketLoading.value = false
   }
@@ -460,12 +537,29 @@ function isInstalled(file: string): PluginInfo | undefined {
 }
 
 /** 从市场安装/更新一个插件 */
-async function installFromMarket(entry: MarketEntry): Promise<void> {
-  marketUpdating.value = entry.file
+/** F-31：统一安装（kind 路由 lxHost / mfHost） */
+async function installFromMarket(entry: MarketItem): Promise<void> {
+  marketUpdating.value = entry.url
   try {
-    await call('plugins:import', { url: entry.url, origin: 'subscribe' })
-    ui.toast(`已安装/更新 ${entry.name}`, 'success')
+    await call(entry.installed ? 'market:update' : 'market:install', { item: entry })
+    ui.toast(`${entry.installed ? '已更新' : '已安装'} ${entry.name}（${KIND_LABEL[entry.kind]}）`, 'success')
     await loadPlugins()
+    await loadMarket()
+  } catch (e: any) {
+    ui.toast(`${entry.name}：${e.message}`, 'error')
+  } finally {
+    marketUpdating.value = ''
+  }
+}
+
+/** 卸载（按 sourceUrl 匹配，Bug 125） */
+async function uninstallFromMarket(entry: MarketItem): Promise<void> {
+  marketUpdating.value = entry.url
+  try {
+    await call('market:uninstall', { item: entry })
+    ui.toast(`已卸载 ${entry.name}`, 'info')
+    await loadPlugins()
+    await loadMarket()
   } catch (e: any) {
     ui.toast(`${entry.name}：${e.message}`, 'error')
   } finally {
@@ -586,8 +680,16 @@ async function doSubscribe(): Promise<void> {
 }
 
 async function removeSub(url: string): Promise<void> {
+  // F-26：移除订阅时询问是否同时卸载该订阅下插件
+  let uninstall = false
   try {
-    subs.value = await call<PluginSubscription[]>('plugins:subs:remove', { url })
+    uninstall = window.confirm('移除订阅时是否同时卸载该订阅安装的插件？（取消则仅移除订阅记录）')
+  } catch {
+    uninstall = false
+  }
+  try {
+    subs.value = await call<PluginSubscription[]>('plugins:subs:remove', { url, uninstall })
+    await loadPlugins()
     ui.toast('订阅已移除', 'success')
   } catch (e: any) {
     ui.toast(e.message, 'error')
@@ -1139,6 +1241,17 @@ onBeforeUnmount(stopPoll)
           </div>
 
           <div class="row">
+            <div class="label"><b>手机粒子</b><span>手机端默认关闭，开启后限 50 粒子省电档</span></div>
+            <Toggle :model-value="particlePhone" @update:model-value="v => setParticlePhone(v)" />
+          </div>
+
+          <!-- Bug 66：车机模式退出入口（识别为车机后此前不可逆） -->
+          <div v-if="carMode" class="row">
+            <div class="label"><b>车机模式</b><span>当前按车机布局渲染（琥珀黄大字大按钮）</span></div>
+            <button class="btn" @click="exitCarMode"><Icon name="monitor" :size="14" />退出车机模式</button>
+          </div>
+
+          <div class="row">
             <div class="label"><b>列表密度</b><span>影响歌曲列表行高与一屏可见数量</span></div>
             <div class="seg">
               <button :class="{ on: setting.listDensity === 'compact' }" @click="patch({ listDensity: 'compact' })">紧凑</button>
@@ -1645,6 +1758,56 @@ onBeforeUnmount(stopPoll)
             </div>
           </div>
 
+          <!-- 4.8 局域网同步：桌面作为主机 -->
+          <div class="sec-head" style="margin-top: 30px">
+            <div>
+              <h2>局域网同步</h2>
+              <p class="desc">同一 Wi-Fi 下手机/平板扫码或手输 IP 连接本机，同步收藏、最近播放与设置（LWW 合并，不同步音频文件）</p>
+            </div>
+          </div>
+          <div class="set-block">
+            <div class="row" style="display: flex; align-items: center; justify-content: space-between; gap: 12px">
+              <div class="label"><b>作为同步主机</b><span>{{ lanInfo.active ? `已开启 · 端口 ${lanInfo.port} · 配对码 ${lanInfo.pin}` : '未开启' }}</span></div>
+              <button v-if="!lanInfo.active" class="btn sm" :disabled="lanBusy" @click="lanStart">{{ lanBusy ? '启动中…' : '开启' }}</button>
+              <button v-else class="btn sm ghost" @click="lanStop">关闭</button>
+            </div>
+            <div v-if="lanInfo.active" class="label" style="margin-top: 8px">
+              <span>本机地址：{{ lanInfo.ips.map(ip => `${ip}:${lanInfo.port}`).join('　') }}（手机端「设置 → 局域网同步」输入并填配对码 {{ lanInfo.pin }}）</span>
+            </div>
+            <div v-if="lanInfo.active && lanInfo.lastSyncAt" class="label" style="margin-top: 4px">
+              <span>最近同步：{{ new Date(lanInfo.lastSyncAt).toLocaleString() }}</span>
+            </div>
+          </div>
+
+          <!-- N29/N31：自定义市场 URL 与 git 令牌 -->
+          <div class="sec-head" style="margin-top: 30px">
+            <div>
+              <h2>源市场</h2>
+              <p class="desc">默认指向官方插件库分支 manifest，可替换为自建清单；私有仓库可填访问令牌</p>
+            </div>
+          </div>
+          <div class="set-block">
+            <div class="field" style="margin-bottom: 10px">
+              <label>自定义市场 URL（N29）</label>
+              <input
+                :value="setting.marketUrl"
+                placeholder="https://example.com/market.json（留空使用官方源）"
+                style="width: 100%"
+                @change="patch({ marketUrl: ($event.target as HTMLInputElement).value })"
+              />
+            </div>
+            <div class="field">
+              <label>git 令牌（N31，私有仓库 raw 下载）</label>
+              <input
+                :value="setting.gitToken"
+                type="password"
+                placeholder="ghp_…（仅保存在本机设置）"
+                style="width: 100%"
+                @change="patch({ gitToken: ($event.target as HTMLInputElement).value })"
+              />
+            </div>
+          </div>
+
           <!-- 插件库（MusicFree 协议） -->
           <div class="sec-head" style="margin-top: 30px">
             <div>
@@ -2041,31 +2204,58 @@ onBeforeUnmount(stopPoll)
       </template>
     </Modal>
 
-    <!-- 插件市场 -->
-    <Modal v-model="marketOpen" title="插件市场" :width="560">
-      <p class="tip">星河官方插件库 · 在线目录，点击「安装」添加，已安装的可「更新」</p>
+    <!-- 源市场（0.10 统一源市场：三类源 + 搜索 + kind Tab + 版本对比） -->
+    <Modal v-model="marketOpen" title="源市场" :width="620">
+      <p class="tip">统一源市场：音源 / 插件 / 视频源，一键安装与更新（N28/N30）</p>
+      <div class="market-toolbar">
+        <input v-model="marketKeyword" type="search" placeholder="搜索名称、作者、描述" style="flex: 1" />
+        <div class="imp-tabs" style="margin: 0">
+          <button
+            v-for="t in KIND_TABS"
+            :key="t.key"
+            :class="{ on: marketKind === t.key }"
+            @click="marketKind = t.key"
+          >
+            {{ t.label }}
+          </button>
+        </div>
+      </div>
       <div v-if="marketLoading" class="src-list" style="margin-top: 10px">
         <div v-for="i in 3" :key="i" class="sk" style="height: 58px; border-radius: 10px; margin-bottom: 8px" />
       </div>
       <div v-else-if="marketError" class="imp-err">{{ marketError }}</div>
       <div v-else class="src-list" style="margin-top: 10px; max-height: 46vh; overflow-y: auto">
-        <div v-for="m in marketEntries" :key="m.file" class="src">
+        <div v-for="m in marketFiltered" :key="m.url" class="src" @click="marketDetailId = marketDetailId === m.id ? '' : m.id">
           <div class="src-main">
             <div class="src-title">
               <b>{{ m.name }}</b>
               <span v-if="m.version" class="src-ver">v{{ m.version }}</span>
-            </div>
-            <div class="src-platforms">
-              <span v-for="t in (m.types || []).slice(0, 6)" :key="t" class="pf">{{ pluginTypeLabel(t) }}</span>
+              <span class="pf">{{ KIND_LABEL[m.kind] }}</span>
+              <!-- N30：可更新 badge -->
+              <span v-if="m.canUpdate" class="pf upd">可更新</span>
             </div>
             <div v-if="m.author || m.description" class="src-plat">
               <span v-if="m.author">{{ m.author }}</span>
               <span v-if="m.description">· {{ m.description }}</span>
             </div>
+            <!-- F-29：条目详情（changelog / 最低版本 / commit） -->
+            <div v-if="marketDetailId === m.id" class="src-detail">
+              <p v-if="m.changelog">更新说明：{{ m.changelog }}</p>
+              <p v-if="m.compat">最低应用版本：{{ m.compat }}</p>
+              <p v-if="m.commitSha">版本：{{ m.commitSha.slice(0, 8) }}</p>
+              <p class="src-url">{{ m.url }}</p>
+            </div>
           </div>
           <div class="src-actions">
-            <button class="btn sm" :disabled="marketUpdating === m.file" @click="installFromMarket(m)">
-              {{ marketUpdating === m.file ? '处理中…' : isInstalled(m.file) ? '更新' : '安装' }}
+            <button
+              class="btn sm"
+              :disabled="marketUpdating === m.url"
+              @click.stop="installFromMarket(m)"
+            >
+              {{ marketUpdating === m.url ? '处理中…' : m.installed ? (m.canUpdate ? '更新' : '已安装') : '安装' }}
+            </button>
+            <button v-if="m.installed" class="btn sm ghost" :disabled="marketUpdating === m.url" @click.stop="uninstallFromMarket(m)">
+              卸载
             </button>
           </div>
         </div>
@@ -2749,6 +2939,31 @@ h1 {
   display: flex;
   gap: 8px;
   flex-wrap: wrap;
+}
+.market-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 10px;
+}
+.src-detail {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.04);
+  font-size: 12px;
+  color: var(--text-2);
+}
+.src-detail p {
+  margin: 2px 0;
+}
+.src-url {
+  opacity: 0.6;
+  word-break: break-all;
+}
+.pf.upd {
+  color: #34d399;
+  border-color: rgba(52, 211, 153, 0.4);
 }
 .imp-tabs {
   display: flex;

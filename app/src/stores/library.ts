@@ -48,8 +48,15 @@ export const useLibraryStore = defineStore('library', () => {
         void refreshLocal()
       }
     })
-    on('sources:changed', () => {
-      /* 音源变化由设置页自行刷新 */
+    // Bug 122：sources:changed 真实消费者 —— 音源增删后刷新平台列表与本地状态
+    on('sources:changed', async () => {
+      try {
+        // 平台缓存失效：播放器/搜索层下次直接重取（platformList 变化）
+        await call<any>('sources:platforms').catch(() => null)
+        // 设置页音源列表等由各自页面监听本事件刷新；这里刷新曲库侧依赖
+      } catch {
+        /* ignore */
+      }
     })
   }
 

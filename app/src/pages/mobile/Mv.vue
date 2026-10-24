@@ -181,6 +181,35 @@ async function biliLogout(): Promise<void> {
   }
 }
 
+/** 源 Tab（F-14 / 3.10）：bili 默认兜底；kg/kw 元数据置灰 */
+const source = ref('bili')
+const SOURCE_TABS = [
+  { key: 'bili', label: 'B站' },
+  { key: 'wy', label: '网易云' },
+  { key: 'qq', label: 'QQ' },
+  { key: 'kg', label: '酷狗' },
+  { key: 'kw', label: '酷我' },
+]
+function sourceLabel(v: MvItem): string {
+  const map: Record<string, string> = { bili: 'B站', wy: '网易', qq: 'QQ', kg: '酷狗', kw: '酷我' }
+  return map[v.source || 'bili'] || v.source || 'B站'
+}
+function isSignedSource(v: MvItem): boolean {
+  return v.source === 'kg' || v.source === 'kw'
+}
+function mvId(v: MvItem): string {
+  return v.sourceId || v.bvid || ''
+}
+function openMv(v: MvItem): void {
+  if (isSignedSource(v)) return
+  router.push(`/mv/${v.source || 'bili'}/${mvId(v)}`)
+}
+function switchSource(k: string): void {
+  if (source.value === k) return
+  source.value = k
+  void search()
+}
+
 async function search(): Promise<void> {
   const k = keyword.value.trim() || '音乐'
   loading.value = true
@@ -188,7 +217,7 @@ async function search(): Promise<void> {
   page.value = 1
   hasMore.value = true
   try {
-    const res = await call<MvItem[]>('music:mv', { keyword: k, page: 1 })
+    const res = await call<MvItem[]>('music:mv', { keyword: k, page: 1, source: source.value })
     list.value = res
     hasMore.value = res.length > 0
     if (!res.length) error.value = '没有找到相关视频，换个关键词试试'
@@ -240,9 +269,9 @@ async function loadMore(): Promise<void> {
   loadingMore.value = true
   try {
     const next = page.value + 1
-    const res = await call<MvItem[]>('music:mv', { keyword: keyword.value.trim() || '音乐', page: next })
-    const seen = new Set(list.value.map(v => v.bvid))
-    const fresh = res.filter(v => !seen.has(v.bvid))
+    const res = await call<MvItem[]>('music:mv', { keyword: keyword.value.trim() || '音乐', page: next, source: source.value })
+    const seen = new Set(list.value.map(v => `${v.source || 'bili'}:${mvId(v)}`))
+    const fresh = res.filter(v => !seen.has(`${v.source || 'bili'}:${mvId(v)}`))
     if (!fresh.length && !res.length) hasMore.value = false
     else {
       list.value = [...list.value, ...fresh]
@@ -289,6 +318,17 @@ onBeforeUnmount(() => {
       <div class="mv-hot">
         <button v-for="k in HOT_SUGGESTIONS" :key="k" class="mv-hot-tag" @click="quick(k)">{{ k }}</button>
       </div>
+      <!-- 源 Tab（F-14 / 3.10） -->
+      <div class="mv-src-tabs">
+        <button
+          v-for="t in SOURCE_TABS"
+          :key="t.key"
+          :class="{ on: source === t.key }"
+          @click="switchSource(t.key)"
+        >
+          {{ t.label }}
+        </button>
+      </div>
       <!-- 视频源登录入口（规格书 2.x：登录后解锁高清晰度；入口常驻视频页顶部） -->
       <div class="mv-account">
         <button class="mv-acc-btn" :class="{ on: bili.loggedIn }" @click="openLogin">
@@ -313,9 +353,10 @@ onBeforeUnmount(() => {
     <!-- 视频卡：2 列 -->
     <template v-else>
       <div class="mv-grid">
-        <button v-for="v in list" :key="v.bvid" class="mv-card" @click="router.push(`/mv/${v.bvid}`)">
+        <button v-for="v in list" :key="`${v.source || 'bili'}:${mvId(v)}`" class="mv-card" :class="{ dim: isSignedSource(v) }" @click="openMv(v)">
           <div class="mv-cover-wrap">
             <Cover :src="picUrl(v.pic)" :size="180" radius="12" class="mv-cover" />
+            <span class="mv-badge src">{{ sourceLabel(v) }}</span>
             <span v-if="v.duration" class="mv-badge">{{ v.duration }}</span>
             <span v-if="v.play" class="mv-badge play"><Icon name="play" :size="10" />{{ fmtPlay(v.play) }}</span>
           </div>
@@ -481,6 +522,40 @@ onBeforeUnmount(() => {
 .mv-badge.play {
   left: 6px;
   right: auto;
+}
+.mv-badge.src {
+  left: 6px;
+  right: auto;
+  bottom: auto;
+  top: 6px;
+}
+.mv-card.dim .mv-cover {
+  filter: brightness(0.6);
+}
+.mv-src-tabs {
+  display: flex;
+  gap: 6px;
+  margin-top: 10px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.mv-src-tabs::-webkit-scrollbar {
+  display: none;
+}
+.mv-src-tabs button {
+  flex: none;
+  height: 30px;
+  padding: 0 14px;
+  border-radius: 15px;
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--text-2);
+  font-size: 12.5px;
+}
+.mv-src-tabs button.on {
+  background: var(--accent-soft, rgba(167, 139, 250, 0.16));
+  border-color: var(--accent);
+  color: var(--accent);
 }
 .mv-title {
   margin-top: 8px;

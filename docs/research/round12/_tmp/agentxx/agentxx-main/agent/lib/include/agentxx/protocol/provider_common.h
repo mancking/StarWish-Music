@@ -1,0 +1,449 @@
+/// 各 LLM Provider (OpenAI Chat Completions / OpenAI Responses / Anthropic) 与
+/// 模型调用节点共用的工具函数
+///
+/// - 这些函数原先在 openai_provider.cpp / anthropic_provider.cpp /
+///   modelcall.cpp 各存一份拷贝, 收敛到这里避免实现细节漂移
+/// - 只放与具体协议无关的通用逻辑; 协议特化 (请求体组装/SSE 解析/错误提取等)
+///   仍留在各自 provider 内
+#pragma once
+
+#include "agentxx/util/neograph_json_bridge.h"
+#include "fmt/format.h"
+#include "neograph/api.h"
+#include "neograph/provider.h"
+#include "utilxx/http_header.h"
+#include <chrono>
+#include <cstdint>
+#include <random>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+namespace agentxx {
+namespace protocol {
+
+/// 流式 chunk 类型扩展 (agentxx 自定义标记)
+///
+/// neograph::ChatStreamChunk 的 `type` 为 int, 上游只固定提供 TYPE_CONTENT /
+/// TYPE_THINKING; 取值 1 << 20 起为本项目自定义, 不会与上游取值冲突。
+///
+/// 这些 chunk **不是模型输出文本**, 只用于把"生成阶段变化"通知 UI (占位提示),
+/// 因此不参与正文/思考累积与 tps 统计:
+/// - 发出方: 各 Provider 的 SSE 解析 (工具调用开始)、模型调用节点 (请求已发出)
+/// - 消费方: `ModelCallWrapNode::onReceiveToken` 的 token 回调 (原样转发) →
+///   `EventBridge::handleLLMToken` (映射为 `WireDelta::Type::GenStatus`)
+namespace chunk_type {
+
+/// 模型节点开始生成: 请求已发出, 首个 token 尚未到达 (data 为空)
+inline constexpr int kGenerationStart = 1 << 20;
+
+/// 工具调用开始: 收到工具调用的首个分片 (参数未接收完, 内容不完整无法展示)
+/// - data 为工具名 (可能为空: 工具名分片尚未到达, 如 Anthropic 的 tool_use 块)
+inline constexpr int kToolCallStart = 1 << 21;
+
+/// 判定是否为生成阶段标记 (非模型输出文本)
+inline constexpr bool isStatusChunk(int type) noexcept {
+    return type == kGenerationStart || type == kToolCallStart;
+}
+
+} // namespace chunk_type
+
+/// 会话 ID 关联请求头键名
+inline constexpr std::string_view kHeaderSessionId       = "X-Session-Id";
+inline constexpr std::string_view kHeaderOpencodeSession = "X-Opencode-Session";
+
+/// CompletionParams.extra_fields 中传递会话 ID 的保留键名
+inline constexpr std::string_view kExtraFieldSessionId = "session_id";
+
+/// 从 CompletionParams 中提取本次会话的 sessionId
+///
+/// 提取优先级:
+/// 1. extra_fields["session_id"]
+/// 2. extra_fields["sessionId"]
+/// 3. extra_fields["X-Session-Id"]
+/// 4. extra_fields["X-Opencode-Session"]
+///
+/// - `args`:
+///     - [params] 补全参数
+///
+/// - `return` 本次会话的 sessionId 字符串, 未提取到时返回空
+inline std::string extractSessionId(const neograph::CompletionParams& params) {
+    if (!params.extra_fields.is_object() || params.extra_fields.empty()) {
+        return {};
+    }
+    static constexpr std::string_view candidateKeys[] = {
+        "session_id",
+        "sessionId",
+        "X-Session-Id",
+        "X-Opencode-Session",
+    };
+    for (const auto& key : candidateKeys) {
+        const std::string keyStr{key};
+        if (params.extra_fields.contains(keyStr)) {
+            auto valStr = params.extra_fields.value(keyStr, "");
+            if (!valStr.empty()) {
+                return valStr;
+            }
+            auto child = params.extra_fields[keyStr];
+            if (child.is_number()) {
+                return child.dump();
+            }
+        }
+    }
+    return {};
+}
+
+/// 判定 extra_fields 中的键是否为内部控制字段 (不应序列化进向 upstream LLM 发送的 JSON 请求体中)
+///
+/// - `args`:
+///     - [key] 待检查的键名
+///
+/// - `return` true 表示为内部保留控制键, 应在组装 request body 时跳过
+inline bool isInternalExtraField(std::string_view key) {
+    return key == "session_id" || key == "sessionId" || key == kHeaderSessionId
+           || key == kHeaderOpencodeSession;
+}
+
+/// 向请求头中设置本次会话的 sessionId
+///
+/// 按照规范使用两个 key:
+/// - X-Session-Id
+/// - X-Opencode-Session
+/// 相同都携带 sessionId 作为 value
+///
+/// - `args`:
+///     - [headers] 待填充的请求头映射
+///     - [sessionId] 本次会话的 sessionId, 为空时不添加
+inline void applySessionHeaders(utilxx::HeaderMap& headers, std::string_view sessionId) {
+    if (!sessionId.empty()) {
+        headers.set(kHeaderSessionId, sessionId);
+        headers.set(kHeaderOpencodeSession, sessionId);
+    }
+}
+
+/// 向请求头中设置由 CompletionParams 提取的本次会话 sessionId
+///
+/// - `args`:
+///     - [headers] 待填充的请求头映射
+///     - [params] 补全参数
+inline void
+    applySessionHeaders(utilxx::HeaderMap& headers, const neograph::CompletionParams& params) {
+    applySessionHeaders(headers, extractSessionId(params));
+}
+
+/// 生成唯一的 tool_call id: 毫秒时间戳 + 32 位随机数
+/// - 无需与已有 id 比较, 碰撞概率 ~2^-32 (同一毫秒内), 跨毫秒必然不同
+/// - 相比按下标回填 call_{i}, 不会与 LLM 返回的 call_N 形式 id 冲突
+///
+/// - `args`:
+///     - [index] 同一毫秒内仍需要区分多个 id 时使用的序号 (默认 0)
+///
+/// - `return` 形如 `call_{毫秒时间戳}_{index}_{8位hex随机数}` 的 id
+inline std::string makeUniqueToolCallId(size_t index = 0) {
+    thread_local std::mt19937_64 rng{
+        static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count())
+    };
+    const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()
+    )
+                        .count();
+    return fmt::format("call_{}_{}_{:08x}", ts, index, static_cast<uint32_t>(rng()));
+}
+
+/// 把 typed 上下文直接组装为 OpenAI Chat Completions 请求体的 `messages` 数组
+///
+/// - 与 [neograph::messages_to_json] 的输出逐字段一致: 角色 / 正文 / tool_calls /
+///   tool 应答 / 多模态分片顺序均相同, 只是直接产出 `utilxx_base::Json`,
+///   省掉 "typed -> neograph json -> utilxx Json" 里的一次整段 DOM 拷贝
+///   (每轮请求都会发生, 长上下文时是主要的内存与分配量来源之一)
+/// - 二者必须保持一致: `/test` 的 `openai_provider` 模块有逐字节对照用例
+///
+/// - `args`:
+///     - [messages] 会话上下文 (typed)
+///     - [sendThinking] 是否回传明文思考 (`reasoning_content`);
+///       关闭时不写入该字段, 等价于旧实现的"构造后逐条删除该键"
+///
+/// - `return` OpenAI messages 数组
+inline utilxx_base::Json chatMessagesToOpenAIJson(
+    const std::vector<neograph::ChatMessage>& messages,
+    bool                                      sendThinking
+) {
+    auto arr = utilxx_base::Json::array();
+    for (const auto& msg : messages) {
+        utilxx_base::Json j;
+        j["role"] = msg.role;
+
+        if (msg.role == "tool") {
+            j["content"]       = msg.content;
+            j["tool_call_id"]  = msg.tool_call_id;
+        } else if (!msg.tool_calls.empty()) {
+            // 带工具调用的助手消息: 无正文时 content 为 null (与 neograph 一致)
+            j["content"] = msg.content.empty() ? utilxx_base::Json{} : utilxx_base::Json(msg.content);
+            auto tcArr   = utilxx_base::Json::array();
+            for (const auto& tc : msg.tool_calls) {
+                tcArr.push_back(utilxx_base::Json{
+                    {"id", utilxx_base::Json(tc.id)},
+                    {"type", utilxx_base::Json("function")},
+                    {"function",
+                     utilxx_base::Json{
+                         {"name", utilxx_base::Json(tc.name)},
+                         {"arguments", utilxx_base::Json(tc.arguments)},
+                     }},
+                });
+            }
+            j["tool_calls"] = std::move(tcArr);
+        } else if (!msg.image_urls.empty() || !msg.audio_urls.empty() || !msg.video_urls.empty()) {
+            // 多模态: 文本 + 图片/音频/视频 (OpenAI 分片格式)
+            auto parts = utilxx_base::Json::array();
+            if (!msg.content.empty()) {
+                parts.push_back(utilxx_base::Json{
+                    {"type", utilxx_base::Json("text")},
+                    {"text", utilxx_base::Json(msg.content)},
+                });
+            }
+            for (const auto& url : msg.image_urls) {
+                parts.push_back(utilxx_base::Json{
+                    {"type", utilxx_base::Json("image_url")},
+                    {"image_url", utilxx_base::Json{{"url", utilxx_base::Json(url)}}},
+                });
+            }
+            for (const auto& url : msg.audio_urls) {
+                if (auto parsed = neograph::parse_data_url(url)) {
+                    // data URL 可拆成 base64 数据 + 格式; HTTP URL 拆不出, 走 url 字段
+                    parts.push_back(utilxx_base::Json{
+                        {"type", utilxx_base::Json("input_audio")},
+                        {"input_audio",
+                         utilxx_base::Json{
+                             {"data", utilxx_base::Json(parsed->second)},
+                             {"format",
+                              utilxx_base::Json(neograph::media_format_from_mime(parsed->first))},
+                         }},
+                    });
+                } else {
+                    parts.push_back(utilxx_base::Json{
+                        {"type", utilxx_base::Json("input_audio")},
+                        {"input_audio", utilxx_base::Json{{"url", utilxx_base::Json(url)}}},
+                    });
+                }
+            }
+            for (const auto& url : msg.video_urls) {
+                parts.push_back(utilxx_base::Json{
+                    {"type", utilxx_base::Json("video_url")},
+                    {"video_url", utilxx_base::Json{{"url", utilxx_base::Json(url)}}},
+                });
+            }
+            j["content"] = std::move(parts);
+        } else {
+            j["content"] = msg.content;
+        }
+
+        if (msg.role == "assistant") {
+            if (!msg.reasoning_details.empty()) {
+                if (!msg.reasoning_details.is_array()) {
+                    throw std::invalid_argument("ChatMessage reasoning_details must be an array");
+                }
+                j["reasoning_details"] = agentxx::util::fromNeographJson(msg.reasoning_details);
+            } else if (sendThinking && !msg.reasoning_content.empty()) {
+                j["reasoning_content"] = msg.reasoning_content;
+            }
+        }
+
+        arr.push_back(std::move(j));
+    }
+    return arr;
+}
+
+/// 与 `chatMessagesToOpenAIJson(messages, sendThinking).dump()` **逐字节一致**的流式版本
+///
+/// - 用途: 请求体组装时把消息数组直接写成 JSON 文本, 不先构造整段消息数组的 DOM。
+///   长上下文下每轮都要发一次全量消息, 构造整段 DOM 会同时留下"DOM 一份 + dump 一份"
+///   两块 O(上下文) 的临时内存, 逐条追加把临时内存压到单条消息量级
+///   (最终请求体字符串本身仍是 O(上下文), 无法避免)
+/// - 实现复用 [chatMessagesToOpenAIJson]: 逐条消息走同一份转换逻辑, 因此输出与
+///   整段 dump 完全一致 (JSON 数组就是 `[` + 元素按序以 `,` 连接 + `]`)
+/// - 注意: 越界/类型错误的处理与整段版本一致 (同样会抛异常)
+///
+/// - `args`:
+///     - [out] 追加目标 (调用方负责预留容量, 避免反复扩容)
+///     - [messages] 会话上下文 (typed)
+///     - [sendThinking] 是否回传明文思考
+inline void appendOpenAIMessagesJson(
+    std::string&                              out,
+    const std::vector<neograph::ChatMessage>& messages,
+    bool                                      sendThinking
+) {
+    if (messages.empty()) {
+        out += "[]";
+        return;
+    }
+    out.push_back('[');
+    // 单元素向量复用既有实现: 每条消息单独转换并立即 dump, 转换结果不跨条累积
+    std::vector<neograph::ChatMessage> one;
+    one.reserve(1);
+    for (size_t i = 0; i < messages.size(); ++i) {
+        if (i > 0) {
+            out.push_back(',');
+        }
+        one.clear();
+        one.push_back(messages[i]);
+        out += chatMessagesToOpenAIJson(one, sendThinking)[0].dump();
+    }
+    out.push_back(']');
+}
+
+/// 把 typed 工具定义直接组装为 OpenAI Chat Completions 请求体的 `tools` 数组
+///
+/// - 与 [neograph::tools_to_json] 的输出逐字段一致, 同样省掉一次整段 DOM 拷贝
+/// - 无参数 schema 的工具回退为空对象 schema (严格校验的网关会拒绝
+///   `"parameters": null`)
+///
+/// - `args`:
+///     - [tools] 工具定义列表
+///
+/// - `return` OpenAI tools 数组
+inline utilxx_base::Json chatToolsToOpenAIJson(const std::vector<neograph::ChatTool>& tools) {
+    auto arr = utilxx_base::Json::array();
+    for (const auto& tool : tools) {
+        const neograph::json& params
+            = tool.parameters.is_object() ? tool.parameters : neograph::json::object();
+        arr.push_back(utilxx_base::Json{
+            {"type", utilxx_base::Json("function")},
+            {"function",
+             utilxx_base::Json{
+                 {"name", utilxx_base::Json(tool.name)},
+                 {"description", utilxx_base::Json(tool.description)},
+                 {"parameters", agentxx::util::fromNeographJson(params)},
+             }},
+        });
+    }
+    return arr;
+}
+
+/// 与 `chatToolsToOpenAIJson(tools).dump()` **逐字节一致**的流式版本
+///
+/// - 用途同 [appendOpenAIMessagesJson]: 工具定义数组直接写成文本, 不构造整段 DOM
+///   (工具定义每轮都会随请求体发送, 只是体量小于消息数组)
+///
+/// - `args`:
+///     - [out] 追加目标
+///     - [tools] 工具定义列表
+inline void appendOpenAIToolsJson(std::string& out, const std::vector<neograph::ChatTool>& tools) {
+    if (tools.empty()) {
+        out += "[]";
+        return;
+    }
+    out.push_back('[');
+    std::vector<neograph::ChatTool> one;
+    one.reserve(1);
+    for (size_t i = 0; i < tools.size(); ++i) {
+        if (i > 0) {
+            out.push_back(',');
+        }
+        one.clear();
+        one.push_back(tools[i]);
+        out += chatToolsToOpenAIJson(one)[0].dump();
+    }
+    out.push_back(']');
+}
+
+/// 补充用量明细 (缓存 token) 的单独传递
+///
+/// 背景: `neograph::ChatCompletion::Usage` 只有 prompt / completion / total /
+/// cached_prompt / reasoning 五项; Anthropic 另外回报"缓存写入量"
+/// (`cache_creation_input_tokens`), 它在 agentxx 用量记录里单独成列。
+/// 为了不改动第三方库的结构, provider 把这类补充用量写进
+/// `completion.message.extra[kUsageDetailExtraKey]` (对象), 由模型调用节点取出后
+/// 写用量记录, 并把该键置空 —— 不让内部记账字段混进会话消息。
+///
+/// - 该键不会被序列化进下一轮请求体 (extra 不参与请求装配)
+/// - provider 不上报时键不存在, 调用方按 0 处理
+inline constexpr std::string_view kUsageDetailExtraKey = "_agentxx_usage_detail";
+
+/// 补充用量字段名: 命中缓存的 prompt token 数 (`cached_prompt_tokens` 的同源值)
+inline constexpr std::string_view kUsageCacheReadTokensKey = "cache_read_tokens";
+/// 补充用量字段名: 写入缓存的 prompt token 数 (仅 Anthropic 回报)
+inline constexpr std::string_view kUsageCacheWriteTokensKey = "cache_write_tokens";
+
+/// 补充用量明细 (缓存读/写)
+struct UsageDetail {
+    int64_t cacheReadTokens  = 0;
+    int64_t cacheWriteTokens = 0;
+
+    bool empty() const noexcept {
+        return cacheReadTokens == 0 && cacheWriteTokens == 0;
+    }
+};
+
+/// provider 侧: 写入补充用量 (值为 0 的字段照写, 便于对端区分"已知为 0"与"未上报")
+inline void setUsageDetail(neograph::ChatCompletion& completion, const UsageDetail& detail) {
+    neograph::json obj                          = neograph::json::object();
+    obj[std::string{kUsageCacheReadTokensKey}]  = detail.cacheReadTokens;
+    obj[std::string{kUsageCacheWriteTokensKey}] = detail.cacheWriteTokens;
+    completion.message.extra[std::string{kUsageDetailExtraKey}] = std::move(obj);
+}
+
+/// 模型调用节点侧: 取出补充用量, 并把该键置空 (不进入会话消息)
+/// - 键不存在时返回全 0
+inline UsageDetail takeUsageDetail(neograph::ChatCompletion& completion) {
+    auto        out = UsageDetail{};
+    const std::string key{kUsageDetailExtraKey};
+    auto&             extra = completion.message.extra;
+    if (!extra.is_object() || !extra.contains(key)) {
+        return out;
+    }
+    auto obj = extra[key];
+    if (obj.is_object()) {
+        out.cacheReadTokens
+            = static_cast<int64_t>(obj.value(std::string{kUsageCacheReadTokensKey}, int64_t{0}));
+        out.cacheWriteTokens
+            = static_cast<int64_t>(obj.value(std::string{kUsageCacheWriteTokensKey}, int64_t{0}));
+    }
+    // 置空而非删除: 第三方 json 结构没有删除键的接口, 置空同样能保证不混进会话消息
+    extra[key] = neograph::json(nullptr);
+    return out;
+}
+
+/// 只读读取补充用量 (不改动 completion; provider 内部结算用)
+inline UsageDetail readUsageDetail(const neograph::ChatCompletion& completion) {
+    auto              out = UsageDetail{};
+    const std::string key{kUsageDetailExtraKey};
+    const auto&       extra = completion.message.extra;
+    if (!extra.is_object() || !extra.contains(key)) {
+        return out;
+    }
+    auto obj = extra[key];
+    if (obj.is_object()) {
+        out.cacheReadTokens
+            = static_cast<int64_t>(obj.value(std::string{kUsageCacheReadTokensKey}, int64_t{0}));
+        out.cacheWriteTokens
+            = static_cast<int64_t>(obj.value(std::string{kUsageCacheWriteTokensKey}, int64_t{0}));
+    }
+    return out;
+}
+
+/// 判定是否为"有效空响应": content / 明文思考 / tool_calls 全空, 且无加密思考内容/// - 加密思考内容存于 `message.extra[carrierKey]`, 是供应商网关只回传思考密文
+///   (summary/content 均空) 时唯一的有效内容; 数组非空即视为有内容
+/// - 空响应对 Agent 而言等于本次生成失败: 无内容可展示、无 tool_calls 可路由,
+///   由调用方抛出异常, 经 modelcall 重试流程自动重试并提示 UI
+///
+/// - `args`:
+///     - [completion] 待判定的补全结果
+///     - [carrierKey] 加密思考内容在 `message.extra` 中的键
+///       (OpenAI Responses: [OpenAIProvider::kResponsesReasoningItemsKey];
+///        Anthropic: [AnthropicProvider::kThinkingBlocksKey])
+///
+/// - `return` true 表示本次响应无任何有效内容 (应视为失败)
+inline bool
+    isEmptyResponse(const neograph::ChatCompletion& completion, std::string_view carrierKey) {
+    const auto& msg = completion.message;
+    if (!msg.content.empty() || !msg.reasoning_content.empty() || !msg.tool_calls.empty()) {
+        return false;
+    }
+    const std::string key{carrierKey};
+    return !(msg.extra.contains(key) && msg.extra[key].is_array() && !msg.extra[key].empty());
+}
+
+} // namespace protocol
+} // namespace agentxx

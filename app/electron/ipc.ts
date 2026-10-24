@@ -3,7 +3,9 @@ import fs from 'node:fs'
 import path from 'node:path'
 import type { AppSettings, Song } from '../shared/types'
 import { createLogger } from './core/log'
-import { lxHost } from './core/lx-host'
+import { lxHost, setSourceDebugSink } from './core/lx-host'
+import * as marketHost from './core/market-host'
+import { startLanSync, stopLanSync, lanSyncInfo } from './core/lan-sync'
 import * as mfHost from './core/mf-host'
 import {
   getCover,
@@ -21,6 +23,8 @@ import {
   importPlaylist,
   searchAll,
   searchMv,
+  mvBySong,
+  searchPlaylistList,
 } from './core/music-service'
 import { buildHomeFeed, invalidateFeed } from './core/recommend'
 import { buildRadio, invalidateRadio } from './core/radio'
@@ -37,6 +41,7 @@ import {
   pauseDownload,
   removeDownload,
   restoreDownloads,
+  sweepOrphanParts,
   resumeDownload,
   setDownloadEmitter,
 } from './core/download'
@@ -69,7 +74,9 @@ import {
 import { biliLogout, biliQrGenerate, biliQrPoll, biliStatus, biliCookieLogin, biliPasswordLogin } from './core/bili'
 import { cancelScan, getScanProgress, scanLibrary } from './core/library'
 import { coverCacheSize, clearCoverCache, coverProtocolUrl } from './core/cover'
-import { downloadMediaTo, releaseMediaCache, saveOfflineVideo, listOfflineVideos, removeOfflineVideos, offlineVideoFile } from './core/media'
+import { downloadMediaTo, releaseMediaCache, saveOfflineVideo, listOfflineVideos, removeOfflineVideos, offlineVideoFile, offlineKeyOf } from './core/media'
+import { extractToMp3, cancelExtract } from './core/audio'
+import { cacheInfo as playbackCacheInfo, clearPlaybackCache } from './core/cache'
 import {
   cacheRootDir,
   coverCacheDir,
@@ -257,14 +264,18 @@ const handlers: Record<string, Handler> = {
   'sources:list': () => {
     const disabled = dbGetSetting<string[]>('sources.disabled') || []
     const deleted = dbGetSetting<string[]>('sources.deleted') || []
+    const enabledOnce = dbGetSetting<string[]>('sources.enabled') || []
+    lxHost.setUserEnabledList(enabledOnce)
     lxHost.setDisabledList(disabled)
     lxHost.setDeletedList(deleted)
+    wireSourceDebug()
     return lxHost.list()
   },
   'sources:platforms': () => lxHost.platformList(),
   'sources:toggle': ({ file, enabled }: { file: string; enabled: boolean }) => {
     lxHost.setEnabled(file, enabled)
     dbSetSetting('sources.disabled', lxHost.getDisabledList())
+    dbSetSetting('sources.enabled', lxHost.getUserEnabledList())
     broadcast('sources:changed', lxHost.list())
     return lxHost.list()
   },
@@ -284,7 +295,8 @@ const handlers: Record<string, Handler> = {
   'sources:restore': () => {
     lxHost.restoreBuiltin()
     dbSetSetting('sources.deleted', [])
-    dbSetSetting('sources.disabled', [])
+    // F-25：恢复内置只清 deleted，用户 disabled 保留
+    dbSetSetting('sources.disabled', lxHost.getDisabledList())
     broadcast('sources:changed', lxHost.list())
     return lxHost.list()
   },
@@ -294,22 +306,47 @@ const handlers: Record<string, Handler> = {
   'plugins:code': ({ file }: { file: string }) => mfHost.getSourceCode(file),
   'plugins:toggle': ({ file, enabled }: { file: string; enabled: boolean }) => mfHost.togglePlugin(file, enabled),
   'plugins:delete': ({ file }: { file: string }) => mfHost.deletePlugin(file),
-  'plugins:import': async ({ url, content, file }: { url?: string; content?: string; file?: string }) => {
+  'plugins:import': async ({ url, content, file, origin }: { url?: string; content?: string; file?: string; origin?: string }) => {
+    // Bug 121：桌面补传 origin（市场/订阅来源标签此前被丢弃）
     if (url) return await mfHost.importFromUrl(url, file)
-    if (content) return mfHost.importFromContent(content, 'local', undefined, file)
+    if (content) return mfHost.importFromContent(content, (origin as any) || 'local', undefined, file)
     throw new Error('请提供插件链接或内容')
   },
   'plugins:subscribe': async ({ url, name }: { url: string; name?: string }) =>
     await mfHost.importSubscription(url, name),
   'plugins:subs:list': () => mfHost.listSubscriptions(),
-  'plugins:subs:remove': ({ url }: { url: string }) => mfHost.removeSubscription(url),
+  'plugins:subs:remove': ({ url, uninstall }: { url: string; uninstall?: boolean }) =>
+    mfHost.removeSubscription(url, !!uninstall),
+  /* C-25：订阅立即刷新 */
+  'plugins:subs:refresh': async ({ url, name }: { url: string; name?: string }) =>
+    await mfHost.importSubscription(url, name),
+  /* Bug 127：回滚到上一版 */
+  'plugins:rollback': ({ file }: { file: string }) => mfHost.rollbackPlugin(file),
   'plugins:market': async ({ url }: { url: string }) => await mfHost.fetchMarket(url),
   'plugins:search': async ({ file, query, page, type }: any) => await mfHost.search(file, query, page || 1, type || 'music'),
   'plugins:lyric': async ({ file, musicItem }: any) => await mfHost.getLyric(file, musicItem),
   'plugins:url': async ({ file, musicItem, quality }: any) => await mfHost.getMusicUrl(file, musicItem, quality || 'standard'),
 
+  /* ---------------- 统一源市场（规格书 0.10 / C-26 门面 IPC） ---------------- */
+  'market:list': async ({ url }: { url: string }) => await marketHost.listMarket(url),
+  'market:channels': () => marketHost.channels(),
+  'market:install': async ({ item }: { item: any }) => await marketHost.installItem(item),
+  'market:update': async ({ item }: { item: any }) => await marketHost.updateItem(item),
+  'market:uninstall': async ({ item }: { item: any }) => await marketHost.uninstallItem(item),
+  'market:detail': ({ item }: { item: any }) => item,
+
+  /* ---------------- 局域网同步（规格书 4.8） ---------------- */
+  'lan:info': () => lanSyncInfo(),
+  'lan:start': async () => await startLanSync(),
+  'lan:stop': () => {
+    stopLanSync()
+    return { active: false }
+  },
+
   /* ---------------- 音乐数据 ---------------- */
   'music:search': async ({ keyword, page, platform }: any) => decList(await searchAll(keyword, page || 1, { platform })),
+  /* 规格 3.7 / Bug 17：搜索页歌单 Tab */
+  'music:searchPlaylists': async ({ keyword, page }: any) => await searchPlaylistList(keyword, page || 1),
   'music:url': async ({ song, quality }: { song: Song; quality: string }) => {
     const { resolveUrl } = await import('./core/music-service')
     return resolveUrl(song, quality || getSettings().quality, getSettings().autoSwitchSource)
@@ -343,13 +380,19 @@ const handlers: Record<string, Handler> = {
     const r = await importPlaylist(input, platform)
     return { ...r, songs: decList(r.songs) }
   },
-  'music:mv': async ({ keyword, page }: any) => {
-    const list = await searchMv(keyword || '音乐', page || 1)
+  /* MV 多音源（规格书 2.17 / 3.10）：source 决定平台，bvid 仍作 B 站兼容参数 */
+  'music:mv': async ({ keyword, page, source }: any) => {
+    const list = await searchMv(keyword || '音乐', page || 1, source || 'bili')
     return list.map(v => ({ ...v, pic: v.pic && /^https?:\/\//i.test(v.pic) ? coverProtocolUrl(v.pic) : v.pic }))
   },
-  'music:mvinfo': ({ bvid }: any) => getMvInfo(bvid),
-  'music:mvurl': ({ bvid, cid, qn }: any) => getMvUrl(bvid, cid, qn),
-  'music:mvparts': ({ bvid }: any) => getMvParts(bvid),
+  'music:mvinfo': ({ bvid, source }: any) => getMvInfo(source || 'bili', bvid),
+  'music:mvurl': ({ bvid, cid, qn, source }: any) => getMvUrl(source || 'bili', bvid, cid, qn),
+  'music:mvparts': ({ bvid, source }: any) => getMvParts(source || 'bili', bvid),
+  /* 规格 2.18：播放页 MV 按钮（mvBySong，5 分钟缓存） */
+  'music:mvBySong': async ({ song }: any) => {
+    const list = await mvBySong(song)
+    return list.map(v => ({ ...v, pic: v.pic && /^https?:\/\//i.test(v.pic) ? coverProtocolUrl(v.pic) : v.pic }))
+  },
   'home:feed': async ({ force }: any) => decFeed(await buildHomeFeed(!!force)),
   /** 私人电台：按口味生成可连续播放的新歌队列（换一批时 force=true） */
   'radio:build': async ({ force, size }: any) => {
@@ -532,6 +575,77 @@ const handlers: Record<string, Handler> = {
     await releaseMediaCache(url)
     return true
   },
+  /* 规格 2.15：截图保存 PNG（存系统图片目录，返回完整路径） */
+  'app:saveImage': async ({ name, dataUrl }: { name: string; dataUrl: string }) => {
+    const m = /^data:image\/(png|jpeg);base64,(.+)$/.exec(String(dataUrl || ''))
+    if (!m) throw new Error('无效的图片数据')
+    const ext = m[1] === 'jpeg' ? 'jpg' : 'png'
+    const buf = Buffer.from(m[2]!, 'base64')
+    let dir: string
+    try {
+      dir = path.join(app.getPath('pictures'), 'StarWish')
+    } catch {
+      dir = path.join(userDataDir(), 'pictures')
+    }
+    fs.mkdirSync(dir, { recursive: true })
+    const base = (name || '截图').replace(/[\/:*?"<>|]/g, '_').slice(0, 80) || '截图'
+    let file = path.join(dir, `${base}.${ext}`)
+    let n = 1
+    while (fs.existsSync(file)) {
+      file = path.join(dir, `${base} (${n}).${ext}`)
+      n++
+      if (n > 99) break
+    }
+    fs.writeFileSync(file, buf)
+    return { file, size: buf.length }
+  },
+  /* 规格 2.12 / Bug 8：音频提取保存 MP3（lamejs 转码 + 进度 + 可取消） */
+  'audio:extract': async ({ url, title }: { url: string; title?: string }) => {
+    if (!url) throw new Error('缺少音频地址')
+    const id = `ex_${Date.now().toString(36)}`
+    const ac = new AbortController()
+    extractAborts.set(id, ac)
+    void (async () => {
+      try {
+        const r = await extractToMp3({
+          id,
+          url,
+          title: title || '提取音频',
+          signal: ac.signal,
+          onProgress: pct => broadcast('audio:extract:progress', { id, pct }),
+        })
+        // 完成后并入本地曲库（与下载一致）
+        try {
+          const { scanLibrary } = await import('./core/library')
+          await scanLibrary([path.dirname(r.file)], () => {})
+        } catch {
+          /* ignore */
+        }
+        broadcast('audio:extract:progress', { id, pct: 100, file: r.file })
+        broadcast('toast', { type: 'success', message: '音频已提取保存' })
+      } catch (e: any) {
+        broadcast('audio:extract:progress', { id, error: String(e?.message || '提取失败') })
+      } finally {
+        extractAborts.delete(id)
+      }
+    })()
+    return { id }
+  },
+  'audio:extractCancel': ({ id }: { id: string }) => {
+    const ac = extractAborts.get(id)
+    if (ac) ac.abort()
+    return cancelExtract(id)
+  },
+  /* 规格书 v2.8 · 1.12：播放缓存信息（音频 50 首 / 500MB，视频 1GB） */
+  'cache:info': () => playbackCacheInfo(),
+  /* 规格书 v2.8 · 1.12：清除播放缓存（scope: cover | media | all，不删除已下载文件） */
+  'cache:clear': ({ scope = 'all' }: { scope?: 'cover' | 'media' | 'all' } = {}) => {
+    if (scope === 'all' || scope === 'cover') clearCoverCache()
+    if (scope === 'all' || scope === 'media') clearPlaybackCache()
+    const cover = coverCacheSize()
+    const media = playbackCacheInfo().total
+    return { cover, media, total: cover + media }
+  },
   /* 视频：离线缓存 —— 检查某 bvid+cid 是否已离线（返回本地路径，供直接播放） */
   'video:offline:file': ({ bvid, cid }: { bvid: string; cid: string }) => offlineVideoFile(bvid, cid),
   /* 视频：离线缓存 —— 整片下载到离线目录 */
@@ -542,7 +656,11 @@ const handlers: Record<string, Handler> = {
   /* 视频：离线缓存 —— 管理面板：列出离线视频 + 总占用 */
   'video:offline:list': () => listOfflineVideos(),
   /* 视频：离线缓存 —— 删除单个（传 key）或清空全部（不传） */
-  'video:offline:remove': ({ key }: { key?: string }) => removeOfflineVideos(key),
+  'video:offline:remove': ({ key, bvid, cid }: { key?: string; bvid?: string; cid?: string }) => {
+    // Bug 109/T-01：统一契约 —— 传 manifest 键或 bvid+cid 均可；两者都缺时视为「清空全部」
+    const k = key || (bvid && cid ? offlineKeyOf(bvid, cid) : undefined)
+    return removeOfflineVideos(k)
+  },
   'library:scan': async ({ dirs }: { dirs: string[] }) => {
     const settings = getSettings()
     const list = (dirs && dirs.length ? dirs : settings.localDirs).filter(Boolean)
@@ -583,7 +701,9 @@ const handlers: Record<string, Handler> = {
 
   /* ---------------- 窗口 ---------------- */
   'win:minimize': () => {
-    wins.main?.minimize()
+    // Bug 34：开启「最小化到托盘」时隐藏窗口而非任务栏最小化
+    if (getSettings().minimizeToTray) wins.main?.hide()
+    else wins.main?.minimize()
     return true
   },
   'win:toggleMaximize': () => {
@@ -720,34 +840,6 @@ const handlers: Record<string, Handler> = {
     broadcast('settings:changed', s)
     return { settings: s, dir: newDir }
   },
-  // scope: cover | media | all
-  'cache:clear': ({ scope = 'all' }: any = {}) => {
-    if (scope === 'all' || scope === 'cover') clearCoverCache()
-    if (scope === 'all' || scope === 'media') {
-      try {
-        const dir = mediaCacheDir()
-        for (const f of fs.readdirSync(dir)) fs.unlinkSync(path.join(dir, f))
-      } catch {
-        /* ignore */
-      }
-    }
-    let media = 0
-    try {
-      const dir = mediaCacheDir()
-      media = fs.readdirSync(dir).reduce((sum, f) => {
-        try {
-          return sum + fs.statSync(path.join(dir, f)).size
-        } catch {
-          return sum
-        }
-      }, 0)
-    } catch {
-      media = 0
-    }
-    const cover = coverCacheSize()
-    return { cover, media, total: cover + media }
-  },
-
   /* ---------------- 数据目录 ---------------- */
   'data:setDir': ({ dir }: any) => {
     const target = String(dir || '').trim()
@@ -773,6 +865,21 @@ const handlers: Record<string, Handler> = {
         fs.cpSync(path.join(oldDir, 'sources'), path.join(target, 'sources'), { recursive: true })
       } catch {
         /* 音源目录缺失时忽略 */
+      }
+      // N27：迁移清单补 plugins 目录与 plugins-registry.json
+      try {
+        fs.cpSync(path.join(oldDir, 'plugins'), path.join(target, 'plugins'), { recursive: true })
+      } catch {
+        /* 插件目录缺失时忽略 */
+      }
+      for (const f of ['plugins-registry.json', 'bili-login.json']) {
+        const from = path.join(oldDir, f)
+        if (!fs.existsSync(from)) continue
+        try {
+          fs.copyFileSync(from, path.join(target, f))
+        } catch {
+          /* ignore */
+        }
       }
       saveSettings({ dataDir: target } as Partial<AppSettings>)
       try {
@@ -844,12 +951,41 @@ export function markBootReady(): void {
 }
 
 /** 启动就绪信号（供其它模块 await） */
+/** 音频提取任务的中止器（Bug 8：进度反馈 + 可取消） */
+const extractAborts = new Map<string, AbortController>()
+
+/* F-17：音源调试日志（logs/sources/<源名>.log），开关 settings.sourceDebug */
+let debugLoggerCache: { on: boolean; dir: string } | null = null
+function wireSourceDebug(): void {
+  const on = !!getSettings().sourceDebug
+  setSourceDebugSink(
+    on
+      ? (name, line) => {
+          try {
+            const fs = require('node:fs') as typeof import('node:fs')
+            const path = require('node:path') as typeof import('node:path')
+            const dir = path.join(logRootDir(), 'sources')
+            fs.mkdirSync(dir, { recursive: true })
+            fs.appendFileSync(path.join(dir, `${name.replace(/[/\\:*?"<>|]/g, '_')}.log`), line + '\n', 'utf8')
+          } catch {
+            /* 日志失败不影响播放 */
+          }
+        }
+      : null
+  )
+  debugLoggerCache = { on, dir: '' }
+  void debugLoggerCache
+}
+
 export function whenBootReady(): Promise<void> {
   return bootReadyPromise
 }
 
 export function registerIpc(): void {
   restoreDownloads()
+  sweepOrphanParts()
+  // C-25：订阅 >24h 自动补拉（后台进行，不阻塞启动）
+  void mfHost.refreshSubscriptionsIfStale().catch(() => undefined)
   setDownloadEmitter(t => broadcast('download:progress', t))
   ipcMain.handle('sw:invoke', async (event, channel: string, payload: any) => {
     const fn = handlers[channel]

@@ -1,0 +1,33 @@
+{
+  "name": "any-listen",
+  "version": "0.1.0",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "pnpm build:desktop",
+    "build:desktop": "pnpm -F @shared/scripts build:desktop:win",
+    "build:dir": "pnpm -F @shared/scripts build:desktop:dir",
+    "build:theme": "pnpm -F @shared/theme build:theme",
+    "build:web": "pnpm -F @shared/scripts build:web",
+    "ckdep": "pnpm -F @shared/deps-update check",
+    "cldep": "rm -rf node_modules && pnpm -r exec rm -rf node_modules",
+    "dev": "pnpm dev:desktop",
+    "dev:desktop": "pnpm -F @shared/scripts dev:desktop",
+    "dev:web": "pnpm -F @shared/scripts dev:web",
+    "pi": "pnpm -F @shared/scripts postinstall",
+    "pub": "pnpm -F @shared/publish pub --commit",
+    "pub:desktop": "pnpm -F @shared/publish pub --type=desktop --commit",
+    "pub:web": "pnpm -F @shared/publish pub --type=web-server --commit",
+    "fmt": "oxfmt"
+  },
+  "devDependencies": {
+    "@any-listen/eslint": "workspace:@shared/eslint@^",
+    "oxfmt": "^0.72.0",
+    "prettier-plugin-organize-imports": "^4.3.0"
+  },
+  "engines": {
+    "node": ">=22.12.0 || ^20.19.0"
+  },
+  "packageManager": "pnpm@10.34.5+sha512.a4ee05f2f73658255bd6a89859c065a45c28a57daefae2c893a168ee2b73168c37b91e83e57ea67654ad03f03031746430e8bce38e362e042605fb8abc80192e"
+}

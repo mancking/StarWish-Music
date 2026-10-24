@@ -65,7 +65,7 @@ export interface PluginInfo {
   /** 支持的搜索类型：music / lyric / album / artist / sheet / comment */
   searchTypes: string[]
   /** 导入来源：local=本地文件 / url=网址 / subscribe=订阅 */
-  origin: 'local' | 'url' | 'subscribe'
+  origin: 'local' | 'url' | 'subscribe' | 'market'
   /** 原始导入地址（url/subscribe 时有值），订阅更新用 */
   sourceUrl?: string
   loadError: string | null
@@ -213,6 +213,14 @@ export interface AppSettings {
   danmakuAntiSubtitle: boolean
   /** 屏蔽词，换行分隔 */
   danmakuBlockWords: string
+  /** F-17：音源调试日志开关 */
+  sourceDebug: boolean
+  /** F-21：首次启动引导标记 */
+  onboarded: boolean
+  /** N29：自定义源市场 URL */
+  marketUrl: string
+  /** N31：git 下载令牌 */
+  gitToken: string
 
   /* ---------------- WebDAV 备份（单向：本地 → 远端） ---------------- */
   webdavEnabled: boolean
@@ -317,14 +325,33 @@ export interface PlaylistTagGroup {
   tags: PlaylistTagItem[]
 }
 
+/** MV 档位（规格书 2.17：统一 ≤6 档 {qn,label}） */
+export interface MvQualityOption {
+  qn: number
+  label: string
+}
+
+/**
+ * MV 统一结构（规格书 2.17 / N18 多源字段槽）：
+ * source=bili|wy|qq|kg|kw|外部音源平台；B 站老数据 bvid 兼容映射（optional）。
+ */
 export interface MvItem {
-  bvid: string
+  /** 平台内 MV id：网易数字 id / QQ vid / B 站 bvid */
+  sourceId?: string
+  /** B 站老数据兼容：bili 源时 = sourceId */
+  bvid?: string
+  /** 来源平台（缺省视为 bili，向后兼容旧数据） */
+  source?: string
   title: string
   author: string
   pic: string
   duration: string
+  /** 秒数（number）：卡片与记忆位置统一用秒（N18） */
+  durationSec?: number
   play: number
   danmaku: number
+  /** 可用档位（有则显示） */
+  qualities?: MvQualityOption[]
 }
 
 export interface ApiResult<T> {

@@ -6,7 +6,7 @@
  */
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { platform } from '@/platform'
-import { setSpectrumActive, spectrumBars } from '@/audio/spectrum'
+import { setSpectrumActive, spectrumBars } from '@/player-core/spectrum'
 
 const props = withDefaults(
   defineProps<{

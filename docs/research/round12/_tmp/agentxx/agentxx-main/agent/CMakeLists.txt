@@ -1,0 +1,1717 @@
+# The Flutter tooling requires that developers have CMake 3.10 or later
+# installed. You should not increase this version, as doing so will cause
+# the plugin to fail to compile for some customers of the plugin.
+cmake_minimum_required(VERSION 3.10)
+# find_package 使用 <PackageName>_ROOT 变量
+cmake_policy(SET CMP0074 NEW)
+# MSVC 运行时库标志由抽象层选择
+cmake_policy(SET CMP0091 NEW)
+# find_package 使用大写的 _ROOT 变量
+cmake_policy(SET CMP0144 NEW)
+cmake_policy(SET CMP0167 OLD)
+
+# ===== 版本号管理 (单一权威源: agent/VERSION) =====
+if (NOT DEFINED AGENTXX_VERSION)
+  set(_AGENTXX_VERSION_FILE "${CMAKE_CURRENT_SOURCE_DIR}/VERSION")
+  if (NOT EXISTS "${_AGENTXX_VERSION_FILE}")
+    set(_AGENTXX_VERSION_FILE "${CMAKE_CURRENT_SOURCE_DIR}/../VERSION")
+  endif()
+  if (EXISTS "${_AGENTXX_VERSION_FILE}")
+    file(STRINGS "${_AGENTXX_VERSION_FILE}" _AGENTXX_RAW_VERSION LIMIT_COUNT 1)
+    string(STRIP "${_AGENTXX_RAW_VERSION}" AGENTXX_VERSION)
+  else()
+    set(AGENTXX_VERSION "0.1.0")
+  endif()
+endif()
+
+# 提取纯数字版本供 project(VERSION) 使用 (兼容 SemVer 如 0.1.0-rc1)
+string(REGEX MATCH "^([0-9]+(\\.[0-9]+)*)" _AGENTXX_CMAKE_VERSION "${AGENTXX_VERSION}")
+if (NOT _AGENTXX_CMAKE_VERSION)
+  set(AGENTXX_VERSION "0.1.0")
+else ()
+  set(AGENTXX_VERSION "${_AGENTXX_CMAKE_VERSION}")
+endif()
+unset(_AGENTXX_CMAKE_VERSION)
+
+message("[agentxx] Release Version: ${AGENTXX_VERSION}")
+
+project(agentxx_project 
+  VERSION ${AGENTXX_VERSION} 
+  LANGUAGES C CXX
+)
+
+# ccache
+find_program(CCACHE_PROGRAM ccache)
+if (CCACHE_PROGRAM)
+  set(CMAKE_C_COMPILER_LAUNCHER ${CCACHE_PROGRAM})
+  set(CMAKE_CXX_COMPILER_LAUNCHER ${CCACHE_PROGRAM})
+endif ()
+set(CMAKE_FIND_DEBUG_MODE OFF)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+# option ==========
+option(XX_IS_RELEASE_D "Release Build." ON)
+option(AGENTXX_BUILD_CLIENT "Generate the client target." OFF)
+option(AGENTXX_BUILD_TEST "Generate the test target." OFF)
+option(AGENTXX_BUILD_BENCHMARK "Generate the benchmark target." OFF)
+option(AGENTXX_ENABLE_HYPERSCAN "Add HyperScan for regex support. Use std::regex if disable." OFF)
+option(AGENTXX_ENABLE_BOOST_PROCESS "Use Boost.process for execute command toolcall." ON)
+option(AGENTXX_ENABLE_PLUGIN_CODEGRAPH "Add CodeGraph-CPP for code analysis." ON)
+option(AGENTXX_ENABLE_PLUGIN_JS "Build QuickJS JS plugin engine (agentxx_javascript_engine)." ON)
+option(AGENTXX_ENABLE_PLUGIN_SYSTEM_MONITOR "Build agentxx_system_monitor plugin (CPU/GPU usage)." ON)
+option(AGENTXX_ENABLE_PLUGIN_AUDIO_STREAM "Build agentxx_audio_stream plugin (audio capture)." ON)
+option(AGENTXX_ENABLE_PLUGIN_TEXT_SELECTION "Build agentxx_text_selection_monitor plugin (text selection)." ON)
+option(AGENTXX_ENABLE_PLUGIN_EXAMPLE "Build example plugin." ON)
+option(AGENTXX_ENABLE_PLUGIN_COMPUTER_USE "Build agentxx_computer_use plugin (ui_control)." ON)
+option(AGENTXX_ENABLE_PLUGIN_SCREEN_CAPTURE "Build agentxx_screen_capture plugin (screen capture)." ON)
+option(AGENTXX_ENABLE_PLUGIN_PLANNING "Build agentxx_planning plugin (task planning write tool)." ON)
+option(AGENTXX_ENABLE_PLUGIN_FILESYSTEM "Build agentxx_filesystem plugin (list/read/write/edit/glob/grep)." ON)
+option(AGENTXX_ENABLE_PLUGIN_EXECUTE_COMMAND "Build agentxx_execute_command plugin (bash/windows command)." ON)
+option(AGENTXX_ENABLE_PLUGIN_STRING "Build agentxx_string plugin (html2markdown/regexp)." ON)
+option(AGENTXX_ENABLE_PLUGIN_MATH "Build agentxx_math plugin (math calculation)." ON)
+option(AGENTXX_ENABLE_PLUGIN_SYSTEM "Build agentxx_system plugin (current date/time)." ON)
+option(AGENTXX_ENABLE_PLUGIN_WEBSEARCH "Build agentxx_websearch plugin (search/fetch url)." ON)
+option(AGENTXX_ENABLE_PLUGIN_RAG_SEARCH "Build agentxx_rag_search plugin (embedding based docs search)." ON)
+option(AGENTXX_ENABLE_PLUGIN_LLM_UNCENSORED "Build agentxx_llm_uncensored plugin (extra system prompt injection)." ON)
+# 可选内置合并编译: 启用的插件源文件直接编译进 libagentxx, 运行期无需插件
+# 动态库 (无 dlopen; 适合嵌入式/单文件分发)。
+# 
+# 内置合并名单:
+# - 未设置/空/"all": 全部启用插件内置合并进 libagentxx (默认)
+# - 分号(或逗号)分隔的插件名列表: 仅名单内插件内置合并, 名单外启用插件仍
+#   编译为独立动态库 (混合模式; 例: -DAGENTXX_PLUGIN_BUILTIN_LIST="agentxx_filesystem,agentxx_execute_command,agentxx_system,agentxx_websearch,agentxx_planning")
+set(AGENTXX_PLUGIN_BUILTIN_LIST 
+  ""
+  CACHE STRING
+  "Which enabled plugins to merge into libagentxx ('all' = all; semicolon/comma list = only listed ones)"
+)
+
+# ===== 内存分配器: mimalloc =====
+# https://github.com/microsoft/mimalloc (源码位于 third_party/mimalloc, 经
+# ExternalProject 构建安装; 接管 malloc/free/new/delete, 替换 glibc / CRT 分配器)
+# - 作用范围: 最终程序 (agentxx_cli / agentxx_test / agentxx_benchmark), 见
+#   cmake/agentxx_mimalloc.cmake
+# - 不受影响的目标: libagentxx.so (跟随最终程序的分配器) 与插件动态库
+#   (plugins/ 不改动: 内置合并进 libagentxx 的插件随最终程序使用 mimalloc,
+#    独立编译的插件动态库不链接 mimalloc, 由最终程序决定实际分配器)
+# - macOS/iOS 上 **不可用**: Mach-O 使用两层次命名空间, libc++/系统框架对
+#   malloc/free 的引用在链接期已绑定到 libSystem, 最终程序静态覆盖的分配器
+#   无法对其生效 (也不导出 _malloc), 跨模块 free 必然崩溃。故 macOS/iOS 自动关闭
+# - 默认关闭 (OFF): 实测在"每轮都要序列化/渲染整段上下文"的运行形态下, 它的常驻
+#   内存是 glibc/CRT 的 2~4 倍 (提交量 5~6 倍, Windows release 实测数据见
+#   docs/zh-cn/design/benchmark.md 第 10、12 节); 需要换分配性能/抗碎片时显式打开
+option(AGENTXX_ENABLE_MIMALLOC "Use mimalloc as the memory allocator of the programs (agentxx_cli/test/benchmark). OFF by default: long-context runs cost 2~4x resident memory (5~6x commit; docs/zh-cn/design/benchmark.md sections 10/12). Disabled automatically on macOS/iOS." OFF)
+# 链接方式 (外部可指定, 默认静态):
+# - STATIC: 静态库并入产物, 内置分配器 (无额外运行库依赖, 分发单文件即可)
+# - SHARED: 链接 libmimalloc.so / mimalloc.dll (分配器可独立升级/替换)
+set(AGENTXX_MIMALLOC_LINK "STATIC" CACHE STRING "How to link mimalloc: STATIC (built into the program) or SHARED (link the mimalloc shared library).")
+set_property(CACHE AGENTXX_MIMALLOC_LINK PROPERTY STRINGS STATIC SHARED)
+
+# ===== Debug 构建加速选项 / Sanitizers =====
+# 单一开关: 启用后 Debug 配置同时带上三种插桩 (默认开启)
+# - ASan (地址检查): GCC/Clang 用 -fsanitize=address; MSVC 用 /fsanitize=address
+# - UBSan (未定义行为: 有符号溢出/数组越界/对齐错误/无效枚举值/空指针解引用等):
+#   GCC/Clang 用 -fsanitize=undefined -fno-sanitize-recover=undefined
+#   (-fno-sanitize-recover 使命中即 abort, 避免报告被静默吞掉; MSVC 无实现, 忽略)
+#   插桩只作用于本项目编译的代码: 预编译三方库不插桩, 不构成误报源
+# - 插件框架定向探针: 仅对 `lib/src/plugins/*.cpp` 与 `test/plugin/*.cpp`
+#   额外插桩 (MSVC 无实现, 忽略)
+# 关闭后 Debug 构建不再插桩, 编译与链接显著加快 (仍保留调试符号便于断点调试与
+# -fno-omit-frame-pointer 便于性能分析)
+option(AGENTXX_ENABLE_SANITIZER "Enable Debug sanitizers: ASan + UBSan + plugin-framework probe (GCC/Clang; MSVC: ASan only)." ON)
+# - 预编译稳定的第三方头文件 (fmt/asio/boost.exception 等) 加速 lib/client/test 编译;
+#   项目自身头文件不参与 PCH，改动时不会触发全量重编。仅 GCC/Clang 生效
+option(AGENTXX_ENABLE_PCH "Enable precompiled headers (GCC/Clang)." ON)
+# - LTO (链接期优化): Release 配置下启用
+#   - GCC/Clang: -flto=auto (GCC) / -flto=thin (Clang)
+#   - MSVC: /GL (编译) + /LTCG (链接)
+#   关闭后 Release 回到纯 /O2 (-O3) 与常规链接, 便于对照排查 LTO 相关问题
+option(AGENTXX_ENABLE_LTO "Enable Link Time Optimization (LTO) for Release builds." ON)
+# - HyperScan 的 fat runtime (运行期多微架构分发, 仅 Linux 上游默认可开) **固定禁用**:
+#   其实现靠 nm + objcopy --redefine-syms 给各微架构 variant 的 obj 重命名符号,
+#   与 LTO object 无符号表的特性互斥; 而本项目产物要发布给各种 CPU (可能只有
+#   SSE4.2 基线), 因此改用编译期基线 ISA (见 hyperscan_repo 处: 按目标架构自动选
+#   x86_64 → x86-64-v2, x86 → core2), 并让 hyperscan 一同参与 LTO
+# - 链接器选择 (GCC/Clang): auto 自动检测 mold -> gold -> 默认 bfd;
+#   也可直接指定 mold/gold/bfd 等。mold 可大幅减少大体积二进制链接时间
+set(AGENTXX_LINKER "auto" CACHE STRING "Linker for GCC/Clang: auto|mold|gold|bfd|...")
+# - 相同代码合并 (ICF, --icf=all): Release 下把机器码/只读数据完全相同的段
+#   合并为一份, 减小产物体积 (实测已 strip 产物: agentxx_cli -3.2%,
+#   libagentxx.so -2.7%; 未 strip 时因符号表一并合并看起来更多),
+#   对运行行为无影响 (只影响"相同函数/常量是否有不同地址"这种非法用法)。
+#   仅 mold/gold/lld 支持该选项, 使用默认 bfd 链接器时自动跳过
+option(AGENTXX_ENABLE_ICF "Enable Identical Code Folding (--icf=all) for Release builds (mold/gold/lld only)." ON)
+
+# 仅用于指示是否编译用于调试用途，不代表真实编译类型
+# - [XX_IS_DEBUG_D] == 1 时，启用大部分调试日志等信息，因此 profile 之类注重
+# 性能的编译将视为 release
+if (XX_IS_RELEASE_D)
+  set(XX_IS_DEBUG_D    0)
+  set(XX_IS_RELEASE_D  1)
+else()
+  set(XX_IS_DEBUG_D    1)
+  set(XX_IS_RELEASE_D  0)
+endif()
+
+# target system
+set(XX_IS_LINUX_D    0)
+set(XX_IS_WIN_D      0)
+set(XX_IS_MACOS_D    0)
+set(XX_IS_ANDROID_D  0)
+set(XX_IS_IOS_D      0)
+
+if (CMAKE_SYSTEM_NAME STREQUAL "Windows")
+  set(XX_IS_WIN_D 1)
+
+  set(AGENTXX_WINDOWS_IOCP_SUPPORTED ON)
+elseif (CMAKE_SYSTEM_NAME STREQUAL "Android")
+  set(XX_IS_ANDROID_D 1)
+elseif (APPLE AND CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+  set(XX_IS_MACOS_D 1)
+elseif (APPLE AND CMAKE_SYSTEM_NAME STREQUAL "iOS")
+  set(XX_IS_IOS_D 1)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  set(XX_IS_LINUX_D 1)
+
+  if (EXISTS "/usr/include/linux/version.h")
+    # 检查是否支持 [AGENTXX_LINUX_IO_URING_SUPPORTED]
+    file(READ "/usr/include/linux/version.h" _linux_version_h)
+    string(REGEX MATCH "#define LINUX_VERSION_CODE ([0-9]+)" _match "${_linux_version_h}")
+    if(_match AND (CMAKE_MATCH_1 GREATER_EQUAL 330240))  # >= 5.10.0
+        set(AGENTXX_LINUX_IO_URING_SUPPORTED ON)
+    else()
+        set(AGENTXX_LINUX_IO_URING_SUPPORTED OFF)
+    endif()
+  endif()
+endif ()
+
+# compiler ID
+set(XX_IS_MSVC_D 0)
+set(XX_IS_GCC_D 0)
+set(XX_IS_CLANG_D 0)
+# MinGW 工具链 (Windows + GNU/Clang 前端, 非 MSVC): 供代码内条件编译使用,
+# 取代编译器内置的 __MINGW32__ 宏 (内置宏无法由 CMake 统一控制, 交叉编译/
+# 模拟环境/未来工具链变化时判定规则分散)
+set(XX_IS_MINGW_D 0)
+
+if (MSVC)
+  set(XX_IS_MSVC_D 1)
+elseif (CMAKE_C_COMPILER_ID MATCHES "GNU")
+  set(XX_IS_GCC_D 1)
+elseif (CMAKE_C_COMPILER_ID MATCHES "Clang")
+  set(XX_IS_CLANG_D 1)
+else ()
+  message(FATAL_ERROR "[agentxx] 不支持的编译器: ${CMAKE_C_COMPILER_ID}")
+endif ()
+
+# MinGW 判定: Windows 目标平台 + 非 MSVC 编译器 (GNU/Clang 均为 MinGW 工具链,
+# 交叉编译与原生 MSYS2/MinGW 环境一致)
+if (XX_IS_WIN_D AND NOT XX_IS_MSVC_D)
+  set(XX_IS_MINGW_D 1)
+endif ()
+
+# Sanitizer 可用性提示 (需先确定编译器):
+# - MSVC 只有 ASan 实现; UBSan 与插件框架探针无实现, 开启 AGENTXX_ENABLE_SANITIZER
+#   时仅应用 ASan (提示一次, 不阻断配置)
+if (XX_IS_MSVC_D AND AGENTXX_ENABLE_SANITIZER)
+  message("[agentxx] MSVC: only AddressSanitizer is available; UBSan / plugin probe are ignored")
+endif ()
+
+# MinGW 交叉编译不受支持的特性自动降级:
+# - HyperScan 仅支持 Linux (MSVC 分支受限支持), MinGW (GCC/Clang 交叉到
+#   Windows) 无可用实现, 强制关闭以避免 hyperscan_repo ExternalProject 构建
+#   失败; 正则能力自动回退到 std::regex (见 lib/src/util/regex.cpp)
+if (CMAKE_CROSSCOMPILING AND XX_IS_MINGW_D AND AGENTXX_ENABLE_HYPERSCAN)
+  message(WARNING "[agentxx] HyperScan not supported on MinGW cross (Windows+GCC), force AGENTXX_ENABLE_HYPERSCAN=OFF")
+  set(AGENTXX_ENABLE_HYPERSCAN OFF CACHE BOOL "Add HyperScan for regex support. Use std::regex if disable." FORCE)
+endif()
+
+# ===== 内存分配器 (mimalloc) 选项校验 =====
+# 链接方式规范化 (只接受 STATIC/SHARED, 其他取值回退默认 STATIC 并告警)
+string(TOUPPER "${AGENTXX_MIMALLOC_LINK}" _agentxx_mimalloc_link)
+if (NOT _agentxx_mimalloc_link STREQUAL "STATIC" AND NOT _agentxx_mimalloc_link STREQUAL "SHARED")
+  message(WARNING "[agentxx] AGENTXX_MIMALLOC_LINK=${AGENTXX_MIMALLOC_LINK} 取值非法 (仅支持 STATIC / SHARED), 已回退 STATIC")
+  set(_agentxx_mimalloc_link "STATIC")
+endif ()
+set(AGENTXX_MIMALLOC_LINK "${_agentxx_mimalloc_link}"
+  CACHE STRING "How to link mimalloc: STATIC (built into the program) or SHARED (link the mimalloc shared library)." FORCE)
+unset(_agentxx_mimalloc_link)
+
+# Sanitizer 与 mimalloc 互斥:
+# - ASan 需要独占 malloc/free (它靠替换分配函数跟踪每一块内存), 与 mimalloc 的
+#   分配器覆盖同时存在时运行即崩溃 (实测: 静态覆盖 + ASan 的可执行程序启动崩溃)
+# - 本项目 Debug 默认开启 AGENTXX_ENABLE_SANITIZER (且插桩只在非 Release 生效),
+#   因此在 Debug/RelWithDebInfo 下按需自动关闭 mimalloc, Release 不受影响
+# - 需要在 Debug 下验证 mimalloc 时, 用 -DAGENTXX_ENABLE_SANITIZER=OFF 重配
+if (AGENTXX_ENABLE_MIMALLOC AND AGENTXX_ENABLE_SANITIZER AND NOT XX_IS_RELEASE_D)
+  message(WARNING
+    "[agentxx] 非 Release 构建启用了 AGENTXX_ENABLE_SANITIZER (ASan 需独占 malloc), "
+    "本次构建自动关闭 mimalloc; 如需在 Debug 下使用 mimalloc 请加 -DAGENTXX_ENABLE_SANITIZER=OFF")
+  set(AGENTXX_ENABLE_MIMALLOC OFF)
+endif ()
+
+# Windows/MSVC 静态链接说明 (不关闭构建, 仅提示):
+# mimalloc 的静态覆盖以 `_DLL` 判定 (_DLL 由 /MD、/MDd 定义), 使用动态 CRT 时
+# 静态库中的 malloc/free 覆盖不生效 (上游刻意如此, 避免与 CRT 的分配器混用),
+# 此时 Windows 上真正接管分配器需要动态链接 (mimalloc.dll + mimalloc-redirect.dll)
+if (AGENTXX_ENABLE_MIMALLOC AND XX_IS_WIN_D AND XX_IS_MSVC_D AND AGENTXX_MIMALLOC_LINK STREQUAL "STATIC")
+  message(WARNING
+    "[agentxx] Windows/MSVC 使用动态 CRT (/MD): mimalloc 静态链接不会覆盖 CRT 分配器, "
+    "如需真正接管请使用 -DAGENTXX_MIMALLOC_LINK=SHARED (随产物部署 mimalloc.dll + mimalloc-redirect.dll)")
+endif ()
+
+# macOS/iOS 无可用覆盖机制 (自动关闭构建):
+# - Mach-O 采用**两层次命名空间**: libc++.dylib 及系统框架对 _malloc/_free 的
+#   未定义引用在链接期即绑定到 libSystem (ordinal 固定), 运行期 dyld 不会再去
+#   主可执行文件解析; 主可执行文件静态覆盖的分配器只作用于自身 (且 _malloc
+#   不在导出符号表中)。于是出现"程序侧 mimalloc / 框架侧系统分配器"并用,
+#   任何跨模块传递并释放的指针都会在 mi_free 崩溃 (实测 agentxx_cli 启动即崩)。
+# - 这与 ELF 不同: GNU ld 会把可执行文件定义且被共享库引用的 malloc 放进
+#   .dynsym, 运行期符号插入 (interposition) 使全进程统一走 mimalloc。
+# - 如需在 macOS 强制接管分配器, 只能采用 DYLD_INSERT_LIBRARIES 预加载
+#   mimalloc 动态库 (进程外注入, 非本项目自包含分发方式), 故此处直接关闭。
+if (AGENTXX_ENABLE_MIMALLOC AND (XX_IS_MACOS_D OR XX_IS_IOS_D))
+  message(WARNING
+    "[agentxx] macOS/iOS (Mach-O 两层次命名空间): 最终程序的 malloc/free 静态覆盖 "
+    "不会被 libc++/系统框架采用, 跨模块释放会崩溃, 本次构建自动关闭 mimalloc")
+  set(AGENTXX_ENABLE_MIMALLOC OFF)
+endif ()
+
+message("[agentxx] Memory allocator: mimalloc=${AGENTXX_ENABLE_MIMALLOC} (link: ${AGENTXX_MIMALLOC_LINK})")
+
+message("[agentxx] Test Utf8 Log: 你好！")
+message("[agentxx] Current Configure Type: ${CMAKE_CONFIGURATION_TYPES}")
+message("[agentxx] Current Build Type: ${CMAKE_BUILD_TYPE}")
+message("[agentxx] Current Compiler: ${CMAKE_C_COMPILER_ID}")
+
+# ===== 构建树内 MSBuild 辅助文件 (Directory.Build.props / Directory.Build.targets) =====
+# MSBuild 会从每个项目文件所在目录逐级向上查找并自动导入这两个文件; 本项目所有 vcxproj
+# (含 superbuild 下全部嵌套 ExternalProject 构建) 都位于 CMAKE_BINARY_DIR 子树内,
+# 因此在构建根目录各放一份即可对整个构建树生效。
+# 两个文件都只在"内容变化时"写盘 (不用无条件 file(WRITE)): 文件时间戳一变,
+# MSBuild 会判定工程过期, 嵌套构建随之全量重编 (实测每次构建都从依赖库开始重编, 小时级)。
+#
+# (1) Directory.Build.props —— 固定关闭 vcpkg 用户级集成:
+# - vcpkg 的用户级集成 (%LOCALAPPDATA%\vcpkg\vcpkg.user.props / .targets, 由
+#   `vcpkg integrate install` 安装) 生效时, 其 vcpkg.targets 会给每个工程追加
+#   `$(VcpkgRoot)\installed\<triplet>\include` 等编译/链接参数; 是否生效只取决于
+#   环境变量 VCPkgLocalAppDataDisabled / VcpkgEnabled:
+#     - script/windows_*_build.bat 里 `set VCPKG_ROOT=` + `set VCPkgLocalAppDataDisabled=1`
+#       -> 集成关闭, 编译命令行不含 vcpkg 头目录;
+#     - 直接在终端/IDE 执行 cmake --build (未清这些环境变量)
+#       -> 集成打开, 编译命令行多出 vcpkg 头目录。
+# - 编译命令行一变, MSVC 的 FileTracker 就判定源文件过期 -> 该工程全量重编; 两种入口
+#   交替使用 (脚本 -> 直接 cmake -> 脚本) 时每次都从依赖库开始全量重编 (实测单个依赖库
+#   12/14 个源文件重编, 全树以小时计)。
+# - 本项目依赖全部来自 third_party 源码构建, 不需要 vcpkg, 故把开关固定在构建树里,
+#   使脚本/终端/IDE 任何入口得到完全一致的编译命令行 (顺带消除 applocal DLL 收集警告)。
+#
+# (2) Directory.Build.targets —— 嵌套构建中文乱码修复:
+# - 构建脚本 (script/windows_*_build.bat) 会 `chcp 65001`, 子进程 (cl.exe、嵌套 MSBuild)
+#   写入管道的诊断输出均为 UTF-8 字节;
+# - 但外层 MSBuild 的 CustomBuild/ParallelCustomBuild 任务 (Microsoft.Build.CppTasks.Common.dll)
+#   不支持 CMake 生成的 <UseUtf8Encoding>Always</UseUtf8Encoding> 元数据,
+#   未显式指定 StdOutEncoding/StdErrEncoding 时默认按 OEM 代码页 (中文系统=936/GBK) 解码,
+#   于是 ExternalProject 嵌套构建中编译器/内层 MSBuild 的中文输出被误解为乱码
+#   (如 "内层" 显示为 "鍐呭眰": UTF-8 字节被按 GBK 解读);
+# - 通过 BeforeTargets=CustomBuild 在构建步骤执行前给 CustomBuild 项注入
+#   StdOutEncoding/StdErrEncoding=UTF-8, 强制按 UTF-8 解码子进程输出;
+# - 仅当构建环境设置了 AgentxxBuildConsoleCP=65001 (见构建脚本) 时启用,
+#   避免非 UTF-8 控制台 (未 chcp 65001) 场景误转码。
+if (XX_IS_WIN_D AND XX_IS_MSVC_D AND CMAKE_GENERATOR MATCHES "Visual Studio")
+  # 内容一致时不写盘; 内容含分号时直接字符串比较会退化为列表比较, 故经哈希比较
+  function(_agentxx_write_build_file_if_changed file content)
+    set(_old "")
+    if (EXISTS "${file}")
+      file(READ "${file}" _old)
+    endif ()
+    string(SHA256 _old_hash "${_old}")
+    string(SHA256 _new_hash "${content}")
+    if (NOT _old_hash STREQUAL _new_hash)
+      file(WRITE "${file}" "${content}")
+      message("[agentxx] 更新 ${file}")
+    endif ()
+  endfunction()
+
+  string(CONCAT _AGENTXX_DBP_CONTENT
+"<Project>\n"
+"  <!-- agentxx: 固定关闭 vcpkg 用户级集成 (本项目依赖全部来自 third_party 源码构建, 不使用 vcpkg) -->\n"
+"  <!-- 由此编译命令行不再随调用环境变化, 脚本/终端/IDE 各入口的增量编译保持一致 (见 agent/CMakeLists.txt) -->\n"
+"  <PropertyGroup>\n"
+"    <VCPkgLocalAppDataDisabled>1</VCPkgLocalAppDataDisabled>\n"
+"    <VcpkgEnabled>false</VcpkgEnabled>\n"
+"  </PropertyGroup>\n"
+"</Project>\n"
+  )
+  _agentxx_write_build_file_if_changed(
+    "${CMAKE_BINARY_DIR}/Directory.Build.props" "${_AGENTXX_DBP_CONTENT}"
+  )
+  unset(_AGENTXX_DBP_CONTENT)
+
+  string(CONCAT _AGENTXX_DBT_CONTENT
+"<Project>\n"
+"  <!-- agentxx: 强制 MSBuild CustomBuild 任务按 UTF-8 解码子进程输出 (配合构建脚本 chcp 65001), 修复嵌套构建中文乱码 -->\n"
+"  <Target Name=\"Agentxx_ForceUtf8CustomBuildOutput\" BeforeTargets=\"CustomBuild\" Condition=\"'$(AgentxxBuildConsoleCP)' == '65001'\">\n"
+"    <ItemGroup>\n"
+"      <CustomBuild>\n"
+"        <StdOutEncoding>UTF-8</StdOutEncoding>\n"
+"        <StdErrEncoding>UTF-8</StdErrEncoding>\n"
+"      </CustomBuild>\n"
+"    </ItemGroup>\n"
+"  </Target>\n"
+"</Project>\n"
+  )
+  _agentxx_write_build_file_if_changed(
+    "${CMAKE_BINARY_DIR}/Directory.Build.targets" "${_AGENTXX_DBT_CONTENT}"
+  )
+  unset(_AGENTXX_DBT_CONTENT)
+endif ()
+
+set(_AGENTXX_COMMON_C_CXX_FLAGS "")
+set(_AGENTXX_C_FLAGS "")
+set(_AGENTXX_CXX_FLAGS "")
+
+# 开发默认标准，建议 c17 + c++26
+set(CMAKE_C_STANDARD 17)
+set(CMAKE_CXX_STANDARD 26)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_STANDARD_REQUIRED OFF)
+if (XX_IS_MSVC_D)
+  set(_AGENTXX_C_FLAGS "/std:c17")
+  set(_AGENTXX_CXX_FLAGS "/std:c++latest")
+else ()
+  set(_AGENTXX_C_FLAGS "-std=c17")
+  set(_AGENTXX_CXX_FLAGS "-std=c++26")
+endif()
+# msvc 时统一动态链接标准库 /MD /MDd
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+# 优先链接静态库，不影响链接标准库
+if(XX_IS_MSVC_D)
+  list(PREPEND CMAKE_FIND_LIBRARY_SUFFIXES .lib .a)
+else()
+  list(PREPEND CMAKE_FIND_LIBRARY_SUFFIXES .a)
+endif()
+
+include(CheckCXXCompilerFlag)
+include(CheckCXXSourceRuns)
+
+# /D_WIN32_WINNT=0x0A00 限制 win10 或更高:
+# - httplib 要求 >= win10
+if (XX_IS_MSVC_D)
+  set(_AGENTXX_COMMON_C_CXX_FLAGS "${_AGENTXX_COMMON_C_CXX_FLAGS} /D_WIN32_WINNT=0x0A00 /D__STDC_CONSTANT_MACROS=1 /DCPPHTTPLIB_OPENSSL_SUPPORT=1 /DBOOST_ASIO_STANDALONE=1 /DASIO_STANDALONE=1 /DBOOST_ASIO_NO_DEPRECATED=1 /DASIO_NO_DEPRECATED=1 /DBOOST_ASIO_HAS_STD_INVOKE_RESULT=1 /DASIO_HAS_STD_INVOKE_RESULT=1 /DBOOST_PROCESS_USE_STD_FS=1 /DBOOST_EXCEPTION_MINI_BOOST=1 /DYAML_CPP_STATIC_DEFINE=1")
+  if (AGENTXX_WINDOWS_IOCP_SUPPORTED)
+    set(_AGENTXX_COMMON_C_CXX_FLAGS "${_AGENTXX_COMMON_C_CXX_FLAGS} /DASIO_HAS_IOCP=1 /DBOOST_ASIO_HAS_IOCP=1 /DASIO_HAS_WINDOWS_RANDOM_ACCESS_HANDLE=1 /DBOOST_ASIO_HAS_WINDOWS_RANDOM_ACCESS_HANDLE=1")
+    message("[agentxx] Enable asio/iocp")
+  endif()
+  if (AGENTXX_LINUX_IO_URING_SUPPORTED)
+    set(_AGENTXX_COMMON_C_CXX_FLAGS "${_AGENTXX_COMMON_C_CXX_FLAGS} /DASIO_HAS_IO_URING=1 /DBOOST_ASIO_HAS_IO_URING=1")
+    # set(_AGENTXX_COMMON_C_CXX_FLAGS "${_AGENTXX_COMMON_C_CXX_FLAGS} /DASIO_HAS_IO_URING_AS_DEFAULT=1 /DBOOST_ASIO_HAS_IO_URING_AS_DEFAULT=1")
+    message("[agentxx] Enable asio/io_uring")
+  endif()
+else ()
+  set(_AGENTXX_COMMON_C_CXX_FLAGS "${_AGENTXX_COMMON_C_CXX_FLAGS} -D__STDC_CONSTANT_MACROS=1 -DCPPHTTPLIB_OPENSSL_SUPPORT=1 -DBOOST_ASIO_STANDALONE=1 -DASIO_STANDALONE=1 -DBOOST_ASIO_NO_DEPRECATED=1 -DASIO_NO_DEPRECATED=1 -DBOOST_ASIO_HAS_STD_INVOKE_RESULT=1 -DASIO_HAS_STD_INVOKE_RESULT=1 -DBOOST_PROCESS_USE_STD_FS=1 -DYAML_CPP_STATIC_DEFINE=1")
+  if (XX_IS_WIN_D)
+    # 可能交叉编译
+    set(_AGENTXX_COMMON_C_CXX_FLAGS "${_AGENTXX_COMMON_C_CXX_FLAGS} -D_WIN32_WINNT=0x0A00")
+  endif()
+  if (AGENTXX_WINDOWS_IOCP_SUPPORTED)
+    set(_AGENTXX_COMMON_C_CXX_FLAGS "${_AGENTXX_COMMON_C_CXX_FLAGS} -DASIO_HAS_IOCP=1 -DBOOST_ASIO_HAS_IOCP=1 -DASIO_HAS_WINDOWS_RANDOM_ACCESS_HANDLE=1 -DBOOST_ASIO_HAS_WINDOWS_RANDOM_ACCESS_HANDLE=1")
+    message("[agentxx] Enable asio/iocp")
+  endif()
+  if (AGENTXX_LINUX_IO_URING_SUPPORTED)
+    set(_AGENTXX_COMMON_C_CXX_FLAGS "${_AGENTXX_COMMON_C_CXX_FLAGS} -DASIO_HAS_IO_URING=1 -DBOOST_ASIO_HAS_IO_URING=1")
+    # set(_AGENTXX_COMMON_C_CXX_FLAGS "${_AGENTXX_COMMON_C_CXX_FLAGS} -DASIO_HAS_IO_URING_AS_DEFAULT=1 -DBOOST_ASIO_HAS_IO_URING_AS_DEFAULT=1")
+    message("[agentxx] Enable asio/io_uring")
+  endif()
+endif()
+
+message("[agentxx] CMAKE_CXX_COMPILER_ID: ${CMAKE_CXX_COMPILER_ID}")
+if (XX_IS_MSVC_D)
+  # 使用 /Z7 (Embedded) 替代 /Zi: 调试信息直接嵌入各 .obj 文件,
+  # 彻底避免多进程并行编译时对编译器 PDB (vc14x.pdb / static.pdb) 的写入竞争/锁死 (C1041),
+  # 同时消除链接时的 LNK4099 警告, 且完美支持 ASan 与多工程并行构建
+  cmake_policy(SET CMP0141 NEW)
+  set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT "Embedded")
+
+  # ASan 开启时需禁用 MSVC STL 容器注解 (_DISABLE_STL_ANNOTATION):
+  # 预编译三方静态库 (libboost_process 等, 未插桩) 不携带 annotate_string/
+  # vector/optional 注解元数据, 与插桩目标混链会触发 LNK2038 "annotate_* 不匹配";
+  # 该官方宏使本侧同样不产生注解元数据, 两侧一致即可链接。作用于全部配置,
+  # 避免多配置生成器下某配置漏加导致的不一致。
+  # 代价: 失去容器内部越界检测 (std::string/vector/optional 容量内 OOB);
+  # 堆级检测 (use-after-free/double-free/跨分配越界) 不受影响。
+  set(_AGENTXX_MSVC_ASAN_DEFS "")
+  if (AGENTXX_ENABLE_SANITIZER AND NOT XX_IS_RELEASE_D)
+    set(_AGENTXX_MSVC_ASAN_DEFS " /D_DISABLE_STL_ANNOTATION=1")
+  endif ()
+  set(_AGENTXX_C_FLAGS   "${_AGENTXX_COMMON_C_CXX_FLAGS}${_AGENTXX_MSVC_ASAN_DEFS} ${_AGENTXX_C_FLAGS} /bigobj /utf-8 /W4 /wd4200 /D_GNU_SOURCE")
+  set(_AGENTXX_CXX_FLAGS "${_AGENTXX_COMMON_C_CXX_FLAGS}${_AGENTXX_MSVC_ASAN_DEFS} ${_AGENTXX_CXX_FLAGS} /bigobj /utf-8 /W4 /wd4200 /Zc:__cplusplus")
+  unset(_AGENTXX_MSVC_ASAN_DEFS)
+
+  # LTO (对应 GCC/Clang 分支的 -flto): 编译加 /GL, 链接加 /LTCG
+  # - 仅 Release 生效 (Debug 保留 ASan 与快速增量链接, 不做 LTO)
+  # - /LTCG 与 /INCREMENTAL 互斥: Release 链接参数已含 /INCREMENTAL:NO (CMake 默认)
+  # - /GL 与 /ZI (编辑并继续) 互斥: MSVC 统一 /Z7 (见上方 CMP0141 Embedded), 无冲突
+  # - 关闭 AGENTXX_ENABLE_LTO 即完整回退为 /O2 常规构建
+  set(_AGENTXX_LTO_FLAGS "")
+  set(_AGENTXX_LTO_LDFLAGS "")
+  if (AGENTXX_ENABLE_LTO)
+    set(_AGENTXX_LTO_FLAGS "/GL")
+    set(_AGENTXX_LTO_LDFLAGS "/LTCG")
+  endif()
+  set(CMAKE_C_FLAGS_RELEASE          "${CMAKE_C_FLAGS_RELEASE}          ${_AGENTXX_C_FLAGS}   /Gy ${_AGENTXX_LTO_FLAGS}")
+  set(CMAKE_CXX_FLAGS_RELEASE        "${CMAKE_CXX_FLAGS_RELEASE}        ${_AGENTXX_CXX_FLAGS} /Gy ${_AGENTXX_LTO_FLAGS}")
+  set(CMAKE_C_FLAGS_MINSIZEREL       "${CMAKE_C_FLAGS_MINSIZEREL}       ${_AGENTXX_C_FLAGS}")
+  set(CMAKE_CXX_FLAGS_MINSIZEREL     "${CMAKE_CXX_FLAGS_MINSIZEREL}     ${_AGENTXX_CXX_FLAGS}")
+  set(CMAKE_C_FLAGS_RELWITHDEBINFO   "${CMAKE_C_FLAGS_RELWITHDEBINFO}   ${_AGENTXX_C_FLAGS}")
+  set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "${CMAKE_CXX_FLAGS_RELWITHDEBINFO} ${_AGENTXX_CXX_FLAGS}")
+  set(CMAKE_C_FLAGS_DEBUG            "${CMAKE_C_FLAGS_DEBUG}            ${_AGENTXX_C_FLAGS}")
+  set(CMAKE_CXX_FLAGS_DEBUG          "${CMAKE_CXX_FLAGS_DEBUG}          ${_AGENTXX_CXX_FLAGS}")
+
+  foreach (_lang IN ITEMS C CXX)
+    string(REGEX REPLACE "(^| )/Zi( |$)" " /Z7 " CMAKE_${_lang}_FLAGS_DEBUG "${CMAKE_${_lang}_FLAGS_DEBUG}")
+    string(REGEX REPLACE "(^| )/Zi( |$)" " /Z7 " CMAKE_${_lang}_FLAGS_RELWITHDEBINFO "${CMAKE_${_lang}_FLAGS_RELWITHDEBINFO}")
+  endforeach ()
+
+  if (XX_IS_RELEASE_D)
+    set(_AGENTXX_LDFLAGS "${LDFLAGS} ${_AGENTXX_LDFLAGS} /OPT:REF /OPT:ICF")
+    # /LTCG 只加到 Release 配置的链接参数变体: 通用链接参数会同时作用于嵌套构建
+    # 的其他配置, 与 Debug 默认的 /INCREMENTAL 冲突 (LNK4075) 且拖慢调试链接
+    if (_AGENTXX_LTO_LDFLAGS)
+      foreach (_ld IN ITEMS CMAKE_EXE_LINKER_FLAGS_RELEASE CMAKE_SHARED_LINKER_FLAGS_RELEASE)
+        string(APPEND ${_ld} " ${_AGENTXX_LTO_LDFLAGS}")
+      endforeach ()
+    endif ()
+  else ()
+    # ===== MSVC Debug Sanitizers =====
+    # AddressSanitizer (/fsanitize=address): MSVC 原生实现 (VS2019 16.9+ 引入,
+    # 本项目要求 VS2026/MSVC 14.5x 完全支持)。运行时经 UCRT 堆函数全进程拦截,
+    # 未插桩的预编译三方库 (OpenSSL/Boost 静态库) 跨模块堆错误仍可检出, 盲区仅
+    # 在库内部。注意与 Linux 差异: MSVC ASan 不包含 LeakSanitizer, 内存泄漏
+    # 检测仍需依赖 Linux 构建; UBSan / 插件框架探针在 MSVC 上无实现, 由
+    # AGENTXX_ENABLE_SANITIZER 统一控制时仅应用 ASan。
+    # 历史注释勘误: 早前 "使用 /fsanitize=address 时可能导致链接错误 (uchardet)"
+    # 实为三方库自身在 Debug 注入了 GCC 风格 -fsanitize=address 参数 (cl.exe
+    # 不识别) 所致, 并非 MSVC ASan 本身不可用 (该块已在 third_party/uchardet
+    # 中注释掉, 见 docs/zh-cn/build/windows.md FAQ)。
+    if (AGENTXX_ENABLE_SANITIZER)
+      # 冲突参数清理:
+      # - /RTC*: 与 ASan 插桩互斥 (官方文档明确不兼容; CMake 内置 Debug 默认
+      #   参数即 "/Zi /Ob0 /Od /RTC1");
+      foreach (_lang IN ITEMS C CXX)
+        string(REGEX REPLACE "(^| )/RTC[A-Za-z0-9]*( |$)" " " CMAKE_${_lang}_FLAGS_DEBUG "${CMAKE_${_lang}_FLAGS_DEBUG}")
+        string(APPEND CMAKE_${_lang}_FLAGS_DEBUG " /fsanitize=address")
+      endforeach ()
+      # - 增量链接与 ASan 互斥: 清理 DEBUG 配置默认的 /INCREMENTAL
+      #   (CMAKE_*_LINKER_FLAGS_DEBUG 内置默认值即 "/debug /INCREMENTAL");
+      #   并在通用 LINKER_FLAGS 显式关闭 (/INCREMENTAL:NO), 保证无论嵌套构建中
+      #   配置参数与通用参数的拼接顺序如何, 最终生效的都是非增量链接
+      foreach (_ld IN ITEMS CMAKE_EXE_LINKER_FLAGS_DEBUG CMAKE_SHARED_LINKER_FLAGS_DEBUG)
+        string(REGEX REPLACE "(^| )/INCREMENTAL(:[A-Za-z]+)?( |$)" " " ${_ld} "${${_ld}}")
+        string(APPEND ${_ld} " /INCREMENTAL:NO")
+      endforeach ()
+      string(APPEND _AGENTXX_LDFLAGS " /INCREMENTAL:NO")
+    endif ()
+    set(_AGENTXX_LDFLAGS "${LDFLAGS} ${_AGENTXX_LDFLAGS}")
+  endif()
+
+  # 说明: 不使用 CMAKE_INTERPROCEDURAL_OPTIMIZATION, 而是把 /GL (编译) 与
+  # /LTCG (链接) 直接写进 Release 参数。原因: 该变量只作用于本工程自身目标,
+  # 本项目依赖库全部经 ExternalProject 嵌套构建, 需经 CMAKE_*_FLAGS_RELEASE /
+  # 链接参数显式透传, 二者同时使用会出现重复 /GL (无害但冗余), 故统一走 FLAGS 通道。
+else ()
+  # XX_IS_CLANG_D OR XX_IS_GCC_D
+  set(_AGENTXX_C_FLAGS   "${_AGENTXX_COMMON_C_CXX_FLAGS} ${_AGENTXX_C_FLAGS}   -fvisibility=default -ffunction-sections -fdata-sections -Wall -fPIC -pipe -D_GNU_SOURCE")
+  # 缺少宏判断引发 LTO 时提示 ODR 警告，建议启用 LTO 以检测这些问题
+  set(_AGENTXX_CXX_FLAGS "${_AGENTXX_COMMON_C_CXX_FLAGS} ${_AGENTXX_CXX_FLAGS} -fvisibility=default -ffunction-sections -fdata-sections -Wall -fPIC -pipe -include cstddef -include type_traits")
+  
+  # LTO: 与 MSVC 分支 (/GL + /LTCG) 由同一开关 AGENTXX_ENABLE_LTO 控制
+  # 交叉编译到 Windows (MinGW) 时禁用 LTO: 旧版 bfd ld 无 LLVMgold 插件, 无法链接 -flto 产生的 LLVM bitcode
+  # - 需 lld 才能处理, 但为简化 hermetic 构建, 直接禁用 LTO
+  if (NOT AGENTXX_ENABLE_LTO)
+    set(_AGENTXX_LTO_FLAGS "")
+  elseif (CMAKE_CROSSCOMPILING AND XX_IS_MINGW_D)
+    set(_AGENTXX_LTO_FLAGS "")
+  elseif (XX_IS_GCC_D)
+    # GCC 下 -flto 会导致 lto-wrapper 默认以单线程串行编译全部 LTRANS 任务
+    # (触发 "warning: using serial compilation of N LTRANS jobs"), 耗时达数十分钟且易超时;
+    # 使用 -flto=auto 启用多核并行 LTO 代码生成
+    set(_AGENTXX_LTO_FLAGS "-flto=auto")
+  else()
+    set(_AGENTXX_LTO_FLAGS "-flto=thin")
+  endif()
+  set(CMAKE_C_FLAGS_RELEASE          "${_AGENTXX_C_FLAGS}   -O3 ${_AGENTXX_LTO_FLAGS} ${CMAKE_C_FLAGS_RELEASE}")
+  set(CMAKE_CXX_FLAGS_RELEASE        "${_AGENTXX_CXX_FLAGS} -O3 ${_AGENTXX_LTO_FLAGS} ${CMAKE_CXX_FLAGS_RELEASE}")
+  set(CMAKE_C_FLAGS_MINSIZEREL       "${_AGENTXX_C_FLAGS}   ${CMAKE_C_FLAGS_MINSIZEREL}")
+  set(CMAKE_CXX_FLAGS_MINSIZEREL     "${_AGENTXX_CXX_FLAGS} ${CMAKE_CXX_FLAGS_MINSIZEREL}")
+  set(CMAKE_C_FLAGS_RELWITHDEBINFO   "${_AGENTXX_C_FLAGS}   ${CMAKE_C_FLAGS_RELWITHDEBINFO}")
+  set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "${_AGENTXX_CXX_FLAGS} ${CMAKE_CXX_FLAGS_RELWITHDEBINFO}")
+  # Debug 编译加速: -g / sanitizers 均可通过 AGENTXX_ENABLE_SANITIZER 关闭;
+  # - 开启时同时注入 ASan 与 UBSan (见顶部选项说明), 插件框架的定向探针由
+  #   lib/test 各自的 CMakeLists 施加 (同一开关控制)
+  # - 通用: -fno-omit-frame-pointer 保证 sanitizer/性能分析的栈回溯完整
+  # - 关闭 DEBUG_INFO 时: 需同时剔除 CMake 为 GCC/Clang 默认追加的 -g
+  #   (CMAKE_CXX_FLAGS_DEBUG 默认值即 "-g")，否则产物依旧膨胀
+  set(_AGENTXX_DEBUG_EXTRA_FLAGS "")
+  string(APPEND _AGENTXX_DEBUG_EXTRA_FLAGS " -g")
+  if (AGENTXX_ENABLE_SANITIZER)
+    string(APPEND _AGENTXX_DEBUG_EXTRA_FLAGS " -fsanitize=address -fno-optimize-sibling-calls")
+    # -fno-sanitize-recover=undefined: 命中即 abort, 避免 UB 报告被静默吞掉
+    string(APPEND _AGENTXX_DEBUG_EXTRA_FLAGS " -fsanitize=undefined -fno-sanitize-recover=undefined")
+  endif()
+  string(APPEND _AGENTXX_DEBUG_EXTRA_FLAGS " -fno-omit-frame-pointer")
+  if (XX_IS_GCC_D)
+    # GCC 16+ 编译 C++26 模板/协程时默认 gc 阈值过小易触发编译器 ICE (gt_ggc_mx_lang_tree_node), 放宽 gc 阈值
+    set(_AGENTXX_GCC_GC_FLAGS "--param ggc-min-expand=100 --param ggc-min-heapsize=1048576")
+    string(APPEND _AGENTXX_DEBUG_EXTRA_FLAGS " ${_AGENTXX_GCC_GC_FLAGS}")
+    string(APPEND CMAKE_CXX_FLAGS_RELEASE " ${_AGENTXX_GCC_GC_FLAGS}")
+    string(APPEND CMAKE_C_FLAGS_RELEASE " ${_AGENTXX_GCC_GC_FLAGS}")
+    unset(_AGENTXX_GCC_GC_FLAGS)
+  endif()
+  set(CMAKE_C_FLAGS_DEBUG            "${_AGENTXX_C_FLAGS}   ${_AGENTXX_DEBUG_EXTRA_FLAGS} ${CMAKE_C_FLAGS_DEBUG}")
+  set(CMAKE_CXX_FLAGS_DEBUG          "${_AGENTXX_CXX_FLAGS} ${_AGENTXX_DEBUG_EXTRA_FLAGS} ${CMAKE_CXX_FLAGS_DEBUG}")
+  unset(_AGENTXX_DEBUG_EXTRA_FLAGS)
+
+  if (XX_IS_RELEASE_D)
+    # 死代码/未引用段裁剪:
+    # - ELF (Linux/Android): -Wl,--gc-sections (GNU ld/gold/mold/lld 通用)
+    # - Mach-O (macOS/iOS): 对应选项为 -Wl,-dead_strip (ld64 不认 --gc-sections)
+    if (XX_IS_MACOS_D OR XX_IS_IOS_D)
+      set(_AGENTXX_LDFLAGS "${LDFLAGS} ${_AGENTXX_LDFLAGS} -Wl,-dead_strip ${_AGENTXX_LTO_FLAGS}")
+    else ()
+      set(_AGENTXX_LDFLAGS "${LDFLAGS} ${_AGENTXX_LDFLAGS} -Wl,--gc-sections ${_AGENTXX_LTO_FLAGS}")
+    endif ()
+  else ()
+    # sanitizer 运行时须经编译驱动链接 (-fsanitize=*) 才能注入正确运行库
+    set(_AGENTXX_SAN_LINK_FLAGS "")
+    if (AGENTXX_ENABLE_SANITIZER)
+      string(APPEND _AGENTXX_SAN_LINK_FLAGS " -fsanitize=address -fsanitize=undefined")
+      # ASan 运行库自身导出强符号 __asan_default_options; ld64 在链接可执行文件时
+      # 会丢弃本地未被其它代码引用的同名定义, 使程序内定义的 __asan_default_options
+      # 失效 (选项不生效)。用 -u 强制保留本地定义 (Mach-O 符号带前导下划线)。
+      if (XX_IS_MACOS_D OR XX_IS_IOS_D)
+        string(APPEND _AGENTXX_SAN_LINK_FLAGS " -Wl,-u,___asan_default_options")
+      endif()
+    endif()
+    set(_AGENTXX_LDFLAGS "${LDFLAGS} ${_AGENTXX_LDFLAGS}${_AGENTXX_SAN_LINK_FLAGS}")
+    unset(_AGENTXX_SAN_LINK_FLAGS)
+  endif ()
+endif ()
+string(APPEND CMAKE_EXE_LINKER_FLAGS    " ${_AGENTXX_LDFLAGS}")
+string(APPEND CMAKE_SHARED_LINKER_FLAGS " ${_AGENTXX_LDFLAGS}")
+
+# 交叉到 Windows 时, 基础 FLAGS 也需包含 WINNT 定义, 供 try_compile (curl 等) 检测使用
+# 仅设置 CMAKE_C_FLAGS_RELEASE 等变体不足以被不带 CONFIG 的 try_compile 继承
+if (CMAKE_CROSSCOMPILING AND XX_IS_WIN_D)
+  if (NOT XX_IS_MSVC_D)
+    # 将通用 WINNT 定义注入基础 FLAGS, 使子项目 (ExternalProject) 的 try_compile 可见
+    # 避免 curl 误判 _WIN32_WINNT=0x0502 而报错 "Vista or newer is required"
+    if (NOT CMAKE_C_FLAGS MATCHES "_WIN32_WINNT")
+      set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00" CACHE STRING "" FORCE)
+    endif()
+    if (NOT CMAKE_CXX_FLAGS MATCHES "_WIN32_WINNT")
+      set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00" CACHE STRING "" FORCE)
+    endif()
+  endif()
+  add_compile_definitions(_WIN32_WINNT=0x0A00 WINVER=0x0A00 NTDDI_VERSION=0x0A000000 _WIN32_IE=0x0A00)
+endif()
+
+# 快速链接器 (GCC/Clang): mold > gold > 默认 bfd，大幅减少大体积二进制链接时间
+# - auto: 自动检测 mold / ld.gold，均未安装时使用默认链接器
+# - 也可通过 -DAGENTXX_LINKER=mold|gold|bfd 显式指定
+# - 不适用于 MSVC (无对应 -fuse-ld 语义)
+if (NOT XX_IS_MSVC_D)
+  set(_AGENTXX_LINKER_FLAG "")
+  if (AGENTXX_LINKER STREQUAL "auto")
+    # NOTE: 交叉编译时不可用构建机的 mold/gold:
+    # - Android: NDK clang 的 LTO 链接需要 NDK 内的 LLVMgold.so 插件, 构建机链接器会因
+    #   找不到插件而失败 (mold: fatal: could not open plugin file .../lib/LLVMgold.so)
+    # - Windows/MinGW: 构建机的 mold/gold 与 MinGW ld 不兼容, -fuse-ld=mold 会导致链接失败
+    if (ANDROID OR XX_IS_ANDROID_D OR CMAKE_CROSSCOMPILING)
+      message("[agentxx] Cross compile, use default linker")
+    else ()
+      find_program(_AGENTXX_MOLD_EXECUTABLE mold)
+      find_program(_AGENTXX_GOLD_EXECUTABLE ld.gold)
+      if (_AGENTXX_MOLD_EXECUTABLE)
+        message("[agentxx] Use fast linker: mold")
+        set(_AGENTXX_LINKER_FLAG "-fuse-ld=mold")
+      elseif (_AGENTXX_GOLD_EXECUTABLE)
+        message("[agentxx] Use fast linker: gold")
+        set(_AGENTXX_LINKER_FLAG "-fuse-ld=gold")
+      else ()
+        message("[agentxx] Use default linker (bfd)")
+      endif()
+      unset(_AGENTXX_MOLD_EXECUTABLE CACHE)
+      unset(_AGENTXX_GOLD_EXECUTABLE CACHE)
+    endif()
+  elseif (AGENTXX_LINKER STREQUAL "bfd")
+    message("[agentxx] Use default linker (bfd)")
+  else ()
+    set(_AGENTXX_LINKER_FLAG "-fuse-ld=${AGENTXX_LINKER}")
+  endif()
+  string(APPEND CMAKE_EXE_LINKER_FLAGS    " ${_AGENTXX_LINKER_FLAG}")
+  string(APPEND CMAKE_SHARED_LINKER_FLAGS " ${_AGENTXX_LINKER_FLAG}")
+
+  # ===== Android: 共享库不导出静态库符号 =====
+  # 背景: OpenSSL (4.0.1) 的 aarch64 汇编里 poly1305_init 用 adrp/add 直接取
+  #   同库内符号 poly1305_blocks_sve2 (定义在另一个 .o, 且没写 .hidden), 把
+  #   libcrypto.a 链进共享库时该符号在输出里仍是可抢占的全局符号, lld 拒绝这类
+  #   重定位并报 "relocation R_AARCH64_ADR_PREL_PG_HI21 cannot be used against
+  #   symbol 'poly1305_blocks_sve2'; recompile with -fPIC"。
+  #   OpenSSL 自己构建 libcrypto.so 时有版本脚本 (util/libcrypto.num) 把该符号
+  #   变成局部符号, 所以上游没有暴露这个问题。
+  # 处理: Android 链接共享库时加 --exclude-libs=ALL, 链接器把来自静态库的符号
+  #   按隐藏可见性处理 (不进入动态符号表), 重定位不再需要 GOT; 同时避免把
+  #   OpenSSL/fmt 等第三方符号导出到我们自己的 .so。
+  # - 只加给 SHARED: 可执行文件不导出动态符号
+  # - 本项目自己的 C/C++ API 由源文件直接编入共享库 (OBJECT 库), 不经过静态库,
+  #   导出面不受影响 (libagentxx 仍由 ffi_symbols.map 白名单控制)
+  if (XX_IS_ANDROID_D)
+    message("[agentxx] Android: hide static library symbols in shared libraries (--exclude-libs=ALL)")
+    string(APPEND CMAKE_SHARED_LINKER_FLAGS " -Wl,--exclude-libs=ALL")
+  endif()
+
+  # ===== Release 链接期体积优化 =====
+  # 相同代码合并 (--icf=all): 仅在 mold/gold/lld 下可用, bfd 无该选项
+  # 仅 Linux/Android (ELF): 其他平台链接器对上述选项支持不一
+  # 符号表裁剪由发布脚本完成 (见 script/*_build.sh), 不在链接期处理
+  if (XX_IS_RELEASE_D AND NOT CMAKE_CROSSCOMPILING AND (XX_IS_LINUX_D OR XX_IS_ANDROID_D))
+    if (AGENTXX_ENABLE_ICF)
+      if (_AGENTXX_LINKER_FLAG MATCHES "mold|gold|lld")
+        message("[agentxx] Release: enable ICF (--icf=all) for ${_AGENTXX_LINKER_FLAG}")
+        string(APPEND CMAKE_EXE_LINKER_FLAGS    " -Wl,--icf=all")
+        string(APPEND CMAKE_SHARED_LINKER_FLAGS " -Wl,--icf=all")
+      else ()
+        message("[agentxx] Release: ICF skipped (linker does not support --icf)")
+      endif()
+    endif()
+  endif()
+  unset(_AGENTXX_LINKER_FLAG)
+endif()
+
+unset(_AGENTXX_COMMON_C_CXX_FLAGS)
+unset(_AGENTXX_C_FLAGS)
+unset(_AGENTXX_CXX_FLAGS)
+# LTO 参数已分别写入 CMAKE_*_FLAGS_RELEASE / CMAKE_*_LINKER_FLAGS_RELEASE, 此处清理
+unset(_AGENTXX_LTO_FLAGS)
+unset(_AGENTXX_LTO_LDFLAGS)
+
+# exe install dir
+set(AGENTXX_EXEC_INSTALL_PREFIX "${CMAKE_BINARY_DIR}/exec")
+message("[agentxx] AGENTXX_EXEC_INSTALL_PREFIX: ${AGENTXX_EXEC_INSTALL_PREFIX}")
+message("[agentxx] CMAKE_CURRENT_SOURCE_DIR: ${CMAKE_CURRENT_SOURCE_DIR}")
+
+# deps
+set(AGENTXX_THIRD_PARTY_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/")
+set(AGENTXX_INSTALL_DIR "${CMAKE_BINARY_DIR}/agentxx-project-install/")
+
+# - 添加搜索根目录到 [CMAKE_FIND_ROOT_PATH]，以兼容交叉编译
+# - 搜索模式为 [ONLY] 隔离搜索，避免交叉编译时引用主机上的库导致各种异常
+if (CMAKE_CROSSCOMPILING)
+  set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY "ONLY")
+  set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE "ONLY")
+  set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE "ONLY")
+endif()
+
+# boost 系统安装库 或 自行编译
+# https://github.com/boostorg/boost
+# 下载 release/boost-xxx.7z 解压到 agent/third_party/boost/
+# 自行按文档编译参考: /docs/build/linux.md 或 /docs/build/windows.md
+set (Boost_USE_STATIC_LIBS ON)
+set (Boost_USE_STATIC_RUNTIME OFF) # 是否静态链接标准库
+set (Boost_USE_DEBUG_LIBS ${XX_IS_DEBUG_D})
+set (Boost_USE_RELEASE_LIBS ${XX_IS_RELEASE_D})
+set (Boost_USE_DEBUG_RUNTIME ${XX_IS_DEBUG_D})
+set (Boost_USE_RELEASE_RUNTIME ${XX_IS_RELEASE_D})
+if (NOT DEFINED BOOST_ROOT)
+  message(FATAL_ERROR "[agentxx] Need to set BOOST_ROOT to the path of your Boost installation")
+elseif (NOT EXISTS "${BOOST_ROOT}")
+  message(FATAL_ERROR "[agentxx] BOOST_ROOT not exists: ${BOOST_ROOT}")
+else ()
+  file(TO_CMAKE_PATH "${BOOST_ROOT}" TEMP_BOOST_ROOT)
+  set(BOOST_ROOT "${TEMP_BOOST_ROOT}" CACHE PATH "Boost root path" FORCE)
+  unset(TEMP_BOOST_ROOT)
+endif()
+
+# openssl
+set (OPENSSL_USE_STATIC_LIBS ON)
+if (NOT DEFINED OPENSSL_ROOT_DIR)
+  message(FATAL_ERROR "[agentxx] Need to set OPENSSL_ROOT_DIR to the path of your OpenSSL installation")
+elseif (NOT EXISTS "${OPENSSL_ROOT_DIR}")
+  message(FATAL_ERROR "[agentxx] OPENSSL_ROOT_DIR not exists: ${OPENSSL_ROOT_DIR}")
+else ()
+  file(TO_CMAKE_PATH "${OPENSSL_ROOT_DIR}" TEMP_OPENSSL_ROOT_DIR)
+  set(OPENSSL_ROOT_DIR "${TEMP_OPENSSL_ROOT_DIR}" CACHE PATH "OpenSSL root path" FORCE)
+  unset(TEMP_OPENSSL_ROOT_DIR)
+endif()
+
+if (CMAKE_CROSSCOMPILING)
+  # 统一追加 [CMAKE_FIND_ROOT_PATH]，逐步添加可能导致自动补充搜索路径时 find_package 验证查找失败
+  list (PREPEND CMAKE_FIND_ROOT_PATH "${AGENTXX_INSTALL_DIR}")
+  list (APPEND CMAKE_FIND_ROOT_PATH 
+    "${BOOST_ROOT}" 
+    "${OPENSSL_ROOT_DIR}"
+  )
+endif ()
+list (PREPEND CMAKE_PREFIX_PATH "${AGENTXX_INSTALL_DIR}")
+
+set(_AGENTXX_COMMON_CMAKE_CACHE_ARGS
+    "-DCMAKE_FIND_ROOT_PATH:STRING=${CMAKE_FIND_ROOT_PATH}"
+    "-DCMAKE_PREFIX_PATH:STRING=${CMAKE_PREFIX_PATH}"
+    "-DBOOST_ROOT:PATH=${BOOST_ROOT}"
+    "-DBoost_ROOT:PATH=${BOOST_ROOT}"
+    "-DOPENSSL_ROOT_DIR:PATH=${OPENSSL_ROOT_DIR}"
+    "-DAGENTXX_VERSION:STRING=${AGENTXX_VERSION}"
+    "-DLDFLAGS:STRING=${_AGENTXX_LDFLAGS}"
+)
+set(_AGENTXX_COMMON_CMAKE_ARGS
+    "-DAGENTXX_VERSION=${AGENTXX_VERSION}"
+    # "-DCMAKE_SYSTEM_NAME=${CMAKE_SYSTEM_NAME}" # 传递后会导致 sqlite 编译检查出错
+    "-DCMAKE_CROSSCOMPILING=${CMAKE_CROSSCOMPILING}"
+    "-DCMAKE_SYSTEM_PROCESSOR=${CMAKE_SYSTEM_PROCESSOR}"
+    "-DCMAKE_GENERATOR_PLATFORM=${CMAKE_GENERATOR_PLATFORM}"
+    "-DCMAKE_TOOLCHAIN_FILE:PATH=${CMAKE_TOOLCHAIN_FILE}"
+    -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=${CMAKE_FIND_ROOT_PATH_MODE_LIBRARY}
+    -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=${CMAKE_FIND_ROOT_PATH_MODE_INCLUDE}
+    -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=${CMAKE_FIND_ROOT_PATH_MODE_PACKAGE}
+
+    "-DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}"
+    "-DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}"
+    # ccache 等编译启动器需显式传给嵌套 (ExternalProject) 构建，否则子构建不会使用
+    "-DCMAKE_C_COMPILER_LAUNCHER=${CMAKE_C_COMPILER_LAUNCHER}"
+    "-DCMAKE_CXX_COMPILER_LAUNCHER=${CMAKE_CXX_COMPILER_LAUNCHER}"
+    # 嵌套构建引用 CCACHE_PROGRAM 判断是否启用 ccache 兼容选项 (如 -fpch-preprocess)
+    "-DCCACHE_PROGRAM=${CCACHE_PROGRAM}"
+    # 链接器 (mold/gold/-fsanitize 等) 同样需要显式传递给嵌套构建
+    "-DCMAKE_EXE_LINKER_FLAGS=${CMAKE_EXE_LINKER_FLAGS}"
+    "-DCMAKE_SHARED_LINKER_FLAGS=${CMAKE_SHARED_LINKER_FLAGS}"
+    # DEBUG 链接参数变体同样显式传递: MSVC ASan 开启时顶层已清理 /INCREMENTAL
+    # 并追加 /INCREMENTAL:NO, 嵌套工程需使用一致的值 (否则嵌套会回退到内置
+    # 默认值 "/debug /INCREMENTAL", 与 ASan 互斥)
+    "-DCMAKE_EXE_LINKER_FLAGS_DEBUG=${CMAKE_EXE_LINKER_FLAGS_DEBUG}"
+    "-DCMAKE_SHARED_LINKER_FLAGS_DEBUG=${CMAKE_SHARED_LINKER_FLAGS_DEBUG}"
+    # RELEASE 链接参数变体同样显式传递: MSVC LTO 的 /LTCG 只加在 Release 变体上
+    # (见 MSVC 分支), 嵌套工程必须收到, 否则其 Release 链接缺少 /LTCG
+    "-DCMAKE_EXE_LINKER_FLAGS_RELEASE=${CMAKE_EXE_LINKER_FLAGS_RELEASE}"
+    "-DCMAKE_SHARED_LINKER_FLAGS_RELEASE=${CMAKE_SHARED_LINKER_FLAGS_RELEASE}"
+    "-DCMAKE_INSTALL_PREFIX=${AGENTXX_INSTALL_DIR}"
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+    -DCMAKE_EXPORT_COMPILE_COMMANDS=${CMAKE_EXPORT_COMPILE_COMMANDS}
+
+    "-DCMAKE_MSVC_RUNTIME_LIBRARY=${CMAKE_MSVC_RUNTIME_LIBRARY}"
+    -DCMAKE_POLICY_DEFAULT_CMP0074=NEW
+    -DCMAKE_POLICY_DEFAULT_CMP0091=NEW
+    -DCMAKE_POLICY_DEFAULT_CMP0141=NEW
+    -DCMAKE_POLICY_DEFAULT_CMP0144=NEW
+    -DCMAKE_POLICY_DEFAULT_CMP0167=OLD
+    "-DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=${CMAKE_MSVC_DEBUG_INFORMATION_FORMAT}"
+
+    "-DCMAKE_CONFIGURATION_TYPES=${CMAKE_CONFIGURATION_TYPES}"
+    "-DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}"
+    "-DCMAKE_C_FLAGS=${CMAKE_C_FLAGS}"
+    "-DCMAKE_CXX_FLAGS=${CMAKE_CXX_FLAGS}"
+    "-DCMAKE_C_FLAGS_RELEASE=${CMAKE_C_FLAGS_RELEASE}"
+    "-DCMAKE_CXX_FLAGS_RELEASE=${CMAKE_CXX_FLAGS_RELEASE}"
+    "-DCMAKE_C_FLAGS_MINSIZEREL=${CMAKE_C_FLAGS_MINSIZEREL}"
+    "-DCMAKE_CXX_FLAGS_MINSIZEREL=${CMAKE_CXX_FLAGS_MINSIZEREL}"
+    "-DCMAKE_C_FLAGS_RELWITHDEBINFO=${CMAKE_C_FLAGS_RELWITHDEBINFO}"
+    "-DCMAKE_CXX_FLAGS_RELWITHDEBINFO=${CMAKE_CXX_FLAGS_RELWITHDEBINFO}"
+    "-DCMAKE_C_FLAGS_DEBUG=${CMAKE_C_FLAGS_DEBUG}"
+    "-DCMAKE_CXX_FLAGS_DEBUG=${CMAKE_CXX_FLAGS_DEBUG}"
+
+    "-DBOOST_ROOT:PATH=${BOOST_ROOT}"
+    "-DBoost_ROOT:PATH=${BOOST_ROOT}"
+    -DBoost_USE_STATIC_LIBS=${Boost_USE_STATIC_LIBS}
+    -DBoost_USE_STATIC_RUNTIME=${Boost_USE_STATIC_RUNTIME}
+    -DBoost_USE_DEBUG_LIBS=${Boost_USE_DEBUG_LIBS}
+    -DBoost_USE_RELEASE_LIBS=${Boost_USE_RELEASE_LIBS}
+    -DBoost_USE_DEBUG_RUNTIME=${Boost_USE_DEBUG_RUNTIME}
+    -DBoost_USE_RELEASE_RUNTIME=${Boost_USE_RELEASE_RUNTIME}
+    "-DOPENSSL_ROOT_DIR:PATH=${OPENSSL_ROOT_DIR}"
+    -DOPENSSL_USE_STATIC_LIBS=${OPENSSL_USE_STATIC_LIBS}
+    -DYAML_CPP_STATIC_DEFINE=ON
+
+    -DAGENTXX_ENABLE_SANITIZER=${AGENTXX_ENABLE_SANITIZER}
+    -DAGENTXX_ENABLE_PCH=${AGENTXX_ENABLE_PCH}
+    
+    -DXX_IS_DEBUG_D=${XX_IS_DEBUG_D}
+    -DXX_IS_RELEASE_D=${XX_IS_RELEASE_D}
+
+    -DXX_IS_LINUX_D=${XX_IS_LINUX_D}
+    -DXX_IS_WIN_D=${XX_IS_WIN_D}
+    -DXX_IS_MACOS_D=${XX_IS_MACOS_D}
+    -DXX_IS_ANDROID_D=${XX_IS_ANDROID_D}
+    -DXX_IS_IOS_D=${XX_IS_IOS_D}
+
+    -DXX_IS_MINGW_D=${XX_IS_MINGW_D}
+    -DXX_IS_MSVC_D=${XX_IS_MSVC_D}
+    -DXX_IS_GCC_D=${XX_IS_GCC_D}
+    -DXX_IS_CLANG_D=${XX_IS_CLANG_D}
+
+    "-DAGENTXX_INSTALL_DIR=${AGENTXX_INSTALL_DIR}"
+    "-DXX_INSTALL_DIR=${AGENTXX_INSTALL_DIR}"
+    -DAGENTXX_ENABLE_HYPERSCAN=${AGENTXX_ENABLE_HYPERSCAN}
+    # 内存分配器 (mimalloc): 最终程序 (client/test/benchmark) 按此把分配器并入产物
+    -DAGENTXX_ENABLE_MIMALLOC=${AGENTXX_ENABLE_MIMALLOC}
+    "-DAGENTXX_MIMALLOC_LINK=${AGENTXX_MIMALLOC_LINK}"
+    -DAGENTXX_ENABLE_PLUGIN_CODEGRAPH=${AGENTXX_ENABLE_PLUGIN_CODEGRAPH}
+    -DAGENTXX_ENABLE_BOOST_PROCESS=${AGENTXX_ENABLE_BOOST_PROCESS}
+    -DAGENTXX_ENABLE_PLUGIN_JS=${AGENTXX_ENABLE_PLUGIN_JS}
+    -DAGENTXX_ENABLE_PLUGIN_SYSTEM_MONITOR=${AGENTXX_ENABLE_PLUGIN_SYSTEM_MONITOR}
+    -DAGENTXX_ENABLE_PLUGIN_AUDIO_STREAM=${AGENTXX_ENABLE_PLUGIN_AUDIO_STREAM}
+    -DAGENTXX_ENABLE_PLUGIN_TEXT_SELECTION=${AGENTXX_ENABLE_PLUGIN_TEXT_SELECTION}
+    -DAGENTXX_ENABLE_PLUGIN_EXAMPLE=${AGENTXX_ENABLE_PLUGIN_EXAMPLE}
+    -DAGENTXX_ENABLE_PLUGIN_COMPUTER_USE=${AGENTXX_ENABLE_PLUGIN_COMPUTER_USE}
+    -DAGENTXX_ENABLE_PLUGIN_SCREEN_CAPTURE=${AGENTXX_ENABLE_PLUGIN_SCREEN_CAPTURE}
+    -DAGENTXX_ENABLE_PLUGIN_PLANNING=${AGENTXX_ENABLE_PLUGIN_PLANNING}
+    -DAGENTXX_ENABLE_PLUGIN_FILESYSTEM=${AGENTXX_ENABLE_PLUGIN_FILESYSTEM}
+    -DAGENTXX_ENABLE_PLUGIN_EXECUTE_COMMAND=${AGENTXX_ENABLE_PLUGIN_EXECUTE_COMMAND}
+    -DAGENTXX_ENABLE_PLUGIN_STRING=${AGENTXX_ENABLE_PLUGIN_STRING}
+    -DAGENTXX_ENABLE_PLUGIN_MATH=${AGENTXX_ENABLE_PLUGIN_MATH}
+    -DAGENTXX_ENABLE_PLUGIN_SYSTEM=${AGENTXX_ENABLE_PLUGIN_SYSTEM}
+    -DAGENTXX_ENABLE_PLUGIN_WEBSEARCH=${AGENTXX_ENABLE_PLUGIN_WEBSEARCH}
+    -DAGENTXX_ENABLE_PLUGIN_RAG_SEARCH=${AGENTXX_ENABLE_PLUGIN_RAG_SEARCH}
+    -DAGENTXX_ENABLE_PLUGIN_LLM_UNCENSORED=${AGENTXX_ENABLE_PLUGIN_LLM_UNCENSORED}
+    "-DAGENTXX_PLUGIN_BUILTIN_LIST=${AGENTXX_PLUGIN_BUILTIN_LIST}"
+
+    "-DAGENTXX_EXEC_INSTALL_PREFIX=${AGENTXX_EXEC_INSTALL_PREFIX}"
+    "-DXX_EXEC_INSTALL_PREFIX=${AGENTXX_EXEC_INSTALL_PREFIX}"
+    "-DAGENTXX_THIRD_PARTY_DIR=${AGENTXX_THIRD_PARTY_DIR}"
+    -DAGENTXX_LINUX_IO_URING_SUPPORTED=${AGENTXX_LINUX_IO_URING_SUPPORTED}
+    -DXX_LINUX_IO_URING_SUPPORTED=${AGENTXX_LINUX_IO_URING_SUPPORTED}
+    -DAGENTXX_WINDOWS_IOCP_SUPPORTED=${AGENTXX_WINDOWS_IOCP_SUPPORTED}
+)
+if (ANDROID_PLATFORM)
+  list(APPEND _AGENTXX_COMMON_CMAKE_ARGS
+    "-DCMAKE_SYSTEM_NAME=${CMAKE_SYSTEM_NAME}"
+    -DANDROID_ABI=${ANDROID_ABI}
+    -DANDROID_PLATFORM=${ANDROID_PLATFORM}
+    -DANDROID_STL=${ANDROID_STL}
+  )
+endif()
+
+message("[agentxx] _AGENTXX_COMMON_CMAKE_ARGS: ${_AGENTXX_COMMON_CMAKE_ARGS}")
+message("[agentxx] _AGENTXX_COMMON_CMAKE_CACHE_ARGS: ${_AGENTXX_COMMON_CMAKE_CACHE_ARGS}")
+message("[agentxx] BOOST_ROOT: ${BOOST_ROOT}")
+message("[agentxx] OPENSSL_ROOT_DIR: ${OPENSSL_ROOT_DIR}")
+message("[agentxx] CMAKE_FIND_ROOT_PATH: ${CMAKE_FIND_ROOT_PATH}")
+
+include(ExternalProject)
+include(FetchContent)
+
+# 断言查找依赖
+find_package(Boost REQUIRED)
+find_package(OpenSSL REQUIRED)
+
+# liburing
+if (AGENTXX_LINUX_IO_URING_SUPPORTED)
+  set(LIBURING_SOURCE_DIR "${AGENTXX_THIRD_PARTY_DIR}/liburing")
+  set(LIBURING_BINARY_DIR "${CMAKE_BINARY_DIR}/liburing-build")
+  ExternalProject_Add(
+    liburing_repo
+    SOURCE_DIR "${LIBURING_SOURCE_DIR}"
+    BINARY_DIR "${LIBURING_BINARY_DIR}"
+    INSTALL_DIR "${AGENTXX_INSTALL_DIR}"
+    CONFIGURE_COMMAND 
+        cp -r "${LIBURING_SOURCE_DIR}" "${LIBURING_BINARY_DIR}/" && 
+        cd "${LIBURING_BINARY_DIR}/liburing" && 
+        "${LIBURING_BINARY_DIR}/liburing/configure"
+        --prefix=${AGENTXX_INSTALL_DIR}
+        --cc=${CMAKE_C_COMPILER}
+        --cxx=${CMAKE_CXX_COMPILER}
+    BUILD_COMMAND 
+      cd "${LIBURING_BINARY_DIR}/liburing/" && make -j${CMAKE_BUILD_PARALLEL_LEVEL}
+    INSTALL_COMMAND 
+      cd "${LIBURING_BINARY_DIR}/liburing/" && make install
+    TEST_COMMAND ""
+  )
+endif()
+
+# ===== mimalloc (内存分配器) =====
+# - 由 AGENTXX_ENABLE_MIMALLOC 控制: 关闭时不构建, 也不需要源码目录
+# - 只构建与 AGENTXX_MIMALLOC_LINK 对应的一种产物: 静态库 (libmimalloc.a) 与
+#   动态库 (libmimalloc.so) 同名同前缀, 二者同时安装时 find_library 容易链错
+# - MI_INSTALL_TOPLEVEL=ON: 头文件装到 include/、库装到 lib/、cmake config 装到
+#   lib/cmake/mimalloc (与其余依赖一致, 经 CMAKE_PREFIX_PATH 命中)
+# - MI_OPT_ARCH=OFF: 与 hyperscan 基线 ISA 的处理一致, 不把 x64 绑到 haswell/AVX2
+#   (上游 x64 默认即 OFF)、arm64 绑到 armv8.1-a (上游 arm64 默认开启): 本项目
+#   产物要发布到各种设备, 需要保持通用 CPU 基线
+# - MI_OVERRIDE=ON: 库内提供 malloc/free/... 覆盖入口 (分配器是否真正接管由
+#   最终程序的链接方式决定, 见 cmake/agentxx_mimalloc.cmake)
+# - MI_ALLOW_THP=OFF: 关闭透明大页 (上游 Linux 默认 FULL)。THP 让 mimalloc 以 2 MB
+#   为单位向系统申请/保留内存, 释放小对象后所在的整块大页不拆分、常驻不降, 实测
+#   同一场景 RSS 从 ~19.6 MB 涨到 ~37.4 MB (匿名页), 与本项目"优先控制常驻内存"
+#   的目标相反; 需要 THP 换 TLB 性能时可运行时用 MIMALLOC_ALLOW_THP=1 打开
+#   (该选项是运行期选项, 环境变量可覆盖编译期默认值)
+if (AGENTXX_ENABLE_MIMALLOC)
+  set(AGENTXX_MIMALLOC_SOURCE_DIR "${AGENTXX_THIRD_PARTY_DIR}/mimalloc/")
+  if (NOT EXISTS "${AGENTXX_MIMALLOC_SOURCE_DIR}/CMakeLists.txt")
+    message(FATAL_ERROR
+      "[agentxx] 未找到 mimalloc 源码: ${AGENTXX_MIMALLOC_SOURCE_DIR}\n"
+      "  请执行: git submodule update --init agent/third_party/mimalloc\n"
+      "  或关闭该功能: -DAGENTXX_ENABLE_MIMALLOC=OFF")
+  endif ()
+
+  set(_AGENTXX_MIMALLOC_BUILD_SHARED OFF)
+  set(_AGENTXX_MIMALLOC_BUILD_STATIC ON)
+  if (AGENTXX_MIMALLOC_LINK STREQUAL "SHARED")
+    set(_AGENTXX_MIMALLOC_BUILD_SHARED ON)
+    set(_AGENTXX_MIMALLOC_BUILD_STATIC OFF)
+  endif ()
+  # 构建目录按链接方式区分: 切换 AGENTXX_MIMALLOC_LINK 时不复用上一种产物
+  string(TOLOWER "${AGENTXX_MIMALLOC_LINK}" _AGENTXX_MIMALLOC_BUILD_SUFFIX)
+
+  ExternalProject_Add(
+    mimalloc_repo
+    SOURCE_DIR "${AGENTXX_MIMALLOC_SOURCE_DIR}"
+    BINARY_DIR "${CMAKE_BINARY_DIR}/mimalloc-build-${_AGENTXX_MIMALLOC_BUILD_SUFFIX}"
+    INSTALL_DIR "${AGENTXX_INSTALL_DIR}"
+    CMAKE_ARGS
+      ${_AGENTXX_COMMON_CMAKE_ARGS}
+      -DMI_BUILD_TESTS=OFF
+      -DMI_BUILD_OBJECT=OFF
+      -DMI_BUILD_SHARED=${_AGENTXX_MIMALLOC_BUILD_SHARED}
+      -DMI_BUILD_STATIC=${_AGENTXX_MIMALLOC_BUILD_STATIC}
+      -DMI_OVERRIDE=ON
+      -DMI_INSTALL_TOPLEVEL=ON
+      -DMI_OPT_ARCH=OFF
+      -DMI_ALLOW_THP=OFF
+    CMAKE_CACHE_ARGS
+      ${_AGENTXX_COMMON_CMAKE_CACHE_ARGS}
+    TEST_COMMAND ""
+  )
+  unset(_AGENTXX_MIMALLOC_BUILD_SHARED)
+  unset(_AGENTXX_MIMALLOC_BUILD_STATIC)
+  unset(_AGENTXX_MIMALLOC_BUILD_SUFFIX)
+endif ()
+
+# simdjson
+ExternalProject_Add(
+  simdjson_repo
+  SOURCE_DIR "${AGENTXX_THIRD_PARTY_DIR}/simdjson/"
+  INSTALL_DIR "${AGENTXX_INSTALL_DIR}"
+  CMAKE_ARGS
+    ${_AGENTXX_COMMON_CMAKE_ARGS}
+    -DSIMDJSON_BUILD_STATIC_LIB=ON
+    -DSIMDJSON_INSTALL=ON
+    -DSIMDJSON_STATIC_REFLECTION=OFF
+    -DSIMDJSON_SINGLEHEADER=ON
+    -DBUILD_SHARED_LIBS=OFF
+    -DBUILD_STATIC_LIBS=ON
+  CMAKE_CACHE_ARGS
+    ${_AGENTXX_COMMON_CMAKE_CACHE_ARGS}
+  TEST_COMMAND ""
+)
+
+# iconv
+ExternalProject_Add(
+  libiconv_repo
+  SOURCE_DIR "${AGENTXX_THIRD_PARTY_DIR}/libiconv-native/"
+  INSTALL_DIR "${AGENTXX_INSTALL_DIR}"
+  CMAKE_ARGS
+    ${_AGENTXX_COMMON_CMAKE_ARGS}
+    -DICONV_ENABLE_EXTRA=OFF
+    -DICONV_EMBED_MODE=OFF
+    -DBUILD_SHARED_LIBS=OFF
+    -DBUILD_STATIC_LIBS=ON
+  CMAKE_CACHE_ARGS
+    ${_AGENTXX_COMMON_CMAKE_CACHE_ARGS}
+  TEST_COMMAND ""
+)
+
+# zlib
+ExternalProject_Add(
+  zlib_repo
+  SOURCE_DIR "${AGENTXX_THIRD_PARTY_DIR}/zlib-ng/"
+  INSTALL_DIR "${AGENTXX_INSTALL_DIR}"
+  CMAKE_ARGS
+    ${_AGENTXX_COMMON_CMAKE_ARGS}
+    -DBUILD_TESTING=OFF
+    -DZLIB_ALIASES=ON
+    -DZLIB_COMPAT=ON
+    -DBUILD_TEST=OFF
+    -DINSTALL_UTILS=OFF
+    -DBUILD_SHARED_LIBS=OFF
+    -DBUILD_STATIC_LIBS=ON
+  CMAKE_CACHE_ARGS
+    ${_AGENTXX_COMMON_CMAKE_CACHE_ARGS}
+  TEST_COMMAND ""
+)
+
+# sqlite
+# https://sqlite.org/download.html
+# 复制版本和链接 sqlite-amalgamation-xxx.zip 
+# strerror_r 变体探测: sqlite3-cmake 用 `strerror_r(0,(char*)0,0)==(char*)0` 判断 GNU 变体,
+# 但 macOS/iOS 的 strerror_r 为 POSIX 语义 (返回 int), 且 size=0 时返回非 0 (ERANGE),
+# 比较结果无法区分 (int 与指针比较), 会误判为 GNU 并定义 STRERROR_R_CHAR_P, 导致
+# sqlite3.c 把 int 返回值赋给 char* 编译失败。故 macOS/iOS 直接跳过探测并置为非 GNU。
+if (XX_IS_MACOS_D OR XX_IS_IOS_D)
+  set(_AGENTXX_SQLITE_STRERROR_R_ARGS "-DHAVE_GNU_STRERROR_R:BOOL=OFF")
+else()
+  set(_AGENTXX_SQLITE_STRERROR_R_ARGS "-DHAVE_GNU_STRERROR_R_EXITCODE:STRING=0")
+endif()
+ExternalProject_Add(
+  sqlite3_repo
+  SOURCE_DIR "${AGENTXX_THIRD_PARTY_DIR}/sqlite3-cmake/"
+  INSTALL_DIR "${AGENTXX_INSTALL_DIR}"
+  CMAKE_ARGS
+    ${_AGENTXX_COMMON_CMAKE_ARGS}
+    "-DSQLITE3_SOURCE_DIR="
+    "-DSQLITE3_VERSION=3.53.2"
+    "-DSQLITE3_URL=https://sqlite.org/2026/sqlite-amalgamation-3530200.zip"
+    -Dsqlite3_ENABLE_THREADSAFE=ON
+    -Dsqlite3_ENABLE_DYNAMIC_EXTENSIONS=OFF
+    -Dsqlite3_ENABLE_MATH=ON
+    -Dsqlite3_ENABLE_FTS3=OFF
+    -Dsqlite3_ENABLE_FTS4=ON
+    -Dsqlite3_ENABLE_FTS5=ON
+    -Dsqlite3_ENABLE_RTREE=ON
+    -Dsqlite3_ENABLE_SESSION=OFF
+    -Dsqlite3_OMIT_DEPRECATED=ON
+    -Dsqlite3_BUILD_SHARED_LIBS=OFF
+    -DBUILD_SHARED_LIBS=OFF
+    -DBUILD_STATIC_LIBS=ON
+  CMAKE_CACHE_ARGS
+    ${_AGENTXX_COMMON_CMAKE_CACHE_ARGS}
+    ${_AGENTXX_SQLITE_STRERROR_R_ARGS}
+  TEST_COMMAND ""
+)
+
+# fmt
+ExternalProject_Add(
+  fmt_repo
+  SOURCE_DIR "${AGENTXX_THIRD_PARTY_DIR}/fmt/"
+  INSTALL_DIR "${AGENTXX_INSTALL_DIR}"
+  CMAKE_ARGS
+    ${_AGENTXX_COMMON_CMAKE_ARGS}
+    -DFMT_PEDANTIC=ON
+    -DFMT_INSTALL=ON
+    -DFMT_WERROR=OFF
+    -DFMT_DOC=OFF
+    -DFMT_TEST=OFF
+    -DFMT_OS=OFF
+    -DFMT_UNICODE=ON
+    -DBUILD_SHARED_LIBS=OFF
+    -DBUILD_STATIC_LIBS=ON
+  CMAKE_CACHE_ARGS
+    ${_AGENTXX_COMMON_CMAKE_CACHE_ARGS}
+  TEST_COMMAND ""
+)
+
+# uchardet
+ExternalProject_Add(
+  uchardet_repo
+  SOURCE_DIR "${AGENTXX_THIRD_PARTY_DIR}/uchardet/"
+  INSTALL_DIR "${AGENTXX_INSTALL_DIR}"
+  CMAKE_ARGS
+    ${_AGENTXX_COMMON_CMAKE_ARGS}
+    -DCHECK_SSE2=ON
+    -DBUILD_BINARY=OFF
+    -DBUILD_SHARED_LIBS=OFF
+    -DBUILD_STATIC_LIBS=ON
+  CMAKE_CACHE_ARGS
+    ${_AGENTXX_COMMON_CMAKE_CACHE_ARGS}
+  TEST_COMMAND ""
+)
+
+# curl
+# macOS/iOS: <string.h> 仅在定义 __STDC_WANT_LIB_EXT1__ 时声明 memset_s,
+# 而 curl 以 -std=c17 编译 (隐式声明即报错); 其 CMake 探测因符号可链接而误判为存在。
+# 这里直接关闭 memset_s/memset_explicit 探测, 回退到 curl 自带的 curlx_memzero 实现
+# (volatile 函数指针调用 memset, 同样保证不清除优化且跨平台可用)。
+if (XX_IS_MACOS_D OR XX_IS_IOS_D)
+  set(_AGENTXX_CURL_MEMZERO_ARGS
+    "-DHAVE_MEMSET_S:BOOL=OFF"
+    "-DHAVE_MEMSET_EXPLICIT:BOOL=OFF")
+  # macOS: 系统/Homebrew 若提供 zstd, curl 的 AUTO 探测会启用并把裸库名
+  # "zstd" 写进导出的 CURL::libcurl 链接接口; 而 macOS SDK 不含 libzstd
+  # (Homebrew 路径不在本项目链接搜索范围内), 链接 libagentxx 时报
+  # "ld: library 'zstd' not found"。为保持依赖自包含, macOS/iOS 显式关闭
+  # zstd (deflate 仍由 zlib 承担, 不依赖任何外部 zstd)
+  set(_AGENTXX_CURL_EXTRA_ARGS
+    "-DCURL_ZSTD=OFF"
+    "-DCURL_BROTLI=OFF")
+else()
+  set(_AGENTXX_CURL_MEMZERO_ARGS)
+  set(_AGENTXX_CURL_EXTRA_ARGS)
+endif()
+ExternalProject_Add(
+  curl_repo
+  # 先构建 zlib: curl configure 时 find_package(ZLIB) 才能命中本项目
+  # 安装的 zlib (AGENTXX_INSTALL_DIR), 避免 fallback 系统 zlib;
+  # openssl 为预构建目录 (third_party/OpenSSL-windows-build), 无构建顺序问题
+  DEPENDS zlib_repo
+  SOURCE_DIR "${AGENTXX_THIRD_PARTY_DIR}/curl/"
+  INSTALL_DIR "${AGENTXX_INSTALL_DIR}"
+  CMAKE_ARGS
+    ${_AGENTXX_COMMON_CMAKE_ARGS}
+    -DBUILD_CURL_EXE=OFF
+    -DCURL_DISABLE_INSTALL=OFF
+    -DCURL_BUILD_EVERYTHING=OFF
+    -DENABLE_UNICODE=ON
+    -DCURL_LTO=ON
+    -DENABLE_DEBUG=OFF
+    -DCURL_DROP_UNUSED=ON
+    -DCURL_USE_CMAKECONFIG=ON
+    -DCURL_USE_PKGCONFIG=ON
+    -DCURL_ENABLE_EXPORT_TARGET=ON
+    -DUSE_LIBIDN2=OFF
+    -DCURL_USE_LIBPSL=OFF
+    -DCURL_USE_LIBSSH2=OFF
+    -DCURL_USE_LIBSSH=OFF
+    -DCURL_USE_GSASL=OFF
+    -DCURL_USE_GSSAPI=OFF
+    -DCURL_USE_LIBBACKTRACE=OFF
+    -DBUILD_LIBCURL_DOCS=OFF
+    -DBUILD_MISC_DOCS=OFF
+    -DENABLE_CURL_MANUAL=OFF
+    -DENABLE_IPV6=ON
+    -DCURL_ENABLE_SSL=ON
+    -DCURL_USE_OPENSSL=ON
+    -DBUILD_TESTING=OFF
+    -DBUILD_EXAMPLES=OFF
+    -DBUILD_SHARED_LIBS=OFF
+    -DBUILD_STATIC_LIBS=ON
+    # macOS/iOS: 关闭系统 zstd/brotli 探测 (避免导出裸库名, 保持依赖自包含)
+    ${_AGENTXX_CURL_EXTRA_ARGS}
+  CMAKE_CACHE_ARGS
+    ${_AGENTXX_COMMON_CMAKE_CACHE_ARGS}
+    ${_AGENTXX_CURL_MEMZERO_ARGS}
+    "-DOPENSSL_ROOT_DIR:PATH=${OPENSSL_ROOT_DIR}"
+  TEST_COMMAND ""
+)
+
+# codegraph-cpp
+if (AGENTXX_ENABLE_PLUGIN_CODEGRAPH)
+  ExternalProject_Add(
+    codegraph_repo
+    DEPENDS sqlite3_repo
+    SOURCE_DIR "${AGENTXX_THIRD_PARTY_DIR}/codegraph-cpp/"
+    INSTALL_DIR "${AGENTXX_INSTALL_DIR}"
+    CMAKE_ARGS
+      ${_AGENTXX_COMMON_CMAKE_ARGS}
+      -DBUILD_SHARED_LIBS=OFF
+      -DBUILD_STATIC_LIBS=ON
+    CMAKE_CACHE_ARGS
+      ${_AGENTXX_COMMON_CMAKE_CACHE_ARGS}
+    TEST_COMMAND ""
+  )
+endif()
+if (AGENTXX_ENABLE_HYPERSCAN)
+  # fat runtime 固定禁用 (不使用上游 Release 默认的"多微架构运行期分发"):
+  # - 上游 fat runtime 仅 Linux 支持 (需 ifunc + Makefiles/Ninja 生成器), 实现上把
+  #   core2/corei7/avx2/avx512 各微架构的执行引擎分别编译一遍, 再由
+  #   cmake/build_wrapper.sh 用 nm + objcopy --redefine-syms 给各 variant 的 .o
+  #   重命名符号, 加载时经 ifunc 按 CPU 选型;
+  # - objcopy 重命名要求 .o 有符号表, 而 LTO object 只有编译器中间表示
+  #   ("objcopy: redefining symbols does not work on LTO-compiled object files"),
+  #   即 fat runtime 与 LTO 只能择一;
+  # - 本项目产物要发布给各种 CPU (可能只有 SSE4.2 基线, 也可能没有 AVX2/AVX-512),
+  #   故改用编译期基线 ISA (比 -march=native 可移植) 并让 hyperscan 一同参与 LTO。
+  set(_AGENTXX_HS_CMAKE_ARGS "${_AGENTXX_COMMON_CMAKE_ARGS}")
+  set(_AGENTXX_HS_CMAKE_CACHE_ARGS "${_AGENTXX_COMMON_CMAKE_CACHE_ARGS}")
+  set(_AGENTXX_HS_EXTRA_ARGS "")
+  if (XX_IS_LINUX_D)
+    list(APPEND _AGENTXX_HS_EXTRA_ARGS "-DFAT_RUNTIME=OFF")
+  endif()
+
+  # 编译期基线 ISA: 按目标 CPU 架构自动选择 (不额外提供开关)
+  # - x86_64: x86-64-v2 (SSE4.2+POPCNT, 2009 年后的 x86_64 通用基线, 不含 AVX)
+  # - x86(32 位): core2 (SSSE3 起, 即 hyperscan 要求的最低指令集基线)
+  # - 其他架构 (ARM 等): 不追加 -march, 用编译器默认基线
+  set(_AGENTXX_HS_MARCH "")
+  if (NOT XX_IS_MSVC_D)
+    if (CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+      set(_AGENTXX_HS_MARCH "x86-64-v2")
+    elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "^(i[3-6]86|x86|X86)$")
+      set(_AGENTXX_HS_MARCH "core2")
+    endif()
+  endif()
+  if (_AGENTXX_HS_MARCH)
+    message("[agentxx] HyperScan: baseline -march=${_AGENTXX_HS_MARCH} (target: ${CMAKE_SYSTEM_PROCESSOR})")
+    set(_AGENTXX_HS_ARGS_PATCHED "")
+    foreach(_hs_arg IN LISTS _AGENTXX_HS_CMAKE_ARGS)
+      if (_hs_arg MATCHES "^-DCMAKE_(C|CXX)_FLAGS=")
+        list(APPEND _AGENTXX_HS_ARGS_PATCHED "${_hs_arg} -march=${_AGENTXX_HS_MARCH}")
+      else()
+        list(APPEND _AGENTXX_HS_ARGS_PATCHED "${_hs_arg}")
+      endif()
+    endforeach()
+    set(_AGENTXX_HS_CMAKE_ARGS "${_AGENTXX_HS_ARGS_PATCHED}")
+    unset(_AGENTXX_HS_ARGS_PATCHED)
+  endif()
+
+  ExternalProject_Add(
+    hyperscan_repo
+    SOURCE_DIR "${AGENTXX_THIRD_PARTY_DIR}/hyperscan/"
+    INSTALL_DIR "${AGENTXX_INSTALL_DIR}"
+    CMAKE_ARGS
+      ${_AGENTXX_HS_CMAKE_ARGS}
+      ${_AGENTXX_HS_EXTRA_ARGS}
+      -DBUILD_STATIC_AND_SHARED=OFF
+      -DBUILD_EXAMPLES=OFF
+      -DBUILD_TOOLS=OFF
+      -DBUILD_UNIT=OFF
+      -DDEBUG_OUTPUT=OFF
+      -DBUILD_SHARED_LIBS=OFF
+      -DBUILD_STATIC_LIBS=ON
+      "-DCMAKE_POLICY_VERSION_MINIMUM:STRING=3.15"
+      -DCMAKE_C_STANDARD=11
+      -DCMAKE_CXX_STANDARD=11
+    CMAKE_CACHE_ARGS
+      ${_AGENTXX_HS_CMAKE_CACHE_ARGS}
+      "-DBOOST_ROOT:PATH=${BOOST_ROOT}"
+      "-DOPENSSL_ROOT_DIR:PATH=${OPENSSL_ROOT_DIR}"
+    TEST_COMMAND ""
+  )
+  unset(_AGENTXX_HS_CMAKE_ARGS)
+  unset(_AGENTXX_HS_CMAKE_CACHE_ARGS)
+  unset(_AGENTXX_HS_EXTRA_ARGS)
+else()
+  message("[agentxx] Disable HyperScan")
+endif()
+
+# neograph
+set(neograph_SOURCE_DIR "${AGENTXX_THIRD_PARTY_DIR}/neograph/")
+ExternalProject_Add(
+  neograph_repo
+  DEPENDS 
+    sqlite3_repo
+    curl_repo
+  SOURCE_DIR ${neograph_SOURCE_DIR}
+  INSTALL_DIR "${AGENTXX_INSTALL_DIR}"
+  CMAKE_ARGS
+    ${_AGENTXX_COMMON_CMAKE_ARGS}
+    -DNEOGRAPH_ENABLE_IO_URING=${AGENTXX_LINUX_IO_URING_SUPPORTED}
+    -DNEOGRAPH_BUILD_EXAMPLES=OFF
+    -DNEOGRAPH_BUILD_TESTS=OFF
+    -DNEOGRAPH_BUILD_PYBIND=OFF
+    -DNEOGRAPH_BUILD_A2A=OFF
+    -DNEOGRAPH_BUILD_POSTGRES=OFF
+    -DNEOGRAPH_BUILD_SQLITE=ON
+    -DNEOGRAPH_BUILD_ASYNC=ON
+    -DNEOGRAPH_BUILD_LLM=ON
+    -DNEOGRAPH_BUILD_MCP=ON
+    -DNEOGRAPH_BUILD_ACP=ON
+    -DNEOGRAPH_BUILD_UTIL=ON
+    -DNEOGRAPH_USE_LIBCURL=OFF
+    -DNEOGRAPH_INSTALL_HEADERS=ON
+    -DBUILD_SHARED_LIBS=OFF
+    -DBUILD_STATIC_LIBS=ON
+  CMAKE_CACHE_ARGS
+    ${_AGENTXX_COMMON_CMAKE_CACHE_ARGS}
+    "-DBOOST_ROOT:PATH=${BOOST_ROOT}"
+    "-DOPENSSL_ROOT_DIR:PATH=${OPENSSL_ROOT_DIR}"
+  TEST_COMMAND ""
+)
+
+# html2md
+ExternalProject_Add(
+  html2md_repo
+  SOURCE_DIR "${AGENTXX_THIRD_PARTY_DIR}/html2md/"
+  INSTALL_DIR "${AGENTXX_INSTALL_DIR}"
+  CMAKE_ARGS
+    ${_AGENTXX_COMMON_CMAKE_ARGS}
+    -DBUILD_EXE=OFF
+    -DBUILD_DOC=OFF
+    -DBUILD_TEST=OFF
+    -DPYTHON_BINDINGS=OFF
+    -DBUILD_SHARED_LIBS=OFF
+    -DBUILD_STATIC_LIBS=ON
+  CMAKE_CACHE_ARGS
+    ${_AGENTXX_COMMON_CMAKE_CACHE_ARGS}
+  TEST_COMMAND ""
+)
+
+# yaml-cpp: MinGW libstdc++ 10 (apt) 与 Clang 18 在 C++23 下 valarray 异常规格不兼容
+# 交叉到 Windows 时降至 C++14 以避免 /usr/lib/gcc/.../valarray:1224 报错
+# (C++17 仍触发相同错误, 需更低)
+if (XX_IS_WIN_D)
+  if (CMAKE_CROSSCOMPILING)
+    set(_YAML_CPP_CXX_STD 14)
+  else()
+    # msvc 还没有 26
+    set(_YAML_CPP_CXX_STD 23)
+  endif()
+elseif (XX_IS_MACOS_D OR XX_IS_IOS_D)
+  # macOS/iOS: 该平台的 CMake 编译器模块 (AppleClang-CXX.cmake) 目前最高只识别到
+  # CXX23, 未定义 CXX26; 而 yaml-cpp 对自身目标强制 CXX_STANDARD_REQUIRED ON,
+  # 传 CMAKE_CXX_STANDARD=26 会在其 generate 阶段直接报错
+  # ("requires the language dialect CXX26 ... does not support")。
+  # 退到 CMake 能表达的 CXX23: 标准差异对 libc++ 无 ABI 影响 (libc++ 内联命名空间
+  # 不随 C++ 标准版本变化), 主工程仍以手动 -std=c++26 编译, LTO 链接不会出现
+  # libstdc++ 那样的 ODR 违规。
+  set(_YAML_CPP_CXX_STD 23)
+else()
+  # 必须与主工程 C++ 标准一致 (C++26), 避免 std::runtime_error 等基础异常类型
+  # 在 C++23 与 C++26 间的虚析构函数/内联规范差异导致 LTO 报 ODR 违规 (-Wodr)
+  set(_YAML_CPP_CXX_STD ${CMAKE_CXX_STANDARD})
+endif()
+ExternalProject_Add(
+  yaml_cpp_repo
+  SOURCE_DIR "${AGENTXX_THIRD_PARTY_DIR}/yaml-cpp/"
+  INSTALL_DIR "${AGENTXX_INSTALL_DIR}"
+  CMAKE_ARGS
+    ${_AGENTXX_COMMON_CMAKE_ARGS}
+    -DCMAKE_C_STANDARD=${CMAKE_C_STANDARD}
+    -DCMAKE_CXX_STANDARD=${_YAML_CPP_CXX_STD}
+    -DCMAKE_CXX_STANDARD_REQUIRED=OFF
+    -DYAML_CPP_BUILD_CONTRIB=OFF
+    -DYAML_CPP_BUILD_TOOLS=OFF
+    -DYAML_BUILD_SHARED_LIBS=OFF
+    -DYAML_ENABLE_PIC=ON
+    -DYAML_CPP_BUILD_TESTS=OFF
+    -DYAML_CPP_INSTALL=ON
+    -DBUILD_SHARED_LIBS=OFF
+    -DBUILD_STATIC_LIBS=ON 
+  CMAKE_CACHE_ARGS
+    ${_AGENTXX_COMMON_CMAKE_CACHE_ARGS}
+    "-DBOOST_ROOT:PATH=${BOOST_ROOT}"
+    "-DOPENSSL_ROOT_DIR:PATH=${OPENSSL_ROOT_DIR}"
+  TEST_COMMAND ""
+)
+
+# glob: 交叉到 Windows 时测试可执行 (glob_tests) 依赖 pthread/dupenv_s 等,
+# 在 MinGW + Clang 下链接失败 (见 cross-windows 构建日志), 但库本身 (Glob) 已成功构建;
+# 仅构建/安装库目标, 跳过测试可执行, 避免由此阻塞整体构建
+ExternalProject_Add(
+  glob_repo
+  SOURCE_DIR "${AGENTXX_THIRD_PARTY_DIR}/glob/"
+  INSTALL_DIR "${AGENTXX_INSTALL_DIR}"
+  CMAKE_ARGS
+    ${_AGENTXX_COMMON_CMAKE_ARGS}
+    -DBUILD_TESTING=OFF
+  CMAKE_CACHE_ARGS
+    ${_AGENTXX_COMMON_CMAKE_CACHE_ARGS}
+  BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --config $<CONFIG> --target Glob
+  INSTALL_COMMAND ${CMAKE_COMMAND} --install <BINARY_DIR> --config $<CONFIG>
+  TEST_COMMAND ""
+)
+
+if (AGENTXX_BUILD_CLIENT)
+  # FTXUI
+  ExternalProject_Add(
+    ftxui_repo
+    SOURCE_DIR "${AGENTXX_THIRD_PARTY_DIR}/ftxui/"
+    INSTALL_DIR "${AGENTXX_INSTALL_DIR}"
+    CMAKE_ARGS
+      ${_AGENTXX_COMMON_CMAKE_ARGS}
+      -DFTXUI_BUILD_DOCS=OFF
+      -DFTXUI_BUILD_EXAMPLES=OFF
+      -DFTXUI_BUILD_MODULES=OFF
+      -DFTXUI_BUILD_TESTS=OFF
+      -DFTXUI_BUILD_TESTS_FUZZER=OFF
+      -DFTXUI_CLANG_TIDY=OFF
+      -DFTXUI_DEV_WARNINGS=ON
+      -DFTXUI_ENABLE_COVERAGE=OFF
+      -DFTXUI_ENABLE_INSTALL=ON
+      -DFTXUI_QUIET=OFF
+    CMAKE_CACHE_ARGS
+      ${_AGENTXX_COMMON_CMAKE_CACHE_ARGS}
+    TEST_COMMAND ""
+  )
+
+  # cmark-gfm; required by markdown-ui
+  ExternalProject_Add(
+    cmark_gfm_repo
+    SOURCE_DIR "${AGENTXX_THIRD_PARTY_DIR}/cmark_gfm/"
+    INSTALL_DIR "${AGENTXX_INSTALL_DIR}"
+    CMAKE_ARGS
+      ${_AGENTXX_COMMON_CMAKE_ARGS}
+      -DCMARK_TESTS=OFF
+      -DCMARK_STATIC=ON
+      -DCMARK_SHARED=OFF
+      -DCMARK_LIB_FUZZER=OFF
+      -DCMARK_FUZZ_QUADRATIC=OFF
+      -DBUILD_SHARED_LIBS=OFF
+      -DBUILD_STATIC_LIBS=ON
+    CMAKE_CACHE_ARGS
+      ${_AGENTXX_COMMON_CMAKE_CACHE_ARGS}
+    TEST_COMMAND ""
+  )
+
+  # markdown ftxui
+  ExternalProject_Add(
+    markdown_ftxui_repo
+    DEPENDS
+      ftxui_repo
+      cmark_gfm_repo
+    SOURCE_DIR "${AGENTXX_THIRD_PARTY_DIR}/markdown_ftxui/"
+    INSTALL_DIR "${AGENTXX_INSTALL_DIR}"
+    CMAKE_ARGS
+      ${_AGENTXX_COMMON_CMAKE_ARGS}
+      -DMARKDOWN_UI_BUILD_TESTS=OFF
+      -DMARKDOWN_UI_BUILD_DEMO=OFF
+      -DBUILD_SHARED_LIBS=OFF
+      -DBUILD_STATIC_LIBS=ON
+    CMAKE_CACHE_ARGS
+      ${_AGENTXX_COMMON_CMAKE_CACHE_ARGS}
+    TEST_COMMAND ""
+  )
+endif()
+
+# QuickJS (JS 插件引擎 agentxx_javascript_engine 的运行时)
+# - 静态库 libqjs.a + 头文件 install 到 AGENTXX_INSTALL_DIR
+# - 关闭 CLI/示例/测试, 仅编译核心库
+if (AGENTXX_ENABLE_PLUGIN_JS)
+  ExternalProject_Add(
+    quickjs_repo
+    SOURCE_DIR "${AGENTXX_THIRD_PARTY_DIR}/quickjs/"
+    INSTALL_DIR "${AGENTXX_INSTALL_DIR}"
+    CMAKE_ARGS
+      ${_AGENTXX_COMMON_CMAKE_ARGS}
+      -DBUILD_SHARED_LIBS=OFF
+      -DQJS_BUILD_CLI_STATIC=OFF
+      -DQJS_BUILD_EXAMPLES=OFF
+      -DQJS_BUILD_WERROR=OFF
+    CMAKE_CACHE_ARGS
+      ${_AGENTXX_COMMON_CMAKE_CACHE_ARGS}
+    TEST_COMMAND ""
+  )
+endif()
+
+# 插件编译由 [agentxx_lib_repo] 处理，因为部分插件需要内嵌编译进 lib
+# ===== cxx_utilxx_base / cxx_utilxx / cxx_pluginxx (本项目自研基础库) =====
+# - 与 fmt/simdjson 等同级放在 third_party 下, 但由本项目维护, 因此
+#   BUILD_ALWAYS/INSTALL_ALWAYS 打开: 源码或 CMake 改动后重新构建并安装
+#   (嵌套构建内部仍是增量编译)
+# - Boost 无需新增参数: 顶层已把 BOOST_ROOT / Boost_USE_* 放进公共参数
+# - MSVC + LTO: 三库的动态库改用**显式导出** (头文件中的 UTILXX_*_API 标注,
+#   默认不导出任何符号), 因此不再需要 WINDOWS_EXPORT_ALL_SYMBOLS, 也不会与
+#   /GL (LTO) 冲突 (自动导出要解析 .obj 符号表, 而 /GL 产物无符号表);
+#   三库与主工程一同参与 LTO
+ExternalProject_Add(
+  cxx_utilxx_base_repo
+  DEPENDS
+    fmt_repo
+    simdjson_repo
+    libiconv_repo
+    uchardet_repo
+  SOURCE_DIR "${AGENTXX_THIRD_PARTY_DIR}/cxx_utilxx_base/"
+  INSTALL_DIR "${AGENTXX_INSTALL_DIR}"
+  BUILD_ALWAYS TRUE
+  INSTALL_ALWAYS TRUE
+  CMAKE_ARGS
+    ${_AGENTXX_COMMON_CMAKE_ARGS}
+    -DCXX_UTILXX_BASE_ENABLE_CHARSET=ON
+    -DCXX_UTILXX_BASE_USE_BOOST_ASIO=ON
+    -DCXX_UTILXX_BASE_LINUX_IO_URING_SUPPORTED=${AGENTXX_LINUX_IO_URING_SUPPORTED}
+  CMAKE_CACHE_ARGS
+    ${_AGENTXX_COMMON_CMAKE_CACHE_ARGS}
+  TEST_COMMAND ""
+)
+
+ExternalProject_Add(
+  cxx_utilxx_repo
+  DEPENDS
+    cxx_utilxx_base_repo
+    fmt_repo
+    html2md_repo
+  SOURCE_DIR "${AGENTXX_THIRD_PARTY_DIR}/cxx_utilxx/"
+  INSTALL_DIR "${AGENTXX_INSTALL_DIR}"
+  BUILD_ALWAYS TRUE
+  INSTALL_ALWAYS TRUE
+  CMAKE_ARGS
+    ${_AGENTXX_COMMON_CMAKE_ARGS}
+    -DCXX_UTILXX_ENABLE_HYPERSCAN=${AGENTXX_ENABLE_HYPERSCAN}
+    -DCXX_UTILXX_ENABLE_BOOST_PROCESS=${AGENTXX_ENABLE_BOOST_PROCESS}
+  CMAKE_CACHE_ARGS
+    ${_AGENTXX_COMMON_CMAKE_CACHE_ARGS}
+    "-DOPENSSL_ROOT_DIR:PATH=${OPENSSL_ROOT_DIR}"
+  TEST_COMMAND ""
+)
+
+ExternalProject_Add(
+  cxx_pluginxx_repo
+  DEPENDS
+    cxx_utilxx_base_repo
+    fmt_repo
+    yaml_cpp_repo
+  SOURCE_DIR "${AGENTXX_THIRD_PARTY_DIR}/cxx_pluginxx/"
+  INSTALL_DIR "${AGENTXX_INSTALL_DIR}"
+  BUILD_ALWAYS TRUE
+  INSTALL_ALWAYS TRUE
+  CMAKE_ARGS
+    ${_AGENTXX_COMMON_CMAKE_ARGS}
+  CMAKE_CACHE_ARGS
+    ${_AGENTXX_COMMON_CMAKE_CACHE_ARGS}
+  TEST_COMMAND ""
+)
+
+# 插件界面描述层 (组件模型/解析/降级适配/纯文本降级/构建器/kit), 与渲染器无关:
+# TUI 与将来的 GUI 客户端共用同一份描述, 客户端各自只实现渲染
+# - 依赖 cxx_utilxx_base + fmt; 本库自带单测默认打开, 主程序构建时关闭 (单测在库仓库跑)
+ExternalProject_Add(
+  cxx_pluginxx_ui_repo
+  DEPENDS
+    cxx_utilxx_base_repo
+    fmt_repo
+  SOURCE_DIR "${AGENTXX_THIRD_PARTY_DIR}/cxx_pluginxx_ui/"
+  INSTALL_DIR "${AGENTXX_INSTALL_DIR}"
+  BUILD_ALWAYS TRUE
+  INSTALL_ALWAYS TRUE
+  CMAKE_ARGS
+    ${_AGENTXX_COMMON_CMAKE_ARGS}
+    -DCXX_PLUGINXX_UI_BUILD_TESTS=OFF
+  CMAKE_CACHE_ARGS
+    ${_AGENTXX_COMMON_CMAKE_CACHE_ARGS}
+  TEST_COMMAND ""
+)
+
+if (AGENTXX_ENABLE_HYPERSCAN)
+  add_dependencies(cxx_utilxx_repo hyperscan_repo)
+endif ()
+if (AGENTXX_LINUX_IO_URING_SUPPORTED)
+  # io_uring 由 cxx_utilxx_base 使用 (system.cpp 的异步文件 I/O 探测), 故先于该库
+  # 构建安装: 该库 configure 时经 pkg_check_modules 解析 liburing.pc
+  add_dependencies(cxx_utilxx_base_repo liburing_repo)
+endif ()
+
+ExternalProject_Add(
+  agentxx_lib_repo
+  DEPENDS 
+    simdjson_repo
+    libiconv_repo
+    zlib_repo
+    sqlite3_repo
+    fmt_repo
+    uchardet_repo
+    neograph_repo
+    html2md_repo
+    yaml_cpp_repo
+    glob_repo
+    cxx_utilxx_base_repo
+    cxx_utilxx_repo
+    cxx_pluginxx_repo
+    cxx_pluginxx_ui_repo
+  SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/lib/"
+  INSTALL_DIR "${AGENTXX_INSTALL_DIR}"
+  BUILD_ALWAYS TRUE
+  INSTALL_ALWAYS TRUE 
+  CMAKE_ARGS
+    ${_AGENTXX_COMMON_CMAKE_ARGS}
+    -Dneograph_SOURCE_DIR=${neograph_SOURCE_DIR}
+  CMAKE_CACHE_ARGS
+    ${_AGENTXX_COMMON_CMAKE_CACHE_ARGS}
+  TEST_COMMAND ""
+)
+
+if (AGENTXX_LINUX_IO_URING_SUPPORTED)
+  add_dependencies(agentxx_lib_repo liburing_repo)
+endif()
+if (AGENTXX_ENABLE_HYPERSCAN)
+  add_dependencies(agentxx_lib_repo hyperscan_repo)
+endif()
+if (AGENTXX_ENABLE_PLUGIN_CODEGRAPH)
+  add_dependencies(agentxx_lib_repo codegraph_repo)
+endif()
+if (AGENTXX_ENABLE_PLUGIN_JS)
+  add_dependencies(agentxx_lib_repo quickjs_repo)
+endif()
+
+if (AGENTXX_BUILD_CLIENT)
+  ExternalProject_Add(
+    agentxx_client_repo
+    DEPENDS 
+      agentxx_lib_repo
+      ftxui_repo
+      cmark_gfm_repo
+      markdown_ftxui_repo
+    SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/client/"
+    INSTALL_DIR "${AGENTXX_INSTALL_DIR}"
+    BUILD_ALWAYS TRUE
+    INSTALL_ALWAYS TRUE
+    CMAKE_ARGS
+      ${_AGENTXX_COMMON_CMAKE_ARGS}
+      -Dneograph_SOURCE_DIR=${neograph_SOURCE_DIR}
+    CMAKE_CACHE_ARGS
+      ${_AGENTXX_COMMON_CMAKE_CACHE_ARGS}
+    TEST_COMMAND ""
+  )
+endif()
+
+if (AGENTXX_BUILD_TEST)
+  ExternalProject_Add(
+    agentxx_test_repo
+    DEPENDS 
+      agentxx_lib_repo
+    SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/test/"
+    INSTALL_DIR "${AGENTXX_INSTALL_DIR}"
+    BUILD_ALWAYS TRUE
+    CMAKE_ARGS
+      ${_AGENTXX_COMMON_CMAKE_ARGS}
+      -Dneograph_SOURCE_DIR=${neograph_SOURCE_DIR}
+      -DAGENTXX_BUILD_CLIENT=${AGENTXX_BUILD_CLIENT}
+    CMAKE_CACHE_ARGS
+      ${_AGENTXX_COMMON_CMAKE_CACHE_ARGS}
+    TEST_COMMAND ""
+  )
+  if (AGENTXX_BUILD_CLIENT)
+    add_dependencies(agentxx_test_repo agentxx_client_repo)
+  endif()
+endif()
+
+if (AGENTXX_BUILD_BENCHMARK)
+  ExternalProject_Add(
+    agentxx_benchmark_repo
+    DEPENDS agentxx_lib_repo
+    SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/benchmark/"
+    INSTALL_DIR "${AGENTXX_INSTALL_DIR}"
+    BUILD_ALWAYS TRUE
+    INSTALL_ALWAYS TRUE
+    CMAKE_ARGS
+      ${_AGENTXX_COMMON_CMAKE_ARGS}
+      -Dneograph_SOURCE_DIR=${neograph_SOURCE_DIR}
+      -DAGENTXX_BUILD_CLIENT=${AGENTXX_BUILD_CLIENT}
+    CMAKE_CACHE_ARGS
+      ${_AGENTXX_COMMON_CMAKE_CACHE_ARGS}
+    TEST_COMMAND ""
+  )
+  if (AGENTXX_BUILD_CLIENT)
+    add_dependencies(agentxx_benchmark_repo agentxx_client_repo)
+  endif()
+endif()
+
+# ===== mimalloc: 最终程序构建前先安装完成 =====
+# client/test/benchmark 的嵌套构建经 find_package(mimalloc) 取用分配器,
+# 需在它们 configure 之前完成安装 (lib/test 之间已有 DEPENDS 顺序,
+# 这里只补 mimalloc 这一条独立依赖)
+if (TARGET mimalloc_repo)
+  foreach (_agentxx_mimalloc_dep agentxx_client_repo agentxx_test_repo agentxx_benchmark_repo)
+    if (TARGET ${_agentxx_mimalloc_dep})
+      add_dependencies(${_agentxx_mimalloc_dep} mimalloc_repo)
+    endif ()
+  endforeach ()
+  unset(_agentxx_mimalloc_dep)
+endif ()
+
+# ===== MSVC ASan 动态运行时部署 =====
+# /MD(d) + /fsanitize=address 编译的可执行程序运行期需要能找到
+# clang_rt.asan_dynamic-x86_64.dll (随 MSVC 工具集安装在 cl.exe 同目录,
+# 经 delay-load thunk 全进程共享同一份实例)。superbuild 在此自动拷贝到 exec
+# 输出目录, 保证测试/client/插件主程序可直接启动; DEPENDS 各 repo 目标确保在
+# 嵌套构建产出 exec 目录之后再拷贝。仅覆盖 x64 构建 (项目 Windows 脚本均为 -A x64)。
+if (XX_IS_WIN_D AND XX_IS_MSVC_D AND NOT XX_IS_RELEASE_D AND AGENTXX_ENABLE_SANITIZER)
+  get_filename_component(_AGENTXX_MSVC_BIN_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
+  set(_AGENTXX_ASAN_DLL "${_AGENTXX_MSVC_BIN_DIR}/clang_rt.asan_dynamic-x86_64.dll")
+  if (EXISTS "${_AGENTXX_ASAN_DLL}")
+    add_custom_target(agentxx_asan_runtime ALL
+      COMMAND ${CMAKE_COMMAND} -E make_directory "${AGENTXX_EXEC_INSTALL_PREFIX}"
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+              "${_AGENTXX_ASAN_DLL}" "${AGENTXX_EXEC_INSTALL_PREFIX}/"
+      DEPENDS "${_AGENTXX_ASAN_DLL}"
+      COMMENT "[agentxx] Deploy MSVC ASan runtime -> ${AGENTXX_EXEC_INSTALL_PREFIX}"
+      VERBATIM)
+    foreach (_dep agentxx_lib_repo agentxx_client_repo agentxx_test_repo agentxx_benchmark_repo)
+      if (TARGET ${_dep})
+        add_dependencies(agentxx_asan_runtime ${_dep})
+      endif ()
+    endforeach ()
+  else ()
+    message(WARNING
+      "[agentxx] 未找到 MSVC ASan 动态运行库: ${_AGENTXX_ASAN_DLL}; "
+      "请确认已安装 MSVC v143+ x64 工具集, 否则启用了 ASan 的程序无法启动")
+  endif ()
+  unset(_AGENTXX_MSVC_BIN_DIR)
+  unset(_AGENTXX_ASAN_DLL)
+endif ()

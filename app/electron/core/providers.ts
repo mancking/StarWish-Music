@@ -93,6 +93,40 @@ export async function searchNetease(keyword: string, page = 1, limit = 30): Prom
 }
 
 /**
+ * 歌单关键词搜索（规格书 3.7 / Bug 17「歌单 Tab」）。
+ * 网易云搜索 type=1000；QQ/酷狗无稳定公开歌单搜索接口时返回空，
+ * 前端对该 Tab 显示空态即可（规格：无结果的 Tab 显示空态，不整页空）。
+ */
+export async function searchPlaylists(keyword: string, page = 1, limit = 20): Promise<PlaylistMeta[]> {
+  const kw = String(keyword || '').trim()
+  if (!kw) return []
+  const offset = (Math.max(1, page) - 1) * limit
+  const endpoints = [
+    `https://music.163.com/api/search/get/web?${qs({ s: kw, type: 1000, offset, limit, total: 'true' })}`,
+    `https://music.163.com/api/cloudsearch/pc?${qs({ s: kw, type: 1000, offset, limit })}`,
+  ]
+  for (const url of endpoints) {
+    try {
+      const body = await wyLimited('music.163.com', 3, () => getJson<any>(url, WY_HEADERS, 6000))
+      const lists = body?.result?.playlists || []
+      if (!lists.length) continue
+      return lists.map((p: any) => ({
+        id: `wy:${p.id}`,
+        source: 'wy',
+        name: String(p.name || ''),
+        pic: https(p.coverImgUrl || p.picUrl || ''),
+        count: num(p.trackCount),
+        play: parseCount(p.playCount),
+        author: String(p.creator?.nickname || ''),
+      })) as PlaylistMeta[]
+    } catch (e: any) {
+      logger.warn('网易云歌单搜索失败', e?.message)
+    }
+  }
+  return []
+}
+
+/**
  * 网易云请求闸门：串行 + 最小间隔，**覆盖全部 music.163.com 请求**。
  *
  * `limited(key, 1)` 只限并发数，队列排空后仍会 0 间隔连发；而首页一次要并发打歌单列表、

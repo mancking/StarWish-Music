@@ -6,7 +6,7 @@
  * 手机是底部弹出面板，桌面是右侧抽屉 —— 由父级容器决定形态，本组件只管内容。
  */
 import { computed } from 'vue'
-import { applyEqPreset, EQ_FREQS, eqBands, eqCar, eqPreset, eqPresets, setEqBand } from '@/audio/eq'
+import { applyEqPreset, EQ_FREQS, eqBands, eqCar, eqPreset, eqPresets, setEqBand } from '@/player-core/eq'
 import { platform } from '@/platform'
 
 const emit = defineEmits<{ (e: 'close'): void }>()

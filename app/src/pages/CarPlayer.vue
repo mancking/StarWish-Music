@@ -8,8 +8,10 @@
 import { computed } from 'vue'
 import { useRouter } from 'vue-router'
 import Icon from '@/components/Icon.vue'
-import ProgressBar from '@/player/components/ProgressBar.vue'
+import ProgressBar from '@/player-music/components/ProgressBar.vue'
+import PlayerBackground from '@/player-music/components/PlayerBackground.vue'
 import { usePlayerStore } from '@/stores/player'
+import { useLibraryStore } from '@/stores/library'
 
 defineOptions({ name: 'CarPlayer' })
 
@@ -17,15 +19,36 @@ const router = useRouter()
 const player = usePlayerStore()
 
 const song = computed(() => player.song)
-const modeLabel = computed(() => (player.state.mode === 'repeat-one' ? '单曲循环' : '列表循环'))
-
+const library = useLibraryStore()
+/** Bug 44：四态文案（此前仅两态） */
+const MODE_TEXT: Record<string, string> = {
+  'repeat-all': '列表循环',
+  'repeat-one': '单曲循环',
+  shuffle: '随机播放',
+  order: '顺序播放',
+}
+const modeLabel = computed(() => MODE_TEXT[player.state.mode] || '列表循环')
+/** Bug 67：缓冲/错误状态文案（32sp，驾驶可见） */
+const statusText = computed(() => {
+  if (player.state.status === 'loading') return '缓冲中…'
+  if (player.state.status === 'error') return player.state.error || '加载失败'
+  return ''
+})
+const liked = computed(() => (song.value ? library.isFavorite(song.value.id) : false))
+/** 车机保留两态循环（规格 1.7）：列表/单曲 */
 function cycleMode(): void {
   player.cycleMode()
+}
+async function toggleLike(): Promise<void> {
+  if (!song.value) return
+  await library.toggleFavorite(song.value)
 }
 </script>
 
 <template>
   <div class="car">
+    <!-- 车机背景降级（4.7）：仅动态渐变/纯色，无封面模糊 -->
+    <PlayerBackground class="car-bg" :cover="player.coverUrl" kind="car" />
     <header class="top">
       <button class="back" aria-label="返回" @click="router.back()">
         <Icon name="shrink" :size="24" />
@@ -37,14 +60,9 @@ function cycleMode(): void {
       <section class="info">
         <h1>{{ song?.name || '未在播放' }}</h1>
         <p>{{ song?.singer || '星河音乐' }}</p>
-        <ProgressBar
-          class="bar"
-          :position="player.displayPosition"
-          :duration="player.duration"
-          variant="car"
-          accent="#fbbf24"
-          @seek="player.seekTo"
-        />
+        <!-- Bug 68：行驶中进度条只作指示、禁拖（驾驶安全） -->
+        <ProgressBar class="bar" :position="player.displayPosition" :duration="player.duration" variant="car" accent="#fbbf24" />
+        <span v-if="statusText" class="status">{{ statusText }}</span>
         <span class="mode" @click="cycleMode">{{ modeLabel }}</span>
       </section>
 
@@ -57,6 +75,10 @@ function cycleMode(): void {
         </button>
         <button class="btn side" aria-label="下一首" @click="player.next()">
           <Icon name="next" :size="30" />
+        </button>
+        <!-- Bug 44：红心收藏（76dp 热区） -->
+        <button class="btn side" :class="{ on: liked }" aria-label="收藏" @click="toggleLike">
+          <Icon :name="liked ? 'heart-filled' : 'heart'" :size="28" />
         </button>
       </section>
     </main>
@@ -72,6 +94,15 @@ function cycleMode(): void {
   background: #0b0b10;
   color: #fbbf24;
   overflow: hidden;
+}
+.car-bg {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+}
+.car > :not(.car-bg) {
+  position: relative;
+  z-index: 1;
 }
 .top {
   display: flex;
@@ -162,5 +193,12 @@ function cycleMode(): void {
 }
 .btn:active {
   transform: scale(0.97);
+}
+.status {
+  font-size: 20px;
+  color: rgba(251, 191, 36, 0.85);
+}
+.btn.on {
+  color: #f472b6;
 }
 </style>

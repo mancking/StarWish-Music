@@ -15,6 +15,7 @@ import { useLibraryStore } from '@/stores/library'
 import { useUiStore } from '@/stores/ui'
 import type { Song } from '@shared/types'
 import brand from '@/assets/brand-cover.png'
+import brandIcon from '@/assets/brand-icon.png'
 
 const router = useRouter()
 const player = usePlayerStore()
@@ -42,6 +43,14 @@ const dateText = computed(() => {
 })
 
 const daily = computed<Song[]>(() => feed.value?.daily || [])
+
+/** 规格书 v2.8 · 3.1：搜索框在顶部右侧，与问候语同一行 */
+const searchText = ref('')
+function submitSearch(): void {
+  const q = searchText.value.trim()
+  if (!q) return
+  void router.push({ path: '/search', query: { q } })
+}
 const continueList = computed<Song[]>(() => feed.value?.continueListening || [])
 const playlists = computed<any[]>(() => feed.value?.playlists || [])
 const toplists = computed<any[]>(() => feed.value?.toplists || [])
@@ -49,6 +58,9 @@ const moods = computed<any[]>(() => feed.value?.moods || [])
 const newSongs = computed<Song[]>(() => feed.value?.newSongs || [])
 const onRepeat = computed<Song[]>(() => feed.value?.onRepeat || [])
 const memory = ref<any>(null)
+const sourceCount = ref(0)
+/** F-21：无可用音源（全部失效或被禁用）时展示导入 banner */
+const noSources = ref(false)
 const podcasts = computed<any[]>(() => feed.value?.podcasts || [])
 
 /* ---------------- 私人电台 ---------------- */
@@ -107,10 +119,21 @@ async function load(force = false): Promise<void> {
   else loading.value = true
   error.value = ''
   try {
-    const [f, m] = await Promise.all([call('home:feed', { force }), call('music:memory').catch(() => null)])
+    const [f, m, platforms] = await Promise.all([
+      call('home:feed', { force }),
+      call('music:memory').catch(() => null),
+      call<string[]>('sources:platforms').catch(() => null),
+    ])
     feed.value = f
     feedCache = f
     memory.value = m
+    if (Array.isArray(platforms)) sourceCount.value = platforms.filter(Boolean).length
+    try {
+      const list = await call<any[]>('sources:list').catch(() => [])
+      noSources.value = !list.some((x: any) => x.enabled && !x.loadError)
+    } catch {
+      noSources.value = false
+    }
   } catch (e: any) {
     error.value = e?.message || '加载失败'
   } finally {
@@ -199,36 +222,47 @@ onMounted(() => {
     </div>
 
     <template v-else>
-      <!-- Hero -->
-      <section class="hero">
-        <img class="hero-art" :src="brand" alt="星河" draggable="false" />
-        <div class="hero-shade" />
-        <div class="hero-content">
-          <div class="kicker">{{ dateText }}</div>
-          <h1>{{ greeting }}，欢迎回来</h1>
-          <p class="sub">从星河里捞一首歌，陪你度过此刻。</p>
-          <div class="hero-actions">
-            <button class="btn primary lg" @click="playDaily">
-              <Icon name="play" :size="15" />播放每日推荐
-            </button>
-            <button class="btn ghost lg" @click="router.push('/favorites')">
-              <Icon name="heart" :size="15" />我喜欢的音乐
-            </button>
-            <button class="btn ghost lg" @click="router.push('/discover')">
-              <Icon name="compass" :size="15" />发现音乐
-            </button>
-          </div>
-          <div class="hero-stats">
-            <div><b>{{ daily.length || 30 }}</b><span>每日推荐</span></div>
-            <i />
-            <div><b>{{ feed?.totalToplists || 0 }}</b><span>榜单</span></div>
-            <i />
-            <div><b>6</b><span>音源平台</span></div>
-          </div>
-        </div>
+      <!-- F-21：无可用音源时首页顶部常驻 banner -->
+      <div v-if="noSources" class="no-src-banner" @click="router.push('/settings?cat=sources')">
+        <Icon name="wifi" :size="15" />
+        <span>当前无可用音源，点此导入</span>
+        <Icon name="chevron-right" :size="14" />
+      </div>
+      <!-- 顶部搜索框（规格书 3.1 ①：页面顶端右对齐，Ctrl+K 聚焦；问候区不放搜索入口） -->
+      <div class="topbar-row">
         <button class="refresh" :class="{ spin: refreshing }" title="刷新推荐" @click="load(true)">
           <Icon name="refresh" :size="15" />
         </button>
+        <form class="top-search" @submit.prevent="submitSearch">
+          <Icon name="search" :size="16" />
+          <input v-model="searchText" type="search" placeholder="搜索歌曲、歌手、专辑" />
+          <button type="submit" class="btn primary sm">搜索</button>
+        </form>
+      </div>
+
+      <!-- 欢迎区（3.1 ②③）：日期行 → 问候语 → 引导文案；无图标、无大图 hero -->
+      <section class="welcome">
+        <div class="kicker">{{ dateText }}</div>
+        <h1>{{ greeting }}，欢迎回来</h1>
+        <p class="sub">从星河里捞一首歌，陪你度过此刻。</p>
+        <div class="hero-actions">
+          <button class="btn primary lg" @click="playDaily">
+            <Icon name="play" :size="15" />播放每日推荐
+          </button>
+          <button class="btn ghost lg" @click="router.push('/favorites')">
+            <Icon name="heart" :size="15" />我喜欢的音乐
+          </button>
+          <button class="btn ghost lg" @click="router.push('/discover')">
+            <Icon name="compass" :size="15" />发现音乐
+          </button>
+        </div>
+        <div class="hero-stats">
+          <div><b>{{ daily.length || 30 }}</b><span>每日推荐</span></div>
+          <i />
+          <div><b>{{ feed?.totalToplists || 0 }}</b><span>榜单</span></div>
+          <i />
+          <div><b>{{ sourceCount }}</b><span>音源平台</span></div>
+        </div>
       </section>
 
       <!-- 继续收听 -->
@@ -446,38 +480,157 @@ onMounted(() => {
 .home {
   padding-top: 12px;
 }
-.hero {
-  position: relative;
-  border-radius: 20px;
-  overflow: hidden;
-  min-height: 196px;
+.no-src-banner {
   display: flex;
   align-items: center;
-  padding: 26px 30px;
-  background: linear-gradient(120deg, #141024, #1b1233);
+  gap: 8px;
+  padding: 10px 16px;
+  margin-bottom: 12px;
+  border-radius: 12px;
+  background: color-mix(in srgb, #fbbf24 12%, transparent);
+  border: 1px solid color-mix(in srgb, #fbbf24 34%, transparent);
+  color: #fbbf24;
+  font-size: 13px;
+  cursor: pointer;
+}
+.topbar-row {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+/* 规格 3.1 ①：圆角胶囊搜索框，高 40~48、宽 320~480，右对齐 */
+.top-search {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 44px;
+  padding: 0 8px 0 14px;
+  border-radius: 22px;
+  background: var(--panel);
   border: 1px solid var(--line);
-  isolation: isolate;
+  width: min(480px, 44vw);
+  min-width: 320px;
+  color: var(--text-3);
 }
-.hero-art {
-  position: absolute;
-  right: 0;
-  top: 0;
-  height: 100%;
-  width: auto;
-  opacity: 0.85;
-  z-index: -2;
-  mask-image: linear-gradient(90deg, transparent, #000 42%);
-  -webkit-mask-image: linear-gradient(90deg, transparent, #000 42%);
+.top-search input {
+  flex: 1;
+  min-width: 0;
+  background: transparent;
+  border: 0;
+  outline: 0;
+  color: var(--text);
+  font-size: 13.5px;
 }
-.hero-shade {
-  position: absolute;
-  inset: 0;
-  z-index: -1;
-  background: linear-gradient(90deg, rgba(10, 10, 18, 0.94) 0%, rgba(10, 10, 18, 0.6) 48%, rgba(10, 10, 18, 0.05) 100%);
+.top-search input::placeholder {
+  color: var(--text-3);
 }
-.hero-content {
-  position: relative;
+.top-search .btn.sm {
+  height: 32px;
+  padding: 0 14px;
+  font-size: 12.5px;
+  border-radius: 16px;
+  flex: none;
+}
+/* 欢迎区（3.1 ②）：日期 13px → 问候 24~28px/600 → 引导文案 14px */
+.welcome {
+  padding: 6px 2px 4px;
+}
+.welcome h1 {
+  font-size: 28px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  color: var(--text);
+}
+.welcome .sub {
+  margin-top: 8px;
+  font-size: 14px;
+  color: var(--text-3);
+}
+.hero-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 20px;
+}
+.btn.lg {
+  height: 40px;
+  padding: 0 18px;
+  border-radius: 20px;
+  font-size: 13px;
+}
+.btn.ghost.lg {
+  background: var(--panel);
+  color: var(--text);
+}
+.btn.ghost.lg:hover {
+  background: var(--hover);
+}
+/* 统计行（3.1 ⑤） */
+.hero-stats {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  margin-top: 18px;
+  font-size: 12.5px;
+  color: var(--text-3);
+}
+.hero-stats b {
+  font-size: 17px;
+  color: var(--text);
+  margin-right: 5px;
+  font-variant-numeric: tabular-nums;
+}
+.hero-stats i {
+  width: 1px;
+  height: 14px;
+  background: var(--line);
+}
+.kicker {
+  margin-bottom: 6px;
+}
+.hero-search {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 44px;
+  padding: 0 8px 0 14px;
+  border-radius: 22px;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  backdrop-filter: blur(10px);
+  min-width: 300px;
+  flex: 0 1 480px;
+}
+.hero-search input {
+  flex: 1;
+  min-width: 0;
+  background: transparent;
+  border: 0;
+  outline: 0;
+  color: #ececf1;
+  font-size: 13.5px;
+}
+.hero-search input::placeholder {
+  color: rgba(255, 255, 255, 0.45);
+}
+.hero-search .btn.sm {
+  height: 32px;
+  padding: 0 14px;
+  font-size: 12.5px;
+  border-radius: 16px;
+  flex: none;
+}
+.hero .sub,
+.hero-actions,
+.hero-stats {
   max-width: 58%;
+}
+@media (max-width: 1180px) {
+  .top-search {
+    min-width: 0;
+    flex: 1 1 320px;
+  }
 }
 .kicker {
   font-size: 13px;

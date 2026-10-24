@@ -1,0 +1,261 @@
+#include "agentxx/agent/io/agent_server.h"
+
+#include "agentxx/agent/io/ws_io_transport.h"
+#include "asio/co_spawn.hpp"
+#include "asio/detached.hpp"
+#include "asio/this_coro.hpp"
+#include "utilxx/ws_client.h"
+#include "utilxx_base/container_util.h"
+#include "utilxx_base/log.h"
+#include <random>
+
+namespace agentxx {
+namespace agent {
+namespace io {
+
+/// 将服务端日志经 transport 转发给远程客户端的 LogSink
+/// 继承 ThreadedLogSink: 后台线程串行处理, send 无需额外加锁
+class TransportLogSink : public utilxx_base::ThreadedLogSink {
+public:
+
+    explicit TransportLogSink(std::shared_ptr<AgentIOTransportBase> transport) :
+        transport_(std::move(transport)) {}
+
+    void onLog(const utilxx_base::LogEntry& entry) override {
+        if (auto t = transport_.lock()) {
+            t->send(WireLog{static_cast<int>(entry.level), entry.message});
+        }
+    }
+
+private:
+
+    std::weak_ptr<AgentIOTransportBase> transport_;
+};
+
+AgentServer::AgentServer(std::shared_ptr<BaseAgent> agent, Config config) :
+    agent_(std::move(agent)),
+    config_(std::move(config)) {
+    if (agent_ && agent_->ioCtx) {
+        ex_ = agent_->ioCtx->get_executor();
+    }
+    if (config_.http.address.empty()) {
+        config_.http.address = "0.0.0.0";
+    }
+    if (config_.token.empty() && config_.autoGenerateToken) {
+        config_.token = generateToken();
+    }
+}
+
+AgentServer::~AgentServer() {
+    if (isIoThread()) {
+        stop();
+    } else {
+        if (http_) {
+            http_->stop();
+        }
+        if (!controllers_.empty()) {
+            XX_LOGW(
+                "[agent_server] AgentServer destroyed off io thread; skipping controllers_ cleanup "
+                "to avoid data race. Callers must call stop() on the agent io thread."
+            );
+        }
+    }
+}
+
+void AgentServer::bindIoThread() const noexcept {
+    ioThreadId_.store(std::this_thread::get_id(), std::memory_order_relaxed);
+}
+
+void AgentServer::bindIoThreadIfUnset() const noexcept {
+    std::thread::id expected{};
+    ioThreadId_
+        .compare_exchange_strong(expected, std::this_thread::get_id(), std::memory_order_relaxed);
+}
+
+bool AgentServer::isIoThread() const noexcept {
+    auto bound = ioThreadId_.load(std::memory_order_relaxed);
+    return bound == std::thread::id{} || bound == std::this_thread::get_id();
+}
+
+void AgentServer::assertIoThread() const {
+    auto bound = ioThreadId_.load(std::memory_order_relaxed);
+    if (bound == std::thread::id{} || bound == std::this_thread::get_id()) {
+        return;
+    }
+#ifndef NDEBUG
+    assert(
+        false && "AgentServer: all operations must only be performed on the bound agent io thread"
+    );
+#else
+    XX_LOGE(
+        "AgentServer: method called off io thread (bound={}, current={}). Callers must post to the "
+        "agent executor!",
+        bound == std::thread::id{} ? std::string{"unbound"} : std::string{"bound"},
+        std::this_thread::get_id() == std::thread::id{} ? std::string{"unknown"}
+                                                        : std::string{"other"}
+    );
+#endif
+}
+
+std::string AgentServer::generateToken(size_t bytes) {
+    static const char* hex = "0123456789abcdef";
+    std::random_device rd;
+    std::string        token;
+    token.reserve(bytes * 2);
+    for (size_t i = 0; i < bytes; ++i) {
+        unsigned r = rd();
+        token.push_back(hex[(r >> 4) & 0xFu]);
+        token.push_back(hex[r & 0xFu]);
+    }
+    return token;
+}
+
+void AgentServer::start(asio::any_io_executor ex) {
+    ex_ = ex;
+    bindIoThread();
+    http_ = std::make_unique<utilxx::HttpServer>(config_.http);
+    http_->enableWebSocket(config_.defaultBasePath, [this](utilxx::HttpServer::WsStream& ws) {
+        return handleWs(ws);
+    });
+    http_->startAsync(ex);
+    XX_OUT(
+        "[agent_server] BaseAgent WS service on {}:{}{} (token={})",
+        config_.http.address,
+        port(),
+        config_.defaultBasePath,
+        config_.token
+    );
+}
+
+void AgentServer::stop() {
+    assertIoThread();
+    if (http_) {
+        http_->stop();
+    }
+    // 单线程无锁遍历关闭
+    for (auto& [id, ctrl] : controllers_) {
+        ctrl->stop();
+    }
+    controllers_.clear();
+}
+
+uint16_t AgentServer::port() const {
+    return http_ ? http_->port() : 0;
+}
+
+std::shared_ptr<SessionServerAgentIO> AgentServer::getOrCreateController(std::string_view sessionId
+) {
+    assertIoThread();
+    auto it = controllers_.find(sessionId); // 单线程无锁查找
+    if (it != controllers_.end()) {
+        return it->second;
+    }
+
+    SessionServerAgentIO::Config cfg;
+    cfg.sessionId            = std::string{sessionId};
+    cfg.interruptTimeout     = config_.interruptTimeout;
+    cfg.gracePeriod          = config_.gracePeriod;
+    cfg.deltaBufferCap       = config_.deltaBufferCap;
+    cfg.initialSyncTailCount = config_.initialSyncTailCount;
+
+    auto ctrl = std::make_shared<SessionServerAgentIO>(ex_, agent_, cfg);
+    utilxx_base::insertOrAssignHeterogeneous(controllers_, sessionId, ctrl);
+
+    // sessionId 以 std::string 值捕获: string_view 参数引用的原始字符串
+    // (serveTransport 的局部 WireHello) 可能在本协程完成前已析构
+    asio::co_spawn(
+        ex_,
+        ctrl->run(),
+        [ctrl, sessionId = std::string{sessionId}](std::exception_ptr ep) {
+            if (ep) {
+                agentxx::util::catchError<bool>(
+                    [&]() {
+                        std::rethrow_exception(ep);
+                        return true;
+                    },
+                    [&](std::string errmsg) {
+                        XX_LOGE("[agent_server] controller '{}' error: {}", sessionId, errmsg);
+                        return false;
+                    }
+                );
+            }
+        }
+    );
+    return ctrl;
+}
+
+asio::awaitable<void> AgentServer::handleWs(utilxx::HttpServer::WsStream& ws) {
+    bindIoThreadIfUnset();
+    auto ex     = co_await asio::this_coro::executor;
+    auto client = utilxx::wrapAcceptedWs(ex, std::move(ws));
+    auto transport
+        = std::make_shared<WsAgentIOTransport>(ex, std::move(client), WsAgentIOTransport::Config{});
+    co_await serveTransport(std::move(transport));
+}
+
+asio::awaitable<void> AgentServer::serveTransport(std::shared_ptr<AgentIOTransportBase> transport) {
+    bindIoThreadIfUnset();
+    assertIoThread();
+    if (!ex_) {
+        ex_ = co_await asio::this_coro::executor;
+    }
+
+    // 服务端模式初始化: 启动读写循环, 不发送 hello
+    WireHello dummyHello;
+    bool      initOk = co_await transport->connect(dummyHello);
+    if (!initOk) {
+        co_return;
+    }
+
+    // 等待客户端 hello
+    auto msg = co_await transport->recv();
+    if (!msg) {
+        co_return;
+    }
+    auto* hello = std::get_if<WireHello>(&*msg);
+    if (!hello) {
+        co_return;
+    }
+
+    // 鉴权
+    bool authOk = config_.token.empty() || hello->token == config_.token;
+    if (!authOk) {
+        transport->send(WireHelloAck{.ok = false, .sessionId = hello->sessionId});
+        co_return;
+    }
+
+    // 异步预热/加载 session 历史与上下文 (若尚未加载, 将 SQLite 读卸载到 threadPool)
+    if (agent_ && agent_->agentContext) {
+        co_await agent_->agentContext->getSessionAsync(hello->sessionId);
+    }
+
+    auto ctrl = getOrCreateController(hello->sessionId);
+
+    // 收集可用模型
+    std::vector<std::string> models;
+    if (agent_ && agent_->agentContext && agent_->agentContext->agentConfig) {
+        for (const auto& [name, mc] : agent_->agentContext->agentConfig->availableModels) {
+            models.push_back(name);
+        }
+    }
+
+    // 一对多 (1:N) 接入: 一个 session 允许同时连接多个 client transport (多个 UI 共同查看/操作)
+    ctrl->attachClient(transport);
+    // 仅向新接入的 transport 定向发送 helloAck 与增量重放 / tail sync, 不干扰其他在线客户端
+    ctrl->handleHello(*hello, std::move(models), transport);
+
+    // 注册日志转发 sink: 将服务端日志经 transport 推送给远程客户端
+    auto logSink = std::make_shared<TransportLogSink>(transport);
+    utilxx_base::LogDispatcher::instance().addSink(logSink);
+
+    // 运行针对该客户端的独立接收循环 (直到 transport 关闭)
+    co_await ctrl->runTransportLoop(transport);
+
+    // 该连接断开
+    utilxx_base::LogDispatcher::instance().removeSink(logSink);
+    ctrl->onDisconnect(transport);
+}
+
+} // namespace io
+} // namespace agent
+} // namespace agentxx

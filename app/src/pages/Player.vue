@@ -12,13 +12,15 @@ import Icon from '@/components/Icon.vue'
 import ParticleField from '@/components/player/ParticleField.vue'
 import SpectrumBars from '@/components/player/SpectrumBars.vue'
 import EqPanel from '@/components/player/EqPanel.vue'
-import CoverStage from '@/player/components/CoverStage.vue'
-import LyricsPane from '@/player/components/LyricsPane.vue'
-import ProgressBar from '@/player/components/ProgressBar.vue'
-import TransportBar from '@/player/components/TransportBar.vue'
-import FunctionBar from '@/player/components/FunctionBar.vue'
-import { useLyricSync } from '@/player/lyrics'
-import { LOOP_ICON, STAGE_ICON, STAGE_LABEL } from '@/player/stages'
+import CoverStage from '@/player-music/components/CoverStage.vue'
+import LyricsPane from '@/player-music/components/LyricsPane.vue'
+import ProgressBar from '@/player-music/components/ProgressBar.vue'
+import TransportBar from '@/player-music/components/TransportBar.vue'
+import FunctionBar from '@/player-music/components/FunctionBar.vue'
+import { useMvHint } from '@/player-music/mv-hint'
+import PlayerBackground from '@/player-music/components/PlayerBackground.vue'
+import { useLyricSync } from '@/player-music/lyrics'
+import { LOOP_ICON, STAGE_ICON, STAGE_LABEL } from '@/player-music/stages'
 import { usePlayerStore } from '@/stores/player'
 import { useLibraryStore } from '@/stores/library'
 import { useUiStore } from '@/stores/ui'
@@ -31,6 +33,7 @@ const router = useRouter()
 const player = usePlayerStore()
 const library = useLibraryStore()
 const ui = useUiStore()
+const settings = computed(() => ui.settings as Record<string, any>)
 
 const car = computed(() => platform.value.car)
 const kind = computed(() => (platform.value.kind === 'pad' ? 'pad' : 'desktop'))
@@ -45,6 +48,14 @@ const lyricsVisible = ref(lsGet('lyrics_panel') !== '0')
 const sleepOpen = ref(false)
 
 const song = computed(() => player.song)
+/* 规格 2.18：播放页 MV 按钮（mvBySong 命中才显示，5 分钟缓存 + 30s 失败防抖） */
+const mvHint = useMvHint()
+watch(song, s => void mvHint.refresh(s), { immediate: true })
+function openMv(): void {
+  const item = mvHint.list.value[0]
+  if (!item || mvHint.cooling()) return
+  router.push(`/mv/${item.source || 'bili'}/${item.sourceId || item.bvid || ''}`)
+}
 const cover = computed(() => player.coverUrl || '')
 const liked = computed(() => (song.value ? library.isFavorite(song.value.id) : false))
 const stage = computed(() => player.stage)
@@ -103,14 +114,11 @@ watch(
   <CarPlayer v-if="car" />
 
   <div v-else class="player" :class="kind">
-    <!-- 背景（规格书 1.2：封面 blur(30px) brightness(.4) + 50% 黑遮罩） -->
-    <div
-      class="bg"
-      :style="cover ? { backgroundImage: `url(${cover})`, filter: `blur(${platform.blur}px) brightness(.4)` } : undefined"
-    />
+    <!-- 背景（规格书 4.7 背景四态：封面模糊/动态渐变/壁纸/纯色，三端复用组件） -->
+    <PlayerBackground class="bg" :cover="cover" />
     <div class="veil" />
 
-    <ParticleField v-if="stage === 'particle'" :count="particleCount()" :enabled="true" />
+    <ParticleField v-if="stage === 'particle'" :count="particleCount()" :enabled="settings.particle !== false" />
     <SpectrumBars v-if="stage === 'stage'" placement="bottom" />
 
     <header class="top">
@@ -192,10 +200,12 @@ watch(
           :stage-active="stage !== 'cover'"
           :eq-active="eqOpen"
           :sleep-on="player.sleepUntil > 0"
+          :mv-on="mvHint.has.value"
           @eq="openEq"
           @rate="player.cycleRate()"
           @visual="cycleVisual()"
           @sleep="openSleep()"
+          @mv="openMv"
         />
       </section>
 

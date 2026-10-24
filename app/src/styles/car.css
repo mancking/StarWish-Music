@@ -1,0 +1,67 @@
+/**
+ * 车机全局适配（规格书 Bug 14 / 4.5 · 驾驶场景）
+ *
+ * [data-car="1"] 由 platform/index.ts 写入 <html>，全页面生效：
+ *  - 热区 ≥76×76（Android Auto 规范），间距与边缘 ≥24
+ *  - 主文字 ≥32px、次文字 ≥24px
+ *  - 强调色统一琥珀黄 #FBBF24
+ *  - 行驶中进度条只作指示（页面禁拖由组件级 car 分支处理）
+ */
+html[data-car='1'] {
+  --accent: #fbbf24;
+  --accent-soft: rgba(251, 191, 36, 0.18);
+  --accent-2: #fbbf24;
+  font-size: 18px;
+}
+
+/* 全局按钮热区：图标按钮放大到 76dp */
+html[data-car='1'] .icon-btn,
+html[data-car='1'] .ibtn,
+html[data-car='1'] .ghost,
+html[data-car='1'] .icon-btn-sm {
+  min-width: 76px;
+  min-height: 76px;
+  display: grid;
+  place-items: center;
+}
+
+/* 列表行 88dp + 封面 56 */
+html[data-car='1'] .row,
+html[data-car='1'] .q-row,
+html[data-car='1'] .song-row {
+  min-height: 88px;
+}
+html[data-car='1'] .row .cover,
+html[data-car='1'] .song-row .cover {
+  width: 56px;
+  height: 56px;
+}
+
+/* 文字下限 */
+html[data-car='1'] body,
+html[data-car='1'] .page,
+html[data-car='1'] button,
+html[data-car='1'] input,
+html[data-car='1'] .row-label {
+  font-size: max(inherit, 24px);
+}
+html[data-car='1'] h1 {
+  font-size: 32px;
+}
+
+/* 选中态琥珀 12% 底 */
+html[data-car='1'] .on,
+html[data-car='1'] .active {
+  background: rgba(251, 191, 36, 0.12);
+}
+
+/* 滚动条隐藏（车载交互以触摸滚动为主） */
+html[data-car='1'] ::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
+
+/* 驾驶勿扰：禁用 hover 依赖（无鼠标）、动画收敛 */
+html[data-car='1'] * {
+  -webkit-tap-highlight-color: transparent;
+}

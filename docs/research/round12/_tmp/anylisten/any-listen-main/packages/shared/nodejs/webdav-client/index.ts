@@ -1,0 +1,318 @@
+import { readFile } from 'node:fs/promises'
+import type { Readable } from 'node:stream'
+
+import type { XMLParser } from 'fast-xml-parser'
+
+import { request, type Options, type Response } from '../request'
+import type { Ls, ParsedResponse, Prop } from './types/ls'
+
+export interface WebDAVClientOptions {
+  baseUrl: string
+  username?: string
+  password?: string
+  onError?: (errorMessage: string) => void
+  onDebugLog?: (logMessage: string) => void
+}
+
+export interface WebDAVDirItem {
+  path: string
+  name: string
+  isDir: true
+  lastModified: number
+  creationDate: number
+}
+export interface WebDAVFileItem {
+  path: string
+  name: string
+  isDir: false
+  lastModified: number
+  creationDate: number
+  contentType: string
+  size: number
+}
+export type WebDAVItem = WebDAVDirItem | WebDAVFileItem
+
+const buildFileItems = (list: ParsedResponse[], path: string): WebDAVItem[] => {
+  return list.map((item) => {
+    const isDir = item.prop.resourcetype?.collection === ''
+    let rawName = item.href.endsWith('/') ? item.href.slice(0, -1) : item.href
+    rawName = rawName.substring(rawName.lastIndexOf('/') + 1)
+    const name = decodeURIComponent(rawName)
+
+    // let rawName: string
+    // let name: string
+    // if (item.propstat.prop.displayname == null) {
+    // rawName = item.href.endsWith('/') ? item.href.slice(0, -1) : item.href
+    // rawName = rawName.substring(rawName.lastIndexOf('/') + 1)
+    // name = decodeURIComponent(rawName)
+    // } else {
+    //   rawName = encodeURIComponent(item.propstat.prop.displayname)
+    //   name = item.propstat.prop.displayname
+    // }
+
+    const file = isDir
+      ? ({
+          path: `${path}/${rawName}`,
+          isDir: true,
+          name,
+          lastModified: new Date(item.prop.getlastmodified).getTime(),
+          creationDate: 0,
+        } satisfies WebDAVDirItem)
+      : ({
+          path: `${path}/${rawName}`,
+          name,
+          isDir: false,
+          lastModified: new Date(item.prop.getlastmodified).getTime(),
+          creationDate: 0,
+          contentType: item.prop.getcontenttype,
+          size: parseInt(item.prop.getcontentlength),
+        } satisfies WebDAVFileItem)
+
+    file.creationDate = item.prop.creationdate ? new Date(item.prop.creationdate).getTime() : file.lastModified
+
+    return file
+  })
+}
+const buildError = (url: string, statusCode?: number, error?: string) => {
+  return new Error(`${statusCode}${error ? `, ${error}` : ''} [${url}]`)
+}
+export const is404Error = (error: unknown) => {
+  return error instanceof Error && error.message.startsWith('404')
+}
+
+const fixPath = (path?: string): string => {
+  if (!path) return '/'
+  if (!path.startsWith('/')) path = `/${path}`
+  return path
+}
+
+type RequestOptions = Omit<Options, 'method'> & { path?: string; needHeader?: boolean }
+
+export class WebDAVClient {
+  private readonly options: WebDAVClientOptions
+  private readonly baseUrl: string
+  private readonly authHeader?: string
+  private xmlParser?: XMLParser
+
+  constructor(options: WebDAVClientOptions) {
+    this.options = options
+    this.baseUrl = options.baseUrl.replace(/\/$/, '')
+    if (options.username) {
+      const token = Buffer.from(`${options.username}:${options.password || ''}`).toString('base64')
+      this.authHeader = `Basic ${token}`
+    }
+  }
+
+  private async parseXML<T = unknown>(xml: string) {
+    if (!this.xmlParser) {
+      const { XMLParser } = await import('fast-xml-parser')
+      this.xmlParser = new XMLParser({
+        ignoreAttributes: true,
+        ignoreDeclaration: true,
+        ignorePiTags: true,
+        // processEntities: false,
+        maxNestedTags: 20,
+        removeNSPrefix: true,
+        trimValues: false,
+        parseTagValue: false,
+        alwaysCreateTextNode: false,
+        // attributeNamePrefix: '',
+        isArray: (name, jpath, isLeafNode, isAttribute) => {
+          switch (jpath) {
+            case 'multistatus.response':
+            case 'multistatus.response.propstat':
+              return true
+            default:
+              return false
+          }
+        },
+      })
+    }
+    return this.xmlParser.parse(xml) as T
+  }
+
+  private handleRequestError(url: string, method: Options['method'], statusCode?: number, body?: string) {
+    const error = buildError(url, statusCode, body)
+    if (statusCode != 404) {
+      try {
+        this.options.onError?.(`[${method} ${url}] ${error.message}`)
+      } catch {}
+    }
+    return error
+  }
+
+  private getFullUrl(path?: string) {
+    return path ? `${this.baseUrl}${path}` : this.baseUrl
+  }
+
+  private async request<T = unknown>(method: Options['method'], { path, needHeader, ...options }: RequestOptions = {}) {
+    const headers = options.headers || {}
+    if (this.authHeader) headers.Authorization = this.authHeader
+    const url = this.getFullUrl(fixPath(path))
+    this.options.onDebugLog?.(`request: [${method} ${url}]`)
+    const res = await request<string>(url, {
+      method,
+      headers,
+      ...options,
+    }).catch((err: Error) => {
+      this.options.onDebugLog?.(`request error: [${method} ${url}] ${err.message} ${err.stack || ''}`)
+      throw err
+    })
+    const contentType = res.headers['content-type']?.toString() ?? ''
+    if (!res.statusCode || res.statusCode > 299) {
+      if (res.body && contentType.includes('xml')) {
+        const error = await this.parseXML(res.body)
+        this.options.onDebugLog?.(`request error: [${method} ${url} ${res.statusCode}] ${JSON.stringify(error) || ''}`)
+        throw this.handleRequestError(url, method, res.statusCode, JSON.stringify(error) || '')
+      }
+      this.options.onDebugLog?.(`request error: [${method} ${url} ${res.statusCode}] ${res.body}`)
+      throw this.handleRequestError(url, method, res.statusCode, res.body)
+    }
+    if (method === 'HEAD' || needHeader) {
+      this.options.onDebugLog?.(
+        `request: [${method} ${url} ${res.statusCode} ${contentType}] [${JSON.stringify(res.headers)}] ${res.body}`
+      )
+      return res.headers as T
+    }
+    if (contentType.includes('xml')) {
+      const data = await this.parseXML<T>(res.body)
+      this.options.onDebugLog?.(`request parsed: ${JSON.stringify(data)}`)
+      return data
+    }
+    this.options.onDebugLog?.(
+      `request: [${method} ${url} ${res.statusCode} ${contentType}] [${JSON.stringify(res.headers)}] ${options.needRaw ? res.raw.byteLength : res.body}`
+    )
+    return (options.needRaw ? res.raw : res.body) as T
+  }
+
+  getRequestOptions(path: string, method: Options['method'] = 'GET'): [string, Options] {
+    this.options.onDebugLog?.(`getRequestOptions: [${path}]`)
+    const url = this.getFullUrl(path)
+    return [
+      url,
+      {
+        method,
+        headers: {
+          Authorization: this.authHeader || '',
+        },
+      },
+    ]
+  }
+
+  async ls(path = '/'): Promise<WebDAVItem[]> {
+    this.options.onDebugLog?.(`ls: [${path}]`)
+    path = fixPath(path)
+    const res = await this.request<Ls>('PROPFIND', { headers: { Depth: '1' }, path })
+    // console.log(JSON.stringify(res.multistatus.response))
+    const currentFullPath = this.getFullUrl(path)
+    // console.log('res.multistatus.response', res.multistatus.response)
+    // filter out the current directory itself from the list
+    const parsedResponses: ParsedResponse[] = res.multistatus.response.map((item) => {
+      // const prop = item.propstat
+      let prop = {} as Prop
+      for (const propstat of item.propstat) {
+        if (propstat.status.includes('200')) {
+          // Use this propstat's prop as the main prop
+          Object.assign(prop, propstat.prop)
+          break
+        }
+      }
+      return {
+        href: item.href,
+        prop,
+      }
+    })
+    const responses = parsedResponses.filter((item) => {
+      const isDir = item.prop.resourcetype?.collection === ''
+      if (!isDir) return true
+      const href = item.href.endsWith('/') ? item.href.slice(0, -1) : item.href
+      return !currentFullPath.endsWith(href)
+    })
+    return buildFileItems(responses, path == '/' ? '' : path)
+  }
+
+  async rm(path: string) {
+    this.options.onDebugLog?.(`rm: [${path}]`)
+    return this.request('DELETE', { path })
+  }
+
+  async mkdir(path: string) {
+    this.options.onDebugLog?.(`mkdir: [${path}]`)
+    return this.request('MKCOL', { path })
+  }
+
+  async mv(src: string, dest: string) {
+    this.options.onDebugLog?.(`mv: [${src}] -> [${dest}]`)
+    return this.request('MOVE', { headers: { Destination: this.baseUrl + dest }, path: src })
+  }
+
+  async cp(src: string, dest: string) {
+    this.options.onDebugLog?.(`cp: [${src}] -> [${dest}]`)
+    return this.request('COPY', { headers: { Destination: this.baseUrl + dest }, path: src })
+  }
+
+  async get(path: string) {
+    this.options.onDebugLog?.(`get: [${path}]`)
+    const res = await this.request<Uint8Array>('GET', { needRaw: true, path })
+    return Buffer.from(res)
+  }
+
+  async getHead(path: string) {
+    this.options.onDebugLog?.(`getHead: [${path}]`)
+    return this.request<Response<string>['headers']>('HEAD', { needRaw: true, path })
+  }
+
+  async put(path: string, data: Buffer | string) {
+    this.options.onDebugLog?.(`put: [${path}]`)
+    return this.request('PUT', {
+      path,
+      binary: data instanceof Buffer ? data : await readFile(data),
+    })
+  }
+
+  async putData(path: string, data: Buffer | string) {
+    this.options.onDebugLog?.(`putData: [${path}]`)
+    const opts: RequestOptions = { path }
+    if (typeof data === 'string') {
+      opts.text = data
+    } else {
+      opts.binary = data
+    }
+    return this.request('PUT', opts)
+  }
+
+  async getStream(path: string, rangeStart?: string, rangeEnd?: string) {
+    this.options.onDebugLog?.(`getStream: [${path}] ${rangeStart || ''}-${rangeEnd || ''}`)
+    const res = await this.request<Readable>('GET', {
+      needBody: true,
+      path,
+      headers: rangeStart || rangeEnd ? { Range: `bytes=${rangeStart}-${rangeEnd}` } : undefined,
+    })
+    return res
+  }
+
+  async getPartial(path: string, start: number | null, end?: number | null) {
+    this.options.onDebugLog?.(`getPartial: [${path}] [${start || ''}-${end || ''}]`)
+    const res = await this.request<Uint8Array>('GET', {
+      needRaw: true,
+      path,
+      headers: { Range: `bytes=${start || '0'}-${end || ''}` },
+    })
+    return Buffer.from(res)
+  }
+
+  // async lock(path: string, lockToken?: string) {
+  //   this.options.onDebugLog?.(`lock: [${path}]`)
+  //   const headers: Record<string, string> = {}
+  //   if (lockToken) headers.If = `<${path}> (${lockToken})`
+  //   const resp = await this.request<{ 'lock-token'?: string }>('LOCK', { path, headers, needHeader: true })
+  //   return resp['lock-token'] || ''
+  // }
+
+  // async unlock(path: string, lockToken: string) {
+  //   this.options.onDebugLog?.(`unlock: [${path}]`)
+  //   const headers: Record<string, string> = {}
+  //   if (lockToken) headers.LockToken = lockToken
+  //   return this.request('UNLOCK', { path, headers })
+  // }
+}

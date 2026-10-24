@@ -33,11 +33,38 @@ let sleepUntil = 0
 let histMarked = ''
 let retryCount = 0
 const MAX_RETRY = 2
+/** Bug 46：play() reject 与 error 事件同源失败的互斥标记（1.5s 内 error 事件不重复处理） */
+let errorHandledAt = 0
+/** Bug 75：error 事件归属歌曲（切歌后旧错误不生效） */
+let errorSongId = ''
 /** 本曲已失败的音源（取链/媒体报错时累计，换源重试时跳过） */
 let failedSources: string[] = []
 let lastSource = ''
 /** 连续「换源用尽后跳下一首」仍失败的歌曲数，播放成功即清零（与桌面一致） */
 let consecutiveFails = 0
+const QUEUE_KEY = 'xinyuan_queue'
+
+/** 队列持久化（规格书 1.13）：写入/排序/删除后镜像到 localStorage，重启恢复 */
+function persistQueue(): void {
+  try {
+    localStorage.setItem(
+      QUEUE_KEY,
+      JSON.stringify({ queue: queue.slice(0, 200), index, at: Date.now() })
+    )
+  } catch { /* 配额满忽略 */ }
+}
+
+function restoreQueue(): void {
+  try {
+    const raw = localStorage.getItem(QUEUE_KEY)
+    if (!raw) return
+    const data = JSON.parse(raw) as { queue?: Song[]; index?: number }
+    if (Array.isArray(data.queue) && data.queue.length) {
+      queue = data.queue.filter(x => x?.id)
+      index = Math.min(Math.max(0, Number(data.index) || 0), queue.length - 1)
+    }
+  } catch { /* 损坏数据忽略 */ }
+}
 
 /** HTMLMediaElement 原生错误是英文，统一映射为中文提示 */
 function friendlyPlayError(msg?: string): string | null {
@@ -82,7 +109,7 @@ function tick(): void {
 let tickTimer = 0
 function startTick(): void {
   if (tickTimer) return
-  tickTimer = window.setInterval(tick, 500)
+  tickTimer = window.setInterval(tick, 250)
 }
 function stopTick(): void {
   if (!tickTimer) return
@@ -94,7 +121,7 @@ function stopTick(): void {
  * @param keepFailures 内部重试链专用：保留 failedSources / retryCount；
  *   外部点播（换歌、重点当前曲、切下一首）一律 fresh，与桌面 playAt 重置一致
  */
-async function load(i: number, autoplay = true, keepFailures = false): Promise<void> {
+async function load(i: number, autoplay = true, keepFailures = false, startAt = 0): Promise<void> {
   if (i < 0 || i >= queue.length) {
     status = 'idle'
     error = null
@@ -109,13 +136,18 @@ async function load(i: number, autoplay = true, keepFailures = false): Promise<v
   }
   index = i
   const song = queue[i]
+  errorSongId = song?.id || ''
   status = 'loading'
   error = null
-  position = 0
+  position = startAt
   duration = 0
   publish()
   try {
-    const r = await resolveUrl(song, getSettings().quality, getSettings().autoSwitchSource, failedSources)
+    // Bug 49/88：取链 10s 超时，弱网不永卡 loading
+    const r = await Promise.race([
+      resolveUrl(song, getSettings().quality, getSettings().autoSwitchSource, failedSources),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('取链超时')), 10_000)),
+    ])
     if (index !== i) return // 已切歌
     lastSource = r.matched?.source || song.source
     // 真机走原生 /swmedia/ 代理（注入 Referer/UA 防盗链，SwMediaClient 拦截），
@@ -124,11 +156,21 @@ async function load(i: number, autoplay = true, keepFailures = false): Promise<v
     const sameOrigin = r.url.startsWith('/')
     el.src = isNativeWebView() && !sameOrigin ? `/swmedia/?u=${encodeURIComponent(r.url)}` : r.url
     el.playbackRate = state().rate
+    if (startAt > 0) {
+      const seekBack = (): void => {
+        try {
+          el.currentTime = startAt
+        } catch { /* metadata 未就绪时忽略 */ }
+      }
+      if (el.readyState >= 1) seekBack()
+      else el.addEventListener('loadedmetadata', seekBack, { once: true })
+    }
     if (autoplay) await el.play()
     status = el.paused ? 'paused' : 'playing'
     updateMediaSession()
   } catch (e: any) {
     if (index !== i) return
+    errorHandledAt = Date.now()
     // 自动播放被系统策略阻止不是音源故障：换源/跳过都无意义，提示手动播放即可
     if (/notallowed|user didn|blocked/i.test(String(e?.message || ''))) {
       status = 'error'
@@ -175,7 +217,10 @@ function next(auto = false): void {
   const mode = getSettings().playMode
   if (auto && mode === 'repeat-one') { void load(index, true); return }
   if (mode === 'shuffle') {
-    void load(Math.floor(Math.random() * queue.length), true)
+    let n = index
+    let guard = 0
+    while (n === index && guard++ < 30) n = Math.floor(Math.random() * queue.length)
+    void load(n, true)
     return
   }
   let i = index + 1
@@ -209,7 +254,12 @@ el.addEventListener('ratechange', () => publish())
 el.addEventListener('volumechange', () => publish())
 el.addEventListener('error', () => {
   if (!el.src) return
-  const song = state().song
+  // Bug 46：load() 的 catch 已处理过同一次失败（play() reject 先行）则不重复计数
+  if (Date.now() - errorHandledAt < 1500) return
+  // Bug 75：error 事件校验触发曲与当前曲一致，旧失败不污染新曲
+  const cur = state().song
+  if (errorSongId && cur && errorSongId !== cur.id) return
+  const song = cur
   markSourceFailed(song)
   if (retryCount < MAX_RETRY) {
     retryCount++
@@ -230,8 +280,18 @@ el.addEventListener('ended', () => {
   stopTick()
   next(true)
 })
-el.addEventListener('timeupdate', tick)
-el.addEventListener('progress', tick)
+// Bug 79：进度统一由 interval 驱动（250ms 兜底），timeupdate/progress 不再重复 tick
+el.addEventListener('timeupdate', () => {
+  // 只同步缓冲显示，不重复推进度
+  try {
+    if (el.buffered.length) buffered = el.buffered.end(el.buffered.length - 1)
+  } catch { /* ignore */ }
+})
+el.addEventListener('progress', () => {
+  try {
+    if (el.buffered.length) buffered = el.buffered.end(el.buffered.length - 1)
+  } catch { /* ignore */ }
+})
 
 /* ---------------- MediaSession：锁屏 / 通知栏 / 蓝牙线控 ----------------
  * v2.3.1 新增系统能力：后台播放时锁屏出现「封面 + 标题 + 上/下/播控」，
@@ -295,6 +355,14 @@ export const player = {
   init(): void {
     const s = getSettings()
     el.volume = typeof s.volume === 'number' ? s.volume : 0.8
+    // Bug 80/105：重启恢复倍速与定时关闭
+    const rate = Math.max(0.5, Math.min(2, Number((s as any).playbackRate) || 1))
+    el.playbackRate = rate
+    const until = Number((s as any).sleepUntil) || 0
+    if (until > Date.now()) sleepUntil = until
+    else if (until) saveSettings({ sleepUntil: 0 } as any)
+    // 规格书 1.13：重启恢复队列与当前播放位置（暂停态，点播放即续）
+    restoreQueue()
     publish()
   },
 
@@ -302,6 +370,7 @@ export const player = {
 
   setQueue(songs: Song[], i = 0, autoplay = true): PlayerState {
     queue = songs || []
+    persistQueue()
     if (i < 0 || i >= queue.length) { index = i; publish(); return state() }
     void load(i, autoplay)
     return state()
@@ -327,7 +396,13 @@ export const player = {
 
   toggle(): PlayerState {
     if (!queue.length) return state()
-    if (el.paused) { void el.play().catch(() => undefined) } else { el.pause() }
+    if (el.paused) {
+      // 重启恢复的队列：audio 尚无 src，点播放从当前曲起播（规格书 1.13）
+      if (!el.src) { void load(Math.max(0, index), true); return state() }
+      void el.play().catch(() => undefined)
+    } else {
+      el.pause()
+    }
     return state()
   },
 
@@ -344,18 +419,31 @@ export const player = {
   setVolume(v: number): PlayerState { el.volume = Math.min(1, Math.max(0, v)); return state() },
   setMuted(m: boolean): PlayerState { el.muted = !!m; return state() },
   setMode(mode: PlayMode): PlayerState { saveSettings({ playMode: mode }); publish(); return state() },
-  setRate(rate: number): PlayerState { el.playbackRate = Number(rate) || 1; return state() },
+  setRate(rate: number): PlayerState {
+    const r = Number(rate) || 1
+    el.playbackRate = r
+    saveSettings({ playbackRate: r } as any)
+    return state()
+  },
   setQuality(q: string): PlayerState {
     saveSettings({ quality: q as any })
-    // 与桌面一致：品质变化即时重取链
-    if (index >= 0 && !el.paused) void load(index, true)
-    else publish()
+    // 与桌面一致：品质变化即时重取链；Bug 30/104：保留当前进度
+    if (index >= 0 && !el.paused) {
+      const pos = el.currentTime || 0
+      void load(index, true, false, pos)
+    } else publish()
     return state()
   },
 
   setSleepTimer(minutes: number): { until: number } {
-    if (!minutes) { sleepUntil = 0; emit('player:sleep', { until: 0 }); return { until: 0 } }
+    if (!minutes) {
+      sleepUntil = 0
+      saveSettings({ sleepUntil: 0 } as any)
+      emit('player:sleep', { until: 0 })
+      return { until: 0 }
+    }
     sleepUntil = Date.now() + Math.round(minutes * 60000)
+    saveSettings({ sleepUntil } as any)
     emit('player:sleep', { until: sleepUntil })
     return { until: sleepUntil }
   },
@@ -363,13 +451,18 @@ export const player = {
   getSleepUntil(): number { return sleepUntil },
 
   addNext(song: Song): PlayerState {
+    // Bug 33：插播去重（与桌面一致），同 id 只保留插入位
+    queue = queue.filter(x => x.id !== song.id)
+    if (index >= queue.length) index = queue.length - 1
     queue.splice(index + 1, 0, song)
+    persistQueue()
     publish()
     return state()
   },
 
   addToQueue(songs: Song[]): PlayerState {
     queue = [...queue, ...(songs || [])]
+    persistQueue()
     publish()
     return state()
   },
@@ -378,11 +471,14 @@ export const player = {
     const n = Number(i)
     if (n < 0 || n >= queue.length) return state()
     const wasCurrent = n === index
+    // Bug 32：删当前曲时若处于暂停态，补位歌曲保持暂停不自动播
+    const wasPlaying = !el.paused
     queue.splice(n, 1)
+    persistQueue()
     if (wasCurrent) {
       el.pause()
       el.removeAttribute('src')
-      void load(Math.min(n, queue.length - 1), true)
+      void load(Math.min(n, queue.length - 1), wasPlaying)
     } else if (n < index) {
       index -= 1
       publish()
@@ -400,6 +496,7 @@ export const player = {
     if (f === index) index = t
     else if (f < index && t >= index) index -= 1
     else if (f > index && t <= index) index += 1
+    persistQueue()
     publish()
     return state()
   },
@@ -411,6 +508,7 @@ export const player = {
     index = -1
     status = 'stopped'
     stopTick()
+    try { localStorage.removeItem(QUEUE_KEY) } catch { /* ignore */ }
     publish()
     return state()
   },

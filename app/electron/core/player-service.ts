@@ -3,7 +3,7 @@ import type { PlayMode, PlayerState, Song } from '../../shared/types'
 import { createLogger } from './log'
 import { resolveUrl } from './music-service'
 import { addHistory, getSong, dbGetSetting, dbSetSetting } from './db'
-import { getSettings } from './settings'
+import { getSettings, saveSettings } from './settings'
 
 const logger = createLogger('player')
 
@@ -156,26 +156,54 @@ class PlayerService {
     this.state.volume = s.volume
     this.state.mode = s.playMode
     this.state.quality = s.quality
+    // Bug 80：倍速重启保持
+    const rate = Math.max(0.5, Math.min(2, Number((s as any).playbackRate) || 1))
+    this.state.rate = rate
     this.send({ type: 'config', volume: s.volume, fadeMs: s.fadeMs })
+    this.send({ type: 'rate', rate })
+    // Bug 42/105：定时关闭重启回填（过期即清除）
+    const until = Number(dbGetSetting('sleep.until')) || 0
+    if (until > Date.now()) {
+      const remainMin = Math.max(1, Math.ceil((until - Date.now()) / 60000))
+      this.setSleepTimer(remainMin)
+    } else if (until) {
+      dbSetSetting('sleep.until', 0)
+    }
   }
 
   restoreSession(): void {
-    const last = dbGetSetting<{ songId: string; position: number }>('player.last')
+    const last = dbGetSetting<{ songId: string; position: number; queue?: Song[] }>('player.last')
     if (!last?.songId) return
     const song = getSong(last.songId)
     if (!song) return
+    // Bug 107：恢复队列快照（含当前曲位置）
+    const snapshot = Array.isArray(last.queue) ? last.queue.filter(x => x?.id) : []
+    if (snapshot.length) {
+      this.state.queue = snapshot
+      const idx = snapshot.findIndex(x => x.id === song.id)
+      this.state.index = idx >= 0 ? idx : 0
+      if (idx < 0) this.state.queue = [song, ...snapshot]
+    } else {
+      this.state.queue = [song]
+      this.state.index = 0
+    }
     this.state.song = song
-    this.state.queue = [song]
-    this.state.index = 0
     this.state.position = Math.max(0, Number(last.position) || 0)
     this.state.duration = song.duration || 0
     this.state.status = 'paused'
+    // Bug 99：给播放宿主发 load（暂停态不发 autoplay），重启后点播放即有声
+    this.load(song, false, this.state.position).catch(() => {})
     this.emitState()
   }
 
   saveSession(): void {
     if (!this.state.song) return
-    dbSetSetting('player.last', { songId: this.state.song.id, position: this.state.position })
+    // Bug 107：队列一并快照，重启后恢复
+    dbSetSetting('player.last', {
+      songId: this.state.song.id,
+      position: this.state.position,
+      queue: this.state.queue.slice(0, 200),
+    })
   }
 
   setQueue(songs: Song[], startIndex = 0, autoplay = true): void {
@@ -462,6 +490,12 @@ class PlayerService {
     const r = Math.max(0.5, Math.min(2, Number(rate) || 1))
     this.state.rate = r
     this.send({ type: 'rate', rate: r })
+    // Bug 97：倍速落库，重启保持
+    try {
+      saveSettings({ playbackRate: r } as any)
+    } catch {
+      /* ignore */
+    }
     this.emitState()
   }
 
@@ -473,13 +507,17 @@ class PlayerService {
     }
     if (!minutes || minutes <= 0) {
       this.sleepUntil = 0
+      dbSetSetting('sleep.until', 0)
       this.broadcast('player:sleep', { until: 0 })
       return { until: 0 }
     }
     this.sleepUntil = Date.now() + minutes * 60 * 1000
+    // Bug 105：结束时间戳持久化（xinyuan_sleep_until 语义），重启回填
+    dbSetSetting('sleep.until', this.sleepUntil)
     this.sleepTimer = setTimeout(() => {
       this.sleepTimer = null
       this.sleepUntil = 0
+      dbSetSetting('sleep.until', 0)
       this.pause()
       this.broadcast('player:sleep', { until: 0 })
       this.broadcast('toast', { type: 'info', message: '定时关闭已生效，播放已暂停' })
@@ -507,6 +545,9 @@ class PlayerService {
   }
 
   setQuality(q: string): void {
+    // Bug 106：切音质清零失败计数，避免残留影响换源判断
+    this.failures = 0
+    this.consecutiveFails = 0
     if (this.state.quality === q) return
     this.state.quality = q
     this.emitState()

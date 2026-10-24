@@ -1,0 +1,528 @@
+/// agentxx_system_monitor 插件 —— 系统资源监控工具与展示插件
+#include "cpu_gpu_monitor.h"
+#include "system_monitor_plugin.h"
+
+#include "agentxx/plugin/api/client_plugin_api.h"
+#include "agentxx/plugin/api/plugin_guard.h"
+#include "agentxx/plugin/api/plugin_kit.h"
+#include "utilxx_base/json.h"
+#include "utilxx_base/log.h"
+#include "utilxx_base/string_util.h"
+
+#include "asio/co_spawn.hpp"
+#include "asio/detached.hpp"
+#include "asio/io_context.hpp"
+#include "fmt/format.h"
+
+#include <atomic>
+#include <chrono>
+#include <memory>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <vector>
+
+using namespace agentxx_system_monitor_plugin;
+using namespace agentxx::plugin;
+
+namespace {
+
+constexpr int kUsageIntervalSec = 5;
+
+std::string usageToJson(const CpuGpuUsage& u) {
+    utilxx_base::Json j;
+    j["cpu"]               = u.cpuUsagePercent;
+    j["cpu_cores"]         = u.cpuCoreCount;
+    j["mem_total_mb"]      = u.memory.totalPhysicalMB;
+    j["mem_used_mb"]       = u.memory.usedPhysicalMB;
+    j["mem_percent"]       = u.memory.usagePercent;
+    utilxx_base::Json gpus = utilxx_base::Json::array();
+    for (const auto& g : u.gpus) {
+        gpus.push_back({
+            {"name",                   g.name               },
+            {"dedicated_vram_mb",      g.dedicatedVramMB    },
+            {"dedicated_vram_used_mb", g.dedicatedVramUsedMB},
+            {"shared_vram_mb",         g.sharedVramMB       },
+            {"shared_vram_used_mb",    g.sharedVramUsedMB   },
+            {"usage_percent",          g.usagePercent       }
+        });
+    }
+    j["gpus"] = std::move(gpus);
+    return j.dump();
+}
+
+std::string formatUsageText(const CpuGpuUsage& usage) {
+    std::stringstream ss;
+    std::string       cpuLine = fmt::format("CPU Usage: {:.1f}%", usage.cpuUsagePercent);
+    if (usage.cpuCoreCount > 0) {
+        cpuLine += fmt::format(" ({} cores)", usage.cpuCoreCount);
+    }
+    ss << cpuLine << "\n";
+    const auto mbToBytes = [](uint64_t mb) {
+        return mb * 1024 * 1024;
+    };
+    ss << fmt::format(
+        "Memory: {:.1f}% · Used: {} / Total: {}\n",
+        usage.memory.usagePercent,
+        utilxx_base::formatSize(mbToBytes(usage.memory.usedPhysicalMB)),
+        utilxx_base::formatSize(mbToBytes(usage.memory.totalPhysicalMB))
+    );
+    for (size_t i = 0; i < usage.gpus.size(); ++i) {
+        const auto& gpu = usage.gpus[i];
+        /// 显存取值: 优先独立显存; 统一内存 GPU (如 Apple Silicon) 没有独立显存,
+        /// 退回与系统内存同源的共享显存, 否则该行会显示成 0MB/0MB
+        const bool        useSharedVram = gpu.dedicatedVramMB == 0 && gpu.sharedVramMB > 0;
+        const uint64_t    vramTotalMB   = useSharedVram ? gpu.sharedVramMB : gpu.dedicatedVramMB;
+        const uint64_t    vramUsedMB
+            = useSharedVram ? gpu.sharedVramUsedMB : gpu.dedicatedVramUsedMB;
+        const std::string vramLabel = useSharedVram ? "VRAM (shared)" : "VRAM";
+        std::string       title     = fmt::format("GPU {}", i);
+        if (!gpu.name.empty()) {
+            title += fmt::format(" [{}]", gpu.name);
+        }
+        ss << fmt::format(
+            "{}: GPU Usage: {:.1f}%, {}: {}MB Used / {}MB Total",
+            title,
+            gpu.usagePercent,
+            vramLabel,
+            vramUsedMB,
+            vramTotalMB
+        );
+        if (i + 1 < usage.gpus.size()) {
+            ss << "\n";
+        }
+    }
+    return ss.str();
+}
+
+} // namespace
+
+struct SysMonCtx : public PluginBase {
+    std::atomic<bool> usageEnabled{true};
+    CpuGpuMonitor     monitor;
+
+    /// 同实例查询串行化。
+    ///
+    /// 后台采样任务（offload 到主程序阻塞池）、`client_attached` 的一次性采样、
+    /// 工具执行与能力调用可能同时发起查询，而 `CpuGpuMonitor` 的 CPU 采样基线
+    /// 与 GPU 枚举缓存是实例内可变状态：并发访问会读写同一份数据（TSan 定向
+    /// 回归可复现）。
+    /// - 锁是**实例成员**，不跨实例共享（多实例契约）；
+    /// - 查询只使用调用线程自己创建的 io_context 与文件 IO，不回调主程序 IO 线程，
+    ///   因此"阻塞池线程持锁 + 另一线程等待"不会与主程序 IO 线程形成锁反转；
+    /// - 阻塞池本就被查询同步占用（`querySync` 内 `io.run()`），串行化不改变
+    ///   现有线程占用模型，只把并发查询变成排队。
+    std::mutex queryMutex;
+
+    CpuGpuUsage querySync() {
+        std::lock_guard<std::mutex> lock(queryMutex);
+        asio::io_context            io;
+        CpuGpuUsage                 usage;
+        asio::co_spawn(
+            io,
+            [this, &usage]() -> asio::awaitable<void> {
+                usage = co_await monitor.query();
+            },
+            asio::detached
+        );
+        io.run();
+        return usage;
+    }
+};
+
+/// 注册事务 (start 的实际内容); 失败由主程序按拒绝处理并回滚。
+static int32_t sysMonSetup(SysMonCtx& ctx) {
+    // 1. 工具
+    auto schema = ctx.schema("agentxx_get_system_core_info").build();
+    blocking_tool(
+        ctx,
+        "agentxx_get_system_core_info",
+        "Get system resource usage: CPU utilization and core count, memory usage, GPU utilization, and GPU memory usage.",
+        schema,
+        [](SysMonCtx& c, std::string_view) -> std::string {
+            auto usage = c.querySync();
+            return formatUsageText(usage);
+        }
+    );
+
+    // 2. 能力: agentxx.system_usage
+    capability(
+        ctx,
+        "agentxx.system_usage",
+        [](SysMonCtx& c, const PluginxxHost*, std::string_view, std::string_view) -> std::string {
+            auto usage = c.querySync();
+            return usageToJson(usage);
+        }
+    );
+
+    // 3. 事件订阅
+    if (ctx.iface.events && ctx.iface.events->subscribe) {
+        auto t1 = PluginStringView::fromCstr("client.agentxx_system_monitor.usage_enabled");
+        ctx.iface.events->subscribe(
+            ctx.host,
+            &t1,
+            [](const PluginxxStringView* event_json, void* ud) {
+                auto* c = static_cast<SysMonCtx*>(ud);
+                if (!c) {
+                    return;
+                }
+                try {
+                    std::string s(
+                        event_json && event_json->data ? event_json->data : "{}",
+                        event_json ? static_cast<size_t>(event_json->size) : 0
+                    );
+                    auto j = utilxx_base::Json::parse(s);
+                    c->usageEnabled.store(j.value("enabled", true), std::memory_order_release);
+                } catch (...) {
+                }
+            },
+            &ctx
+        );
+
+        auto t2 = PluginStringView::fromCstr("agentxx_host.client_attached");
+        ctx.iface.events->subscribe(
+            ctx.host,
+            &t2,
+            [](const PluginxxStringView*, void* ud) {
+                auto* c = static_cast<SysMonCtx*>(ud);
+                if (!c || !c->usageEnabled.load(std::memory_order_relaxed)) {
+                    return;
+                }
+                if (!c->iface.scheduler || !c->iface.scheduler->offload) {
+                    return;
+                }
+                c->iface.scheduler->offload(
+                    c->host,
+                    [](void* ud, const PluginxxCancelToken*, PluginxxString*) -> void* {
+                        auto* c = static_cast<SysMonCtx*>(ud);
+                        return new CpuGpuUsage(c->querySync());
+                    },
+                    [](void* ud, int32_t status, void* res, const PluginxxStringView*) {
+                        auto* c = static_cast<SysMonCtx*>(ud);
+                        if (status == PLUGINXX_OPERATOR_OK && res && c && c->host && c->iface.events
+                            && c->iface.events->publish) {
+                            auto*       u    = static_cast<CpuGpuUsage*>(res);
+                            std::string json = usageToJson(*u);
+                            auto        topicSv
+                                = PluginStringView::fromCstr("agentxx_system_monitor.usage");
+                            auto jsonSv = PluginStringView::from(json.data(), json.size());
+                            c->iface.events->publish(c->host, &topicSv, &jsonSv);
+                            delete u;
+                        } else {
+                            delete static_cast<CpuGpuUsage*>(res);
+                        }
+                    },
+                    c,
+                    nullptr
+                );
+            },
+            &ctx
+        );
+    }
+
+    // 4. 后台采样任务
+    ctx.spawn([](SysMonCtx& c, OpCtl ctl) -> Task<void> {
+        while (!ctl.cancelled()) {
+            if (c.usageEnabled.load(std::memory_order_relaxed)) {
+                auto usage = co_await offload(c, [&](const PluginxxCancelToken*) {
+                    return c.querySync();
+                });
+                if (ctl.cancelled()) {
+                    break;
+                }
+
+                std::string json    = usageToJson(usage);
+                auto        topicSv = PluginStringView::fromCstr("agentxx_system_monitor.usage");
+                auto        jsonSv  = PluginStringView::from(json.data(), json.size());
+                if (c.iface.events && c.iface.events->publish) {
+                    c.iface.events->publish(c.host, &topicSv, &jsonSv);
+                }
+            }
+            co_await sleep(c, kUsageIntervalSec * 1000);
+        }
+    });
+
+    return 0;
+}
+
+static void*
+    sysMonStart(SysMonCtx& ctx, const PluginxxOperatorNotify* notify, PluginxxString* error) {
+    if (!notify) {
+        if (error) {
+            PluginString::set(ctx.host, error, "agentxx_system_monitor start: notify required");
+        }
+        return nullptr;
+    }
+    if (sysMonSetup(ctx) != 0) {
+        if (error) {
+            PluginString::set(ctx.host, error, "agentxx_system_monitor start: registration failed");
+        }
+        return nullptr;
+    }
+    notify->done(notify->host_ud, PLUGINXX_OPERATOR_OK, nullptr);
+    return nullptr;
+}
+
+static void* sysMonStop(SysMonCtx& ctx, const PluginxxOperatorNotify* notify, PluginxxString*) {
+    ctx.stopSpawns();
+    notify->done(notify->host_ud, PLUGINXX_OPERATOR_OK, nullptr);
+    return nullptr;
+}
+
+AGENTXX_PLUGIN_AGENT_EXPORT(
+    SysMonCtx,
+    "agentxx_system_monitor",
+    "1.1.0",
+    "System resource monitor: CPU/memory/GPU usage tool",
+    sysMonStart,
+    sysMonStop
+);
+
+struct SysMonClientCtx : public ClientPluginBase {
+    AgentxxInfoSection* section = nullptr;
+    std::atomic<bool>   usage_enabled{true};
+    std::string         last_usage_json;
+};
+
+struct UsageStat {
+    double  cpu        = 0.0;
+    int64_t cpuCores   = 0;
+    double  memPct     = 0.0;
+    int64_t memUsedMb  = 0;
+    int64_t memTotalMb = 0;
+    size_t  gpuCount   = 0;
+    double  gpuPeakPct = 0.0;
+};
+
+static UsageStat parseUsage(const std::string& raw) {
+    UsageStat st;
+    try {
+        auto j        = utilxx_base::Json::parse(raw);
+        st.cpu        = j.value("cpu", 0.0);
+        st.cpuCores   = j.value<int64_t>("cpu_cores", 0);
+        st.memPct     = j.value("mem_percent", 0.0);
+        st.memUsedMb  = j.value<int64_t>("mem_used_mb", 0);
+        st.memTotalMb = j.value<int64_t>("mem_total_mb", 0);
+        if (j.contains("gpus") && j["gpus"].is_array()) {
+            for (const auto& elem : j["gpus"]) {
+                ++st.gpuCount;
+                double u = 0.0;
+                if (elem.is_object() && elem.contains("usage_percent")) {
+                    u = elem.value("usage_percent", 0.0);
+                }
+                if (u > st.gpuPeakPct) {
+                    st.gpuPeakPct = u;
+                }
+            }
+        }
+    } catch (...) {
+    }
+    return st;
+}
+
+static std::string buildUsageInfoItemsJson(const SysMonClientCtx&, const UsageStat& st) {
+    // 组件项经描述层与扩展 kit 组装 (同一份描述, 终端与将来的 GUI 客户端共用;
+    // 每行是一个 Text, 语义色用 tone)
+    std::vector<pluginxx::ui::Item> items;
+    auto pushText = [&](const std::string& text, std::string tone = {}) {
+        utilxx_base::Json params;
+        params["text"] = text;
+        if (!tone.empty()) {
+            params["tone"] = std::move(tone);
+        }
+        items.push_back(agentxx::ui::kit::text(params));
+    };
+    pushText(fmt::format("|- CPU {:.0f}% · {}x", st.cpu, st.cpuCores));
+    std::string ram = fmt::format("|- RAM {:.0f}%", st.memPct);
+    if (st.memTotalMb > 0) {
+        const auto mbToBytes = [](int64_t mb) {
+            return static_cast<uint64_t>(mb) * 1024 * 1024;
+        };
+        ram = fmt::format(
+            "{} · {}/{}",
+            ram,
+            utilxx_base::formatSize(mbToBytes(st.memUsedMb), 1024, false),
+            utilxx_base::formatSize(mbToBytes(st.memTotalMb), 1024, false)
+        );
+    }
+    pushText(ram);
+    if (st.gpuCount == 1) {
+        pushText(fmt::format("|- GPU {:.0f}%", st.gpuPeakPct));
+    } else if (st.gpuCount > 1) {
+        pushText(fmt::format("|- GPU {:.0f}% · {}x", st.gpuPeakPct, st.gpuCount));
+    }
+    utilxx_base::Json out;
+    out["items"] = pluginxx::ui::dumpBlocks(items);
+    return out.dump();
+}
+
+static void refreshUsageDisplay(SysMonClientCtx& ctx) {
+    if (!ctx.host) {
+        return;
+    }
+    if (!ctx.section && ctx.iface.ui && ctx.iface.ui->register_info_section) {
+        auto idSv    = PluginStringView::fromCstr("agentxx_system_monitor.usage");
+        auto propsSv = PluginStringView::fromCstr(R"({"title":"System"})");
+        ctx.section  = ctx.iface.ui->register_info_section(ctx.host, &idSv, &propsSv);
+    }
+    if (!ctx.section || !ctx.iface.ui || !ctx.iface.ui->update_info_section
+        || ctx.last_usage_json.empty()) {
+        return;
+    }
+    std::string json;
+    if (ctx.usage_enabled.load(std::memory_order_relaxed)) {
+        json = buildUsageInfoItemsJson(ctx, parseUsage(ctx.last_usage_json));
+    } else {
+        utilxx_base::Json off;
+        off["items"] = utilxx_base::Json::array();
+        json         = off.dump();
+    }
+    auto jsonSv = PluginStringView::from(json.data(), json.size());
+    ctx.iface.ui->update_info_section(ctx.host, ctx.section, &jsonSv);
+}
+
+/// client 侧注册事务 (start 的实际内容); 无 UI 能力时静默降级 (返回 0)。
+static int32_t sysMonClientSetup(SysMonClientCtx& ctx) {
+    if (!ctx.iface.ui) {
+        return 0;
+    }
+
+    auto idSv    = PluginStringView::fromCstr("agentxx_system_monitor.usage");
+    auto propsSv = PluginStringView::fromCstr(R"({"title":"System"})");
+    ctx.section  = ctx.iface.ui->register_info_section(ctx.host, &idSv, &propsSv);
+
+    if (ctx.iface.events && ctx.iface.events->subscribe) {
+        ctx.iface.events->subscribe(
+            ctx.host,
+            AGENTXX_CLIENT_EVT_PLUGIN_DATA,
+            [](const PluginxxStringView* payload_json, void* ud) {
+                auto* ctx = static_cast<SysMonClientCtx*>(ud);
+                if (!ctx || PluginStringView::empty(payload_json)) {
+                    return;
+                }
+                try {
+                    auto j = utilxx_base::Json::parse(
+                        std::string_view(payload_json->data, payload_json->size)
+                    );
+                    if (j.value("plugin", std::string{}) != "agentxx_system_monitor"
+                        || j.value("event", std::string{}) != "usage") {
+                        return;
+                    }
+                    if (j.contains("data") && j["data"].is_string()) {
+                        ctx->last_usage_json = j["data"].get<std::string>();
+                        refreshUsageDisplay(*ctx);
+                    }
+                } catch (...) {
+                }
+            },
+            &ctx
+        );
+    }
+
+    if (ctx.iface.ui->register_command) {
+        auto nameSv = PluginStringView::fromCstr("sysinfo");
+        auto descSv = PluginStringView::fromCstr(
+            "Toggle system resource usage display in sidebar Info section"
+        );
+        ctx.iface.ui->register_command(
+            ctx.host,
+            &nameSv,
+            &descSv,
+            [](void* ud, const PluginxxStringView*, PluginxxString* actionOut, PluginxxString*)
+                -> int32_t {
+                auto* ctx = static_cast<SysMonClientCtx*>(ud);
+                if (!ctx) {
+                    return -1;
+                }
+                const bool next = !ctx->usage_enabled.load(std::memory_order_relaxed);
+                ctx->usage_enabled.store(next, std::memory_order_relaxed);
+                refreshUsageDisplay(*ctx);
+                if (ctx->iface.wire && ctx->iface.wire->send_plugin_data) {
+                    std::string payload = next ? R"({"enabled":true})" : R"({"enabled":false})";
+                    auto        evtSv   = PluginStringView::fromCstr("usage_enabled");
+                    auto        paySv   = PluginStringView::from(payload.data(), payload.size());
+                    ctx->iface.wire->send_plugin_data(ctx->host, &evtSv, &paySv);
+                }
+                std::string text = next ? "System resource info: ON" : "System resource info: OFF";
+                std::string stateStr = ctx->clientState();
+                if (!stateStr.empty() && stateStr != "{}") {
+                    try {
+                        auto st = utilxx_base::Json::parse(stateStr);
+                        if (st.contains("agentPlugins") && st["agentPlugins"].is_array()) {
+                            bool found = false;
+                            for (const auto& v : st["agentPlugins"]) {
+                                if (v.is_object()
+                                    && v.value("name", std::string{}) == "agentxx_system_monitor") {
+                                    found = true;
+                                }
+                            }
+                            if (!found) {
+                                text
+                                    += " (warn: plugin missing on server side; toggle is local only)";
+                            }
+                        }
+                    } catch (...) {
+                    }
+                }
+                utilxx_base::Json out;
+                out["action"]      = "toast";
+                out["text"]        = text;
+                out["level"]       = 0;
+                std::string dumped = out.dump();
+                auto        paySv  = PluginStringView::from(dumped.data(), dumped.size());
+                if (actionOut) {
+                    *actionOut = PluginString::from(ctx->host, &paySv);
+                }
+                return 0;
+            },
+            &ctx
+        );
+    }
+
+    return 0;
+}
+
+static void* sysMonClientStart(
+    SysMonClientCtx&              ctx,
+    const PluginxxOperatorNotify* notify,
+    PluginxxString*               error
+) {
+    if (!notify) {
+        if (error) {
+            PluginString::set(
+                ctx.host,
+                error,
+                "agentxx_system_monitor client start: notify required"
+            );
+        }
+        return nullptr;
+    }
+    if (sysMonClientSetup(ctx) != 0) {
+        if (error) {
+            PluginString::set(
+                ctx.host,
+                error,
+                "agentxx_system_monitor client start: registration failed"
+            );
+        }
+        return nullptr;
+    }
+    notify->done(notify->host_ud, PLUGINXX_OPERATOR_OK, nullptr);
+    return nullptr;
+}
+
+static void*
+    sysMonClientStop(SysMonClientCtx&, const PluginxxOperatorNotify* notify, PluginxxString*) {
+    // UI 注册与订阅由主程序在 stop 后统一撤销。
+    notify->done(notify->host_ud, PLUGINXX_OPERATOR_OK, nullptr);
+    return nullptr;
+}
+
+AGENTXX_PLUGIN_CLIENT_EXPORT(
+    SysMonClientCtx,
+    "agentxx_system_monitor",
+    "1.1.0",
+    "System resource usage: Info section (CPU/RAM/GPU), /sysinfo toggle",
+    sysMonClientStart,
+    sysMonClientStop
+);

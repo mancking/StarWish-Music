@@ -1,0 +1,1177 @@
+/// agentxx_codegraph —— CodeGraph 代码分析插件
+#include "agentxx/plugin/api/client_plugin_api.h"
+#include "codegraph_manager.h"
+#include "codegraph_plugin.h"
+#include "fmt/format.h"
+#include "fmt/ranges.h"
+#include "utilxx_base/json.h"
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <map>
+#include <memory>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace agentxx_codegraph_plugin {
+
+using CodeGraphManager = agentxx_codegraph_plugin::CodeGraphManager;
+
+struct HostConfig {
+    std::string              dataDir;
+    std::string              projectRoot;
+    std::vector<std::string> loadPaths;
+    std::vector<std::string> ignorePaths;
+    bool                     useGitignore = true;
+    bool                     loadCwd      = true;
+};
+
+struct PluginCtx : public agentxx::plugin::PluginBase {
+    std::shared_ptr<agentxx_codegraph_plugin::CodeGraphManager> mgr;
+    std::string                                                 projectRoot;
+};
+
+static HostConfig
+    readHostConfig(const PluginxxHost* host, const agentxx::plugin::AgentIfaces& iface) {
+    HostConfig cfg;
+    if (!host || !iface.config) {
+        return cfg;
+    }
+    if (iface.config->get_config) {
+        PluginxxString json{nullptr, 0};
+        iface.config->get_config(host, &json);
+        if (json.data) {
+            std::string s{json.data, static_cast<size_t>(json.size)};
+            agentxx::plugin::PluginString::free(host, &json);
+            agentxx::plugin::ArgReader args(s);
+            cfg.dataDir     = args.value<std::string>("dataDir", std::string{});
+            cfg.projectRoot = args.value<std::string>("projectRoot", std::string{});
+        }
+    }
+    if (iface.config->get_plugin_args) {
+        PluginxxString json{nullptr, 0};
+        iface.config->get_plugin_args(host, &json);
+        if (json.data) {
+            std::string s{json.data, static_cast<size_t>(json.size)};
+            agentxx::plugin::PluginString::free(host, &json);
+            agentxx::plugin::ArgReader args(s);
+            cfg.loadPaths    = args.value<std::vector<std::string>>("paths", {});
+            cfg.ignorePaths  = args.value<std::vector<std::string>>("ignore_paths", {});
+            cfg.useGitignore = args.value<bool>("use_gitignore", cfg.useGitignore);
+            cfg.loadCwd      = args.value<bool>("load_cwd", cfg.loadCwd);
+        }
+    }
+    return cfg;
+}
+
+struct ToolPrompt {
+    std::string depict;
+    std::string query;
+    std::string limit;
+    std::string symbol;
+    std::string maxDepth;
+    std::string path;
+    std::string incremental;
+    std::string from;
+    std::string to;
+};
+
+static ToolPrompt defaultToolPrompt(std::string_view name) {
+    ToolPrompt p;
+    if (name == "agentxx_codegraph_search") {
+        p.depict
+            = "Search for code symbols (functions, classes, variables, etc.) by name using the "
+              "codegraph index.\n"
+              "Use this to quickly locate definitions across a large codebase.\n"
+              "Returns plain multi-line text: one block per symbol (\"[N] kind name\" plus "
+              "indented file:line and signature lines).";
+        p.query = "Symbol name to search for. Supports partial matching.";
+        p.limit = "Maximum number of results to return. Default: 20.";
+    } else if (name == "agentxx_codegraph_context") {
+        p.depict
+            = "Get rich context for a code symbol: its definition, callers, callees, and methods "
+              "(for classes).\n"
+              "Useful for understanding how a function or class is used throughout the codebase.\n"
+              "Returns plain multi-line text with \"symbol:\", \"callers (N):\", \"callees "
+              "(N):\", \"methods (N):\" and \"edges (N):\" sections.";
+        p.symbol   = "Fully qualified symbol name (e.g. `MyClass::myMethod`).";
+        p.limit    = "Maximum results per category. Default: 10.";
+        p.maxDepth = "Maximum call-graph traversal depth. Default: 3.";
+    } else if (name == "agentxx_codegraph_callers") {
+        p.depict
+            = "Find all functions that call a given symbol (reverse call-graph traversal).\n"
+              "Use this to understand what depends on a function before modifying it.\n"
+              "Returns plain multi-line text: \"Callers (N):\" followed by one block per symbol.";
+        p.symbol   = "Symbol name to find callers for.";
+        p.maxDepth = "Maximum traversal depth. Default: 3.";
+    } else if (name == "agentxx_codegraph_callees") {
+        p.depict
+            = "Find all functions that a given symbol calls (forward call-graph traversal).\n"
+              "Use this to understand a function's dependencies.\n"
+              "Returns plain multi-line text: \"Callees (N):\" followed by one block per symbol.";
+        p.symbol   = "Symbol name to find callees for.";
+        p.maxDepth = "Maximum traversal depth. Default: 3.";
+    } else if (name == "agentxx_codegraph_path") {
+        p.depict
+            = "Find the call-chain path between two symbols in the call graph.\n"
+              "Use this to trace how execution flows from one function to another.\n"
+              "Returns plain multi-line text: \"Path (N):\" followed by one block per symbol on "
+              "the path.";
+        p.from     = "Starting symbol name.";
+        p.to       = "Target symbol name.";
+        p.maxDepth = "Maximum search depth. Default: 10.";
+    }
+    return p;
+}
+
+/// 启用时注入的 system prompt 附加提示词 —— 强调符号定义/引用查找优先使用 CodeGraph
+constexpr std::string_view kSystemCodegraphPrompt = R"_(
+## CodeGraph
+
+You have access to CodeGraph code analysis tools for precise, index-based code navigation. **When you need to locate symbol definitions or find references / call relationships, prefer CodeGraph tools over text search (`agentxx_filesystem_grep`/`glob`)**:
+
+- `agentxx_codegraph_search` — search symbols by name (partial match) to locate definitions quickly
+- `agentxx_codegraph_context` — rich context for a symbol: definition, callers, callees, methods and edges
+- `agentxx_codegraph_callers` — reverse call-graph: find all functions that call a given symbol
+- `agentxx_codegraph_callees` — forward call-graph: find all functions that a given symbol calls
+- `agentxx_codegraph_path` — call-chain path between two symbols
+
+Workflow: use `search` to resolve the exact symbol name, then `context`/`callers`/`callees`/`path` as needed. Use these for tasks like "where is X defined", "who calls X", "what does X call", "what depends on X", "is it safe to modify X" before falling back to grep/glob. Results may be incomplete while indexing is in progress (tool output will warn).
+)_";
+
+static void injectCodegraphSystemPrompt(
+    const PluginxxHost*                 host,
+    const agentxx::plugin::AgentIfaces& iface
+) {
+    if (!host || !iface.prompt || !iface.prompt->set_prompt) {
+        return;
+    }
+    codegraph::Json j        = codegraph::Json::object();
+    codegraph::Json append   = codegraph::Json::object();
+    append["codegraph"]      = std::string(kSystemCodegraphPrompt);
+    j["appendSystemPrompts"] = append;
+    std::string payload      = j.dump();
+    auto        payloadSv = agentxx::plugin::PluginStringView::from(payload.data(), payload.size());
+    if (iface.prompt->set_prompt(host, &payloadSv) != 0) {
+        pluginLog(
+            host,
+            iface.log,
+            3,
+            "agentxx_codegraph: set appendSystemPrompts[codegraph] failed"
+        );
+    } else {
+        pluginLog(
+            host,
+            iface.log,
+            2,
+            "agentxx_codegraph: appendSystemPrompts[codegraph] injected via prompt iface"
+        );
+    }
+}
+
+static void
+    ensureToolPromptsInHost(const PluginxxHost* host, const agentxx::plugin::AgentIfaces& iface) {
+    if (!host || !iface.prompt || !iface.prompt->get_prompt || !iface.prompt->set_prompt) {
+        return;
+    }
+    PluginxxString json{nullptr, 0};
+    iface.prompt->get_prompt(host, &json);
+    if (!json.data) {
+        return;
+    }
+    std::string s{json.data, static_cast<size_t>(json.size)};
+    agentxx::plugin::PluginString::free(host, &json);
+    agentxx::plugin::ArgReader promptArgs(s);
+    static const char*         kToolNames[] = {
+        "agentxx_codegraph_search",
+        "agentxx_codegraph_context",
+        "agentxx_codegraph_callers",
+        "agentxx_codegraph_callees",
+        "agentxx_codegraph_path",
+    };
+    codegraph::Json patch = codegraph::Json::object();
+    codegraph::Json tools = codegraph::Json::object();
+    bool            dirty = false;
+    // 已有提示词经 ArgReader 原始 Json 判断存在性
+    const auto& raw = promptArgs.raw();
+    const bool  hasToolPrompt
+        = raw.is_object() && raw.contains("toolPrompt") && raw["toolPrompt"].is_object();
+    for (const char* name : kToolNames) {
+        if (hasToolPrompt && raw["toolPrompt"].contains(name)) {
+            continue;
+        }
+        auto p = defaultToolPrompt(name);
+        if (p.depict.empty()) {
+            continue;
+        }
+        codegraph::Json tp   = codegraph::Json::object();
+        tp["depict"]         = p.depict;
+        codegraph::Json args = codegraph::Json::object();
+        if (!p.query.empty()) {
+            args["query"] = p.query;
+        }
+        if (!p.limit.empty()) {
+            args["limit"] = p.limit;
+        }
+        if (!p.symbol.empty()) {
+            args["symbol"] = p.symbol;
+        }
+        if (!p.maxDepth.empty()) {
+            args["max_depth"] = p.maxDepth;
+        }
+        if (!p.path.empty()) {
+            args["path"] = p.path;
+        }
+        if (!p.incremental.empty()) {
+            args["incremental"] = p.incremental;
+        }
+        if (!p.from.empty()) {
+            args["from"] = p.from;
+        }
+        if (!p.to.empty()) {
+            args["to"] = p.to;
+        }
+        tp["args"]  = args;
+        tools[name] = tp;
+        dirty       = true;
+    }
+    if (!dirty) {
+        return;
+    }
+    patch["toolPrompt"]   = tools;
+    std::string payload   = patch.dump();
+    auto        payloadSv = agentxx::plugin::PluginStringView::from(payload.data(), payload.size());
+    if (iface.prompt->set_prompt(host, &payloadSv) != 0) {
+        pluginLog(host, iface.log, 3, "agentxx_codegraph: set_prompt failed");
+    }
+}
+
+static std::string appendJsonNodeDetails(std::string& out, const codegraph::Json& node) {
+    if (node.contains("file")) {
+        auto file = node["file"].get<std::string>();
+        if (node.contains("line")) {
+            out += fmt::format("\n    file: {}:{}", file, node["line"].get<int64_t>());
+        } else {
+            out += fmt::format("\n    file: {}", file);
+        }
+    }
+    if (node.contains("signature")) {
+        auto sig = node["signature"].get<std::string>();
+        if (!sig.empty()) {
+            out += fmt::format("\n    signature: {}", sig);
+        }
+    }
+    return out;
+}
+
+static std::string jsonNodesToText(std::string_view title, const codegraph::Json& arr) {
+    std::string out = fmt::format("{} ({}):", title, arr.size());
+    if (arr.size() == 0) {
+        out += "\n  (none)";
+        return out;
+    }
+    for (size_t i = 0; i < arr.size(); ++i) {
+        const auto& n = arr[i];
+        out += fmt::format("\n[{}] {} {}", i + 1, n.value("kind", ""), n.value("name", ""));
+        appendJsonNodeDetails(out, n);
+    }
+    return out;
+}
+
+static std::string jsonEdgesToText(const codegraph::Json& arr) {
+    std::string out = fmt::format("edges ({}):", arr.size());
+    if (arr.size() == 0) {
+        out += "\n  (none)";
+        return out;
+    }
+    for (size_t i = 0; i < arr.size(); ++i) {
+        const auto& e  = arr[i];
+        out           += fmt::format(
+            "\n[{}] {} -> {} ({})",
+            i + 1,
+            e.value("src", int64_t{0}),
+            e.value("dst", int64_t{0}),
+            e.value("kind", "")
+        );
+    }
+    return out;
+}
+
+static std::string contextToText(const codegraph::Json& ctx, CodeGraphManager* m) {
+    std::string out;
+    if (ctx.contains("symbol")) {
+        const auto& s  = ctx["symbol"];
+        out           += fmt::format("symbol: {} {}", s.value("kind", ""), s.value("name", ""));
+        appendJsonNodeDetails(out, s);
+    }
+    if (ctx.contains("callers") && ctx["callers"].is_array()) {
+        if (!out.empty()) {
+            out += "\n";
+        }
+        out += jsonNodesToText("callers", ctx["callers"]);
+    }
+    if (ctx.contains("callees") && ctx["callees"].is_array()) {
+        if (!out.empty()) {
+            out += "\n";
+        }
+        out += jsonNodesToText("callees", ctx["callees"]);
+    }
+    if (ctx.contains("methods") && ctx["methods"].is_array()) {
+        if (!out.empty()) {
+            out += "\n";
+        }
+        out += jsonNodesToText("methods", ctx["methods"]);
+    }
+    if (ctx.contains("edges") && ctx["edges"].is_array()) {
+        if (!out.empty()) {
+            out += "\n";
+        }
+        out += jsonEdgesToText(ctx["edges"]);
+    }
+    if (m && m->isIndexing()) {
+        out += "\nwarning: CodeGraph is still indexing, results may be incomplete";
+    }
+    return out.empty() ? "(empty context)" : out;
+}
+
+static std::string
+    impactToText(std::string_view title, const codegraph::Json& impact, CodeGraphManager* m) {
+    std::string out;
+    if (impact.contains("nodes") && impact["nodes"].is_array()) {
+        out += jsonNodesToText(title, impact["nodes"]);
+    } else {
+        out += fmt::format("{} (0):\n  (none)", title);
+    }
+    if (impact.contains("edges") && impact["edges"].is_array() && impact["edges"].size() > 0) {
+        out += fmt::format("\n{}", jsonEdgesToText(impact["edges"]));
+    }
+    if (m && m->isIndexing()) {
+        out += "\nwarning: CodeGraph is still indexing, results may be incomplete";
+    }
+    return out;
+}
+
+struct SchemaBuilder {
+    codegraph::Json properties = codegraph::Json::object();
+
+    void str(std::string_view key, std::string_view desc) {
+        properties[std::string(key)] = codegraph::Json{
+            {"type",        "string"         },
+            {"description", std::string(desc)}
+        };
+    }
+
+    void num(std::string_view key, std::string_view desc) {
+        properties[std::string(key)] = codegraph::Json{
+            {"type",        "number"         },
+            {"description", std::string(desc)}
+        };
+    }
+
+    std::string dump(std::initializer_list<std::string_view> req = {}) const {
+        codegraph::Json s;
+        s["type"]       = "object";
+        s["properties"] = properties;
+        if (req.size() > 0) {
+            auto arr = codegraph::Json::array();
+            for (auto r : req) {
+                arr.push_back(codegraph::Json(std::string(r)));
+            }
+            s["required"] = arr;
+        }
+        return s.dump();
+    }
+};
+
+static void registerAllTools(PluginCtx& ctx) {
+    constexpr int kAutoSummary = AGENTXX_PLUGIN_TOOL_FLAG_AUTO_SUMMARY;
+
+    // agentxx_codegraph_search
+    {
+        auto        p = ctx.toolPrompt("agentxx_codegraph_search");
+        std::string depict
+            = p.depict.empty() ? defaultToolPrompt("agentxx_codegraph_search").depict : p.depict;
+        SchemaBuilder b;
+        b.str(
+            "query",
+            p.args.contains("query") ? p.args["query"]
+                                     : "Symbol name to search for. Supports partial matching."
+        );
+        b.num(
+            "limit",
+            p.args.contains("limit") ? p.args["limit"]
+                                     : "Maximum number of results to return. Default: 20."
+        );
+        agentxx::plugin::blocking_tool(
+            ctx,
+            "agentxx_codegraph_search",
+            depict,
+            b.dump({"query"}),
+            [](PluginCtx& c, std::string_view args_json) -> std::string {
+                agentxx::plugin::ArgReader args(args_json);
+                std::string                query = args.value<std::string>("query", std::string{});
+                if (query.empty()) {
+                    throw std::invalid_argument{"Arg `query` is empty"};
+                }
+                int64_t limit64 = args.value<int64_t>("limit", 20);
+                auto    r       = c.mgr->searchSymbols(query, static_cast<int>(limit64));
+                if (!r.success) {
+                    return fmt::format("error: {}", r.error);
+                }
+                std::string out = fmt::format("Symbols ({}):", r.nodes.size());
+                if (r.nodes.empty()) {
+                    out += "\n  (none)";
+                }
+                int idx = 0;
+                for (const auto& node : r.nodes) {
+                    out += fmt::format(
+                        "\n[{}] {} {}",
+                        ++idx,
+                        codegraph::node_kind_str(node.kind),
+                        node.name
+                    );
+                    if (!node.qualified_name.empty() && node.qualified_name != node.name) {
+                        out += fmt::format("\n    qualified_name: {}", node.qualified_name);
+                    }
+                    out += fmt::format("\n    file: {}:{}", node.file_path, node.line);
+                    if (!node.signature.empty()) {
+                        out += fmt::format("\n    signature: {}", node.signature);
+                    }
+                }
+                if (c.mgr->isIndexing()) {
+                    out += "\nwarning: CodeGraph is still indexing, results may be incomplete";
+                }
+                return out;
+            },
+            0,
+            kAutoSummary
+        );
+    }
+
+    // agentxx_codegraph_context
+    {
+        auto        p = ctx.toolPrompt("agentxx_codegraph_context");
+        std::string depict
+            = p.depict.empty() ? defaultToolPrompt("agentxx_codegraph_context").depict : p.depict;
+        SchemaBuilder b;
+        b.str("symbol", p.args.contains("symbol") ? p.args["symbol"] : "Target symbol name.");
+        b.num(
+            "limit",
+            p.args.contains("limit") ? p.args["limit"]
+                                     : "Maximum results per category. Default: 10."
+        );
+        b.num(
+            "max_depth",
+            p.args.contains("max_depth") ? p.args["max_depth"]
+                                         : "Maximum traversal depth. Default: 3."
+        );
+        agentxx::plugin::blocking_tool(
+            ctx,
+            "agentxx_codegraph_context",
+            depict,
+            b.dump({"symbol"}),
+            [](PluginCtx& c, std::string_view args_json) -> std::string {
+                agentxx::plugin::ArgReader args(args_json);
+                std::string symbol = args.value<std::string>("symbol", std::string{});
+                if (symbol.empty()) {
+                    throw std::invalid_argument{"Arg `symbol` is empty"};
+                }
+                int64_t limit64 = args.value<int64_t>("limit", 10);
+                int64_t depth64 = args.value<int64_t>("max_depth", 3);
+                auto    r       = c.mgr->getSymbolContext(
+                    symbol,
+                    static_cast<int>(limit64),
+                    static_cast<int>(depth64)
+                );
+                if (!r.success) {
+                    return fmt::format("error: {}", r.error);
+                }
+                return contextToText(r.context, c.mgr.get());
+            },
+            0,
+            kAutoSummary
+        );
+    }
+
+    // agentxx_codegraph_callers
+    {
+        auto        p = ctx.toolPrompt("agentxx_codegraph_callers");
+        std::string depict
+            = p.depict.empty() ? defaultToolPrompt("agentxx_codegraph_callers").depict : p.depict;
+        SchemaBuilder b;
+        b.str("symbol", p.args.contains("symbol") ? p.args["symbol"] : "Target symbol name.");
+        b.num(
+            "max_depth",
+            p.args.contains("max_depth") ? p.args["max_depth"]
+                                         : "Maximum traversal depth. Default: 3."
+        );
+        agentxx::plugin::blocking_tool(
+            ctx,
+            "agentxx_codegraph_callers",
+            depict,
+            b.dump({"symbol"}),
+            [](PluginCtx& c, std::string_view args_json) -> std::string {
+                agentxx::plugin::ArgReader args(args_json);
+                std::string symbol = args.value<std::string>("symbol", std::string{});
+                if (symbol.empty()) {
+                    throw std::invalid_argument{"Arg `symbol` is empty"};
+                }
+                int64_t depth64 = args.value<int64_t>("max_depth", 3);
+                auto    r       = c.mgr->getCallers(symbol, static_cast<int>(depth64));
+                if (!r.success) {
+                    return fmt::format("error: {}", r.error);
+                }
+                return impactToText("Callers", r.impact, c.mgr.get());
+            },
+            0,
+            kAutoSummary
+        );
+    }
+
+    // agentxx_codegraph_callees
+    {
+        auto        p = ctx.toolPrompt("agentxx_codegraph_callees");
+        std::string depict
+            = p.depict.empty() ? defaultToolPrompt("agentxx_codegraph_callees").depict : p.depict;
+        SchemaBuilder b;
+        b.str("symbol", p.args.contains("symbol") ? p.args["symbol"] : "Target symbol name.");
+        b.num(
+            "max_depth",
+            p.args.contains("max_depth") ? p.args["max_depth"]
+                                         : "Maximum traversal depth. Default: 3."
+        );
+        agentxx::plugin::blocking_tool(
+            ctx,
+            "agentxx_codegraph_callees",
+            depict,
+            b.dump({"symbol"}),
+            [](PluginCtx& c, std::string_view args_json) -> std::string {
+                agentxx::plugin::ArgReader args(args_json);
+                std::string symbol = args.value<std::string>("symbol", std::string{});
+                if (symbol.empty()) {
+                    throw std::invalid_argument{"Arg `symbol` is empty"};
+                }
+                int64_t depth64 = args.value<int64_t>("max_depth", 3);
+                auto    r       = c.mgr->getCallees(symbol, static_cast<int>(depth64));
+                if (!r.success) {
+                    return fmt::format("error: {}", r.error);
+                }
+                return impactToText("Callees", r.impact, c.mgr.get());
+            },
+            0,
+            kAutoSummary
+        );
+    }
+
+    // agentxx_codegraph_path
+    {
+        auto        p = ctx.toolPrompt("agentxx_codegraph_path");
+        std::string depict
+            = p.depict.empty() ? defaultToolPrompt("agentxx_codegraph_path").depict : p.depict;
+        SchemaBuilder b;
+        b.str("from", p.args.contains("from") ? p.args["from"] : "Starting symbol name.");
+        b.str("to", p.args.contains("to") ? p.args["to"] : "Target symbol name.");
+        b.num(
+            "max_depth",
+            p.args.contains("max_depth") ? p.args["max_depth"]
+                                         : "Maximum search depth. Default: 10."
+        );
+        agentxx::plugin::blocking_tool(
+            ctx,
+            "agentxx_codegraph_path",
+            depict,
+            b.dump({"from", "to"}),
+            [](PluginCtx& c, std::string_view args_json) -> std::string {
+                agentxx::plugin::ArgReader args(args_json);
+                std::string                from = args.value<std::string>("from", std::string{});
+                std::string                to   = args.value<std::string>("to", std::string{});
+                if (from.empty() || to.empty()) {
+                    return "error: Args `from` and `to` are required";
+                }
+                int64_t depth64 = args.value<int64_t>("max_depth", 10);
+                auto    r       = c.mgr->findPath(from, to, static_cast<int>(depth64));
+                if (!r.success) {
+                    return fmt::format("error: {}", r.error);
+                }
+                std::string out = fmt::format("Path ({}):", r.path.size());
+                if (r.path.empty()) {
+                    out += "\n  (none)";
+                }
+                int idx = 0;
+                for (const auto& node : r.path) {
+                    out += fmt::format(
+                        "\n[{}] {} {}",
+                        ++idx,
+                        codegraph::node_kind_str(node.kind),
+                        node.name
+                    );
+                    if (!node.qualified_name.empty() && node.qualified_name != node.name) {
+                        out += fmt::format("\n    qualified_name: {}", node.qualified_name);
+                    }
+                    out += fmt::format("\n    file: {}:{}", node.file_path, node.line);
+                    if (!node.signature.empty()) {
+                        out += fmt::format("\n    signature: {}", node.signature);
+                    }
+                }
+                if (c.mgr->isIndexing()) {
+                    out += "\nwarning: CodeGraph is still indexing, results may be incomplete";
+                }
+                return out;
+            },
+            0,
+            kAutoSummary
+        );
+    }
+}
+
+static void
+    snapshotQueryDone(void* ud, int32_t status, void* result, const PluginxxStringView* error) {
+    (void)error;
+    auto* ctx   = static_cast<PluginCtx*>(ud);
+    auto* files = static_cast<int64_t*>(result);
+    agentxx::plugin::guardCallVoid(
+        [ctx](const char* m) noexcept {
+            pluginLog(ctx ? ctx->host : nullptr, ctx ? ctx->iface.log : nullptr, 4, m ? m : "");
+        },
+        [&] {
+            if (status == PLUGINXX_OPERATOR_OK && ctx && ctx->host && ctx->iface.events
+                && ctx->iface.events->publish) {
+                codegraph::Json j = codegraph::Json::object();
+                j["loaded"]       = true;
+                if (!ctx->projectRoot.empty()) {
+                    j["project_root"] = ctx->projectRoot;
+                }
+                std::string payload = j.dump();
+                auto        statusTopic
+                    = agentxx::plugin::PluginStringView::fromCstr("agentxx_codegraph.status");
+                auto payloadSv
+                    = agentxx::plugin::PluginStringView::from(payload.data(), payload.size());
+                ctx->iface.events->publish(ctx->host, &statusTopic, &payloadSv);
+                if (files && *files > 0) {
+                    codegraph::Json p = codegraph::Json::object();
+                    p["processed"]    = *files;
+                    p["total"]        = *files;
+                    p["current_file"] = "";
+                    std::string pp    = p.dump();
+                    auto        progTopic
+                        = agentxx::plugin::PluginStringView::fromCstr("agentxx_codegraph.progress");
+                    auto ppSv = agentxx::plugin::PluginStringView::from(pp.data(), pp.size());
+                    ctx->iface.events->publish(ctx->host, &progTopic, &ppSv);
+                }
+            }
+        }
+    );
+    if (ctx && ctx->host && ctx->host->vtable && ctx->host->vtable->free) {
+        if (files) {
+            ctx->host->vtable->free(files);
+        }
+    }
+}
+
+static void* snapshotQueryWork(void* ud, const PluginxxCancelToken*, PluginxxString*) {
+    auto* ctx = static_cast<PluginCtx*>(ud);
+    return agentxx::plugin::guardCall(
+        [ctx](const char* m) noexcept {
+            pluginLog(ctx ? ctx->host : nullptr, ctx ? ctx->iface.log : nullptr, 4, m ? m : "");
+        },
+        nullptr,
+        [&]() -> void* {
+            auto files
+                = ctx ? static_cast<int64_t*>(ctx->host->vtable->alloc(sizeof(int64_t))) : nullptr;
+            if (files) {
+                *files = -1;
+                if (ctx && ctx->mgr) {
+                    auto st = ctx->mgr->getStatus();
+                    if (st.success) {
+                        *files = st.total_files;
+                    }
+                }
+            }
+            return files;
+        }
+    );
+}
+
+static void PLUGINXX_CALL on_client_attached(const PluginxxStringView*, void* ud) {
+    auto* ctx = static_cast<PluginCtx*>(ud);
+    agentxx::plugin::guardCallVoid(
+        [ctx](const char* m) noexcept {
+            pluginLog(ctx ? ctx->host : nullptr, ctx ? ctx->iface.log : nullptr, 4, m ? m : "");
+        },
+        [&] {
+            if (!ctx || !ctx->host || !ctx->iface.scheduler || !ctx->iface.scheduler->offload) {
+                return;
+            }
+            ctx->iface.scheduler
+                ->offload(ctx->host, snapshotQueryWork, snapshotQueryDone, ctx, nullptr);
+        }
+    );
+}
+
+} // namespace agentxx_codegraph_plugin
+
+using namespace agentxx_codegraph_plugin;
+
+extern "C" PLUGINXX_EXPORT const PluginxxInfo* agentxx_plugin_agent_get_info(void) {
+    static const PluginxxInfo info{
+        PLUGINXX_API_VERSION,
+        0,
+        agentxx::plugin::PluginStringView::fromCstr("agentxx_codegraph"),
+        agentxx::plugin::PluginStringView::fromCstr("1.0.0"),
+        agentxx::plugin::PluginStringView::fromCstr(
+            "CodeGraph code analysis: symbol search/context/callers/callees/impact/path"
+        ),
+    };
+    return &info;
+}
+
+extern "C" PLUGINXX_EXPORT int
+    agentxx_plugin_agent_create(const PluginxxHost* host, void** plugin_ctx) {
+    PluginCtx* raw    = nullptr;
+    auto       logger = [&raw](const char* m) noexcept {
+        pluginLog(raw ? raw->host : nullptr, raw ? raw->iface.log : nullptr, 4, m ? m : "");
+    };
+    return agentxx::plugin::guardCall(std::move(logger), -1, [&]() -> int {
+        if (!host || !host->vtable || !plugin_ctx) {
+            return -1;
+        }
+        auto ctx = std::make_unique<PluginCtx>();
+        ctx->init(host);
+        raw = ctx.get();
+
+        if (!ctx->iface.tools || !ctx->iface.tools->register_tool || !ctx->iface.events) {
+            pluginLog(host, ctx->iface.log, 4, "agentxx_codegraph: lacks tools/events iface");
+            return -1;
+        }
+
+        auto cfg = readHostConfig(ctx->host, ctx->iface);
+        if (cfg.dataDir.empty()) {
+            pluginLog(
+                ctx->host,
+                ctx->iface.log,
+                3,
+                "agentxx_codegraph: dataDir not set, skip tools"
+            );
+            *plugin_ctx = ctx.release();
+            return 0;
+        }
+
+        agentxx_codegraph_plugin::CodeGraphIndexConfig cgConfig;
+        cgConfig.loadPaths           = cfg.loadPaths;
+        cgConfig.ignorePaths         = cfg.ignorePaths;
+        cgConfig.useGitignore        = cfg.useGitignore;
+        cgConfig.autoLoadProjectRoot = cfg.loadCwd;
+
+        std::string sqliteDir = (std::filesystem::path(cfg.dataDir) / "sqlite").string();
+        ctx->mgr
+            = std::make_shared<agentxx_codegraph_plugin::CodeGraphManager>(sqliteDir, cgConfig);
+        ctx->mgr->setLogSink([ctxPtr = ctx.get()](int level, const std::string& msg) {
+            pluginLog(
+                ctxPtr ? ctxPtr->host : nullptr,
+                ctxPtr ? ctxPtr->iface.log : nullptr,
+                level,
+                msg
+            );
+        });
+
+        PluginCtx* ctxRaw = ctx.get();
+        ctx->mgr->setProgressCallback(
+            [ctxRaw](int processed, int total, std::string_view currentFile) {
+                try {
+                    if (!ctxRaw || !ctxRaw->host || !ctxRaw->iface.events
+                        || !ctxRaw->iface.events->publish) {
+                        return;
+                    }
+                    codegraph::Json j   = codegraph::Json::object();
+                    j["processed"]      = processed;
+                    j["total"]          = total;
+                    j["current_file"]   = std::string{currentFile};
+                    std::string payload = j.dump();
+                    auto        progTopic
+                        = agentxx::plugin::PluginStringView::fromCstr("agentxx_codegraph.progress");
+                    auto payloadSv
+                        = agentxx::plugin::PluginStringView::from(payload.data(), payload.size());
+                    ctxRaw->iface.events->publish(ctxRaw->host, &progTopic, &payloadSv);
+                } catch (...) {
+                }
+            }
+        );
+
+        std::string projectRoot = cfg.projectRoot;
+        if (projectRoot.empty()) {
+            std::error_code ec;
+            projectRoot = std::filesystem::current_path(ec).string();
+            if (ec) {
+                projectRoot.clear();
+            }
+        }
+        if (projectRoot.empty()) {
+            pluginLog(ctx->host, ctx->iface.log, 4, "agentxx_codegraph: get current path failed");
+            *plugin_ctx = ctx.release();
+            return 0;
+        }
+
+        if (!ctx->mgr->initialize(projectRoot)) {
+            pluginLog(ctx->host, ctx->iface.log, 4, "agentxx_codegraph: initialize failed");
+            *plugin_ctx = ctx.release();
+            return 0;
+        }
+        ctx->projectRoot = projectRoot;
+
+        // 工具/prompt/事件/后台索引任务属于 start 事务, 见 codegraphAgentSetup
+        *plugin_ctx = ctx.release();
+        return 0;
+    });
+}
+
+/// 注册事务 (start 的实际内容): 工具/prompt/事件订阅/后台索引预热。
+/// - dataDir 缺失或 initialize 失败时 mgr 为空: 保持降级加载, start 直接完成
+///   (与迁移前 create 的降级行为一致)。
+/// - 后台 warmup 由 std::thread 改为主程序托管任务 (ctx.spawn): 卸载时可取消,
+///   且 offload 期间持有实例 lease, destroy/dlclose 前必然等待索引代码返回。
+static int codegraphAgentSetup(PluginCtx& ctx) {
+    if (!ctx.mgr) {
+        return 0;
+    }
+    ensureToolPromptsInHost(ctx.host, ctx.iface);
+    injectCodegraphSystemPrompt(ctx.host, ctx.iface);
+    registerAllTools(ctx);
+
+    if (ctx.iface.events && ctx.iface.events->subscribe) {
+        auto attachTopic
+            = agentxx::plugin::PluginStringView::fromCstr("agentxx_host.client_attached");
+        ctx.iface.events->subscribe(ctx.host, &attachTopic, on_client_attached, &ctx);
+    }
+
+    ctx.spawn([](PluginCtx& c, agentxx::plugin::OpCtl ctl) -> agentxx::plugin::Task<void> {
+        co_await agentxx::plugin::sleep(c, 2000);
+        if (ctl.cancelled()) {
+            co_return;
+        }
+        const auto startedAt = std::chrono::steady_clock::now();
+        const bool ok = co_await agentxx::plugin::offload(c, [&c](const PluginxxCancelToken*) {
+            return c.mgr->updateIndex();
+        });
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - startedAt
+        )
+                            .count();
+        pluginLog(
+            c.host,
+            c.iface.log,
+            ok ? 2 : 3,
+            fmt::format("[codegraph] background warmup index {} ({}ms)", ok ? "done" : "failed", ms)
+        );
+    });
+
+    if (ctx.iface.events && ctx.iface.events->publish) {
+        codegraph::Json j   = codegraph::Json::object();
+        j["loaded"]         = true;
+        j["project_root"]   = ctx.projectRoot;
+        std::string payload = j.dump();
+        auto statusTopic = agentxx::plugin::PluginStringView::fromCstr("agentxx_codegraph.status");
+        auto payloadSv   = agentxx::plugin::PluginStringView::from(payload.data(), payload.size());
+        ctx.iface.events->publish(ctx.host, &statusTopic, &payloadSv);
+    }
+    pluginLog(ctx.host, ctx.iface.log, 2, "agentxx_codegraph started (6 tools)");
+    return 0;
+}
+
+static void* codegraphAgentStart(
+    PluginCtx&                    ctx,
+    const PluginxxOperatorNotify* notify,
+    PluginxxString*               error
+) {
+    if (!notify) {
+        if (error) {
+            agentxx::plugin::PluginString::set(
+                ctx.host,
+                error,
+                "agentxx_codegraph start: notify required"
+            );
+        }
+        return nullptr;
+    }
+    if (codegraphAgentSetup(ctx) != 0) {
+        if (error) {
+            agentxx::plugin::PluginString::set(
+                ctx.host,
+                error,
+                "agentxx_codegraph start: setup failed"
+            );
+        }
+        return nullptr;
+    }
+    notify->done(notify->host_ud, PLUGINXX_OPERATOR_OK, nullptr);
+    return nullptr;
+}
+
+static void* codegraphAgentStop(PluginCtx&, const PluginxxOperatorNotify* notify, PluginxxString*) {
+    // 注册记录与后台任务句柄由主程序在 stop 后统一撤销/取消; 索引数据保留在
+    // 实例上下文中, 下次 start 直接复用。
+    notify->done(notify->host_ud, PLUGINXX_OPERATOR_OK, nullptr);
+    return nullptr;
+}
+
+AGENTXX_PLUGIN_AGENT_LIFECYCLE_EXPORT(PluginCtx, codegraphAgentStart, codegraphAgentStop)
+
+extern "C" PLUGINXX_EXPORT void agentxx_plugin_agent_destroy(void* plugin_ctx) {
+    auto* ctx = static_cast<PluginCtx*>(plugin_ctx);
+    agentxx::plugin::guardCallVoid(
+        [ctx](const char* m) noexcept {
+            pluginLog(ctx ? ctx->host : nullptr, ctx ? ctx->iface.log : nullptr, 4, m ? m : "");
+        },
+        [&] {
+            if (!ctx) {
+                return;
+            }
+            pluginLog(ctx->host, ctx->iface.log, 2, "agentxx_codegraph unloaded");
+            delete ctx;
+        }
+    );
+}
+
+/// ==================== client 侧入口 —— CodeGraph 索引状态渲染 (Append 段风格, 恢复 1e524e62)
+/// ====================
+
+/// client 侧每实例上下文 (多实例契约: 原进程级 static 状态全部移入)
+struct ClientCtx {
+    const PluginxxHost*           host = nullptr;
+    agentxx::plugin::ClientIfaces iface{};
+    const AgentxxClientUiIface*   ui           = nullptr;
+    AgentxxInfoSection*           section      = nullptr;
+    bool                          loaded       = false;
+    bool                          has_progress = false;
+    int64_t                       processed    = 0;
+    int64_t                       total        = 0;
+    std::string                   current_file;
+
+    void logErr(const char* m) const noexcept {
+        agentxx::plugin::logTo(host, iface.log, 4, "agentxx_codegraph", m ? m : "");
+    }
+};
+
+static std::string buildInfoItemsJson(ClientCtx& c) {
+    // 组件项经描述层与扩展 kit 组装 (文本行用 kit::text, 进度用构建器)
+    std::vector<pluginxx::ui::Item> items;
+    auto pushText = [&](const std::string& text, std::string tone = {}) {
+        utilxx_base::Json params;
+        params["text"] = text;
+        if (!tone.empty()) {
+            params["tone"] = std::move(tone);
+        }
+        items.push_back(agentxx::ui::kit::text(params));
+    };
+    if (!c.loaded) {
+        pushText("|- wait for load", "hint");
+    } else {
+        const bool indexing = c.total > 0 ? !(c.processed >= c.total) : (c.processed > 0);
+        if (c.has_progress && indexing) {
+            if (c.total > 0) {
+                const double pct = static_cast<double>(c.processed) / static_cast<double>(c.total);
+                pushText(
+                    fmt::format("|- indexing {:.0f}% ({}/{})", pct * 100.0, c.processed, c.total)
+                );
+                items.push_back(pluginxx::ui::build::progress(pct * 100.0, 100.0));
+            } else {
+                pushText(fmt::format("|- Indexing {} files", c.processed));
+            }
+            if (!c.current_file.empty()) {
+                std::string fname = c.current_file;
+                const auto  pos   = fname.find_last_of("/\\");
+                if (pos != std::string::npos) {
+                    fname = fname.substr(pos + 1);
+                }
+                pushText(fmt::format("|  {}", fname), "hint");
+            }
+        } else if (c.has_progress && c.total > 0) {
+            pushText(fmt::format("|- available \u00b7 {}", c.total));
+        } else {
+            pushText("|- wait for index", "hint");
+        }
+    }
+    utilxx_base::Json out;
+    out["items"] = pluginxx::ui::dumpBlocks(items);
+    return out.dump();
+}
+
+static void refreshSection(ClientCtx& c) {
+    if (!c.host || !c.ui || !c.ui->update_info_section) {
+        return;
+    }
+    if (!c.section && c.ui->register_info_section) {
+        auto idSv    = agentxx::plugin::PluginStringView::fromCstr("agentxx_codegraph.status");
+        auto titleSv = agentxx::plugin::PluginStringView::fromCstr(R"({"title":"CodeGraph"})");
+        c.section    = c.ui->register_info_section(c.host, &idSv, &titleSv);
+    }
+    if (!c.section) {
+        return;
+    }
+    const std::string json   = buildInfoItemsJson(c);
+    auto              jsonSv = agentxx::plugin::PluginStringView::from(json.data(), json.size());
+    c.ui->update_info_section(c.host, c.section, &jsonSv);
+}
+
+static void PLUGINXX_CALL onClientPluginData(const PluginxxStringView* payload_json, void* ud) {
+    auto* ctx = static_cast<ClientCtx*>(ud);
+    if (!ctx || !ctx->host) {
+        return;
+    }
+    std::string raw(
+        payload_json && payload_json->data ? payload_json->data : "{}",
+        payload_json ? static_cast<size_t>(payload_json->size) : 0
+    );
+    try {
+        auto j      = utilxx_base::Json::parse(raw);
+        auto plugin = j.value("plugin", std::string{});
+        auto event  = j.value("event", std::string{});
+        if (plugin != "agentxx_codegraph") {
+            return;
+        }
+        utilxx_base::Json d;
+        if (j.contains("data")) {
+            auto dv = j["data"];
+            if (dv.is_string()) {
+                try {
+                    d = utilxx_base::Json::parse(dv.get<std::string>());
+                } catch (...) {
+                    d = utilxx_base::Json::object();
+                }
+            } else if (dv.is_object()) {
+                d = dv;
+            }
+        }
+        if (event == "status") {
+            bool loaded = d.value("loaded", false);
+            ctx->loaded = loaded;
+            if (!loaded) {
+                ctx->has_progress = false;
+                ctx->processed    = 0;
+                ctx->total        = 0;
+                ctx->current_file.clear();
+            }
+            refreshSection(*ctx);
+        } else if (event == "progress") {
+            int64_t     processed = d.value<int64_t>("processed", 0);
+            int64_t     total     = d.value<int64_t>("total", 0);
+            std::string cur       = d.value("current_file", std::string{});
+            ctx->processed        = processed;
+            ctx->total            = total;
+            ctx->current_file     = std::move(cur);
+            ctx->has_progress     = true;
+            ctx->loaded           = true;
+            refreshSection(*ctx);
+        }
+    } catch (...) {
+    }
+}
+
+extern "C" PLUGINXX_EXPORT const AgentxxClientPluginInfo* agentxx_plugin_client_get_info(void) {
+    static const AgentxxClientPluginInfo info{
+        AGENTXX_CLIENT_PLUGIN_API_VERSION,
+        0,
+        agentxx::plugin::PluginStringView::fromCstr("agentxx_codegraph"),
+        agentxx::plugin::PluginStringView::fromCstr("1.0.0"),
+        agentxx::plugin::PluginStringView::fromCstr("CodeGraph index status (sidebar Info section)"
+        ),
+    };
+    return &info;
+}
+
+/// client 侧 create: 只构造上下文 (查询接口表, 不注册任何 UI 项)
+extern "C" PLUGINXX_EXPORT int
+    agentxx_plugin_client_create(const PluginxxHost* host, void** plugin_ctx) {
+    ClientCtx* raw = nullptr;
+    return agentxx::plugin::guardCall(
+        [&raw](const char* m) noexcept {
+            if (raw) {
+                raw->logErr(m);
+            }
+        },
+        -1,
+        [&]() -> int {
+            if (!host || !host->vtable || !plugin_ctx) {
+                return -1;
+            }
+            auto ctx   = std::make_unique<ClientCtx>();
+            ctx->host  = host;
+            ctx->iface = agentxx::plugin::ClientIfaces::query(host);
+            ctx->ui    = agentxx::plugin::queryInterface<AgentxxClientUiIface>(
+                host,
+                AGENTXX_IFACE_CLIENT_UI
+            );
+            *plugin_ctx = ctx.release();
+            return 0;
+        }
+    );
+}
+
+/// client 侧 start: 注册 Info 段落与跨端数据订阅 (注册事务)
+static void* codegraphClientStart(
+    ClientCtx&                    ctx,
+    const PluginxxOperatorNotify* notify,
+    PluginxxString*               err
+) {
+    if (ctx.ui && ctx.ui->register_info_section) {
+        auto idSv    = agentxx::plugin::PluginStringView::fromCstr("agentxx_codegraph.status");
+        auto titleSv = agentxx::plugin::PluginStringView::fromCstr(R"({"title":"CodeGraph"})");
+        ctx.section  = ctx.ui->register_info_section(ctx.host, &idSv, &titleSv);
+        if (ctx.section) {
+            refreshSection(ctx);
+        }
+    }
+    if (!ctx.iface.events || !ctx.iface.events->subscribe
+        || !ctx.iface.events
+                ->subscribe(ctx.host, AGENTXX_CLIENT_EVT_PLUGIN_DATA, onClientPluginData, &ctx)) {
+        agentxx::plugin::PluginString::set(ctx.host, err, "events subscribe failed");
+        return nullptr;
+    }
+    if (ctx.iface.log && ctx.iface.log->log) {
+        auto msgSv = agentxx::plugin::PluginStringView::fromCstr("agentxx_codegraph client loaded");
+        ctx.iface.log->log(ctx.host, 2, &msgSv);
+    }
+    notify->done(notify->host_ud, PLUGINXX_OPERATOR_OK, nullptr);
+    return nullptr;
+}
+
+/// client 侧 stop: 撤销 Info 段落 (可重复调用)
+static void*
+    codegraphClientStop(ClientCtx& ctx, const PluginxxOperatorNotify* notify, PluginxxString*) {
+    if (ctx.section && ctx.ui && ctx.ui->unregister_info_section) {
+        ctx.ui->unregister_info_section(ctx.host, ctx.section);
+        ctx.section = nullptr;
+    }
+    ctx.current_file.clear();
+    notify->done(notify->host_ud, PLUGINXX_OPERATOR_OK, nullptr);
+    return nullptr;
+}
+
+AGENTXX_PLUGIN_CLIENT_LIFECYCLE_EXPORT(ClientCtx, codegraphClientStart, codegraphClientStop)
+
+extern "C" PLUGINXX_EXPORT void agentxx_plugin_client_destroy(void* plugin_ctx) {
+    auto* ctx = static_cast<ClientCtx*>(plugin_ctx);
+    agentxx::plugin::guardCallVoid(
+        [ctx](const char* m) noexcept {
+            if (ctx) {
+                ctx->logErr(m);
+            }
+        },
+        [&] {
+            if (!ctx || !ctx->host) {
+                delete ctx;
+                return;
+            }
+            // destroy 只释放本地状态: UI 项撤销已由 stop 完成
+            if (ctx->iface.log && ctx->iface.log->log) {
+                auto msgSv = agentxx::plugin::PluginStringView::fromCstr(
+                    "agentxx_codegraph client unloaded"
+                );
+                ctx->iface.log->log(ctx->host, 2, &msgSv);
+            }
+            delete ctx;
+        }
+    );
+}

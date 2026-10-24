@@ -14,7 +14,7 @@ const common = {
   target: 'node20',
   format: 'cjs',
   sourcemap: false,
-  minify: false,
+  minify: true,
   logLevel: 'info',
   external: ['electron', 'sql.js', 'music-metadata'],
   define: { 'process.env.NODE_ENV': '"production"' },

@@ -1,0 +1,27 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "compileLinuxDebugCxx",
+            "type": "shell",
+            "command": "${workspaceFolder}/agent/script/linux_debug_build.sh",
+            "args": [],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "compileWindowsDebugCxx",
+            "type": "shell",
+            "command": "${workspaceFolder}/agent/script/windows_debug_build.bat",
+            "args": [],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": []
+        }
+    ]
+}

@@ -1,0 +1,1231 @@
+#include "agentxx-test/core/test_agent.h"
+
+#include "agentxx-test/core/test_message_supplement.h"
+
+#include "agentxx/agent/code_agent.h"
+#include "agentxx/agent/context.h"
+#include "agentxx/agent/io/agent_io.h"
+#include "agentxx/middlewares/middleware.h"
+#include "agentxx/nodes/modelcall.h"
+#include "agentxx/tools/tool.h"
+#include "agentxx/util/neograph_json_bridge.h"
+#include "asio/as_tuple.hpp"
+#include "asio/co_spawn.hpp"
+#include "asio/deferred.hpp"
+#include "asio/experimental/parallel_group.hpp"
+#include "asio/steady_timer.hpp"
+#include "asio/this_coro.hpp"
+#include "asio/use_awaitable.hpp"
+#include "neograph/graph/cancel.h"
+#include "neograph/graph/loader.h"
+#include "utilxx_base/hash.h"
+#include <atomic>
+#include <chrono>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "fmt/format.h"
+
+namespace {
+// 本模块测试计数器 (仅本编译单元可见; 不经头文件 extern 导出)
+int g_ms_passed = 0;
+int g_ms_failed = 0;
+} // namespace
+
+// 断言计数宏覆盖: 将 test_framework.h 的 XX_TEST_EXPECT_* 映射到本模块计数器
+#define XX_TEST_PASSED g_ms_passed
+#define XX_TEST_FAILED g_ms_failed
+
+namespace agentxx {
+namespace test {
+
+// ===========================================================================
+// 测试目标: 中断 / 取消(超时停止) 后 BaseAgent 自动补充的消息
+// (实现位于 agent/lib/src/nodes/toolcall.cpp)
+//
+// 1. 中断 (tool 触发 NodeInterrupt):
+//    - 触发中断的 tool 结果自动补充为 [Interrupt] 占位消息
+//      (role=tool, flags=Interrupt), 保证 assistant tool_call 有对应 tool 回复
+//    - 中断处理并 resume 后, 该 tool 重新执行返回真实结果, 最终上下文
+//      角色顺序: system -> user -> assistant(tool_calls) -> tool -> assistant
+// 2. 取消 / 超时停止 (CancelToken 取消):
+//    - 串行 toolcall 下, 取消时未完成的 tool 全部自动补充 [User canceled]
+//      tool 消息 (role=tool, flags=AutoInserted, 按 tool_calls 声明顺序)
+//    - 最终上下文角色顺序完整, 每条 assistant tool_call 都有 tool 回复
+// ===========================================================================
+
+/// 中断 E2E 专用 IO:
+/// - handleInterrupt 在中断处理时刻校验自动补充的 [Interrupt] 消息
+///   (角色/内容/flag/关联 tool_call_id/tool_name)
+/// - 同时校验中断时刻保存的上下文 (tempMessages) 角色顺序
+/// - 返回固定结果驱动 resume
+class InterruptMockIO : public agentxx::agent::AgentIOBase {
+public:
+
+    // 注意: 必须用 weak_ptr 持有 AgentContext!
+    // 否则 io 被 BaseAgent 存入 session->io (shared_ptr) 后, 会形成
+    // AgentContext -> Session::io -> InterruptMockIO -> AgentContext 循环引用,
+    // 导致 AgentContext 整棵树无法释放 (ASan 报告内存泄漏)
+    std::weak_ptr<agentxx::agent::AgentContext> agentContext;
+    std::atomic<bool>                           interruptMsgOk{false};
+    std::atomic<bool>                           interruptTempOrderOk{false};
+    std::atomic<int>                            interruptCalls{0};
+
+    explicit InterruptMockIO(std::shared_ptr<agentxx::agent::AgentContext> ctx) :
+        agentContext(ctx) {}
+
+    void onDelta(const agentxx::agent::WireDelta&) override {}
+
+    void onSync(const agentxx::agent::WireSyncPayload&) override {}
+
+    asio::awaitable<std::optional<std::string>> getInput() override {
+        co_return std::nullopt;
+    }
+
+    asio::awaitable<utilxx_base::Json> handleInterrupt(
+        std::string_view sessionId,
+        std::string_view /*interruptNode*/,
+        std::string_view /*interruptValue*/,
+        std::string_view /*interruptArgJson*/
+    ) override {
+        ++interruptCalls;
+        auto ctx = agentContext.lock();
+        if (!ctx || !ctx->middlewareHandleContext) {
+            co_return agentxx::middleware::makeInterruptResult(utilxx_base::Json::object());
+        }
+        auto& graphData = ctx->middlewareHandleContext;
+
+        // 1) 中断时刻自动补充的 [Interrupt] tool 消息:
+        //    - 触发中断的 tool 结果以 [Interrupt] 占位 (role=tool), 保证
+        //      assistant tool_call 有对应 tool 回复, 角色顺序完整
+        auto cache = graphData->getGraphDataItemValue<utilxx_base::Json>(
+            sessionId,
+            agentxx::middleware::MiddlewareContext::graphDataKey_interruptToolcallCache
+        );
+        if (cache.is_array() && cache.size() == 1) {
+            const auto& m = cache[0];
+            const auto  flags
+                = static_cast<neograph::MessageFlag>(m.value<unsigned long long>("flags", 0));
+            interruptMsgOk = m.value("role", std::string{}) == "tool"
+                             && m.value("content", std::string{}) == "[Interrupt]"
+                             && m.value("tool_call_id", std::string{}) == "call_it_1"
+                             && m.value("tool_name", std::string{}) == "test_interrupt"
+                             && neograph::hasFlag(flags, neograph::MessageFlag::Interrupt);
+        }
+
+        // 2) 中断时刻上下文 (会话为唯一权威, 不再有图状态快照):
+        //    角色顺序应为 system -> user -> assistant(tool_calls)
+        //    (modelcall 节点会在会话上下文头部补充 system 消息)
+        // - 未定稿的 tool 结果不进上下文 (只在 interruptToolcallCache 里),
+        //   resume 后重新执行该节点再写入
+        auto sess = ctx->sessions ? ctx->sessions->get(sessionId) : nullptr;
+        if (sess && sess->isIoThread() && sess->messagesCount() == 3) {
+            const auto& msgs = sess->messages();
+            interruptTempOrderOk
+                = msgs[0].role == "system" && msgs[1].role == "user"
+                  && msgs[2].role == "assistant" && msgs[2].tool_calls.size() == 1
+                  && msgs[2].tool_calls[0].id == "call_it_1";
+        }
+
+        co_return agentxx::middleware::makeInterruptResult(utilxx_base::Json{
+            {"handled", "handled"}
+        });
+    }
+};
+
+/// 触发中断的 tool: 首次调用经 requestInterrupt 存储参数并抛 NodeInterrupt,
+/// resume 后从 interruptResult 按 resultId 提取结果返回 (与 subagent 工具同模式)
+class InterruptTriggerTool : public agentxx::tools::XXToolBase {
+public:
+
+    explicit InterruptTriggerTool(std::weak_ptr<agentxx::agent::AgentContext> ctx) :
+        XXToolBase("test_interrupt", ctx, false, false) {}
+
+    neograph::ChatTool get_definition() const override {
+        return neograph::ChatTool{
+            .name        = "test_interrupt",
+            .description = "trigger interrupt for supplement test",
+            .parameters  = neograph::json{{"type", "object"}},
+        };
+    }
+
+    asio::awaitable<std::string> execute_async(const utilxx_base::Json& arguments) override {
+        auto agentCtxPtr = agentContext.lock();
+        if (!agentCtxPtr || !agentCtxPtr->middlewareHandleContext) {
+            co_return R"({"error":"AgentContext not available"})";
+        }
+        auto sessionId = arguments.value("sessionId", std::string{});
+        auto resultId  = arguments.value("tool_call_id", std::string{});
+
+        // 通过 requestInterrupt 触发/恢复中断:
+        // - 首次: 存储中断参数到 graphData, 抛 NodeInterrupt
+        // - 恢复: 从 graphData 读取中断结果, 按 resultId 提取
+        auto result = co_await agentCtxPtr->middlewareHandleContext->requestInterrupt(
+            sessionId,
+            [&]() {
+                return agentxx::middleware::InterruptHandleArg{
+                    .name     = agentxx::middleware::MiddlewareContext::interruptHandleName_default,
+                    .arg      = utilxx_base::Json{{"question", "approve?"}},
+                    .resultId = resultId,
+                };
+            },
+            nullptr
+        );
+
+        // interruptResult 存储的是 {resultId: value} map; 按自身 resultId 提取
+        // - 客户端结果恒为对象形态 {"values": {控件 id: 值}}: 服务端取 values
+        //   写回 resume 值, 故此处按控件值对象解析 (取首个控件值, 与 toolcall
+        //   重复调用检查等生产消费者一致)
+        if (result.is_object() && !resultId.empty() && result.contains(resultId)) {
+            auto val = result[resultId];
+            if (val.is_string()) {
+                co_return val.get<std::string>();
+            }
+            if (val.is_object() && val.size() == 1) {
+                for (auto it = val.begin(); it != val.end(); ++it) {
+                    if (it->is_string()) {
+                        co_return it->get<std::string>();
+                    }
+                    co_return it->dump();
+                }
+            }
+            co_return val.dump();
+        }
+        if (result.is_string()) {
+            co_return result.get<std::string>();
+        }
+        co_return result.dump();
+    }
+};
+
+/// 快速 tool: 排在 slow 之后声明 (串行 toolcall 下取消后不再执行,
+/// 同样被补充 [User canceled])
+class FastDoneTool : public agentxx::tools::XXToolBase {
+public:
+
+    explicit FastDoneTool(std::weak_ptr<agentxx::agent::AgentContext> ctx) :
+        XXToolBase("test_fast", ctx, false, false) {}
+
+    neograph::ChatTool get_definition() const override {
+        return neograph::ChatTool{
+            .name        = "test_fast",
+            .description = "fast tool for cancel supplement test",
+            .parameters  = neograph::json{{"type", "object"}},
+        };
+    }
+
+    asio::awaitable<std::string> execute_async(const utilxx_base::Json&) override {
+        co_return "fast done";
+    }
+};
+
+/// 慢速 tool: 模拟耗时 IO, 取消时未完成 → 应自动补充 [User canceled]
+class SlowHangTool : public agentxx::tools::XXToolBase {
+public:
+
+    SlowHangTool(std::weak_ptr<agentxx::agent::AgentContext> ctx, std::atomic<bool>* started) :
+        XXToolBase("test_slow", ctx, false, false),
+        started_(started) {}
+
+    neograph::ChatTool get_definition() const override {
+        return neograph::ChatTool{
+            .name        = "test_slow",
+            .description = "slow tool for cancel supplement test",
+            .parameters  = neograph::json{{"type", "object"}},
+        };
+    }
+
+    asio::awaitable<std::string> execute_async(const utilxx_base::Json&) override {
+        started_->store(true, std::memory_order_release);
+        // 模拟耗时异步 IO: 最长等待 5s (取消时被取消语义中断, 未完成
+        // → 自动补充 [User canceled]; 5s 避免全量测试高负载下 2s 偶发自然完成)
+        asio::steady_timer timer(co_await asio::this_coro::executor, std::chrono::seconds(5));
+        co_await timer.async_wait(asio::use_awaitable);
+        co_return "slow done";
+    }
+
+private:
+
+    std::atomic<bool>* started_;
+};
+
+/// 测试用 Agent: 注入 中断/快速/慢速 tool
+class SupplementTestAgent : public agentxx::agent::CodeAgent {
+public:
+
+    std::atomic<bool> slowStarted{false};
+
+    explicit SupplementTestAgent(std::shared_ptr<agentxx::agent::AgentConfig> cfg) :
+        CodeAgent(std::move(cfg)) {}
+
+protected:
+
+    asio::awaitable<std::vector<std::unique_ptr<agentxx::tools::XXToolBase>>> initTools() override {
+        auto tools = co_await CodeAgent::initTools();
+        tools.push_back(std::make_unique<InterruptTriggerTool>(agentContext));
+        tools.push_back(std::make_unique<FastDoneTool>(agentContext));
+        tools.push_back(std::make_unique<SlowHangTool>(agentContext, &slowStarted));
+        co_return tools;
+    }
+};
+
+// ===========================================================================
+// 中断 E2E: tool 触发 NodeInterrupt
+// - 中断时刻: 自动补充 [Interrupt] tool 消息 (角色/内容/flag/关联 id 正确)
+// - 中断处理后 resume: 最终上下文角色顺序正确, tool 回复为真实中断结果
+// ===========================================================================
+asio::awaitable<void> test_interrupt_auto_supplement() {
+    auto sim     = startDaSimServer();
+    auto baseUrl = "http://127.0.0.1:" + std::to_string(sim.port);
+
+    auto cfg                 = std::make_shared<agentxx::agent::AgentConfig>();
+    cfg->model.baseUrl       = baseUrl;
+    cfg->model.apiKey        = "EMPTY";
+    cfg->model.modelName     = "test-sim";
+    cfg->prompt.systemPrompt = "You are a helpful assistant.";
+
+    g_da_sim_response_content = "Final answer after interrupt.";
+    g_da_sim_delay_ms         = 0;
+    // 首次 LLM 调用返回 tool_call; 响应后 sim 自动清空, 第二次调用返回 content
+    g_da_sim_tool_calls = utilxx_base::Json::array({
+        utilxx_base::Json{
+                          {"index", 0},
+                          {"id", "call_it_1"},
+                          {"type", "function"},
+                          {"function",
+             utilxx_base::Json{
+                 {"name", "test_interrupt"},
+                 {"arguments", "{}"},
+             }},
+                          },
+    });
+
+    SupplementTestAgent agent(cfg);
+    co_await agent.init();
+
+    auto io     = std::make_shared<InterruptMockIO>(agent.agentContext);
+    auto result = co_await agent.runTurnAsync("interrupt_msg_test", "Please interrupt", io);
+
+    // 中断被处理并 resume, 轮次正常完成 (interrupted 标记 true, 无错误)
+    XX_TEST_EXPECT_FALSE(result.hasError);
+    XX_TEST_EXPECT_TRUE(result.interrupted);
+
+    // 中断处理时刻: IO 的 handleInterrupt 内已完成校验
+    XX_TEST_EXPECT_EQ(io->interruptCalls.load(), 1);
+    XX_TEST_EXPECT_TRUE(io->interruptMsgOk.load());
+    XX_TEST_EXPECT_TRUE(io->interruptTempOrderOk.load());
+
+    // resume 后最终上下文: 角色顺序 system -> user -> assistant(tool_calls)
+    // -> tool(真实中断结果) -> assistant(最终回复)
+    auto session = agent.agentContext->sessions->get("interrupt_msg_test");
+    XX_TEST_EXPECT_TRUE(session != nullptr);
+    if (session) {
+        const auto& msgs = session->llmMessagesJson();
+        XX_TEST_EXPECT_TRUE(msgs.is_array() && msgs.size() == 5);
+        if (msgs.is_array() && msgs.size() == 5) {
+            XX_TEST_EXPECT_EQ(msgs[0].value("role", std::string{}), std::string{"system"});
+            XX_TEST_EXPECT_EQ(msgs[1].value("role", std::string{}), std::string{"user"});
+            XX_TEST_EXPECT_EQ(msgs[2].value("role", std::string{}), std::string{"assistant"});
+            XX_TEST_EXPECT_EQ(msgs[3].value("role", std::string{}), std::string{"tool"});
+            XX_TEST_EXPECT_EQ(msgs[4].value("role", std::string{}), std::string{"assistant"});
+
+            // assistant tool_call 与 tool 回复按 tool_call_id 关联
+            XX_TEST_EXPECT_TRUE(
+                msgs[2]["tool_calls"].is_array() && msgs[2]["tool_calls"].size() == 1
+            );
+            if (msgs[2]["tool_calls"].is_array() && msgs[2]["tool_calls"].size() == 1) {
+                XX_TEST_EXPECT_EQ(
+                    msgs[2]["tool_calls"][0].value("id", std::string{}),
+                    std::string{"call_it_1"}
+                );
+            }
+            XX_TEST_EXPECT_EQ(
+                msgs[3].value("tool_call_id", std::string{}),
+                std::string{"call_it_1"}
+            );
+            XX_TEST_EXPECT_EQ(
+                msgs[3].value("tool_name", std::string{}),
+                std::string{"test_interrupt"}
+            );
+            // resume 后 tool 重新执行返回真实中断结果, 不再是 [Interrupt] 占位
+            XX_TEST_EXPECT_EQ(msgs[3].value("content", std::string{}), std::string{"handled"});
+            // 最终 tool 消息不应残留 [Interrupt]/[AutoInserted] 标记
+            const auto flags
+                = static_cast<neograph::MessageFlag>(msgs[3].value<unsigned long long>("flags", 0));
+            XX_TEST_EXPECT_FALSE(neograph::hasFlag(flags, neograph::MessageFlag::Interrupt));
+            XX_TEST_EXPECT_FALSE(neograph::hasFlag(flags, neograph::MessageFlag::AutoInserted));
+
+            XX_TEST_EXPECT_EQ(
+                msgs[4].value("content", std::string{}),
+                std::string{"Final answer after interrupt."}
+            );
+        }
+    }
+
+    co_return;
+}
+
+// ===========================================================================
+// 取消/超时停止 E2E: tool 执行中取消
+// - 串行 toolcall: slow 先执行被取消中断, 后续 fast 不再执行
+// - 未完成的 tool 全部自动补充 [User canceled] (按声明顺序)
+// - 最终上下文角色顺序完整: 每条 assistant tool_call 都有对应 tool 回复
+// ===========================================================================
+
+/// 校验取消后的消息序列 (串行 toolcall 语义):
+/// [system, user, assistant(tool_calls=[call_slow_1, call_fast_1]),
+///  tool(call_slow_1=[User canceled] AutoInserted), tool(call_fast_1=[User canceled] AutoInserted)]
+/// - 串行执行: slow 先执行, 取消中断 slow 后 fast 不再执行
+/// - 未完成的 tool 全部自动补充 [User canceled] (按声明顺序), 保证角色顺序完整
+static bool checkCanceledMessageSequence(const utilxx_base::Json& msgs) {
+    if (!msgs.is_array() || msgs.size() != 5) {
+        return false;
+    }
+    // 角色顺序
+    if (msgs[0].value("role", std::string{}) != "system") {
+        return false;
+    }
+    if (msgs[1].value("role", std::string{}) != "user") {
+        return false;
+    }
+    if (msgs[2].value("role", std::string{}) != "assistant") {
+        return false;
+    }
+    if (msgs[3].value("role", std::string{}) != "tool") {
+        return false;
+    }
+    if (msgs[4].value("role", std::string{}) != "tool") {
+        return false;
+    }
+    // assistant 声明的 tool_calls 顺序
+    if (!msgs[2]["tool_calls"].is_array() || msgs[2]["tool_calls"].size() != 2) {
+        return false;
+    }
+    if (msgs[2]["tool_calls"][0].value("id", std::string{}) != "call_slow_1") {
+        return false;
+    }
+    if (msgs[2]["tool_calls"][1].value("id", std::string{}) != "call_fast_1") {
+        return false;
+    }
+    // 未完成的 tool 自动补充 [User canceled] (按 tool_calls 声明顺序):
+    // - slow 先执行, 取消时执行中未完成 → 补充 [User canceled]
+    if (msgs[3].value("tool_call_id", std::string{}) != "call_slow_1") {
+        return false;
+    }
+    if (msgs[3].value("tool_name", std::string{}) != "test_slow") {
+        return false;
+    }
+    if (msgs[3].value("content", std::string{}) != "[User canceled]") {
+        return false;
+    }
+    {
+        const auto flags
+            = static_cast<neograph::MessageFlag>(msgs[3].value<unsigned long long>("flags", 0));
+        if (!neograph::hasFlag(flags, neograph::MessageFlag::AutoInserted)) {
+            return false;
+        }
+    }
+    // - fast 排在 slow 之后, 取消后未执行 → 同样补充 [User canceled]
+    if (msgs[4].value("tool_call_id", std::string{}) != "call_fast_1") {
+        return false;
+    }
+    if (msgs[4].value("tool_name", std::string{}) != "test_fast") {
+        return false;
+    }
+    if (msgs[4].value("content", std::string{}) != "[User canceled]") {
+        return false;
+    }
+    {
+        const auto flags
+            = static_cast<neograph::MessageFlag>(msgs[4].value<unsigned long long>("flags", 0));
+        if (!neograph::hasFlag(flags, neograph::MessageFlag::AutoInserted)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+asio::awaitable<void> test_cancel_auto_supplement() {
+    auto sim     = startDaSimServer();
+    auto baseUrl = "http://127.0.0.1:" + std::to_string(sim.port);
+
+    auto cfg                 = std::make_shared<agentxx::agent::AgentConfig>();
+    cfg->model.baseUrl       = baseUrl;
+    cfg->model.apiKey        = "EMPTY";
+    cfg->model.modelName     = "test-sim";
+    cfg->prompt.systemPrompt = "You are a helpful assistant.";
+
+    g_da_sim_response_content = "";
+    g_da_sim_delay_ms         = 0;
+    // LLM 返回两个 toolcall: 先慢速 tool, 后快速 tool
+    g_da_sim_tool_calls = utilxx_base::Json::array({
+        utilxx_base::Json{
+                          {"index", 0},
+                          {"id", "call_slow_1"},
+                          {"type", "function"},
+                          {"function",
+             utilxx_base::Json{
+                 {"name", "test_slow"},
+                 {"arguments", "{}"},
+             }},
+                          },
+        utilxx_base::Json{
+                          {"index", 1},
+                          {"id", "call_fast_1"},
+                          {"type", "function"},
+                          {"function",
+             utilxx_base::Json{
+                 {"name", "test_fast"},
+                 {"arguments", "{}"},
+             }},
+                          },
+    });
+
+    SupplementTestAgent agent(cfg);
+    co_await agent.init();
+
+    auto ex = co_await asio::this_coro::executor;
+
+    // 串行 toolcall: 等待 slow 开始执行后再取消, 确保取消发生在 slow 执行期间:
+    // - slow (2s 执行中) 被取消信号立即中断, 未完成 → 补充 [User canceled]
+    // - fast 排在 slow 之后, 取消后不再执行 → 同样补充 [User canceled]
+    auto cancelWatcher = [&]() -> asio::awaitable<void> {
+        asio::steady_timer timer(ex);
+        for (int i = 0; i < 2000; ++i) {
+            if (agent.slowStarted.load(std::memory_order_acquire)) {
+                break;
+            }
+            timer.expires_after(std::chrono::milliseconds(5));
+            co_await timer.async_wait(asio::use_awaitable);
+        }
+        auto session = agent.agentContext->sessions->get("cancel_msg_test");
+        if (session) {
+            auto token = session->getCancelToken();
+            if (token) {
+                token->cancel();
+            }
+        }
+        co_return;
+    };
+
+    const auto startAt = std::chrono::steady_clock::now();
+    auto [order, turnExc, turnResult, watcherExc]
+        = co_await asio::experimental::make_parallel_group(
+              asio::co_spawn(
+                  ex,
+                  agent.runTurnAsync("cancel_msg_test", "Run tools", nullptr),
+                  asio::deferred
+              ),
+              asio::co_spawn(ex, cancelWatcher(), asio::deferred)
+        )
+              .async_wait(asio::experimental::wait_for_all(), asio::use_awaitable);
+    const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now() - startAt
+    )
+                               .count();
+
+    XX_TEST_EXPECT_TRUE(turnExc == nullptr);
+    XX_TEST_EXPECT_TRUE(watcherExc == nullptr);
+    XX_TEST_EXPECT_TRUE(turnResult.hasError);
+    XX_TEST_EXPECT_EQ(turnResult.errorMessage, std::string{"Cancelled by user"});
+    // 取消应立即中断会话轮次 (不等待慢速 tool 自然完成)
+    XX_TEST_EXPECT_TRUE(elapsedMs < 8000);
+
+    // 轮询等待自动补充消息最终保存完成 (baseRun 走 isCancel 分支后,
+    // wrap_handle 在 rethrow 前写入 tempMessages)
+    {
+        auto               ex2 = co_await asio::this_coro::executor;
+        asio::steady_timer poll(ex2);
+        bool               ok = false;
+        utilxx_base::Json  im;
+        const auto         deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+        while (std::chrono::steady_clock::now() < deadline) {
+            // 轮末错误路径已把 tempMessages 快照收敛进 llmMessages 并清理
+            // graphData, 断言权威面 (llmMessages) 即可
+            auto sess = agent.agentContext->sessions->get("cancel_msg_test");
+            im        = sess ? sess->llmMessagesJson() : utilxx_base::Json{};
+            if (checkCanceledMessageSequence(im)) {
+                ok = true;
+                break;
+            }
+            poll.expires_after(std::chrono::milliseconds(20));
+            co_await poll.async_wait(asio::use_awaitable);
+        }
+        XX_TEST_EXPECT_TRUE(ok);
+    }
+
+    g_da_sim_tool_calls = utilxx_base::Json::array();
+    sim.stop();
+    co_return;
+}
+
+// ===========================================================================
+// repairMessages 悬挂 toolcall 清理 (实现位于 agent/lib/src/nodes/modelcall.cpp)
+//
+// 背景: 取消/异常后重新从图开始节点执行时, 上下文可能以
+//   "assistant(tool_calls) 但无对应 tool 结果" 结尾 (悬挂 tool_calls)。
+//   repairMessages 会清空该 assistant 的 tool_calls 声明; 但清空后,
+//   assistant 之后引用这些 id 的 tool 结果消息成为孤儿 (无对应声明),
+//   会让 LLM API 校验失败 (OpenAI invalid tool_call_id / Anthropic orphan
+//   tool result 400), 也应一并删除, 删除范围直到下一条 agent 消息
+//   (user/system 或 无 tool_calls 的 assistant) 为止。
+// ===========================================================================
+
+/// 构造悬挂上下文, 直接调用 ModelCallWrapNode::repairMessages 验证清理结果
+/// - assistant 声明 [danglingCount] 个 tool_call (id: call_a, call_b, ...),
+///   其中仅 [repliedCount] 个有对应 tool 结果
+/// - [followUpRole] 悬挂结果之后的下一条 agent 消息 role
+///   ("" 表示没有后续消息)
+/// - [expectDanglingCleared] 期望悬挂 tool_calls 被清空
+/// - [expectOrphanRemoved] 期望已回复的 tool 结果被删除
+///   (悬挂清空后它们成为孤儿, 一并清理)
+/// - [expectFollowUpKept] 期望下一条 agent 消息被保留
+static void runRepairDanglingScenario(
+    size_t      danglingCount,
+    size_t      repliedCount,
+    std::string followUpRole,
+    bool        expectDanglingCleared,
+    bool        expectOrphanRemoved,
+    bool        expectFollowUpKept
+) {
+    // ---- 构造 AgentContext ----
+    auto ctx                         = std::make_shared<agentxx::agent::AgentContext>();
+    ctx->agentConfig                 = std::make_shared<agentxx::agent::AgentConfig>();
+    ctx->agentConfig->repairMessages = true;
+    ctx->middlewareHandleContext     = std::make_shared<agentxx::middleware::MiddlewareContext>();
+
+    // ---- 构造 ModelCallWrapNode ----
+    neograph::graph::NodeContext nodeCtx;
+    nodeCtx.model = "test-model";
+    agentxx::nodes::ModelCallWrapNode node("test_llm", nodeCtx, ctx);
+
+    // ---- 构造 state: 悬挂上下文 ----
+    // [system, user, assistant(tool_calls=[call_a..]), tool(已回复)xN, <followUp>]
+    neograph::json msgs = neograph::json::array();
+    msgs.push_back(neograph::json{
+        {"role",    "system"},
+        {"content", "sys"   }
+    });
+    msgs.push_back(neograph::json{
+        {"role",    "user" },
+        {"content", "hello"}
+    });
+
+    auto toolCalls = neograph::json::array();
+    for (size_t i = 0; i < danglingCount; ++i) {
+        toolCalls.push_back(neograph::json{
+            {"id", fmt::format("call_{}", char('a' + i))},
+            {"type", "function"},
+            {"function", neograph::json{{"name", "tool_a"}, {"arguments", "{}"}}},
+        });
+    }
+    msgs.push_back(neograph::json{
+        {"role",       "assistant"         },
+        {"content",    "calling tools"     },
+        {"tool_calls", std::move(toolCalls)},
+    });
+    for (size_t i = 0; i < repliedCount; ++i) {
+        msgs.push_back(neograph::json{
+            {"role", "tool"},
+            {"content", "result"},
+            {"tool_call_id", fmt::format("call_{}", char('a' + i))},
+            {"tool_name", "tool_a"},
+        });
+    }
+    if (!followUpRole.empty()) {
+        msgs.push_back(neograph::json{
+            {"role",    followUpRole},
+            {"content", "next"      }
+        });
+    }
+
+    // ---- 上下文写入会话 (会话是唯一权威; 图状态不再保存 messages 通道) ----
+    neograph::graph::GraphState state;
+    neograph::graph::RunContext runCtx;
+    runCtx.thread_id = "repair_dangling_test";
+    ctx->getSession(runCtx.thread_id)
+        ->replaceMessagesFromJson(agentxx::util::fromNeographJson(msgs));
+    neograph::graph::NodeInput in{state, runCtx, nullptr};
+
+    // ---- 调用 repairMessages ----
+    node.repairMessages(in);
+
+    // ---- 断言清理结果 ----
+    const auto& resultMsgs = ctx->getSession(runCtx.thread_id)->messages();
+    size_t     idx        = 0;
+    // system + user 保留
+    XX_TEST_EXPECT_TRUE(resultMsgs.size() >= 2);
+    XX_TEST_EXPECT_EQ(resultMsgs[0].role, std::string{"system"});
+    XX_TEST_EXPECT_EQ(resultMsgs[1].role, std::string{"user"});
+    idx = 2;
+
+    // 悬挂 assistant 消息
+    XX_TEST_EXPECT_TRUE(idx < resultMsgs.size());
+    if (idx < resultMsgs.size()) {
+        XX_TEST_EXPECT_EQ(resultMsgs[idx].role, std::string{"assistant"});
+        if (expectDanglingCleared) {
+            XX_TEST_EXPECT_TRUE(resultMsgs[idx].tool_calls.empty());
+        } else {
+            XX_TEST_EXPECT_TRUE(!resultMsgs[idx].tool_calls.empty());
+        }
+        ++idx;
+    }
+
+    // 孤儿 tool 结果: 应被删除 (除非未清理)
+    if (expectOrphanRemoved) {
+        XX_TEST_EXPECT_TRUE(
+            idx >= resultMsgs.size() || resultMsgs[idx].role != std::string{"tool"}
+        );
+    } else {
+        // 未清理时孤儿结果仍在 (正常路径: 全部 tool_call 都有回复, 不悬挂)
+        XX_TEST_EXPECT_TRUE(idx < resultMsgs.size());
+        if (idx < resultMsgs.size()) {
+            XX_TEST_EXPECT_EQ(resultMsgs[idx].role, std::string{"tool"});
+        }
+    }
+
+    // 下一条 agent 消息: 应保留 (如果存在)
+    if (expectFollowUpKept) {
+        bool foundFollowUp = false;
+        for (size_t i = idx; i < resultMsgs.size(); ++i) {
+            if (resultMsgs[i].role == followUpRole) {
+                foundFollowUp = true;
+                break;
+            }
+        }
+        XX_TEST_EXPECT_TRUE(foundFollowUp);
+    }
+}
+
+/// 测试 1: 悬挂 tool_calls (call_b 无结果) + 已回复的 tool(call_a) 成为孤儿
+/// [system, user, assistant(tool_calls=[call_a, call_b]), tool(call_a=result)]
+/// - call_b 无 tool 结果 → 悬挂 → 清空 tool_calls
+/// - tool(call_a=result) 随声明清空成为孤儿 → 删除
+/// - 末尾孤儿删除后末尾为 assistant(无 tool_calls)
+asio::awaitable<void> test_repair_dangling_orphan_tool_result() {
+    runRepairDanglingScenario(2, 1, "", true, true, false);
+    co_return;
+}
+
+/// 测试 2: 悬挂 + 孤儿 tool 结果 + 下一条 agent 消息 (user)
+/// [system, user, assistant(tool_calls=[call_a, call_b]), tool(call_a=result),
+///  user("next")]
+/// - 悬挂 → 清空 tool_calls, 删除孤儿 tool 结果
+/// - 下一条 user 消息保留
+asio::awaitable<void> test_repair_dangling_multiple_orphans_keep_next_agent_msg() {
+    runRepairDanglingScenario(2, 1, "user", true, true, true);
+    co_return;
+}
+
+/// 测试 3: 悬挂 + 孤儿 tool 结果 + 下一条 agent 消息 (assistant 无 tool_calls)
+/// [system, user, assistant(tool_calls=[call_a, call_b]), tool(call_a=result),
+///  assistant("prev answer")]
+/// - 悬挂 → 清空 tool_calls, 删除孤儿 tool 结果
+/// - 下一条 assistant 消息 (无 tool_calls, 是 agent 消息边界) 保留
+asio::awaitable<void> test_repair_dangling_keep_next_assistant_msg() {
+    runRepairDanglingScenario(2, 1, "assistant", true, true, true);
+    co_return;
+}
+
+/// 测试 4 (对照): 全部 tool_call 都有回复 → 不悬挂, 不清理
+/// [system, user, assistant(tool_calls=[call_a, call_b]),
+///  tool(call_a=result), tool(call_b=result), user("next")]
+/// - call_a/call_b 都有 tool 结果 → 不悬挂 → tool_calls 保留, tool 结果保留
+/// - 后续 user 消息保留
+asio::awaitable<void> test_repair_all_replied_no_cleanup() {
+    runRepairDanglingScenario(2, 2, "user", false, false, true);
+    co_return;
+}
+
+/// 测试 5: 多组 assistant toolcall 均完整 → 全部保留
+/// [system, user,
+///  assistant(tool_calls=[call_a]), tool(call_a=result),
+///  assistant(tool_calls=[call_b]), tool(call_b=result)]
+/// - 两组都 allReplied → 不悬挂 → 全部保留
+asio::awaitable<void> test_repair_multiple_complete_groups_kept() {
+    // ---- 构造 AgentContext / Node ----
+    auto ctx                         = std::make_shared<agentxx::agent::AgentContext>();
+    ctx->agentConfig                 = std::make_shared<agentxx::agent::AgentConfig>();
+    ctx->agentConfig->repairMessages = true;
+    ctx->middlewareHandleContext     = std::make_shared<agentxx::middleware::MiddlewareContext>();
+
+    neograph::graph::NodeContext nodeCtx;
+    nodeCtx.model = "test-model";
+    agentxx::nodes::ModelCallWrapNode node("test_llm", nodeCtx, ctx);
+
+    // ---- 构造 state ----
+    neograph::json msgs = neograph::json::array();
+    msgs.push_back(neograph::json{
+        {"role",    "system"},
+        {"content", "sys"   }
+    });
+    msgs.push_back(neograph::json{
+        {"role",    "user" },
+        {"content", "hello"}
+    });
+    msgs.push_back(neograph::json{
+        {"role",       "assistant"},
+        {"content",    "group 1"  },
+        {"tool_calls",
+         neograph::json::array({
+             neograph::json{
+                 {"id", "call_a"},
+                 {"type", "function"},
+                 {"function", neograph::json{{"name", "tool_a"}, {"arguments", "{}"}}},
+             },
+         })                       },
+    });
+    msgs.push_back(neograph::json{
+        {"role",         "tool"  },
+        {"content",      "result"},
+        {"tool_call_id", "call_a"},
+        {"tool_name",    "tool_a"},
+    });
+    msgs.push_back(neograph::json{
+        {"role",       "assistant"},
+        {"content",    "group 2"  },
+        {"tool_calls",
+         neograph::json::array({
+             neograph::json{
+                 {"id", "call_b"},
+                 {"type", "function"},
+                 {"function", neograph::json{{"name", "tool_b"}, {"arguments", "{}"}}},
+             },
+         })                       },
+    });
+    msgs.push_back(neograph::json{
+        {"role",         "tool"  },
+        {"content",      "result"},
+        {"tool_call_id", "call_b"},
+        {"tool_name",    "tool_b"},
+    });
+
+    neograph::graph::GraphState state;
+    neograph::graph::RunContext runCtx;
+    runCtx.thread_id = "repair_dangling_test";
+    // 上下文写入会话 (会话是唯一权威; 图状态不再保存 messages 通道)
+    ctx->getSession(runCtx.thread_id)
+        ->replaceMessagesFromJson(agentxx::util::fromNeographJson(msgs));
+    neograph::graph::NodeInput in{state, runCtx, nullptr};
+
+    node.repairMessages(in);
+
+    // ---- 断言: 全部保留 ----
+    const auto& resultMsgs = ctx->getSession(runCtx.thread_id)->messages();
+    XX_TEST_EXPECT_EQ(resultMsgs.size(), size_t{6});
+    if (resultMsgs.size() == 6) {
+        // [system, user, assistant(call_a), tool(call_a), assistant(call_b), tool(call_b)]
+        XX_TEST_EXPECT_EQ(resultMsgs[0].role, std::string{"system"});
+        XX_TEST_EXPECT_EQ(resultMsgs[1].role, std::string{"user"});
+        XX_TEST_EXPECT_EQ(resultMsgs[2].role, std::string{"assistant"});
+        XX_TEST_EXPECT_TRUE(resultMsgs[2].tool_calls.size() == 1);
+        XX_TEST_EXPECT_EQ(resultMsgs[2].tool_calls[0].id, std::string{"call_a"});
+        XX_TEST_EXPECT_EQ(resultMsgs[3].role, std::string{"tool"});
+        XX_TEST_EXPECT_EQ(resultMsgs[3].tool_call_id, std::string{"call_a"});
+        XX_TEST_EXPECT_EQ(resultMsgs[4].role, std::string{"assistant"});
+        XX_TEST_EXPECT_TRUE(resultMsgs[4].tool_calls.size() == 1);
+        XX_TEST_EXPECT_EQ(resultMsgs[4].tool_calls[0].id, std::string{"call_b"});
+        XX_TEST_EXPECT_EQ(resultMsgs[5].role, std::string{"tool"});
+        XX_TEST_EXPECT_EQ(resultMsgs[5].tool_call_id, std::string{"call_b"});
+    }
+    co_return;
+}
+
+/// 测试 6: 中间位置的悬挂组也被修正 (不只最后一条)
+/// [system, user,
+///  assistant(tool_calls=[call_a, call_b]), tool(call_a=result),   // call_b 悬挂
+///  assistant(tool_calls=[call_c]), tool(call_c=result)]           // 完整组
+/// - 最后一条含 tool_calls 的 assistant (call_c) 完整 → 旧逻辑不修
+/// - 新逻辑: 中间组 call_b 悬挂 → 清空 call_a/call_b 声明 + 删除孤儿 tool(call_a)
+/// - 后面的完整组 (call_c) 保留
+asio::awaitable<void> test_repair_middle_dangling_group_fixed() {
+    auto ctx                         = std::make_shared<agentxx::agent::AgentContext>();
+    ctx->agentConfig                 = std::make_shared<agentxx::agent::AgentConfig>();
+    ctx->agentConfig->repairMessages = true;
+    ctx->middlewareHandleContext     = std::make_shared<agentxx::middleware::MiddlewareContext>();
+
+    neograph::graph::NodeContext nodeCtx;
+    nodeCtx.model = "test-model";
+    agentxx::nodes::ModelCallWrapNode node("test_llm", nodeCtx, ctx);
+
+    neograph::json msgs = neograph::json::array();
+    msgs.push_back(neograph::json{
+        {"role",    "system"},
+        {"content", "sys"   }
+    });
+    msgs.push_back(neograph::json{
+        {"role",    "user" },
+        {"content", "hello"}
+    });
+    // 中间悬挂组: call_a 有结果, call_b 无结果
+    msgs.push_back(neograph::json{
+        {"role",       "assistant"},
+        {"content",    "group 1"  },
+        {"tool_calls",
+         neograph::json::array({
+             neograph::json{
+                 {"id", "call_a"},
+                 {"type", "function"},
+                 {"function", neograph::json{{"name", "tool_a"}, {"arguments", "{}"}}},
+             },
+             neograph::json{
+                 {"id", "call_b"},
+                 {"type", "function"},
+                 {"function", neograph::json{{"name", "tool_b"}, {"arguments", "{}"}}},
+             },
+         })                       },
+    });
+    msgs.push_back(neograph::json{
+        {"role",         "tool"  },
+        {"content",      "result"},
+        {"tool_call_id", "call_a"},
+        {"tool_name",    "tool_a"},
+    });
+    // 后面的完整组
+    msgs.push_back(neograph::json{
+        {"role",       "assistant"},
+        {"content",    "group 2"  },
+        {"tool_calls",
+         neograph::json::array({
+             neograph::json{
+                 {"id", "call_c"},
+                 {"type", "function"},
+                 {"function", neograph::json{{"name", "tool_c"}, {"arguments", "{}"}}},
+             },
+         })                       },
+    });
+    msgs.push_back(neograph::json{
+        {"role",         "tool"  },
+        {"content",      "result"},
+        {"tool_call_id", "call_c"},
+        {"tool_name",    "tool_c"},
+    });
+
+    neograph::graph::GraphState state;
+    neograph::graph::RunContext runCtx;
+    runCtx.thread_id = "repair_dangling_test";
+    // 上下文写入会话 (会话是唯一权威; 图状态不再保存 messages 通道)
+    ctx->getSession(runCtx.thread_id)
+        ->replaceMessagesFromJson(agentxx::util::fromNeographJson(msgs));
+    neograph::graph::NodeInput in{state, runCtx, nullptr};
+
+    node.repairMessages(in);
+
+    // ---- 断言 ----
+    // 期望: [system, user, assistant(无 tool_calls), assistant(call_c), tool(call_c)]
+    const auto& resultMsgs = ctx->getSession(runCtx.thread_id)->messages();
+    XX_TEST_EXPECT_EQ(resultMsgs.size(), size_t{5});
+    if (resultMsgs.size() == 5) {
+        XX_TEST_EXPECT_EQ(resultMsgs[0].role, std::string{"system"});
+        XX_TEST_EXPECT_EQ(resultMsgs[1].role, std::string{"user"});
+        // 中间悬挂组: tool_calls 已清空, 孤儿 tool(call_a) 已删除
+        XX_TEST_EXPECT_EQ(resultMsgs[2].role, std::string{"assistant"});
+        XX_TEST_EXPECT_TRUE(resultMsgs[2].tool_calls.empty());
+        // 后面的完整组保留
+        XX_TEST_EXPECT_EQ(resultMsgs[3].role, std::string{"assistant"});
+        XX_TEST_EXPECT_TRUE(resultMsgs[3].tool_calls.size() == 1);
+        XX_TEST_EXPECT_EQ(resultMsgs[3].tool_calls[0].id, std::string{"call_c"});
+        XX_TEST_EXPECT_EQ(resultMsgs[4].role, std::string{"tool"});
+        XX_TEST_EXPECT_EQ(resultMsgs[4].tool_call_id, std::string{"call_c"});
+    }
+    co_return;
+}
+
+// ===========================================================================
+// repairMessages systemPrompt 哈希值计算与记录验证
+// ===========================================================================
+static asio::awaitable<void> test_repair_system_prompt_hash() {
+    auto ctx                         = std::make_shared<agentxx::agent::AgentContext>();
+    ctx->agentConfig                 = std::make_shared<agentxx::agent::AgentConfig>();
+    ctx->agentConfig->repairMessages = true;
+    ctx->middlewareHandleContext     = std::make_shared<agentxx::middleware::MiddlewareContext>();
+
+    neograph::graph::NodeContext nodeCtx;
+    nodeCtx.model = "test-model";
+    agentxx::nodes::ModelCallWrapNode node("test_modelcall_wrap", nodeCtx, ctx);
+
+    std::string prompt1 = "You are a helpful coding assistant v1.";
+    std::string prompt2
+        = "You are a helpful coding assistant v2."; // 长度相同 (39 chars)，但内容不同
+    XX_TEST_EXPECT_EQ(prompt1.size(), prompt2.size());
+
+    const auto hash1 = utilxx_base::hash::fnv1a64(prompt1);
+    const auto hash2 = utilxx_base::hash::fnv1a64(prompt2);
+    XX_TEST_EXPECT_TRUE(hash1 != hash2);
+
+    // 1) 初始执行 repairMessages: 记录 system_prompt_hash
+    {
+        neograph::json msgs = neograph::json::array();
+        msgs.push_back(neograph::json{
+            {"role",    "system"},
+            {"content", prompt1 }
+        });
+        msgs.push_back(neograph::json{
+            {"role",    "user" },
+            {"content", "hello"}
+        });
+
+        neograph::graph::GraphState state;
+        neograph::graph::RunContext runCtx;
+        runCtx.thread_id = "test_sys_hash_session";
+        // 上下文写入会话 (会话是唯一权威; 图状态不再保存 messages 通道)
+        ctx->getSession(runCtx.thread_id)
+            ->replaceMessagesFromJson(agentxx::util::fromNeographJson(msgs));
+        neograph::graph::NodeInput in{state, runCtx, nullptr};
+
+        node.repairMessages(in);
+
+        auto checkInfo = ctx->middlewareHandleContext->getGraphDataItemValue<utilxx_base::Json>(
+            "test_sys_hash_session",
+            agentxx::middleware::MiddlewareContext::graphDataKey_messageCheckInfo
+        );
+        XX_TEST_EXPECT_TRUE(checkInfo.contains("system_prompt_hash"));
+        XX_TEST_EXPECT_TRUE(checkInfo["system_prompt_hash"].is_number_integer());
+        XX_TEST_EXPECT_EQ(checkInfo.value<uint64_t>("system_prompt_hash", 0), hash1);
+    }
+
+    // 2) 再次执行 (相同 prompt): 哈希值不变
+    {
+        neograph::json msgs = neograph::json::array();
+        msgs.push_back(neograph::json{
+            {"role",    "system"},
+            {"content", prompt1 }
+        });
+        msgs.push_back(neograph::json{
+            {"role",    "user" },
+            {"content", "hello"}
+        });
+
+        neograph::graph::GraphState state;
+        neograph::graph::RunContext runCtx;
+        runCtx.thread_id = "test_sys_hash_session";
+        // 上下文写入会话 (会话是唯一权威; 图状态不再保存 messages 通道)
+        ctx->getSession(runCtx.thread_id)
+            ->replaceMessagesFromJson(agentxx::util::fromNeographJson(msgs));
+        neograph::graph::NodeInput in{state, runCtx, nullptr};
+
+        node.repairMessages(in);
+
+        auto checkInfo = ctx->middlewareHandleContext->getGraphDataItemValue<utilxx_base::Json>(
+            "test_sys_hash_session",
+            agentxx::middleware::MiddlewareContext::graphDataKey_messageCheckInfo
+        );
+        XX_TEST_EXPECT_EQ(checkInfo.value<uint64_t>("system_prompt_hash", 0), hash1);
+    }
+
+    // 3) 修改 prompt (等长但内容改变 prompt2): 能够检测到哈希变化并更新记录
+    {
+        neograph::json msgs = neograph::json::array();
+        msgs.push_back(neograph::json{
+            {"role",    "system"},
+            {"content", prompt2 }
+        });
+        msgs.push_back(neograph::json{
+            {"role",    "user" },
+            {"content", "hello"}
+        });
+
+        neograph::graph::GraphState state;
+        neograph::graph::RunContext runCtx;
+        runCtx.thread_id = "test_sys_hash_session";
+        // 上下文写入会话 (会话是唯一权威; 图状态不再保存 messages 通道)
+        ctx->getSession(runCtx.thread_id)
+            ->replaceMessagesFromJson(agentxx::util::fromNeographJson(msgs));
+        neograph::graph::NodeInput in{state, runCtx, nullptr};
+
+        node.repairMessages(in);
+
+        auto checkInfo = ctx->middlewareHandleContext->getGraphDataItemValue<utilxx_base::Json>(
+            "test_sys_hash_session",
+            agentxx::middleware::MiddlewareContext::graphDataKey_messageCheckInfo
+        );
+        XX_TEST_EXPECT_TRUE(checkInfo.contains("system_prompt_hash"));
+        XX_TEST_EXPECT_EQ(checkInfo.value<uint64_t>("system_prompt_hash", 0), hash2);
+    }
+
+    co_return;
+}
+
+/// 重复调用确认 (repeatCallCheck) 测试工具: 记录执行次数, 供断言"用户点允许后
+/// 工具真的被执行" (修复前: HIL 取值规则错误导致点允许也一律按拒绝处理)
+class RepeatCheckTool : public agentxx::tools::XXToolBase {
+public:
+
+    RepeatCheckTool(std::weak_ptr<agentxx::agent::AgentContext> ctx, std::atomic<int>* execCount) :
+        XXToolBase(
+            "test_repeat",
+            ctx,
+            /*in_autoSummaryOutput=*/false,
+            /*in_canDelayLoad=*/false,
+            /*in_maxRetry=*/0,
+            /*in_repeatCallCheck=*/true
+        ),
+        execCount_(execCount) {}
+
+    neograph::ChatTool get_definition() const override {
+        return neograph::ChatTool{
+            .name        = "test_repeat",
+            .description = "repeat call check test tool",
+            .parameters  = neograph::json{
+                {"type",       "object"},
+                {"properties", neograph::json::object()},
+            },
+        };
+    }
+
+    asio::awaitable<std::string> execute_async(const utilxx_base::Json&) override {
+        execCount_->fetch_add(1, std::memory_order_relaxed);
+        co_return "repeat tool executed";
+    }
+
+private:
+
+    std::atomic<int>* execCount_;
+};
+
+/// 重复调用确认 E2E 专用 IO: 对中断询问一律回"允许" (确认卡片控件 id = allow)
+class RepeatCheckMockIO : public agentxx::agent::AgentIOBase {
+public:
+
+    std::weak_ptr<agentxx::agent::AgentContext> agentContext;
+    std::atomic<int>                            interruptCalls{0};
+    /// 询问参数中是否出现 repeat_toolcall 处理器名 (确认本次询问确为重复调用确认)
+    std::atomic<bool> isRepeatCallAsk{false};
+
+    explicit RepeatCheckMockIO(std::shared_ptr<agentxx::agent::AgentContext> ctx) :
+        agentContext(ctx) {}
+
+    void onDelta(const agentxx::agent::WireDelta&) override {}
+
+    void onSync(const agentxx::agent::WireSyncPayload&) override {}
+
+    asio::awaitable<std::optional<std::string>> getInput() override {
+        co_return std::nullopt;
+    }
+
+    asio::awaitable<utilxx_base::Json> handleInterrupt(
+        std::string_view /*sessionId*/,
+        std::string_view /*interruptNode*/,
+        std::string_view /*interruptValue*/,
+        std::string_view interruptArgJson
+    ) override {
+        ++interruptCalls;
+        if (interruptArgJson.find("repeat_toolcall") != std::string_view::npos) {
+            isRepeatCallAsk.store(true, std::memory_order_release);
+        }
+        // 用户点"允许" (确认卡片控件取值 "true"); 走与真实客户端一致的
+        // {"values": {...}} 结果形态 (AgentIOBase::registerOnBus 取 values 写回)
+        co_return agentxx::middleware::makeInterruptResult(utilxx_base::Json{
+            {"allow", "true"}
+        });
+    }
+};
+
+/// 重复调用确认 E2E 专用 Agent: 注入启用 repeatCallCheck 的工具
+class RepeatCheckTestAgent : public agentxx::agent::CodeAgent {
+public:
+
+    std::atomic<int> repeatExecCount{0};
+
+    explicit RepeatCheckTestAgent(std::shared_ptr<agentxx::agent::AgentConfig> cfg) :
+        CodeAgent(std::move(cfg)) {}
+
+protected:
+
+    asio::awaitable<std::vector<std::unique_ptr<agentxx::tools::XXToolBase>>> initTools() override {
+        auto tools = co_await CodeAgent::initTools();
+        tools.push_back(std::make_unique<RepeatCheckTool>(agentContext, &repeatExecCount));
+        co_return tools;
+    }
+};
+
+// ===========================================================================
+// 重复调用确认 E2E (回归):
+// - 阈值 2: 第 2 次相同调用触发 HIL 询问
+// - 用户点"允许"后工具必须真的执行 (修复前: 结果取值规则错误 → 恒按拒绝处理,
+//   返回 "[Repeated call denied by user: ...]" 且不再执行)
+// ===========================================================================
+asio::awaitable<void> test_repeat_call_check_allow() {
+    auto sim     = startDaSimServer();
+    auto baseUrl = "http://127.0.0.1:" + std::to_string(sim.port);
+
+    auto cfg                 = std::make_shared<agentxx::agent::AgentConfig>();
+    cfg->model.baseUrl       = baseUrl;
+    cfg->model.apiKey        = "EMPTY";
+    cfg->model.modelName     = "test-sim";
+    cfg->prompt.systemPrompt = "You are a helpful assistant.";
+    // 阈值 2: 第二次相同调用即触发询问 (默认 5 需要更多轮重复)
+    cfg->toolcallRepeatCheckThreshold = 2;
+
+    g_da_sim_response_content = "Final answer after repeat check.";
+    // 前两次 LLM 响应返回同一个 tool_call (触发重复检查), 之后返回纯文本
+    g_da_sim_tool_calls_remaining = 2;
+    g_da_sim_tool_calls           = utilxx_base::Json::array({
+        utilxx_base::Json{
+                          {"index", 0},
+                          {"id", "call_repeat_1"},
+                          {"type", "function"},
+                          {"function",
+                       utilxx_base::Json{
+                           {"name", "test_repeat"},
+                           {"arguments", "{}"},
+             }},
+                          },
+    });
+
+    RepeatCheckTestAgent agent(cfg);
+    co_await agent.init();
+
+    auto io     = std::make_shared<RepeatCheckMockIO>(agent.agentContext);
+    auto result = co_await agent.runTurnAsync("repeat_check_test", "run tool twice", io);
+
+    XX_TEST_EXPECT_FALSE(result.hasError);
+    // 第 2 次相同调用触发一次询问, 且确为重复调用确认 (处理器名 repeat_toolcall)
+    XX_TEST_EXPECT_EQ(io->interruptCalls.load(), 1);
+    XX_TEST_EXPECT_TRUE(io->isRepeatCallAsk.load());
+    // 用户点"允许": 工具执行 2 次 (修复前为 1 次)
+    XX_TEST_EXPECT_EQ(agent.repeatExecCount.load(), 2);
+
+    auto session = agent.agentContext->sessions->get("repeat_check_test");
+    XX_TEST_EXPECT_TRUE(session != nullptr);
+    if (session) {
+        // 上下文中不应出现拒绝提示 (修复前必然出现)
+        bool denied = false;
+        for (const auto& m : session->llmMessagesJson()) {
+            if (m.contains("content") && m["content"].is_string()
+                && m["content"].get<std::string>().find("[Repeated call denied by user:")
+                       != std::string::npos) {
+                denied = true;
+                break;
+            }
+        }
+        XX_TEST_EXPECT_FALSE(denied);
+    }
+}
+
+asio::awaitable<TestResult> run_message_supplement_tests() {
+    g_ms_passed = 0;
+    g_ms_failed = 0;
+
+    try {
+        co_await test_interrupt_auto_supplement();
+        co_await test_cancel_auto_supplement();
+        co_await test_repair_dangling_orphan_tool_result();
+        co_await test_repair_dangling_multiple_orphans_keep_next_agent_msg();
+        co_await test_repair_dangling_keep_next_assistant_msg();
+        co_await test_repair_all_replied_no_cleanup();
+        co_await test_repair_multiple_complete_groups_kept();
+        co_await test_repair_middle_dangling_group_fixed();
+        co_await test_repair_system_prompt_hash();
+        co_await test_repeat_call_check_allow();
+    } catch (const std::exception& e) {
+        TEST_FAIL << "message_supplement suite exception: " << e.what() << std::endl;
+        g_ms_failed++;
+    }
+
+    co_return TestResult{g_ms_passed, g_ms_failed};
+}
+
+} // namespace test
+} // namespace agentxx

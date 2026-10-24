@@ -1,0 +1,1521 @@
+# 资源基准测试 (agentxx_benchmark)
+
+性能基准程序 `agentxx_benchmark` 除微基准 (字符串/正则/路由/CodeAgent 初始化等) 外,
+还包含一组**资源基准测试** (`resource_*` 模块), 目标是在尽量贴近真实运行的形态下
+采集内存/CPU/渲染数据, 并把内存归属拆到模块级别, 供优化前后对比。
+
+- 编译: 顶层 `-DAGENTXX_BUILD_BENCHMARK=ON` (release 脚本默认开启), 产物 `{build}/exec/agentxx_benchmark`
+- 报告目录: `{build}/exec/bench/` (可用 `AGENTXX_BENCH_OUTPUT_DIR` 覆盖)
+- 每次运行输出两份报告: `bench_<时间戳>.json` (机器对比) 与 `bench_<时间戳>.md` (人工阅读)
+- 数据标注: 文档内的实测数据一律标注**日期 + 主仓 commit** (规范见第 0 节);
+  当前最新一批为 `2026-10-12 / fc66f870` (系统分配器; 第 16 节), 同日的逐轮临时内存优化
+  与同二进制 A/B 见第 17 节; 上一批为
+  `2026-10-11 / 5062151e` (第 15 节), 再上一批为
+  `2026-10-07 / d6e21470` (第 14 节), 更早为 `2026-09-28 / c957b504`
+  (neograph `1522761`, cxx_utilxx `6bc7f72`; 第 12、13 节) 与
+  `2026-09-26 / 88fee6e0` (第 5、9~11 节), 原始文件在
+  [`resource/benchmark/`](../../../resource/benchmark/README.md)
+
+```bash
+# 全部场景 (每个场景由独立子进程执行), 并与上一次报告对比
+./agentxx_benchmark resource --baseline exec/bench/bench_20260101_120000.123456.json
+
+# 单个场景 (在当前进程内直接运行)
+./agentxx_benchmark resource_real_tui
+./agentxx_benchmark --list
+```
+
+## 0. 数据标注规范
+
+本文档里的实测数据要能被复查、也能和以后的数据对比, 因此遵守以下约定
+(新增数据一律照此标注):
+
+1. **日期与 commit 成对出现**: 每处数据标注采集日期与产生它的主仓 git commit
+   (短哈希 7 位), 写法如 `2026-09-26 / 88fee6e0`; 只写日期不写 commit 的数据
+   不作为对比基线;
+2. **依赖变了要一起标**: 关键依赖是子模块 (neograph / cxx_utilxx / cxx_utilxx_base /
+   cxx_pluginxx), 若与上一次数据之间依赖 commit 变了, 在标注后追加其 commit
+   (写法如 `neograph 1522761`), 否则两组数据不可直接比较;
+3. **同时标出构建与运行配置**: 平台/编译器/构建类型 (Release/Debug) 以及影响结果的
+   开关 (`AGENTXX_ENABLE_MIMALLOC`、`AGENTXX_MIMALLOC_LINK` 等); 开关不同的数据
+   分开列, 不要混在同一张表里比较;
+4. **原始数据入库**: 值得后续对比的原始文件 (bench 报告 `bench_*.json` / `.md`、
+   Windows 侧采样 `*.summary.json` 与 `MIMALLOC_SHOW_STATS` 退出统计、驱动脚本)
+   复制到 `resource/benchmark/<日期>_<commit>_<平台或场景>/`, 该目录的 `README.md`
+   写同样的标注; 文档引用报告时给出该目录内的路径 (例如
+   `resource/benchmark/2026-09-26_88fee6e0_linux-resource/`);
+5. **历史数据**: 已有的、未标注 commit 的旧数据保留原样, 但在标注处写明
+   "commit 未记录", 并且只作量级参考。
+
+> 每份 bench 报告 (`{exec}/bench/bench_<时间戳>.json`) 自带的 `timestamp` / `build` /
+> `host` 只有时间与构建信息, 不含 git commit —— 入库时按第 1、2 条在 `README.md`
+> 里补上, 报告文件本身保持原样。
+
+## 1. 场景矩阵
+
+| 模块名 | 形态 | 说明 |
+|---|---|---|
+| `resource_cli` | 同进程 CLI + Channel | 进程内 stdio 客户端 + agent, 真实轮次 + 100K/200K 上下文注入 + **真实逐轮往返** (每轮走完整流程, 无注入历史) |
+| `resource_tui` | 同进程(无界面) TUI + Channel | TUI 端点仅作协议端点 (不启动 FTXUI), 测同步/分页/消息窗口 |
+| `resource_split_cli` | 真实两进程 | `agentxx_cli server` + `agentxx_cli cli --agent ws://...`, 分别采样 |
+| `resource_split_tui` | 真实 server + 连接客户端 | server 子进程 + bench 进程内 headless TUI 端点 (WS) |
+| `resource_ffi` | 动态库调用 | `dlopen(libagentxx.so)` + C ABI 驱动轮次 (对照组) |
+| `resource_real_tui` | 同进程 + **真实 TUI** | `TUIClientAgentIO::start()` 启动 FTXUI 界面线程, 采集帧耗时/帧数/渲染字节 |
+| `resource_server_only` | 真实 server 单独运行 | 无客户端常驻; 空载漂移、真实 WS 轮次负载、客户端断开后回收 |
+| `resource_real_tui_child` | 真实 TUI 子进程 + 真实 server | 客户端经**伪终端 (PTY)** 启动, 用"打字"驱动轮次 (仅 POSIX) |
+| `resource_plugin_attrib` | 同进程 | 逐个加载/卸载 5 个常用插件, 量化每个插件的边际内存与回收量 |
+
+聚合模块 `resource` 默认把**每个场景放到独立子进程**执行 (父进程合并各场景报告):
+内存基准要求各场景从相同的干净进程基线开始, 同进程连续运行时前一场景的堆 arena/
+页驻留/峰值 RSS 会污染后续场景的 startup 数据 (实测同进程连跑时 `plugin_attrib`
+基线由 12MB 变为 41MB, 峰值 RSS 也会继承前者)。`AGENTXX_BENCH_NO_ISOLATE=1`
+可退回同进程顺序运行 (快速验证)。
+
+真实两进程场景的轮次负载可用 `AGENTXX_BENCH_SCALE` (0.01~1.0, 默认 1.0) 缩放,
+报告 note 会标注实际使用的系数与目标 token 数。
+
+`resource_cli` 末段是**真实逐轮往返** (采样点 `rounds<N>x<bytes>`): 每轮都走完整流程
+(用户输入 → LLM 请求/SSE → 工具调用与结果回写 → 消息落库 → 事件回传), 与真实对话
+一致, 用于观察长上下文下的每轮固定开销与稳态漂移 (此前的 P1/P2 是直接注入历史,
+序列化/事件次数少于真实逐轮)。相关环境变量:
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `AGENTXX_BENCH_ROUNDS` | 20 | 逐轮往返的轮数 |
+| `AGENTXX_BENCH_ROUND_BYTES` | 8192 | 每轮用户消息字节数 (轮次内容 `ROUND-<n>-...`) |
+| `AGENTXX_BENCH_STREAM_CHUNKS` | 0 | mock LLM 每个响应的 SSE 事件数 (0/1 = 单事件; 值 >1 时把回复切成 N 个 `delta.content` 事件), 用于测量逐事件 SSE 解析开销 |
+
+## 2. 采集指标
+
+### 2.1 进程级 (`bench_mem_probe.h`)
+
+| 指标 | 来源 | 说明 |
+|---|---|---|
+| RSS / 私有 / 匿名 / 文件 / shmem / swap | `/proc/<pid>/status` | 常驻构成 |
+| PSS / 私有脏页 / Anonymous | `/proc/<pid>/smaps_rollup` | 私有脏页最接近"真实独占内存" |
+| 峰值 RSS / 峰值虚拟内存 | `VmHWM` / `VmPeak` | 优化前后峰值对比 |
+| 线程数 / 文件描述符 | `/proc/<pid>/status` + `/proc/<pid>/fd` | 资源泄漏辅助信号 |
+| glibc 堆在用/空闲/arena/mmap | `mallinfo2` (**仅自身进程**) | 子进程采样显示 n/a |
+| 堆碎片率 | `空闲 / (在用 + 空闲)` | 高碎片 = 可优化点 |
+| `malloc_trim(0)` 可回收 | RSS 前后差值 (仅自身进程) | 已 free 但未归还系统的量 |
+| CPU 利用率 / 用户态 / 内核态时间 | `/proc/<pid>/stat` | 优化 CPU 用 |
+
+Windows 平台取可获取的部分 (工作集/私有/峰值/句柄数/线程数), 堆与 smaps 相关指标不可用。
+
+### 2.2 模块级内存分解 (`/proc/<pid>/smaps`)
+
+按映射归属类别合并, 输出每个模块的 RSS/PSS/私有脏页/映射大小/段数:
+
+| 类别 | 含义 |
+|---|---|
+| `exe` | 可执行文件自身 (静态链接进主程序的库代码/数据也在其中) |
+| `project-lib` | libagentxx / libcxx_utilxx / libcxx_pluginxx |
+| `plugin-lib` | 每个插件动态库单独一行 (插件名) |
+| `system-lib` | libc/libstdc++/libgcc/ld 等 |
+| `heap` | `[heap]` (glibc 主堆) |
+| `anon` | 无路径匿名映射 (mmap 区/线程栈/缓冲) |
+| `data-file` / `stack` / `vdso` / `shm` | 其他文件映射/栈/虚拟 syscall/共享内存 |
+
+这一层回答"内存被哪些动态库/堆/匿名区占用"; 子进程同样可采集 (权限允许时)。
+
+### 2.3 逻辑内存 (`bench_mem_logical.h`)
+
+直接统计各模块**数据结构自身**的字节数 (与 OS 级互为补充):
+
+- `agent.session.view_messages` / `agent.session.llm_messages` / `agent.session.msg_index`
+- `agent.middleware.share_store` / `agent.plugins.registry` / `agent.plugins.tool_schema`
+- `agent.graph.definition` / `agent.tool_names` / `agent.components.info` / `agent.config`
+- `client.tui.messages` / `client.tui.stream_token` / `client.tui.context_snapshot` /
+  `client.tui.session_list` / `client.tui.append_components` / `client.tui.pending_inputs`
+- `__store.*` (会话库/索引库/全局库的**磁盘**占用, 不计入逻辑合计)
+
+统计方式: 消息按字段长度求和 + 对象开销 (不调用 `toJson().dump()`, 避免统计本身产生
+大量临时分配而干扰 RSS 采样)。
+
+### 2.4 分阶段增量 (`MemPhaseTracker`)
+
+每个场景在关键节点采样并记录相对上一步的 RSS/PSS/堆/匿名增量与耗时, 用于回答
+"哪一步吃掉多少内存"。例如真实 TUI 场景:
+
+```
+process_base → agent_constructed → tui_started → agent_init_done
+  → warmup_turn_done → ctx100k_ready → ctx200k_ready
+```
+
+插件边际成本场景逐项标记 `plugin_<name>`, 卸载后再标记 `unloaded`。
+
+### 2.5 渲染性能 (真实 TUI)
+
+- 帧数 / 平均帧耗时 / 最大帧耗时 (组件树构建耗时, 见 `TUIClientAgentIO::frameStats()`)
+- 渲染输出字节: 同进程场景经 stdout 捕获文件统计; 子进程场景统计 PTY 读走字节
+- 传输消息条数: 计数传输代理统计 client→server / server→client 条数, 用于确认
+  "客户端确实参与了同步/流式接收"
+
+帧统计由 libagentxx 的全局标记 `AgentConfigStatic::enableBenchmark` 控制, 默认关闭:
+
+- 关闭时 (正常使用): 渲染每帧只做一次无等待原子读判断, 不读时钟、不累加计数,
+  `frameStats()` 恒为 0
+- 打开时: 每帧记录组件树构建耗时 (帧数/累计/最大)
+- 基准程序在 `main()` 启动时打开该标记, 子进程场景 (每个场景独立进程) 同样生效;
+  `agentxx_cli` / `agentxx_test` 不打开, 保持正常运行时的开销
+
+## 3. 报告与对比
+
+- JSON: `results` (微基准) + `resource` (每个采样点含 `mem`/`cpu`/`modules`/`logical`/`phases`)
+- Markdown: 运行环境 → 总览 → 分阶段 → 模块分解 → 逻辑内存 → 与基线对比 (`--baseline`)
+- 控制台: 每个采样点一行 + 分阶段表 + 结束时"资源对比总览"与基线差值/模块级差异
+
+对比用法:
+
+```bash
+# 优化前
+./agentxx_benchmark resource
+# 优化后再跑, 并以上一次报告为基线 → 报告与控制台给出 ΔRSS/ΔPSS/Δ堆 与模块级差异
+./agentxx_benchmark resource --baseline exec/bench/bench_<优化前>.json
+
+# 基线也可以取仓库里留存的历史报告 (不依赖构建目录)
+./agentxx_benchmark resource --baseline \
+    resource/benchmark/2026-09-26_88fee6e0_linux-resource/bench_20260926_023051.685359718.json
+```
+
+留存的历史报告目录见 [resource/benchmark/README.md](../../../resource/benchmark/README.md)。
+
+实测重复运行的稳定性: 进程内生场景 ΔRSS 在 ±0.3MB 内; 真实两进程 (WS 轮次驱动
+200K token 上下文) 的波动几乎全部落在 `[heap]` 列 (±1MB), 这也是后续优化的重点。
+(2026-09-26 / 88fee6e0 复查: Linux 侧本轮每个变体只跑一次聚合; Windows 长上下文场景
+重复 3 次时提交量稳定在 ±3%, 而专用工作集/工作集随分配器归还时机有 ±20~30% 波动,
+对照数值时应以提交量为主, 见 10.2 与 11 节。)
+
+跨批对比还要多一层: 同一台机器、同一套脚本下, 进程内生场景 (cli/tui/plugin_attrib)
+批间差 ≤0.4 MB, 是可靠的判据; 而真实轮次与真实 server 场景的批间漂移可达 ±3~5 MB
+(RSS) 与 ±20% (每轮耗时) —— 因此**不要只看相邻两批**, 至少取三批 (看是否回到更早
+那一批的水平), 判读方法见第 15.4 节。
+
+## 4. 已知限制与统计方式
+
+- `mallinfo2` / `malloc_trim` 只能作用于**自身进程**: 子进程场景 (split_*、
+  real_tui_child、server_only) 的堆列显示 `n/a`。
+- `resource_real_tui_child` 依赖伪终端 (PTY), Windows 上自动跳过。
+- 子进程场景只能取 OS 级指标 (模块分解可用), 逻辑内存只对进程内对象可统计。
+- 帧耗时只统计组件树构建 (`Renderer` lambda) 耗时, 不含 FTXUI 布局绘制与终端写出;
+  终端写出量用"渲染输出字节"近似。
+- 帧统计仅在 `AgentConfigStatic::enableBenchmark` 打开时采集 (基准程序启动时打开);
+  正常运行时 TUI 无统计代码执行。
+- 场景耗时基准 (本机 12 核 release, 聚合运行): 全部场景约 1~3 分钟
+  (2026-09-26 / 88fee6e0 复查: 系统分配器构建约 2.7 分钟, mimalloc 构建约 5 分钟)
+
+## 5. 实测结果示例 (本机 12 核 / release / 聚合运行, 2026-09-26 / 88fee6e0 重测)
+
+> 本节数据为 **2026-09-26 重新实测**: 主仓 commit `88fee6e0`, neograph `1522761`
+> (依赖重写后); 环境: WSL Ubuntu 22.04, 12 核 / GCC 16.1.0 / Release, 聚合运行。
+> 当次完整报告 (glibc 构建) 存于
+> `resource/benchmark/2026-09-26_88fee6e0_linux-resource/bench_20260926_023051.*`;
+> 与依赖更新前数值的差异见第 11 节。
+
+内存归属 (RSS, MB):
+
+| 场景 | 采样点 | RSS | PSS | 匿名 | 堆在用 | 堆空闲(碎片) | 可回收 |
+|---|---|---|---|---|---|---|---|
+| cli (同进程) | startup | 26.68 | 22.12 | 5.70 | 1.30 | 3.93 (75%) | - |
+| cli (同进程) | ctx200k | 31.30 | 26.76 | 10.32 | 3.55 | 6.88 (66%) | 3.10 |
+| tui (同进程, headless) | ctx200k | 31.70 | 26.99 | 10.42 | 4.16 | 6.17 (60%) | 2.05 |
+| split_cli (真实 server) | startup | 24.12 | 14.84 | 2.29 | n/a | n/a | - |
+| split_cli (真实 server) | ctx200k | 36.90 | 28.13 | 12.20 | n/a | n/a | - |
+| split_cli (真实 client) | ctx200k | 18.12 | 8.96 | 1.88 | n/a | n/a | - |
+| real_tui (真实 TUI) | ctx200k | 34.72 | 30.16 | 11.27 | 4.81 | 6.43 (57%) | 1.98 |
+| server_only (真实 server) | 空载 | 20.50 | 17.42 | 2.00 | n/a | n/a | - |
+| server_only (真实 server) | 235 轮 / 200K token | 41.26 | 38.33 | 15.91 | n/a | n/a | - |
+| real_tui_child (真实 TUI 客户端) | 235 轮 | 26.74 | 15.49 | 4.31 | n/a | n/a | - |
+
+模块级归属 (真实 TUI 场景 200K 上下文, 前 10 项):
+
+| 类别 | 模块 | RSS | PSS | 私脏 |
+|---|---|---|---|---|
+| exe | agentxx_benchmark (静态链接 libagentxx/client/ftxui) | 14.78 | 12.49 | 0.23 |
+| anon | `[anon]` (mmap 区/线程栈/缓冲) | 7.48 | 7.48 | 7.48 |
+| plugin-lib | agentxx_filesystem | 2.74 | 2.74 | 0.46 |
+| heap | `[heap]` | 2.40 | 2.40 | 2.40 |
+| plugin-lib | agentxx_websearch | 2.12 | 2.12 | 0.49 |
+| system-lib | libstdc++.so.6 | 2.06 | 0.88 | 0.07 |
+| system-lib | libc.so.6 | 1.68 | 0.08 | 0.02 |
+| plugin-lib | agentxx_execute_command | 0.94 | 0.94 | 0.04 |
+| plugin-lib | agentxx_system | 0.49 | 0.48 | 0.01 |
+| plugin-lib | agentxx_planning | 0.42 | 0.42 | 0.01 |
+
+插件边际成本 (`resource_plugin_attrib`, 逐个加载):
+
+| 插件 | 边际 ΔRSS | ΔPSS | Δ堆 |
+|---|---|---|---|
+| agentxx_filesystem | +4.12 | +4.02 | +0.13 |
+| agentxx_websearch | +2.12 | +2.16 | +0.02 |
+| agentxx_execute_command | +1.00 | +1.00 | +0.05 |
+| agentxx_system | +0.62 | +0.53 | +0.02 |
+| agentxx_planning | +0.50 | +0.46 | +0.04 |
+| 全部卸载后回收 | -6.44 | - | - |
+
+可直接用于优化的结论:
+
+1. **可执行文件段是最大单项, 但几乎不含私有脏页**: exe RSS 14.78MB (未加载任何插件
+   的基线进程仅 11.12MB), 私脏只有 0.23MB —— 这一项主要是代码/只读页的映射,
+   压缩它的收益在"减少映射与文件页" (减小体积、延迟初始化、避免启动即触碰),
+   而不是"减少独占内存"; 真正独占的是 `[anon]` 7.48MB (私脏 7.48) +
+   `[heap]` 2.40MB + 各插件库私脏。
+2. **glibc 堆碎片仍然高**: 场景内堆空闲 6.43MB (占该进程堆 57%), `malloc_trim`
+   可回收 1.98MB —— 优化方向仍是按大小类缓存/对象池复用长生命周期缓冲、
+   避免反复"增长-释放"造成的 arena 空洞 (第 11 节给出了当前每轮分配次数的来源分析)。
+3. **插件成本可量化**: 5 个常用插件合计 +8.36MB (其中 filesystem 4.12MB /
+   websearch 2.12MB 是主要来源), 卸载后可回收 6.44MB; 插件内静态依赖 (curl/正则等)
+   与工具 schema 是主要构成, 可按需加载 (lazy load) 降低常驻。
+4. **客户端内存与服务端上下文解耦**: 真实两进程下服务端 200K 上下文时 RSS 36.90MB,
+   客户端只有 18.12MB; headless TUI 客户端在 100K 上下文时
+   `client.tui.messages` = 231,881 字节 / 468 条 —— 长会话场景建议按客户端类型
+   启用尾窗同步 (`initialSyncTailCount`), 与本地模式的策略保持一致。
+
+## 6. 相关实现
+
+| 文件 | 内容 |
+|---|---|
+| `bench_resource.cpp` | M1~M5 场景 + 聚合运行 (子进程隔离/合并) |
+| `bench_resource_real.cpp` | 真实运行场景 (真实 TUI / server 单独 / PTY TUI 子进程 / 插件边际) |
+| `bench_resource_util.h` | 内存/CPU 采集入口、子进程与 PTY、mock LLM 服务、固定负载模板、token 校准、yaml 配置生成 |
+| `bench_mem_probe.h` | 进程内存细项、smaps 模块分解、阶段追踪、CPU 细项 |
+| `bench_mem_logical.h` | 逻辑内存统计 (agent/TUI/持久化文件) |
+| `bench_util.h` | 结果结构、报告 (JSON/Markdown)、基线对比、微基准计时与上报 |
+
+## 7. 与测试的分工
+
+- `agentxx_test memgrowth` (`agent/test/core/test_memgrowth.cpp`): 内存增长/泄漏回归
+  (多轮对话逐轮采样), 用于 CI 式快速验证;
+- `agentxx_benchmark resource_*`: 性能与内存归属分析, 用于优化前后对比与容量评估。
+
+## 8. 一轮内存/体积优化实测 (2026-09, commit 未记录)
+
+> 本节是 2026-09 那一轮优化**当时的记录** (数值来自当时的构建, 优化前后同环境对比);
+> 当时未记录 commit, 只作量级参考。依赖库重写后的重新实测见第 5 节与第 11 节
+> (2026-09-26 / 88fee6e0)。保留本节是为了说明改动的对应关系与体积收益。
+
+优化项 (代码位置见 `docs/zh-cn/design/index.md` "内存占用与分配器调整"):
+
+| 项 | 内容 |
+|---|---|
+| 链接期 ICF | `-Wl,--icf=all` (仅 mold/gold/lld; 顶层 `AGENTXX_ENABLE_ICF`, 默认 ON) |
+| 符号裁剪 | 发布脚本 `strip` (与链接期无关, 产物已在 `exec/` 裁剪) |
+| 分配器调整 | glibc `M_ARENA_MAX=1` + 轮末 `malloc_trim(0)`; Windows `_heapmin` |
+| 持久化队列 | `PendingViewOp` 只存消息下标, 不再深拷贝消息 (会话库开启时生效) |
+| 重连重放缓冲 | 条数上限之外增加 4 MB 估算字节上限 (`deltaBufferBytesCap`) |
+
+产物体积 (Release, x86_64, 已 strip):
+
+| 产物 | 优化前 | 优化后 | 变化 |
+|---|---|---|---|
+| `agentxx_cli` | 33.24 MB (未 strip) / 23.17 MB (strip) | 22.42 MB | -32.5% / -3.2% |
+| `libagentxx.so` | 22.18 MB (未 strip) / 16.91 MB (strip) | 16.46 MB | -25.8% / -2.7% |
+| `agentxx_benchmark` | 38.83 MB (未 strip) | 26.88 MB | -30.8% |
+
+> 未 strip 的产物是构建方式差异 (直接 `cmake --build` 后未跑脚本的 strip 步骤), 
+> 正常发布流程产物均已裁剪; ICF 在已 strip 产物上的净收益为 3.2% (cli) / 2.7% (.so)。
+
+资源基准 (聚合 `resource`, 与优化前报告 `/tmp/base_A.json` 同环境对比; Δ 为 RSS):
+
+| 场景 | 采样点 | 优化前 RSS | 优化后 RSS | ΔRSS | ΔVmSize |
+|---|---|---|---|---|---|
+| cli (同进程) | startup | 27.50 | 24.95 | **-2.55** | 611 → 290 MB |
+| cli (同进程) | ctx200k | 32.15 | 29.53 | **-2.62** | 611 → 290 MB |
+| tui (同进程) | ctx200k | 32.49 | 29.63 | **-2.86** | 539 → 282 MB |
+| ffi (动态库调用) | ctx200k | 41.94 | 37.30 | **-4.64** | 1285 → 387 MB |
+| real_tui (真实 TUI) | ctx200k | 33.38 | 30.38 | **-3.00** | 611 → 290 MB |
+| split_cli (真实 server) | ctx200k | 35.49 | 33.79 | **-1.70** | 391 → 133 MB |
+| split_tui (真实 server) | ctx200k | 36.07 | 33.78 | **-2.29** | 391 → 134 MB |
+| split_tui (真实 client) | ctx200k | 19.32 | 17.84 | **-1.48** | 387 → 86 MB |
+| server_only | 235 轮 / 200K | 35.68 | 33.65 | **-2.03** | 390 → 134 MB |
+| real_tui_child (server) | ctxScaled2 | 36.21 | 33.46 | **-2.75** | 391 → 133 MB |
+| plugin_attrib | 未加载任何插件 | 12.12 | 10.50 | **-1.62** | 153 → 89 MB |
+| plugin_attrib | 5 插件全载 | 20.38 | 18.62 | **-1.76** | - |
+
+CPU 与耗时 (同场景 user+sys / wall, 单位秒): 服务端场景 user 时间下降 5%~15%
+(3.70→3.30 / 3.84→3.27 / 3.45→3.23), wall 时间持平或略降 (6.3→6.1 / 6.4→6.0),
+即本轮优化未引入 CPU 代价。VmSize 的大幅下降来自 arena 数量收敛 (未固定
+mmap/trim 阈值, 后者实测会增加 15% 场景耗时)。
+
+优化后复测的稳定性: 同一产物连续两次聚合运行, ΔRSS 均在 ±0.4 MB 内
+(模块级差异表为空), 与第 5 节记录的稳定性一致。
+
+### 后续可优化方向
+
+1. **会话消息双份存储**: `viewMessages` (展示) 与 `llmMessages` (LLM 上下文)
+   各自持有正文, 200K token 历史约 1.9 MB; 若要合并需让 LLM 侧引用展示侧内容
+   (涉及压缩改写语义), 改动面大
+2. **`msgIndex_` 与 `WireDelta` 的 id/文本副本**: 每条消息的 id 在 `viewMessages`
+   与 `msgIndex_` 中各存一份 (长会话约 100 KB 级)
+3. **插件静态依赖**: 每个插件各带一份 fmt/simdjson/正则/curl; 5 个常用插件合计
+   ~8 MB RSS, codegraph 单独 ~6 MB (tree-sitter 语法表 + 后台预索引)
+4. **线程栈**: 默认 8 MB 线程栈使 VmSize 仍有百 MB 级冗余 (RSS 影响很小)
+
+
+## 9. 内存分配器 mimalloc 实测 (2026-09-26 / 88fee6e0 重测)
+
+构建开关与接入范围见 `docs/zh-cn/design/index.md` "内存占用与分配器调整"
+(`AGENTXX_ENABLE_MIMALLOC` —— **默认关闭**, 依据是第 10 节 Windows 侧的
+长上下文实测, 2026-09-28 重测见第 12 节; `AGENTXX_MIMALLOC_LINK`, 默认 STATIC)。
+对比对象是**调优后的 glibc** (即第 8 节的产物: `M_ARENA_MAX=1` + 轮末
+`malloc_trim(0)`), 因此本节的差值是两个都已针对常驻内存优化过的分配器之间的差值,
+不是 mimalloc 与"未调优 glibc"的差值。
+
+> 本节数据为 **2026-09-26 重新实测**: 主仓 commit `88fee6e0`, neograph `1522761`;
+> 两侧在**同一构建目录**内只切换 `AGENTXX_ENABLE_MIMALLOC` (mimalloc 为 STATIC 链接,
+> 版本 3.5.3); 环境: WSL Ubuntu 22.04 / 12 核 / GCC 16.1.0 / Release, 聚合运行。
+> 两次完整报告存于 `resource/benchmark/2026-09-26_88fee6e0_linux-resource/`:
+> `bench_20260926_023051.*` (glibc) 与 `bench_20260926_024639.*` (mimalloc)。
+
+RSS (Release, 同机同场景, 单位 MB):
+
+| 场景 | 采样点 | glibc (基线) | mimalloc (STATIC) | ΔRSS |
+|---|---|---|---|---|
+| cli (同进程) | startup | 26.68 | 30.62 | +3.94 |
+| cli (同进程) | ctx100k | 28.80 | 33.00 | +4.20 |
+| cli (同进程) | ctx200k | 31.30 | 36.62 | +5.32 |
+| split_cli (真实 server) | startup | 24.12 | 25.62 | +1.50 |
+| split_cli (真实 server) | ctx100k | 34.11 | 46.65 | +12.54 |
+| split_cli (真实 server) | ctx200k | 36.90 | 72.25 | +35.35 |
+| split_cli (真实 client) | ctx200k | 18.12 | 19.38 | +1.26 |
+| server_only (真实 server) | 235 轮 / 200K token | 41.26 | 71.91 | +30.65 |
+
+CPU 与耗时 (真实 server 进程, `split_cli` 场景 235 轮 WebSocket 会话, 200K 上下文):
+
+| 指标 | glibc (基线) | mimalloc (STATIC) | 变化 |
+|---|---|---|---|
+| user | 4360 ms | 3270 ms | -25% |
+| sys | 1580 ms | 510 ms | -68% |
+| wall | 5794 ms | 3852 ms | -34% |
+
+同批 `server_only` 235 轮场景方向一致 (user 4600 → 4270 ms, sys 1410 → 580 ms,
+wall 6288 → 4737 ms)。
+
+统计方式说明与结论:
+
+- mimalloc 侧的 `堆在用` / `堆空闲` / `可回收` 恒为 0 (这些指标读的是
+  glibc `mallinfo2`), 内存都在 mimalloc 自己的页管理中; 模块分解里表现为
+  `[heap]` 归零、`[anon]` 上升 (mimalloc 的段都是匿名映射)
+- mimalloc 的常驻内存更高, 且**随上下文/轮次放大**: 同进程 cli 场景 +4~5 MB,
+  真实 server 场景 200K 上下文时 +35.35 MB (上一轮实测 +6.57 MB) —— 空闲页保留在
+  各线程堆的页队列里 (清空延迟默认 1s), 而 glibc 侧在轮末被 `malloc_trim(0)` 主动归还;
+  每轮分配次数越多, 被"上一轮峰值"钉住的量越大 (第 11 节)
+- 系统态时间的下降主要来自不再有 glibc arena 的 mmap/munmap 与轮末 trim 抖动
+- **THP 必须关闭**: 上游 Linux 默认 `MI_ALLOW_THP=FULL`, 该模式下 mimalloc 以
+  2 MB 大页为单位保留内存、释放小对象后不拆页, 同一场景 RSS 从 ~19.6 MB 涨到
+  ~37.4 MB (匿名页); 本项目构建时固定 `-DMI_ALLOW_THP=OFF`
+- 清空延迟调参 (Windows 侧实测, 见 10.4): `PURGE_DELAY=0` +
+  `PAGE_COMMIT_ON_DEMAND=1` 把 100K 组的提交量从 224.4 降到 43.8 MB; Linux 侧本轮
+  未重测该组合 (上一轮实测回落 ~1 MB, 同时 CPU 略升)
+- 结论: 用 `AGENTXX_ENABLE_MIMALLOC` 切换两类分配器, 需要常驻内存取 glibc 组合
+  (OFF), 需要 CPU/延迟与长跑抗碎片取 mimalloc (ON)。CPU 收益在 Linux 真实
+  server 场景为 user −25% / sys −68% (wall −34%), Windows 长上下文场景为
+  user −12% / sys −26% (总 CPU −19%), 而常驻内存代价在两平台都随会话长度放大
+  (Linux +35 MB / Windows +200 MB 量级, 见第 10 节), 故默认值保持关闭
+
+## 10. 长上下文内存: mimalloc 开关对照 (Windows release, 2026-09-26 / 88fee6e0 重测)
+
+第 9 节量级在几 MB, 只覆盖 Linux 侧的短/中上下文场景。本节针对更贴近日常使用的
+"长上下文 + 每轮大量临时缓冲"形态 (每轮都要把整段上下文序列化给 LLM、渲染一遍、
+写入会话库): **同一份源码、同一个构建目录, 只切换 `AGENTXX_ENABLE_MIMALLOC`**,
+配置 (无插件 + 单个 mock 模型) 与驱动脚本完全相同, 因此差值是分配器本身的差异。
+
+> 本节数据为 **2026-09-26 重新实测**: 主仓 commit `88fee6e0`, neograph `1522761`;
+> 环境: Windows release / VS18 (MSVC) / AMD Ryzen 5 5600G (6C12T) / 52 GB;
+> 负载与采样说明见 §10.5; 原始采样 (每配置的 `*.summary.json` 与
+> `MIMALLOC_SHOW_STATS` 统计) 存于 `resource/benchmark/2026-09-26_88fee6e0_windows-longctx/`。
+> 与 2026-09-25 上一轮实测 (commit 未记录, neograph 为 `11764c5`, 即依赖重写前) 的差异见第 11 节。
+> **2026-09-28 重测见第 12 节**: 同样条件下 mimalloc 提交量 224.4 → 112.6 MB、
+> 系统分配器 24.1 → 17.9 MB (100K 组), 本节的方向性结论不变。
+
+四组对照:
+
+| 组 | 说明 |
+|---|---|
+| 旧版 9/17 | `agent/build/output/agentxx-0.3.0-windows-x64.zip` 内的 `agentxx_cli.exe` (系统分配器 + 旧代码), 作为"上一个版本"基准 |
+| mimalloc 默认 | 当前代码 + `AGENTXX_ENABLE_MIMALLOC=ON` (当时 Windows release 脚本默认 `MIMALLOC_LINK=SHARED`) |
+| mimalloc 调参 | 当前代码 + mimalloc + 运行期 `MIMALLOC_PURGE_DELAY=0` + `MIMALLOC_PAGE_COMMIT_ON_DEMAND=1` |
+| no-mimalloc | 当前代码 + `-DAGENTXX_ENABLE_MIMALLOC=OFF` (系统分配器; 与"mimalloc 默认"只差这一个开关) |
+
+统计方式与负载:
+
+- 专用工作集 = 任务管理器"内存"列 (`Working Set - Private`); WS = 工作集;
+  提交 = 私有字节; 单位 MB
+- 负载: `agentxx_cli cli` + 本地 mock LLM (SSE 立即返回, 无 toolcall); 50 条 8KB
+  用户消息 ≈ 100K token 上下文, 100 条 ≈ 200K token; 另加"5 条 × 80KB"作为
+  "同样上下文、更少轮次"的对照
+- 每轮都要把整段上下文 (含历史) 重新序列化并发给 LLM, 是该负载 CPU 与临时缓冲的主要
+  来源之一 (分配次数的分档来源分析与 2026-09-26 的更正见第 11 节)
+
+### 10.1 启动与空闲 (无插件, 2026-09-26 / 88fee6e0 重测)
+
+| 场景 | 旧版 9/17 (0.3.0) | mimalloc 默认 | no-mimalloc (同代码) |
+|---|---|---|---|
+| server 启动峰值: 峰值提交 / 峰值虚拟内存 | 2.86 / 4.12 GB | 13.77 / 5.12 GB | **3.34 / 4.12 GB** |
+| server 空闲: WS / 专用 / 提交 | 10.96 / 1.59 / 2.86 | 12.22~12.23 / 2.70~2.71 / 13.77 | **10.89 / 1.61 / 2.94** |
+| TUI 空闲: WS / 专用 / 提交 | 14.52 / 2.71 / 4.22 | 16.94 / 5.07 / 41.85 | **14.41 / 2.82 / 5.05** |
+
+> `--version` 峰值提交/峰值虚拟内存本次未重测: 该命令启动后立即退出 (进程存活
+> 时间短于一次采样), 采不到可靠峰值; 表中改用 server 启动峰值 (含同样的进程
+> 初始化与库加载)。TUI 空闲一行为 2026-09-25 的数据 (commit 未记录; 需要真实终端,
+> 未重测)。
+
+关掉 mimalloc 后空闲数据与旧版一致 (server 专用工作集 1.61 MB): 第 9 节
+记录的"启动 +5.6 MB"在 Windows 上同样存在, 且全部来自分配器 —— 1.0 GiB 的 arena 预留
+只占虚拟内存 (不影响任务管理器"内存"列), 提交量来自它按 64 KiB 片整块提交页、释放后
+至少 1 s 才归还 (且归还只在下一次分配时被触发)。
+
+### 10.2 长上下文 (专用工作集 / WS / 提交, 2026-09-26 / 88fee6e0 重测, 50 × 8KB 组为 3 次运行取范围, 其余单次)
+
+| 场景 | 旧版 9/17 | mimalloc 默认 | mimalloc 调参 | no-mimalloc (同代码) |
+|---|---|---|---|---|
+| ≈100K token (50 × 8KB) | 6.1~10.5 / 24.6~24.9 / 12.7~13.5 | 31.8~47.6 / 62.0~64.6 / 224.4~238.9 | 14.5 / 43.7 / 43.8 | **8.2~8.5 / 25.5~25.9 / 21.0~24.1** |
+| ≈100K token (5 × 80KB) | 6.2 / 20.4 / 8.0 | 31.2 / 45.6 / 176.1 | – | **9.2 / 21.3 / 16.9** |
+| ≈200K token (100 × 8KB) | 15.8 / 32.6 / 20.3 | 83.9 / 117.5 / 288.6 | – | **19.9 / 34.0 / 30.8** |
+
+50 × 8KB 组的 `MIMALLOC_SHOW_STATS=1` 退出统计: `malloc req~ 3.1 GiB` (累计分配)、
+`binned current 631.8 KiB` (真正存活)、`binned 累计 2.0 GiB + huge (≥512 KiB) 累计 1.1 GiB`、
+`arenas reserved 1.0 GiB / committed peak 220.3 MiB / current 8.9 MiB`、`purged 211.3 MiB`、
+线程峰值 26、用时 5.376 s (user 0.343 s / sys 0.562 s)、进程峰值 RSS 63.1 MiB /
+峰值提交 224.9 MiB —— "分配-释放-保留"的量级远大于存活数据, 而系统分配器对大块释放
+会直接交还系统。分配次数按 bin 的来源分析与根因见第 11 节。
+
+> 表内同一格是"专用工作集 / WS / 提交"。同一配置重复运行之间, 提交量稳定 (±3%),
+> 专用工作集/WS 随分配器归还时机有 ±20~30% 波动, 表中范围包含全部重复运行
+> (其中首轮与后台构建并行, 数值偏高; 括号内单独标注的即为该次)。
+
+### 10.3 CPU (100 轮 × 8KB, 进程 CPU 时间, 2026-09-26 / 88fee6e0 重测)
+
+| | 总 CPU | user | kernel |
+|---|---|---|---|
+| mimalloc | 2.515 s | 1.359 s | 1.156 s |
+| no-mimalloc | 3.109 s | 1.547 s | 1.562 s |
+
+用户态 −12%、内核态 −26%、总 CPU 低约 19% (50 轮组同向: mimalloc 0.88 s vs
+no-mimalloc 1.06~1.09 s)。第 9 节 Linux 真实 server 场景的同向结果是
+user −25% / sys −68% (235 轮 WebSocket 长跑), 且 glibc arena 的 mmap/munmap
+抖动比 Windows CRT 明显。
+
+### 10.4 结论
+
+1. **长上下文内存差距全部来自 mimalloc**: 同一份代码关掉它时 100K 上下文专用工作集
+   8.2~8.5 MB (与旧版 9/17 的 6.1~10.5 MB 同量级), 打开它变成 31.8~47.6 MB;
+   200K 上下文 19.9 → 83.9 MB (4.2 倍)
+2. **额外占用由"每轮峰值"决定, 随每轮缓冲变大而增长**: 50 条消息时比 no-mimalloc
+   多约 200 MB 提交, 100 条时多约 258 MB (轮次翻倍, 额外只增 29% —— 因为决定它的是
+   单轮峰值而不是轮数; 而单轮分配量随上下文增长: 62 MB/轮 → 99 MB/轮, 见第 11 节)。
+   机制是 mimalloc 把释放的页留在自己的队列里: 进程空闲时没有分配动作, 惰性 purge
+   不会触发, 常驻就被"上一轮峰值"钉住
+3. **调参只能缓解**: `PURGE_DELAY=0` + `PAGE_COMMIT_ON_DEMAND=1` 把 100K 组的提交
+   从 224.4 降到 43.8 MB (专用工作集 32.0~47.6 → 14.5), 仍高于系统分配器
+   (21.0~24.1)。想保留 mimalloc 又要压住提交量, 可在构建 mimalloc 时固化
+   `-DMI_EXTRA_CPPDEFS="page_commit_on_demand=1;purge_delay=0"`, 并在轮末 (或上下文
+   超过阈值时) 调用 `mi_collect(true)`, 等价于系统分配器路径的 `malloc_trim(0)`
+4. **收益与代价不匹配**: 总 CPU 只省约 19%, 换来 4~6 倍的专用工作集 (100K 组)
+   与约 9 倍的提交量
+5. 因此 2026-09 起**默认关闭**: 顶层 cmake option 默认 `OFF`, 各构建脚本
+   (`windows_{debug,release}_build.bat`、`linux_{debug,release}_build.sh`、
+   `macos_{debug,release}_build.sh` 以及 Android/交叉编译脚本) 默认也不打开;
+   需要时用 `AGENTXX_ENABLE_MIMALLOC=ON` 显式打开 (Windows 上要真正接管分配器还需
+   `AGENTXX_MIMALLOC_LINK=SHARED`)
+6. 与 2026-09-25 的上一轮实测 (commit 未记录, neograph 为 `11764c5`) 相比,
+   同一负载的数值整体升高 (mimalloc 提交
+   69.9 → 224.4 MB, 系统分配器提交 10.36 → 21.0~24.1 MB): 依赖库重写后每轮的
+   分配次数增加了约 1.4 倍, 来源分析与优化方向见第 11 节
+
+### 10.5 复现方式
+
+- 两个变体都在**同一个构建目录**里产出 (只差一个开关, 其余参数/依赖完全一致):
+
+```bash
+# no-mimalloc
+cmake -B agent/build/windows-release -S agent -DAGENTXX_ENABLE_MIMALLOC=OFF
+cmake --build agent/build/windows-release --config Release --parallel 6
+
+# mimalloc (对照)
+cmake -B agent/build/windows-release -S agent -DAGENTXX_ENABLE_MIMALLOC=ON
+cmake --build agent/build/windows-release --config Release --parallel 6
+```
+
+- 负载侧: 起一个本地 OpenAI 兼容 mock 服务 (只回 SSE), 配置里写
+  `base_url: http://127.0.0.1:<port>/v1` 且 `plugin.list: []`, 然后用
+  `agentxx_cli cli --config <cfg>` 逐条送入固定大小的用户消息 (每条一轮),
+  其间按固定间隔采样专用工作集/工作集/提交
+- Windows 专用工作集定义: `Win32_PerfFormattedData_PerfProc_Process.WorkingSetPrivate`
+  (任务管理器"内存"列); WS / 提交取 `WorkingSet64` / `PrivateMemorySize64`
+- 本次 (2026-09-26 / 88fee6e0) 使用的驱动: mock 为最小 Python SSE 服务 (立即返回),
+  驱动逐条写被测进程的 stdin (每行一条消息 = 一轮), 轮次全部被 mock 服务收到后
+  空转 4 秒再读稳态值; 采样项 (WS/专用工作集/提交/峰值提交/CPU 用户态与内核态)
+  与复现步骤见 `resource/history/memory-1/plan.md` 第 4 节; 脚本与用法见
+  `resource/benchmark/harness/README.md`
+- 若要把该场景纳入常驻基准: `resource_cli` 已加入**真实逐轮往返**段
+  (采样点 `rounds<N>x<bytes>`, 见第 1 节的环境变量; 每轮走完整流程而不是注入历史),
+  另外 mock LLM 支持 `AGENTXX_BENCH_STREAM_CHUNKS` 把回复切成 N 个 SSE 事件,
+  用于测量逐事件解析开销
+
+## 11. 依赖重写后的重新实测与分配次数来源分析 (2026-09-26 / 88fee6e0)
+
+2026-09-25 把 neograph 子模块更新为上游重写后的 master + 重写后的 fork 补丁
+(`1522761`, 主仓提交 `88fee6e0`) 之后, 同一负载的每轮分配次数与常驻内存都上升了。
+本节记录重新实测的数据与来源分析; 针对性的优化设计 (零拷贝读取、就地 append、
+收敛整段状态序列化) 与验收指标见
+[resource/history/memory-1/plan.md](../../../resource/history/memory-1/plan.md)。
+**2026-09-28 重测 (第 12 节)**: 同一负载的 `malloc req~` 已降到 1.5 GiB (50 × 8KB) /
+3.7 GiB (100 × 8KB), 16~257 KiB 的整段缓冲档几乎清零; 但本节定位的 `huge`
+(asio 协程帧) 档当时逐项未变 (1.1 GiB / 570 块) —— 该问题随后在同批工作中定位到
+机制并处置 (第 13 节: 外层帧把内层协程帧又算了一遍)。
+
+标注: 重测数据 = 2026-09-26, 主仓 `88fee6e0`, neograph `1522761`;
+"上一轮" = 2026-09-25 的实测, **commit 未记录** (当时 neograph 为 `11764c5`,
+即依赖重写前), 只作量级对照。原始数据存于 `resource/benchmark/` 下两个目录
+(`2026-09-26_88fee6e0_windows-longctx/`、`2026-09-26_88fee6e0_linux-resource/`)。
+
+负载与方法 (与 §10 同一套台账): Windows release, `agentxx_cli cli` + 本地 mock LLM
+(只回 SSE 且立即返回), 无插件, data_dir 指向临时目录, 经 stdin 逐条送入固定大小消息
+(每条一轮), 全部轮次被 mock 服务收到后空转 4 秒取稳态。分配次数取自
+`MIMALLOC_SHOW_STATS=1` 的退出统计 (只有 mimalloc 变体能取到)。
+
+每轮分配次数 (退出时的 `malloc req~`, 累计):
+
+| 组 | 重测 (2026-09-26 / 88fee6e0) | 上一轮 (2026-09-25, commit 未记录) | 变化 |
+|---|---|---|---|
+| 50 轮 × 8KB (≈100K token, 请求体 ≈410 KB) | 3.1 GiB (62 MB/轮) | 1.3 GiB (26 MB/轮) | 2.4 倍 |
+| 50 轮 × 100B (小上下文, 请求体 ≈15 KB) | 1.3 GiB (26 MB/轮) | 290 MiB (5.8 MB/轮) | 4.5 倍 |
+| 100 轮 × 8KB (≈200K token) | 9.9 GiB (99 MB/轮) | – | – |
+| 5 轮 × 80KB (≈100K token, 更少轮次) | 364.8 MiB (73 MB/轮) | – | – |
+
+50 轮 × 8KB 组的按 bin 来源分析 (累计量 / 每轮块数):
+
+| 块大小 (bin) | 累计量 | 块数 | 每轮块数 | 备注 |
+|---|---|---|---|---|
+| ≥512 KiB (`huge`) | 1.1 GiB | 570 | ≈11 | 平均 ≈2 MB/块 |
+| 257.0 KiB | 486.5 MiB | 1.9K | ≈38 | |
+| 128.5 KiB | 393.8 MiB | 3.1K | ≈62 | |
+| 10 KiB | 419.1 MiB | 42.9K | ≈858 | |
+| 64.2 KiB | 243.3 MiB | 3.8K | ≈76 | |
+| 32.1 KiB | 132.5 MiB | 4.2K | ≈84 | |
+| 16.0 KiB | 67.5 MiB | 4.3K | ≈86 | |
+| 384 B | 59.4 MiB | 162.3K | ≈3.2K | |
+| 6.0 KiB | 47.7 MiB | 8.1K | ≈162 | |
+| 128 B / 32 B | 19.8 / 7.2 MiB | 162.8K / 237.7K | ≈3.3K / ≈4.8K | |
+
+来源分析 (代码位置, 2026-09-26 复核后更正): 图状态确实每步都在整段序列化, 但**位置与占比与初版分析不同**
+agentxx 路径上真正每步执行的是 `neograph/src/core/graph_engine.cpp:1503-1505`
+(VALUES 事件 `state.serialize()`, 而 agentxx 侧 `EventBridge::handleChannelWrite`
+不消费 `__state__`, 载荷作废) 与 coordinator 的 checkpoint
+(`graph_coordinator.cpp:258 / 290`, 由 `graph_engine.cpp:1615` 每 super-step 调用);
+`graph_executor.cpp:222` (`hash_state_for_cache`) 与 `graph_executor.cpp:772`
+(`state_snapshot`) 在 agentxx 上**不会执行** (节点缓存未启用, 图里没有 Send)。
+
+关键更正: **`huge` 与上下文大小无关** —— 50 × 100 B (5 KB 上下文) 与 50 × 8 KB
+(400 KB 上下文) 的 `huge` 都是 1.1 GiB / 553~570 块 (每轮固定 ≈11 块 × ≈2 MB),
+所以它不是"整段状态序列化"的产物: 去掉会话持久化 (`data_dir`)、把
+`model_context_max_token` 从 1M 改成 10K、把 mock 改成每响应 100 个 SSE chunk,
+三者都不改变它。**2026-09-26 已定位** (见
+[memory-1/work.md §3.1](../../../resource/history/memory-1/work.md)): 这 11 块是
+**asio awaitable 协程帧** (`awaitable_frame_base<Executor>::operator new`, 每轮
+每个协程调用一次, 帧尺寸是编译期常量), Windows/MSVC 构建给这些帧预留的空间
+远超实际用量 (2.5 MB 的帧里只有几百字节被写到, 帧类型本身仅 ~0.5 KB),
+Linux/GCC 构建上同样的协程帧很小 (同负载下 ≥512 KiB 分配为 0);
+asio 的帧回收缓存只缓存 ≤1020 字节的块, 所以这些大帧每轮重新 malloc/free。
+
+> **这一项只在链接 mimalloc 时变成内存账** (2026-09-26 补充): 帧尺寸与分配器无关
+> (两种分配器收到的都是同一个 `operator new(size)` 请求), 差别是大块请求的路子 ——
+> 系统分配器对大块走 `VirtualAlloc` 路线、未触碰的页不驻留、`free` 即归还, 所以
+> 默认配置 (mimalloc 关闭, 见第 10.4 节) 的 Windows 曲线与 Linux 同量级
+> (100K 组专用工作集 8.2~8.5 MB / 提交 21~24 MB); mimalloc 则把大块整块提交、
+> 释放后留在自己的页队列里, 于是每轮 ≈22 MB 的帧峰值被跨轮保留 (默认 224.4~238.9 MB,
+> 加 `PURGE_DELAY=0`+`PAGE_COMMIT_ON_DEMAND=1` 后 43.8 MB ≈ 基线 + 1 轮残留)。
+> 也就是说: 只要帧尺寸仍是"预留 2.5 MB、实际用几百字节", 并且分配器会保留大块,
+> 这份增长就会出现; 两者任一处消掉, 现象即消失。
+
+> **帧尺寸为什么会算这么大** (2026-09-27 定位, 见
+> [memory-2/work.md §1](../../../resource/history/memory-2/work.md)): 只与
+> "链接期有多少代码被内联进这个协程"有关。同一份 release 参数下: 去掉 `/GL` 单 TU
+> 编译的帧 ≤ 11.7 KiB; 该 TU 用 `/GL` 单独 `/LTCG` 链接也只有 ≤12.6 KiB 的帧
+> (单 TU 可内联面小); 全程序 `/GL` 的
+> `agentxx_cli.exe` 里 ≥384 KiB 的帧有 **94 个 / 合计 164.6 MiB (最大 6.45 MiB)**,
+> 同一份代码的 debug 构建 (无 LTO) 里没有任何 ≥64 KiB 的帧。只把
+> `base_agent.cpp` 改成不加 `/GL`、其余完全不变再重链, 上一轮记录的四个 2.5 MB 帧
+> (`0x263EC0/0x2646C0/0x2649C0/0x264AC0`) 与 6.7 MB 组全部消失, ≥384 KiB 的帧
+> 94 → 51 个、最大 6.45 → 4.76 MiB —— 即**帧尺寸由 LTO 内联面决定**,
+> 生成代码只写到帧的头部几百字节 (帧类型/源码里都没有 MB 级对象)。
+> **2026-09-27 更新 VS (cl 19.51.36260) 后复测**: 真实产物数字与更新前逐位相同
+> (94 个 / 164.6 MiB / 最大 6.45 MiB), 上述缓解手段仍然有效; 小工程探针
+> (`resource/benchmark/harness/min_coro_frame/`) 在 LTO / 非 LTO 下都只有 ~2 KiB 的帧,
+> 复现不出来 —— 巨帧需要"全程序 LTO 的大内联面"。
+> 静态统计可用 [`resource/benchmark/harness/scan_coro_frames.py`](../../../resource/benchmark/harness/scan_coro_frames.py)
+> 复核 (当前 release 基线: 94 个 ≥384 KiB / 最大 6.45 MiB)。
+
+真正随上下文增长的是:
+
+- `10 KiB` 档 = **逐条消息正文拷贝** (8 KB 正文 + 1 字节结尾落到该档): 50 × 8 KB 组
+  858 块/轮 ≈ 8.6 次/条消息; 把消息改成 1 KB 后该档降到 332 块, 而 1.2 KiB 档升到
+  716 块/轮 (≈7.2 次/条) ⇒ 旧基线"每条消息文本被拷贝约 13 次/轮"的现象**依然存在**,
+  只是换了档位 (旧基线的 8 KiB 档现在只剩 2.8 MiB / 365 块);
+- `384 B` / `128 B` / `32 B` 三档与消息**条数**成正比 (50 × 100 B 与 50 × 8 KB 三档
+  块数逐位相同, 5 × 80 KB 只有约 1/3) ⇒ typed 层逐条 `from_json` / `to_json` 的小对象。
+
+> 统计方式说明 (2026-09-26 复核补充): 上表"每轮块数" = 累计 ÷ 轮数, 含**启动成本**
+> (单进程启动自身就有 `malloc req~` 35.9 MiB / `huge` 14 块), 也把"每轮固定量"与
+> "随轮次累积量"混在一起; 改用 N 轮与 N+1 轮相减的差分方式后, 每轮增量为
+> ≈11 块 `huge` (≈22 MB), 详见
+> [memory-1/plan.md §0.4](../../../resource/history/memory-1/plan.md)。
+
+常驻内存对照 (按系统分配器统计, 专用工作集 / WS / 提交, MB):
+
+| 组 | 重测 | 上一轮 |
+|---|---|---|
+| 50 轮 × 8KB | 8.2~8.5 (首次运行 11.8) / 25.5~25.9 / 21.0~24.1 | 7.95 / 21.95 / 10.36 |
+| 100 轮 × 8KB | 19.9 / 34.0 / 30.8 | 13.75 / 28.29 / 17.79 |
+| 50 轮 × 100B | 4.6 / 19.3 / 14.9 | – |
+
+Linux 侧同批重测 (完整表见第 5 节; 与上一轮对照 RSS, MB):
+
+| 场景 | 采样点 | 重测 | 上一轮 |
+|---|---|---|---|
+| cli (同进程) | startup | 26.68 | 28.05 |
+| cli (同进程) | ctx200k | 31.30 | 32.70 |
+| real_tui (真实 TUI) | ctx200k | 34.72 | 33.29 |
+| server_only (真实 server) | 空载 | 20.50 | 19.88 |
+| server_only (真实 server) | 235 轮 / 200K token | 41.26 | 36.27 |
+| real_tui_child (真实 TUI 客户端) | 235 轮 | 26.74 | 23.87 |
+
+> Linux 列的两侧来自不同构建 (依赖重写前/后各一次完整构建), 除代码差异外还包含
+> 少量构建差异, 只作量级对照; Windows 列两侧为同一构建目录内切换开关, 可直接比较。
+
+结论:
+
+1. **每轮分配次数上升约 2~4 倍**: 小上下文组的固定开销从 5.8 MB/轮 涨到 26 MB/轮;
+   按差分计算, 这 26 MB/轮 里 ≈22 MB 是 **asio 协程帧** (Windows/MSVC 构建特有:
+   ≈11 块/轮, 帧尺寸远超实际用量, 见本节前文与
+   [memory-1/work.md §3.1](../../../resource/history/memory-1/work.md)),
+   其余 ≈4 MB 才是协议/持久化/序列化等每轮固定项 (见 plan.md §0.4);
+2. **长会话与真实 server 侧常驻增长最明显**: `server_only` 235 轮 +5.0 MB,
+   `real_tui_child` 客户端 +2.9 MB, 而同进程短场景基本持平 (cli startup 反而略降);
+3. **方向上先动"每步整段序列化"与"逐条消息正文拷贝"**: ①去掉 `StreamMode::VALUES`
+   (`base_agent.cpp:986`, agentxx 侧不消费 `__state__`, 属零风险项) 与 checkpoint
+   序列化指纹化; ②收敛逐条消息正文拷贝 (10 KiB 档 ≈8.6 次/条) 与 32/128/384 B 小对象档;
+   `huge` 已定位为 Windows/MSVC 的 asio 协程帧开销 (与上下文无关, Linux 上不存在),
+   见本节前文
+
+## 12. 重构后重测: 每轮分配量减半, mimalloc 差距收窄 (Windows release, 2026-09-28 / c957b504)
+
+第 10、11 节之后主仓又合入了 30 个提交, 其中与分配量/内存直接相关的是
+`9453d893` (LLM 上下文从 neograph messages 通道迁出, 会话为唯一权威)、
+`f59814d6` (请求体消息链去重 + SSE 行解析零拷贝) 与依赖 cxx_utilxx `6bc7f72`
+(SSE 请求体按值接收、移动进请求体), 其余为客户端界面描述层 (cxx_pluginxx_ui) 接入与文档。
+本节是**同一台机器、同一套负载与驱动脚本**下的重新实测, 并补上 Windows 侧的
+`agentxx_benchmark resource` 全场景数据。
+
+> 标注: 2026-09-28 (本地时间) / 主仓 `c957b504`; 依赖 neograph `1522761` (未变)、
+> cxx_utilxx `6bc7f72`、cxx_utilxx_base `e00bdf9`、cxx_pluginxx `88de2a5`、
+> cxx_pluginxx_ui `a95d8ef` (新增)。环境: Windows Release / VS18 (MSVC) /
+> AMD Ryzen 5 5600G (6C12T) / 52 GB; 同一构建目录内只切换 `AGENTXX_ENABLE_MIMALLOC`
+> (ON + `MIMALLOC_LINK=SHARED`, 或 OFF 即系统分配器), mimalloc 3.5.3。原始数据存于
+> [`resource/benchmark/2026-09-28_c957b504_windows-longctx/`](../../../resource/benchmark/2026-09-28_c957b504_windows-longctx/README.md)。
+> 对照批 = 2026-09-26 / `88fee6e0` (第 10、11 节), 同机同负载同脚本。
+> 注意: 两批之间 cxx_utilxx 子模块也变了 (`34b66ce` → `6bc7f72`), 差值不只是主仓代码。
+
+### 12.1 长上下文稳态 (harness 负载, 单位 MB = "专用工作集 / 提交")
+
+| 场景 | 系统分配器 09-26 | 系统分配器 09-28 | mimalloc 09-26 | mimalloc 09-28 |
+|---|---|---|---|---|
+| ≈100K token (50 × 8KB) | 11.77 / 24.09 (r2 8.21/20.96, r3 8.45/22.10) | 8.39 / 17.85 (r2 9.65/23.76, r3 7.25/17.86) | 32.98 / 224.43 (r2 47.58/224.86, r3 31.80/238.94) | 36.00 / 112.63 (r2 23.07/112.64, r3 18.66/147.82) |
+| ≈100K token (5 × 80KB) | 9.24 / 16.92 | 6.68 / 15.79 | 31.19 / 176.08 | 19.73 / 104.48 |
+| ≈200K token (100 × 8KB) | 19.86 / 30.75 (峰值提交 51.92) | 15.79 / 25.75 (峰值提交 43.90) | 83.88 / 288.55 | 59.83 / 148.84 |
+| 小上下文 (50 × 100B) | 4.58 / 14.85 | 4.48 / 14.29 | 9.14 / 112.63 | 8.88 / 106.38 |
+| server 空闲 (WS / 提交) | 10.89 / 2.94 | 10.86 / 2.91 | 12.23 / 13.77 | 12.24 / 13.76 |
+| mimalloc 调参 (`PURGE_DELAY=0`+`PAGE_COMMIT_ON_DEMAND=1`) | – | – | 14.51 / 43.76 | 10.73 / 26.06 |
+
+进程 CPU 时间 (累计, 100 × 8KB 组):
+
+| | 总 CPU | user | kernel |
+|---|---|---|---|
+| 系统分配器 09-26 → 09-28 | 3.109 → **2.000 s** | 1.547 → 0.641 s | 1.562 → 1.359 s |
+| mimalloc 09-26 → 09-28 | 2.516 → **1.641 s** | 1.359 → 0.531 s | 1.156 → 1.109 s |
+
+同代码两个分配器对照 (09-28, 100 × 8KB): 2.000 s (系统) vs 1.641 s (mimalloc),
+总 CPU −18%; 而 50 × 8KB 组两者接近 (系统 0.80~0.84 s, mimalloc 0.83~0.88 s),
+差值在重复运行的波动量级内。
+
+读法 (与上一批同样的统计方式):
+
+1. **系统分配器下长上下文小幅下降**: 200K 组专用工作集 19.9 → 15.8 MB、提交
+   30.8 → 25.8 MB; 100K 组提交中位 22.1 → 17.9 MB; 小上下文与 server 空闲持平;
+2. **mimalloc 的常驻代价减半**: 100K 组提交 224.4~238.9 → 112.6~147.8 MB,
+   200K 组 288.6 → 148.8 MB; 与系统分配器的差距仍在但收窄
+   (200K 组 专用工作集 3.8 倍、提交 5.8 倍; 100K 组中位 提交 17.9 → 112.6 MB);
+3. **CPU 明显下降**: 200K 组长上下文 CPU 两个变体都降 35%~36%, 小上下文组持平 ——
+   与 `f59814d6` / cxx_utilxx `6bc7f72` 去掉请求体与 SSE 行的多余拷贝方向一致。
+
+与更早的发布版对照 (上一批记录里的 `old_` 组 = `agentxx-0.3.0-windows-x64`, 2026-09-17,
+系统分配器 + 旧代码, 同机同负载): 专用工作集基本持平 (200K 组 15.84 → 15.79 MB;
+100K 组 6.1~10.5 → 7.3~9.7 MB), 提交量略高 (200K 组 20.33 → 25.75 MB;
+100K 组 12.7~13.5 → 17.9~23.8 MB), CPU 更低 (200K 组 2.984 → 2.000 s, −33%),
+server 空闲三者一致 (专用 1.6 MB / 提交 2.9 MB)。
+
+### 12.2 每轮分配量: 减半, 且减少集中在协议/请求体缓冲档
+
+`MIMALLOC_SHOW_STATS=1` 退出统计 (只有 mimalloc 变体能取到):
+
+| 项 (50 × 8KB / 100 × 8KB) | 09-26 | 09-28 |
+|---|---|---|
+| `malloc req~` 累计 | 3.1 GiB / 9.9 GiB | **1.5 GiB / 3.7 GiB** (62→30 MB/轮, 99→37 MB/轮) |
+| `binned` 累计 | 2.0 GiB / 7.4 GiB | 462.4 MiB / 1.3 GiB |
+| `binned` 峰值 | 113.1 MiB / 240.7 MiB | 25.8 MiB / 97.5 MiB |
+| `huge` (≥512 KiB) 累计 / 块数 | 1.1 GiB / 570 (50×8KB)、2.4 GiB / 1.4K (100×8KB) | 1.1 GiB / 570、2.3 GiB / 1.3K (**基本未变**) |
+| 进程峰值提交 | 224.9 MiB / 288.6 MiB | 114.5 MiB / 149.5 MiB |
+
+50 × 8KB 组的分 bin 变化 (累计量 / 块数):
+
+| 块大小 | 09-26 | 09-28 | 说明 |
+|---|---|---|---|
+| 257.0 KiB | 486.5 MiB / 1.9K | 23.5 MiB / 94 | 请求体/整段缓冲档 |
+| 128.5 KiB | 393.8 MiB / 3.1K | 5.1 MiB / 41 | 同上 |
+| 64.2 KiB | 243.3 MiB / 3.8K | 12.5 MiB / 201 | 同上 |
+| 32.1 KiB | 132.5 MiB / 4.2K | 5.1 MiB / 166 | 同上 |
+| 16.0 KiB | 67.5 MiB / 4.3K | 3.3 MiB / 213 | 同上 |
+| 10.0 KiB | 419.1 MiB / 42.9K | 210.7 MiB / 21.5K | 逐条消息正文拷贝 |
+| 6.0 KiB | 47.7 MiB / 8.1K | 6.1 MiB / 1.0K | |
+| 384 B | 59.4 MiB / 162.3K | 21.5 MiB / 58.9K | typed 层逐条小对象 |
+| 128 B / 32 B | 19.8 / 7.2 MiB | 7.2 / 2.1 MiB | 同上 |
+
+结论与原因:
+
+1. **16~257 KiB 的整段/请求体缓冲档几乎清零** (−95%~−99%): 与"请求体不再逐层拷贝"
+   (主仓 `f59814d6` + cxx_utilxx `6bc7f72`) 和"LLM 上下文不再随图状态整段序列化"
+   (`9453d893`) 的方向吻合; 第 11 节推断的"每步整段状态序列化"这一项本轮被消掉;
+2. **10 KiB 档 (逐条消息正文) 减半**, 32/128/384 B 小对象档降到约 1/3 ——
+   第 11 节记录的"每条消息文本被拷贝多次"现象**减轻但没有消失**;
+3. **`huge` 档基本不变**: 50 × 8KB 组 1.1 GiB / 570 块 (≈每轮 11 块 × ≈2 MB) 与上一批
+   逐项相同, 100 × 8KB 组 2.4 → 2.3 GiB / 1.4K → 1.3K 块; 静态扫描也一致
+   (本批 `agentxx_cli.exe` 96 个 ≥384 KiB 的协程帧 / 合计 165.6 MiB /
+   最大 6.45 MiB, 上一批 94 个 / 164.6 MiB / 最大 6.45 MiB) —— 即第 11 节定位的
+   "MSVC + 全程序 LTO 下的巨帧"问题**与本次重构无关, 仍未解决**;
+   mimalloc 变体的提交量减半是 binned 峰值下降 (113.1 → 25.8 MiB) 的结果,
+   巨帧那一份保留 (每轮 ≈22 MB) 当时依旧存在 (已由第 13 节处置消除)。
+
+### 12.3 Windows `agentxx_benchmark resource` 全场景对照 (新增数据)
+
+同一构建目录切换开关各跑一次聚合 (`AGENTXX_BENCH_OUTPUT_DIR` 指向本批目录);
+Windows 上只有 RSS (工作集) / 峰值 / 线程 / 句柄可用, PSS/私脏/堆列不可用:
+
+| 场景 | 侧 | 采样点 | 系统分配器 | mimalloc | ΔRSS |
+|---|---|---|---|---|---|
+| cli | self | startup | 19.96 | 26.46 | +6.50 |
+| cli | self | ctx200k | 24.55 | 34.52 | +9.97 |
+| cli | self | rounds20x8192 (真实逐轮) | 30.06 | 57.53 | +27.47 |
+| tui (headless) | self | ctx200k | 25.21 | 35.17 | +9.96 |
+| split_cli | server | startup | 15.64 | 17.10 | +1.46 |
+| split_cli | server | ctx100k | 30.01 | 37.04 | +7.03 |
+| split_cli | server | ctx200k | 40.46 | 55.07 | +14.61 |
+| split_cli | client | ctx200k | 13.91 | 14.98 | +1.07 |
+| split_tui | server | ctx200k | 38.98 | 47.86 | +8.88 |
+| split_tui | client | ctx200k | 14.29 | 17.71 | +3.42 |
+| real_tui (真实界面) | self | startup | 23.78 | 30.46 | +6.68 |
+| real_tui | self | ctx200k | 29.74 | 40.30 | +10.56 |
+| server_only | server | 空载 | 13.55 | 14.94 | +1.39 |
+| server_only | server | 235 轮 / 200K token | 41.47 | 46.51 | +5.04 |
+| plugin_attrib | self | 未加载插件 | 10.54 | 12.21 | +1.67 |
+| plugin_attrib | self | 5 插件全载 | 13.26 | 14.86 | +1.60 |
+
+- 方向与 harness 一致: mimalloc 的差值在"上下文越大 / 真实逐轮越多"的场景越明显
+  (真实逐轮 20 轮 +27.5 MB、真实 server 200K +14.6 MB), 空载与客户端侧只有 +1 MB 级;
+- 本机 Windows 上 `resource_ffi` 曾崩溃无报告 (退出码 `0xC0000005`, `libagentxx.dll`
+  加载之后; 两个变体都一样), **已在 2026-09-28 修复**: 基准侧手写的函数指针签名与
+  `ffi_api.h` 不一致 (`agentxx_ffi_stop` / `agentxx_ffi_destroy` 少写了 `log` 出参,
+  `agentxx_ffi_send_input` 多写了一个不存在的 `opts` 参数), 被调函数仍会写那个出参,
+  于是写到寄存器里的野指针上; 现已改成取自头文件的类型 (`decltype(&::...)`)。
+  `resource_real_tui_child` 因需要 PTY 无数据 —— 该场景仍按设计跳过;
+- 帧耗时 (真实 TUI, 组件树构建耗时) 两次运行落在 0.069~0.124 ms/帧, 与分配器无关
+  (每档只有 4~21 帧, 只作参考)。
+
+### 12.5 巨帧的机制与处置
+
+第 12.2 节记录的 `huge` 档 (每轮 ≈11 块 × ≈2 MB) 在本轮又前进了一步:
+根因量化到"**外层协程帧把内层协程的帧尺寸又算了一遍**", 处置与效果见第 13 节
+(生产路径的 MB 级帧已消除, 长上下文 mimalloc 场景的提交量再降 40%)。
+
+### 12.4 结论
+
+1. **每轮分配量是分配器差值的乘数**: 本轮把 `malloc req~` 从 62 MB/轮 降到 30 MB/轮
+   (100K 组) 后, mimalloc 的提交量随之从 224.4 降到 112.6 MB, 系统分配器也从
+   24.1 降到 17.9 MB —— 要继续缩小两类分配器的差距, 优先动"每轮分配量"而不是换分配器;
+2. **默认值不变**: 同代码 200K 组 mimalloc 仍是系统分配器的 3.8 倍专用工作集 /
+   5.8 倍提交, 总 CPU 只省 18% (100K 组甚至略高), 故 `AGENTXX_ENABLE_MIMALLOC`
+   保持默认 `OFF` (第 10.4 节的判断依据本轮数据依然成立, 只是绝对差距减半);
+3. **巨帧问题独立于本轮重构**: `huge` 档 (asio 协程帧) 与静态扫描数字逐项一致,
+   即第 11 节定位的 "MSVC + 全程序 LTO 下的巨帧" 与本次重构无关; 该问题已在同批
+   后续工作中定位到机制并处置 (第 13 节: 生产路径的 MB 级帧消除)。
+4. **下一步的收益点**: ①继续收敛 10 KiB 档 (逐条消息正文, 现 ≈430 块/轮) 与
+   32/128/384 B 小对象档 (现约 1/3); ②`huge` 巨帧 (≈22 MB/轮, 只在链接 mimalloc
+   时变成内存账, 但也会抬高 CPU 侧的分配/清零成本); ③插件静态依赖与线程栈
+   (第 8 节"后续可优化方向")。其中 ② 已在本批后续工作中解决, 见第 13 节。
+
+## 13. 巨帧根因与处置: 嵌套协程帧在外层帧里重复 (2026-09-28 / c957b504)
+
+第 11 节把 `huge` 档 (每轮 ≈11 块 × ≈2 MB) 定位为 "asio awaitable 协程帧",
+并归结到 "MSVC + 全程序 LTO 的内联面"; 本节给出**机制**、**处置**与**实测**。
+
+### 13.1 机制: 外层帧把每个被 `co_await` 的内层协程帧又算了一遍
+
+反汇编 `AgentRunner::run` 的恢复函数 (release `/LTCG`, 方法见 13.4) 可以看到:
+
+```
+mov     ecx,0C9EF0h                   ; 825,584 B = 内层 GraphEngine::run_stream_async 的帧大小
+call    awaitable_frame_base<...>::operator new
+mov     qword ptr [rbx+19A000h],rax   ; 把新帧指针写进**本函数自己的帧**的 1.6 MB 偏移处
+lea     rcx,[GraphEngine::run_stream_async$_DestroyCoro$2]
+mov     qword ptr [rax+8],rcx
+lea     rcx,[GraphEngine::run_stream_async$_ResumeCoro$1]
+mov     qword ptr [rax],rcx
+```
+
+统计该恢复函数对自身帧的全部 1017 个内存操作数:
+
+| 帧偏移区间 | 操作数个数 |
+|---|---|
+| 0 ~ 4 KiB | 634 |
+| 4 ~ 64 KiB | 365 |
+| 64 KiB ~ 1 MiB | 0 |
+| 1 MiB ~ 1.6 MiB | 18 |
+
+即帧的 2.5 MB 里只有前 64 KiB 是密集使用的, 后半段是**给被 `co_await` 的内层协程留的状态区**。
+尺寸也逐位对得上:
+
+```
+AgentRunner::run 帧            2,506,528 B
+ ≈ GraphEngine::run_stream_async 帧   825,584 B
+ + GraphEngine::resume_async    帧 1,661,232 B
+ + 自身状态                           ≈19,712 B
+```
+
+结论: **`co_await` 一个会被内联的协程时, 外层帧把内层协程的帧尺寸再加一遍**
+(内层帧本身照常单独分配), 于是 MB 级帧沿调用链"翻倍":
+第 11 节记的"只有 `co_return co_await X()` 的薄包装也拿到 2.5 MB"、
+训练链上 11 个同级帧 (6.77 → 6.69 MB) 都是这个机制的产物。这也解释了为什么
+"帧尺寸随链接期内联面变化"、"帧里除头部几百字节外基本是零"——前半句对, 后半句
+是只看开头那段代码得出的结论 (深处那 18 个操作数就是内层帧指针与内层状态)。
+
+### 13.2 处置: 在"重"边界上打断内联 (不改编译选项)
+
+| 做法 | 适用 | 本项目用法 |
+|---|---|---|
+| `__declspec(noinline)` 标在**重协程**的声明上 | 自己有源码的协程 | `AgentRunner::run` (agent_runner.h) |
+| **非协程转发函数** (noinline) 包住调用 | 第三方/不能改的协程 | `agent_runner.cpp` 的 `engineRunStreamAsync` / `engineResumeAsync` (转发 neograph 的两个引擎调用) |
+
+第二种是关键: 包装是**普通函数** (不是协程), 自身没有帧; 内层协程的帧在包装里
+单独分配, 调用者只拿到一个小小的 awaitable 句柄, 于是调用者的帧不再为它留空间。
+宏 `AGENTXX_NOINLINE` 定义在 `agent/lib/include/agentxx/agent/agent_runner.h`。
+
+### 13.3 效果 (同一构建目录, 只加上述标记 + 两个转发包装)
+
+静态统计方式 (release `agentxx_cli.exe`, `scan_coro_frames.py`):
+
+| 指标 | 处置前 | 处置后 |
+|---|---|---|
+| ≥384 KiB 的帧 | 96 个 / 165.6 MiB | **66 个 / 92.9 MiB** |
+| 1 ~ 4 MiB 的帧 | 41 | **11** |
+| 生产路径 (agent 轮次) 最大帧 | 2.5 MB (`AgentRunner::run` 链) | **< 384 KiB** |
+
+运行时统计方式 (Windows release, `AGENTXX_ENABLE_MIMALLOC=ON` + `MIMALLOC_LINK=SHARED`,
+`agentxx_cli cli` + mock LLM, 8 KB/轮):
+
+| 指标 (50×8KB / 100×8KB) | 处置前 | 处置后 |
+|---|---|---|
+| `huge` (≥512 KiB) 累计 / 块数 | 1.1 GiB / 570、2.3 GiB / 1.3K | **131 MiB / 167、433 MiB / 577** |
+| `huge` 峰值 | 28.0 / 29.4 MiB | **3.0 / 4.4 MiB** |
+| `malloc req~` 累计 | 1.5 / 3.7 GiB | 599 MiB / 1.8 GiB |
+| 进程峰值提交 (按分配器统计) | 114.5 / 149.5 MiB | **80.6 / 89.1 MiB** |
+| 稳态提交 | 112.6 / 148.8 MB | **80.6 / 89.1 MB** |
+| 稳态专用工作集 | 36.0 (31.2~47.6) / 59.8 MB | **31.2~32.7 / 42.0 MB** |
+| CPU 合计 (user+kernel) | 0.875 / 1.641 s | 0.78~0.86 / 1.48 s |
+
+即: 100×8KB (200K token) 组提交量 **−40%**、专用工作集 **−30%**、`huge` 字节 **−81%**;
+50×8KB 组 `huge` 字节 **−88%**。系统分配器路径本来就不把这些帧计入常驻
+(未触碰页不提交), 收益主要体现在分配器放置策略与系统调用次数上。
+
+### 13.4 复现与回归卡口
+
+```powershell
+# 静态统计方式: ≥384 KiB 的帧数与最大帧 (无需运行)
+python resource/benchmark/harness/scan_coro_frames.py <agentxx_cli.exe>
+# 归属到函数 (定位"帧尺寸来自哪个函数", 也就是需要打断内联的位置)
+python resource/benchmark/harness/frame_owner.py <agentxx_cli.exe> <link.map>
+#   /MAP 需要一次等价重链 (/DEBUG:FULL /MAP, ≈150 s), 做法见 memory-2/work.md §2.1
+# 运行时统计方式: MIMALLOC_SHOW_STATS=1 看 huge 档累计量/块数 (块数 ÷ 轮数 = 每轮巨帧次数)
+```
+
+未处置的巨帧 (与生产路径无关, 需要时按 13.2 处理):
+
+- 训练模式: `runTrainingMode` 链 6.77 MB、`runEvolutionLoop` 1.67 MB (仅 `agentxx_cli train`);
+- neograph 子图: `SubgraphNode::run` 4.98 MB、`run_subgraph_async` 1.66 MB
+  (仅图里含子图时才会走到; 默认 agent 图不含)。
+
+## 14. 界面层与可观测性改动后的重测: 无内存回退, 帧处置后的提交量下移 (Windows release, 2026-10-07 / d6e21470)
+
+第 12、13 节之后主仓又合入 67 个提交, 主要是客户端模型层 (历史窗口/队列镜像)、
+输入投递队列、会话检索与改名、可观测性 (关键指标/诊断包)、
+插件注册可逆与独占 slot、配置/协议校验等; 与内存直接相关的是
+`2d6c1961` (结构体成员顺序调整, 减小内存) 与第 13 节的巨帧处置 (本批构建已包含)。
+本节是**同一台机器、同一套负载与脚本**下的重新实测, 默认构建 (系统分配器),
+用于确认这些改动没有让常驻内存回退。
+
+> 标注: 2026-10-07 (本地时间) / 主仓 `d6e21470`; 依赖 neograph `1522761` (未变)、
+> cxx_utilxx `6bc7f72` (未变)、cxx_utilxx_base `9c142320` (上一批 `e00bdf9`)、
+> cxx_pluginxx `1c7a04a7` (上一批 `88de2a5`)、cxx_pluginxx_ui `4309de94`
+> (上一批 `a95d8ef`)。环境: Windows Release / VS18 (MSVC 14.51) /
+> AMD Ryzen 5 5600G (6C12T) / 52 GB; `AGENTXX_ENABLE_MIMALLOC=OFF` (默认, 本批未重建
+> mimalloc 变体, 对比只在系统分配器之间)。原始数据存于
+> [`resource/benchmark/2026-10-07_d6e21470_windows-resource/`](../../../resource/benchmark/2026-10-07_d6e21470_windows-resource/README.md)。
+> 对照批 = 2026-09-28 / `c957b504` (第 12 节, 系统分配器单次聚合)。
+> 两点注意: ① 两批之间主仓 67 个提交 + 三个依赖变化, 差值不是单一改动;
+> ② 上一批的 Windows `resource` 数据采集于巨帧处置**之前**, 本批已含处置。
+> 基准侧为适配客户端历史窗口 API 改了 3 处引用
+> (`historyWindowStart` → `history.windowStart()`), 只影响能否编过, 不影响负载。
+
+### 14.1 Windows `agentxx_benchmark resource` 全场景 (RSS, MB; 3 次运行取中位)
+
+| 场景 | 侧 | 采样点 | 09-28 | 本批 | ΔRSS |
+|---|---|---|---|---|---|
+| cli | self | startup | 19.96 | 19.56 | -0.40 |
+| cli | self | ctx100k | 22.08 | 21.57 | -0.51 |
+| cli | self | ctx200k | 24.55 | 24.13 | -0.42 |
+| cli | self | rounds20x8192 (真实逐轮) | 30.06 | 30.73 | +0.67 |
+| tui (headless) | self | startup | 19.95 | 19.58 | -0.37 |
+| tui | self | ctx100k | 22.54 | 22.11 | -0.43 |
+| tui | self | ctx200k | 25.21 | 24.79 | -0.42 |
+| split_cli | server | startup | 15.64 | 16.55 | +0.91 |
+| split_cli | server | ctx100k | 30.01 | 28.66 | -1.35 |
+| split_cli | server | ctx200k | 40.46 | 39.86 | -0.60 |
+| split_cli | client | startup | 13.59 | 13.33 | -0.26 |
+| split_cli | client | ctx100k | 13.90 | 13.70 | -0.20 |
+| split_cli | client | ctx200k | 13.91 | 13.71 | -0.20 |
+| split_tui | server | startup | 15.68 | 16.59 | +0.91 |
+| split_tui | server | ctx100k | 29.79 | 27.77 | -2.02 |
+| split_tui | server | ctx200k | 38.98 | 37.29 | -1.69 |
+| split_tui | client | startup | 12.84 | 12.18 | -0.66 |
+| split_tui | client | ctx100k | 13.96 | 13.30 | -0.66 |
+| split_tui | client | ctx200k | 14.29 | 13.63 | -0.66 |
+| ffi | self | startup | 崩溃无数据 | 20.41 | 新增 |
+| ffi | self | ctx100k | 崩溃无数据 | 28.19 | 新增 |
+| ffi | self | ctx200k | 崩溃无数据 | 34.30 | 新增 |
+| real_tui (真实界面) | self | startup | 23.78 | 20.31 | -3.47 |
+| real_tui | self | ctx100k | 27.21 | 25.98 | -1.23 |
+| real_tui | self | ctx200k | 29.74 | 28.66 | -1.08 |
+| server_only | server | 空载 | 13.55 | 13.30 | -0.25 |
+| server_only | server | 117 轮 / ≈100K token | 30.00 | 27.89 | -2.11 |
+| server_only | server | 235 轮 / 200K token | 41.47 | 36.32 | -5.15 |
+| server_only | server | 断开后 | 41.59 | 36.39 | -5.20 |
+| plugin_attrib | self | 未加载插件 | 10.54 | 10.11 | -0.43 |
+| plugin_attrib | self | agentxx_filesystem | 11.82 | 11.42 | -0.40 |
+| plugin_attrib | self | agentxx_execute_command | 12.45 | 12.00 | -0.45 |
+| plugin_attrib | self | agentxx_system | 12.70 | 12.27 | -0.43 |
+| plugin_attrib | self | agentxx_websearch | 13.00 | 12.58 | -0.42 |
+| plugin_attrib | self | agentxx_planning (5 插件全载) | 13.26 | 12.83 | -0.43 |
+| plugin_attrib | self | 全部卸载后 | 11.90 | 11.48 | -0.42 |
+
+- 3 次运行的极差: 进程内生场景 ≤0.16 MB; 真实 server 的轮次场景较大
+  (split_tui ctx200k 34.26~38.64、server_only 235 轮 34.40~37.57、
+  split_cli ctx100k 27.31~30.62), 与第 3 节"专用工作集随分配器归还时机有 ±20~30%
+  波动"的记录一致, 故取中位;
+- 34 个可比采样点中 31 个下降 (-0.20 ~ -5.20 MB), 3 个上升: 两个 server 启动点
+  (+0.91, 两侧一致) 与 cli 真实逐轮 (+0.67, 3 次极差 0.90, 在运行间波动内);
+- `resource_ffi` 本批首次拿到系统分配器的采样点 (第 12.3 节的签名修复之后);
+  `resource_real_tui_child` 仍按设计无数据 (需要 PTY)。
+
+### 14.2 长上下文 harness 负载 (专用工作集 / 提交)
+
+同一套 mock LLM harness (`resource/benchmark/harness/run_load.ps1`),
+50×8KB 与 100×8KB 各 3 次, 其余单次:
+
+| 场景 | 09-28 | 本批 |
+|---|---|---|
+| ≈100K token (50 × 8KB) | 8.39 / 17.85 (r2 9.65/23.76, r3 7.25/17.86) | 9.21 / 11.55 (r2 9.23/11.56, r3 7.30/11.00) |
+| ≈100K token (5 × 80KB) | 6.68 / 15.79 | 7.23 / 9.18 |
+| ≈200K token (100 × 8KB) | 15.79 / 25.75 (峰值提交 43.90) | 15.97 / 19.88 (峰值提交 22.03; r2 27.55/31.21, r3 15.37/17.96) |
+| 小上下文 (50 × 100B) | 4.48 / 14.29 | 4.80 / 7.36 |
+| server 空闲 (WS / 提交) | 10.86 / 2.91 | 10.71 / 2.98 |
+
+- 专用工作集与上一批基本持平 (差 ≤0.9 MB); **提交量整体下移**: 50×8KB 17.9 → 11.6
+  (-35%)、100×8KB 25.8 → 19.9 (-23%)、50×100B 14.3 → 7.4 (-48%),
+  100×8KB 的峰值提交 43.9 → 22.0 (-50%) —— 与第 13.3 节的机制一致: 巨帧不再被
+  分配, 提交量按帧生命期下移; 系统分配器路径的常驻本来就不含未触碰页, 所以工作集
+  只小幅变化;
+- 进程 CPU 时间 (累计, 100 × 8KB 组): 上一批 2.00 s (user 0.64 / kernel 1.36);
+  本批 2.14 / 2.20 / 2.49 s (user 1.22~1.44, kernel 0.84~1.05) —— 总量接近
+  (中位 +10%), 分布从内核态转向用户态 (不再分配/清零 MB 级帧);
+- server 空闲 (无客户端) 三项指标都在噪声内。
+
+### 14.3 巨帧回归卡口 (静态扫描)
+
+`scan_coro_frames.py` 扫 release `agentxx_cli.exe`:
+
+| 指标 | 13.3 处置后 (09-28) | 本批 (10-07) |
+|---|---|---|
+| ≥384 KiB 的帧 | 66 个 / 92.9 MiB | 66 个 / 92.7 MiB |
+| 1 ~ 4 MiB 的帧 | 11 | 11 |
+| 最大帧 | – | 6.4 MiB (训练链, 见 13.4) |
+
+即 67 个提交与依赖变化没有把巨帧带回来; 生产路径最大帧保持 < 384 KiB,
+最大帧仍是 13.4 列出的训练链 (`runTrainingMode`, 仅在 `agentxx_cli train` 走到)。
+原始扫描输出见
+[`resource/benchmark/2026-10-07_d6e21470_windows-resource/frames_scan_agentxx_cli_2026-10-07.txt`](../../../resource/benchmark/2026-10-07_d6e21470_windows-resource/frames_scan_agentxx_cli_2026-10-07.txt)。
+
+### 14.4 结论
+
+1. 本轮改动**没有引入内存回退**: 全场景 34 个可比采样点 31 降 3 升, 升幅都在
+   运行间波动量级或装配新增的开销上 (两个 server 启动点 +0.91);
+2. 第 13 节的帧处置与分配量收敛在长上下文上兑现为提交量: 50×8KB -35%、
+   100×8KB -23%、50×100B -48%, 100×8KB 峰值提交 -50%; 专用工作集持平;
+3. 巨帧静态卡口维持 66 个 / 92.7 MiB, 与处置后一致 (训练链 6.4 MiB 未处置,
+   与生产路径无关);
+4. 默认值不变: `AGENTXX_ENABLE_MIMALLOC` 保持 `OFF` (本批未重建 mimalloc 变体,
+   第 10.4、12.4 节的判断依据与 13.3 的修复后数据仍然适用)。
+
+## 15. 功能点/钩子/接口表改动后的重测: 常驻内存与长上下文持平, 真实轮次点回到 09-28 水平 (Windows release, 2026-10-11 / 5062151e)
+
+第 14 节之后主仓又合入 35 个提交, 与内存/性能相关的是功能点子系统
+(`09400339` 骨架 / `2e544522` 插件面 / `fcd1821f` 核心点迁移 / `8ba2f9e9` 对外开放调用)、
+钩子表尾三成员与优先级 (`5afc88f5` / `7744ad29`)、接口表四件套与自检
+(`c054066d` / `6df3a3ee` / `b40ae068`)、FFI 接口完善 (`1979d449` / `89836379`)、
+上下文压缩与系统提示词构建 (`e5e59564` / `cf2014ed` / `22301e5f`)、插件工具调整
+(`104d5c79` 启用重复调用检查 / `215e106c` read 不再自动摘要) 等, 其余为 TUI 交互、
+客户端弹窗与术语统一。本节是**同一台机器、同一套负载与脚本**下的重新实测。
+
+> 标注: 2026-10-11 (本地时间) / 主仓 `5062151e`; 依赖 neograph `1522761` (未变)、
+> cxx_utilxx `77b0379` (上一批 `6bc7f72`)、cxx_utilxx_base `ba533cc` (上一批 `9c142320`)、
+> cxx_pluginxx `809c8df` (上一批 `1c7a04a7`)、cxx_pluginxx_ui `9112bb7`
+> (上一批 `4309de94`) —— 四个依赖的变化都是注释/术语/CRLF 与接口表元数据
+> (`cxx_pluginxx` 另有 `IfaceMeta` 成员指针形态、`api_version` 判据、卸载释放文件,
+> `cxx_pluginxx_ui` 另有"插件自备 svg"), 无热路径改动。环境: Windows Release /
+> MSVC 19.51.36260 (VS18) /
+> AMD Ryzen 5 5600G (6C12T) / 52 GB; `AGENTXX_ENABLE_MIMALLOC=OFF` (默认, 本批未重建
+> mimalloc 变体)。原始数据存于
+> [`resource/benchmark/2026-10-11_5062151e_windows-resource/`](../../../resource/benchmark/2026-10-11_5062151e_windows-resource/README.md)。
+> 采集窗口 19:56~20:02, 期间本机照常运行 agent/IDE (非空载); 采集前无构建任务,
+> Linux 侧本批未重建 (当时本机没有 linux 构建目录)。
+> **本节起同时给出 09-28 一列**: 上一批 (10-07) 的数字在多数采样点低于 09-28 与本批,
+> 只看"上一批 → 本批"会把批间波动读成回退 (见 15.4 第 1 条)。
+
+### 15.1 Windows `agentxx_benchmark resource` 全场景 (RSS, MB; 本批 3 次运行取中位)
+
+| 场景 | 侧 | 采样点 | 09-28 | 10-07 | 本批 | 本批−10-07 | 本批−09-28 |
+|---|---|---|---|---|---|---|---|
+| cli | self | startup | 19.96 | 19.56 | 19.68 | +0.12 | -0.28 |
+| cli | self | ctx100k | 22.08 | 21.57 | 21.91 | +0.34 | -0.17 |
+| cli | self | ctx200k | 24.55 | 24.13 | 24.39 | +0.26 | -0.16 |
+| cli | self | rounds20x8192 (真实逐轮) | 30.06 | 30.73 | 31.58 | +0.85 | +1.52 |
+| tui (headless) | self | startup | 19.95 | 19.58 | 19.70 | +0.12 | -0.25 |
+| tui | self | ctx100k | 22.54 | 22.11 | 22.32 | +0.21 | -0.22 |
+| tui | self | ctx200k | 25.21 | 24.79 | 24.99 | +0.20 | -0.22 |
+| split_cli | server | startup | 15.64 | 16.55 | 15.55 | -1.00 | -0.09 |
+| split_cli | server | ctx100k | 30.01 | 28.66 | 31.11 | +2.45 | +1.10 |
+| split_cli | server | ctx200k | 40.46 | 39.86 | 41.04 | +1.18 | +0.58 |
+| split_cli | client | startup | 13.59 | 13.33 | 13.40 | +0.07 | -0.19 |
+| split_cli | client | ctx100k | 13.90 | 13.70 | 13.77 | +0.07 | -0.13 |
+| split_cli | client | ctx200k | 13.91 | 13.71 | 13.79 | +0.08 | -0.12 |
+| split_tui | server | startup | 15.68 | 16.59 | 15.54 | -1.05 | -0.14 |
+| split_tui | server | ctx100k | 29.79 | 27.77 | 30.39 | +2.62 | +0.60 |
+| split_tui | server | ctx200k | 38.98 | 37.29 | 37.68 | +0.39 | -1.30 |
+| split_tui | client | startup | 12.84 | 12.18 | 12.23 | +0.05 | -0.61 |
+| split_tui | client | ctx100k | 13.96 | 13.30 | 13.23 | -0.07 | -0.73 |
+| split_tui | client | ctx200k | 14.29 | 13.63 | 13.77 | +0.14 | -0.52 |
+| ffi | self | startup | – | 20.41 | 20.62 | +0.21 | – |
+| ffi | self | ctx100k | – | 28.19 | 29.52 | +1.33 | – |
+| ffi | self | ctx200k | – | 34.30 | 38.02 | +3.72 | – |
+| real_tui (真实界面) | self | startup | 23.78 | 20.31 | 22.00 | +1.69 | -1.78 |
+| real_tui | self | ctx100k | 27.21 | 25.98 | 27.13 | +1.15 | -0.08 |
+| real_tui | self | ctx200k | 29.74 | 28.66 | 29.54 | +0.88 | -0.20 |
+| server_only | server | 空载 | 13.55 | 13.30 | 13.37 | +0.07 | -0.18 |
+| server_only | server | 空载 5s | 13.55 | 13.30 | 13.37 | +0.07 | -0.18 |
+| server_only | server | 117 轮 / ≈100K token | 30.00 | 27.89 | 31.04 | +3.15 | +1.04 |
+| server_only | server | 235 轮 / 200K token | 41.47 | 36.32 | 39.14 | +2.82 | -2.33 |
+| server_only | server | 断开后 | 41.59 | 36.39 | 39.22 | +2.83 | -2.37 |
+| plugin_attrib | self | 未加载插件 | 10.54 | 10.11 | 10.24 | +0.13 | -0.30 |
+| plugin_attrib | self | agentxx_filesystem | 11.82 | 11.42 | 11.47 | +0.05 | -0.35 |
+| plugin_attrib | self | agentxx_execute_command | 12.45 | 12.00 | 12.07 | +0.07 | -0.38 |
+| plugin_attrib | self | agentxx_system | 12.70 | 12.27 | 12.28 | +0.01 | -0.42 |
+| plugin_attrib | self | agentxx_websearch | 13.00 | 12.58 | 12.61 | +0.03 | -0.39 |
+| plugin_attrib | self | agentxx_planning (5 插件全载) | 13.26 | 12.83 | 12.89 | +0.06 | -0.37 |
+| plugin_attrib | self | 全部卸载后 | 11.90 | 11.48 | 11.56 | +0.08 | -0.34 |
+
+- 本批 3 次运行的极差: 进程内生场景 ≤0.2 MB (cli/tui 各点实际只有 0.1~0.2);
+  真实 server 的轮次点较大 (split_cli ctx200k 38.73~43.49、server_only ctxScaled2
+  38.85~47.54、split_tui server ctx200k 36.65~41.16), 与第 3 节的
+  "随分配器归还时机有 ±20~30% 波动"记录一致, 故取中位;
+- 37 个可比采样点中, 相对 10-07 是 34 升 3 降 (升幅 0.01~3.72 MB),
+  相对 09-28 是 29 降 5 升 (降幅 0.08~2.37 MB, 升幅 0.58~1.52 MB);
+  两次聚合的 `server startup` 点都比 10-07 低约 1.0 MB (与 09-28 持平);
+- 线程与句柄 (资源计数): 常规场景与上一批一致 (cli 32 线程 / 221 fd, 插件场景
+  11~12 线程 / 138~145 fd, 每个插件 +1 fd); 只有 `real_tui/self/startup` 变了
+  —— 32 → 33 线程, 223 → 257 fd (+34), 该点在两批的 3 次运行内都稳定,
+  是本批唯一一处需要留意的资源计数变化 (实时界面起首帧时的 fd 占用);
+
+### 15.2 长上下文与每轮成本
+
+长上下文 harness (`../harness/run_load.ps1`, 无插件 + python mock,
+50×8KB 与 100×8KB 各 3 次, 其余单次; 专用工作集 / 提交):
+
+| 场景 | 09-28 | 10-07 | 本批 |
+|---|---|---|---|
+| ≈100K token (50 × 8KB) | 8.40 / 17.85 | 9.21 / 11.55 (r2 9.23/11.56, r3 7.30/11.00) | 8.50 / 11.45 (r1 9.33/11.66, r3 7.60/11.45) |
+| ≈100K token (5 × 80KB) | 6.68 / 15.79 | 7.23 / 9.18 | 7.20 / 9.25 |
+| ≈200K token (100 × 8KB) | 15.79 / 25.75 (峰值提交 43.90) | 15.97 / 19.88 (峰值提交 22.03; r2 27.55/31.21, r3 15.37/17.96) | 17.03 / 19.56 (峰值提交 22.03; r1 26.11/31.60, r2 15.41/19.54) |
+| 小上下文 (50 × 100B) | 4.48 / 14.29 | 4.80 / 7.36 | 5.16 / 7.47 |
+| server 空闲 (WS / 提交) | 10.86 / 2.91 | 10.71 / 2.98 | 10.80 / 3.02 |
+
+进程 CPU 时间 (累计, 100 × 8KB 组):
+
+| | 总 CPU | user | kernel |
+|---|---|---|---|
+| 09-28 (巨帧处置前) | 2.00 s | 0.641 s | 1.359 s |
+| 10-07 | 2.14 / 2.20 / 2.49 s | 1.22~1.44 s | 0.84~1.05 s |
+| 本批 | 2.00 / 2.31 / 2.33 s | 1.12~1.31 s | 0.84~1.19 s |
+
+- 长上下文一侧**没有变化**: 同尺寸场景跨批的专用工作集差 ≤1.1 MB
+  (50×8KB 8.40 / 9.21 / 8.50, 5×80KB 6.68 / 7.23 / 7.20, 100×8KB 15.79 / 15.97 / 17.03,
+  50×100B 4.48 / 4.80 / 5.16; 顺序为 09-28 / 10-07 / 本批), 提交量与 10-07 差 ≤0.2 MB,
+  且比 09-28 低 6 MB 左右 (第 13 节的巨帧处置收益保持); CPU 总量与分布也与 10-07
+  一致 (内核态不再占大头);
+- 100×8KB 组在 10-07 与本批都出现一次偏高运行 (10-07 r2 27.55/31.21、本批 r1
+  26.11/31.60; 09-28 只有单次 15.79, 未观察到); 这与"首次运行"效应一致 ——
+  50×8KB 组也能看到 (本批首轮 12.58 s vs 后续 5.59 s), 故 100×8KB 取中位;
+- 真实 TUI 帧耗时 (组件树构建, `frameStats()`): 启动窗口 20~26 帧 / 平均
+  0.078~0.093 ms, 同步窗口 4 帧 / 平均 0.076~0.084 ms; 10-07 同定义下为
+  20~22 帧 / 0.086~0.093 ms 与 4 帧 / 0.069~0.086 ms —— 无变化。
+
+每轮成本 (`resource_cli` 的真实逐轮段与 `resource_server_only` 的真实 WS 轮次):
+
+| 项 | 09-28 | 10-07 | 本批 |
+|---|---|---|---|
+| cli 20 轮 × 8KB: 每轮耗时 (avg) | 61.8 ms | 50.1~53.7 ms | 61.2~66.7 ms |
+| cli 20 轮 × 8KB: 进程 CPU (user/sys) | 703 / 235 ms | 437~484 / 156~218 ms | 516~594 / 187~203 ms |
+| server_only 235 轮: wall / user / sys | 3.96 s / 2.45 s / 1.56 s | 4.85~5.06 s / 2.77~3.03 s / 2.00~2.09 s | 5.30~6.15 s / 2.83~3.55 s / 2.48~2.75 s |
+
+即: 本批真实逐轮段比上一批慢约 20% (每轮 61~67 ms vs 50~54 ms), 但 09-28 批
+(巨帧处置**前**、理论上更慢的构建) 也是 61.8 ms/轮 —— 三批之间这项指标的波动
+属于同一量级, 没有单方向趋势。这 35 个提交里确实有触及 tool 轮次路径的改动
+(`215e106c`: `read` 不再走主程序自动摘要, 工具结果整段进上下文; `fcd1821f`/`e5e59564`:
+token 估算与压缩改走功能点; `104d5c79`: 启用重复调用检查), 基准的"真实逐轮"段每轮
+都会真的调 `agentxx_filesystem_read`, 因此**方向可疑但未证实** —— 要收敛需要一次
+"固定依赖、只变主仓"的 A/B 构建, 本次未做。
+
+### 15.3 巨帧回归卡口 (静态扫描)
+
+`scan_coro_frames.py` 扫 release `agentxx_cli.exe`:
+
+| 指标 | 13.3 处置后 (09-28) | 14.3 (10-07) | 本批 |
+|---|---|---|---|
+| ≥384 KiB 的帧 | 66 个 / 92.9 MiB | 66 个 / 92.7 MiB | 66 个 / 92.7 MiB |
+| 1 ~ 4 MiB 的帧 | 11 | 11 | 11 |
+| 最大帧 | – | 6.40 MiB (训练链) | 6.40 MiB (训练链) |
+
+35 个提交与四个依赖变化没有把巨帧带回来, 生产路径最大帧仍 < 384 KiB。
+原始扫描输出见
+[`resource/benchmark/2026-10-11_5062151e_windows-resource/frames_scan_agentxx_cli_2026-10-11.txt`](../../../resource/benchmark/2026-10-11_5062151e_windows-resource/frames_scan_agentxx_cli_2026-10-11.txt)。
+
+### 15.4 结论
+
+1. **不要只跟上一批对比**: 10-07 那一批在多数采样点上低于 09-28; 本批相对
+   10-07 是 34 升 3 降 (+0.01~+3.72 MB), 但相对 09-28 是 29 降 5 升
+   (-2.37~+1.52 MB)。也就是说本批回到 09-28 的水平线, "上一批 → 本批"的抬升主要
+   是批间波动, 不是本轮改动的回退; 进程内生场景 (cli/tui/plugin_attrib) 三批之间
+   差 ≤0.4 MB, 这三类点最稳定, 适合作为跨批判据;
+2. **新增注册表的成本量级是 0.1~0.2 MB**: 启动阶段 `agent_init_done` 比上一批高
+   0.12~0.16 MB, `agent_constructed` 高 0.02~0.03 MB, 与功能点/钩子/接口表元数据
+   三类注册表加上 `agent.config` (+2.3 KB, 系统提示词构建调整) 的量级一致;
+   相对 09-28 则仍是净下降 (插件装配点 -0.37 MB、未加载插件基线 -0.30 MB);
+3. **长上下文与巨帧都持平**: harness 的专用工作集/提交在同一档内, 帧扫描逐项一致
+   (66 个 / 92.7 MiB), 第 13 节的处置收益没有被抵消;
+4. **待跟进**: ①`real_tui/self/startup` 的线程 32→33、fd 223→257 (+34);
+   ②真实逐轮段的每轮成本 (本批与 09-28 同水平, 上一批偏低) —— 需要在同一构建目录里
+   做"固定依赖、只变主仓"的 A/B 才能判定, 或者改用同样驱动、只调插件集合的方式
+   定位到具体插件/工具路径 (本轮 5 插件 + 真实 `read` 调用是它与无插件 harness 的差异);
+   ③下一批建议顺手记录一次**机器参考负载** (固定单线程计算), 便于把批间波动归一化。
+
+
+## 16. 协程捕获生命周期修复批后重测: 无回退, 200K 稳态与上批逐项一致 (Windows release, 2026-10-12 / fc66f870)
+
+第 15 节之后主仓又合入 10 个提交 (`0f935a3a` release 2026.1011.0、
+`2f0368d0` 更新性能测试、`314de909` fix js build、`c46cebe2` fix build、
+`9ce85ff6` / `699ff7d9` 修测试、`14349a3d` 修复 cxx_* 导出静态依赖库符号、
+`5679ca51`、`4f9d0d90` / `fc66f870` 修分离协程捕获的变量生命周期), 45 个文件
++1265/-432。其中**运行时库只有 6 个文件**: `agent/lib/include/agentxx/util/task_scope.h`、
+`agent/lib/src/util/task_scope.cpp`、`agent/lib/src/agent/agent_host.cpp`、
+`agent/lib/src/event/event_stream.cpp`、`agent/lib/src/nodes/toolcall.cpp`、
+`agent/plugins/agentxx_javascript_engine/*`, 合计 +39/-14 行, 且都是把协程里按引用
+捕获的临时量改成按值捕获 —— 不改数据结构, 预期无内存变化, 本节实测确认。
+
+> 标注: 2026-10-12 (本地时间) / 主仓 `fc66f870`; 依赖 neograph `1522761`、
+> cxx_utilxx `77b0379`、cxx_utilxx_base `ba533cc`、cxx_pluginxx `809c8df`、
+> cxx_pluginxx_ui `9112bb7` —— **与上一批完全相同**, 因此两批差值只反映主仓变化。
+> 环境: Windows Release / MSVC 19.51.36260 (VS18) / AMD Ryzen 5 5600G (6C12T) / 52 GB;
+> `AGENTXX_ENABLE_MIMALLOC=OFF` (默认, 系统分配器)。原始数据存于
+> [`resource/benchmark/2026-10-12_fc66f870_windows-resource/`](../../../resource/benchmark/2026-10-12_fc66f870_windows-resource/README.md)。
+> 采集窗口 13:21~13:33, 期间本机照常运行 agent/IDE (非空载)。
+> 旧版 release 二进制已被本次构建覆盖 (磁盘上没有 10-11 的 exe), 未做同机 A/B,
+> 对比全部以上一批留存报告 (`--baseline`) 为基线。
+
+### 16.1 Windows `agentxx_benchmark resource` 全场景 (RSS, MB; 两批各 3 次运行取中位)
+
+| 场景 | 侧 | 采样点 | 10-11 | 本批 | Δ | 本批极差 |
+|---|---|---|---|---|---|---|
+| cli | self | startup | 19.68 | 19.80 | +0.12 | 19.70~19.82 |
+| cli | self | ctx100k | 21.91 | 21.92 | +0.01 | 21.91~21.99 |
+| cli | self | ctx200k | 24.39 | 24.43 | +0.04 | 24.31~24.77 |
+| cli | self | rounds20x8192 (真实逐轮) | 31.58 | 30.37 | -1.21 | 30.34~31.27 |
+| tui (headless) | self | startup | 19.70 | 19.76 | +0.06 | 19.71~19.82 |
+| tui | self | ctx100k | 22.32 | 22.40 | +0.08 | 22.34~22.44 |
+| tui | self | ctx200k | 24.99 | 25.06 | +0.07 | 25.03~25.09 |
+| split_cli | server | startup | 15.55 | 15.58 | +0.03 | 15.58~15.59 |
+| split_cli | server | ctx100k | 31.11 | 29.98 | -1.13 | 29.53~31.89 |
+| split_cli | server | ctx200k | 41.04 | 38.14 | -2.90 | 37.62~41.10 |
+| split_cli | client | startup | 13.40 | 13.49 | +0.09 | 13.45~13.52 |
+| split_cli | client | ctx100k | 13.77 | 13.84 | +0.07 | 13.84~13.87 |
+| split_cli | client | ctx200k | 13.79 | 13.84 | +0.05 | 13.84~13.88 |
+| split_tui | server | startup | 15.54 | 15.55 | +0.01 | 15.52~15.60 |
+| split_tui | server | ctx100k | 30.39 | 29.30 | -1.09 | 28.92~30.04 |
+| split_tui | server | ctx200k | 37.68 | 38.74 | +1.06 | 38.29~40.56 |
+| split_tui | client | startup | 12.23 | 12.28 | +0.05 | 12.27~12.29 |
+| split_tui | client | ctx100k | 13.23 | 13.39 | +0.16 | 13.31~13.39 |
+| split_tui | client | ctx200k | 13.77 | 13.68 | -0.09 | 13.56~13.77 |
+| ffi | self | startup | 20.62 | 20.55 | -0.07 | 20.55~20.57 |
+| ffi | self | ctx100k | 29.52 | 28.77 | -0.75 | 28.67~29.28 |
+| ffi | self | ctx200k | 38.02 | 36.83 | -1.19 | 36.80~37.42 |
+| real_tui (真实界面) | self | startup | 22.00 | 21.54 | -0.46 | 20.62~21.93 |
+| real_tui | self | ctx100k | 27.13 | 26.25 | -0.88 | 26.00~27.06 |
+| real_tui | self | ctx200k | 29.54 | 28.97 | -0.57 | 28.61~29.58 |
+| server_only | server | 空载 | 13.37 | 13.43 | +0.06 | 13.38~13.43 |
+| server_only | server | 空载 5s | 13.37 | 13.43 | +0.06 | 13.38~13.43 |
+| server_only | server | 117 轮 / ≈100K token | 31.04 | 29.46 | -1.58 | 29.30~29.66 |
+| server_only | server | 235 轮 / 200K token | 39.14 | 36.09 | -3.05 | 35.65~37.53 |
+| server_only | server | 断开后 | 39.22 | 36.18 | -3.04 | 35.73~37.62 |
+| plugin_attrib | self | 未加载插件 | 10.24 | 10.27 | +0.03 | 10.24~10.29 |
+| plugin_attrib | self | agentxx_filesystem | 11.47 | 11.51 | +0.04 | 11.48~11.54 |
+| plugin_attrib | self | agentxx_execute_command | 12.07 | 12.11 | +0.04 | 12.10~12.12 |
+| plugin_attrib | self | agentxx_system | 12.28 | 12.40 | +0.12 | 12.39~12.41 |
+| plugin_attrib | self | agentxx_websearch | 12.61 | 12.70 | +0.09 | 12.70~12.71 |
+| plugin_attrib | self | agentxx_planning (5 插件全载) | 12.89 | 12.97 | +0.08 | 12.96~13.00 |
+| plugin_attrib | self | 全部卸载后 | 11.56 | 11.64 | +0.08 | 11.57~11.64 |
+
+- **进程内生场景 (cli / tui / plugin_attrib) 的全部采样点都在 ±0.2 MB 内** ——
+  这三个模式不涉及长上下文与真实子进程, 是跨批判据最稳的部分, 本批没有任何回退;
+- 真实两进程场景 (split_cli / split_tui / ffi / server_only) 本批中位低 0.7~3.1 MB,
+  但看极差: `split_cli ctx200k` 基线 38.73~43.49 对 本批 37.62~41.10;
+  `server_only ctxScaled2` 基线 38.85~47.54 对 本批 35.65~37.53 —— **差值落在批内波动
+  (含个别偏高运行) 范围内, 按"持平"记录, 不作为改善**; 反向的尖峰两批都出现过
+  (基线 server_only 一次 47.54, 本批一次 40.79 出现在 harness 的 100×8KB 组);
+- 提交量 (Windows "提交大小") 同向: cli/plugin_attrib 差 ≤0.15 MB;
+  `server_only ctxScaled2` 27.14 → 21.97 (基线单次最高 35.43), 同样是分布差异;
+- 线程 / 句柄: 除 `real_tui` 外逐项一致 (cli 32 线程 / 221 fd、split_cli server 26/211、
+  server_only 空载 12/151、插件场景 11~12 线程 / 138~145 fd、每个插件 +1 fd);
+  `real_tui/self/startup` 基线 33 线程 / 257 fd → 本批 33 / 245 (同步窗口 268 → 269)。
+  该点的 fd 取瞬时值、两批之间有 ±12 浮动, 不判回归, 但**建议后续批次继续记录**;
+- CPU 时间 (真实 WS 轮次 235 轮): 基线 2.83~3.55 s user / 2.48~2.75 s sys;
+  本批 2.80~2.94 s user / 2.08~2.34 s sys; `cli rounds20x8192` 每轮 59.0~61.7 ms
+  (基线 61.2~66.7 ms) —— 都在两批共有的波动区间内, 无单向趋势。
+
+### 16.2 长上下文与每轮成本
+
+长上下文 harness (`../harness/run_load.ps1`, 无插件 + python mock; 专用工作集 / 提交):
+
+| 场景 | 10-11 | 本批 |
+|---|---|---|
+| ≈100K token (50 × 8KB) | 8.50 / 11.45 (r2 8.50/11.06, r3 7.60/11.45) | 7.75 / 11.51 (r2 7.73/12.27, r3 7.75/11.26) |
+| ≈100K token (5 × 80KB) | 7.20 / 9.25 | 7.23 / 9.30 |
+| ≈200K token (100 × 8KB) | 17.03 / 19.56 (r1 26.11/31.60, r2 15.41/19.54) | **16.99 / 19.57** (n=6: 15.71~26.79 / 18.16~29.12) |
+| ≈400K token (200 × 8KB) | – | 36.60 / 44.52 与 52.47 / 58.31 (n=2; 峰值提交 47.31 / 59.52) |
+| 小上下文 (50 × 100B) | 5.16 / 7.47 | 4.83 / 7.38 |
+| server 空闲 (WS / 提交) | 10.80 / 3.02 | 10.80 / 2.95 |
+
+- 本批把 100×8KB 加跑到 **6 次** 以看清分布: 专用工作集中位 16.99 (基线 3 次中位
+  17.03), 提交中位 19.57 (基线 19.56) —— **两批在 200K token 稳态上逐项一致**;
+  "少数运行偏高 8~10 MB" 的现象两批都出现 (本批 r1/r6, 基线 r1), 属分配器归还时机;
+- 新增的 200×8KB (≈400K token) 两次: 每轮约 62 ms, 总 CPU 6.5~6.8 s;
+  按 100K→200K→400K 三段推算, 每 8KB 轮次的稳态增量约 0.1~0.2 MB, 未见非线性增长;
+- 进程 CPU 时间 (100 × 8KB 组): 基线 user 1.12~1.31 s / kernel 0.84~1.19 s;
+  本批 user 1.03~1.17 s / kernel 0.78~1.11 s; 200 × 8KB: user 4.03~4.20 s /
+  kernel 2.44~2.73 s;
+- 真实 TUI 帧耗时: 启动窗口 20 帧 / 平均 0.079 ms, 同步窗口 4 帧 / 平均 0.078~0.088 ms
+  (基线同定义 22 帧 / 0.079 ms 与 4 帧 / 0.082 ms) —— 无变化。
+
+### 16.3 巨帧回归卡口 (静态扫描)
+
+`scan_coro_frames.py` 扫 release `agentxx_cli.exe`:
+
+| 指标 | 13.3 处置后 (09-28) | 14.3 (10-07) | 15.3 (10-11) | 本批 |
+|---|---|---|---|---|
+| ≥384 KiB 的帧 | 66 个 / 92.9 MiB | 66 个 / 92.7 MiB | 66 个 / 92.7 MiB | 66 个 / 92.7 MiB |
+| 1 ~ 4 MiB 的帧 | 11 | 11 | 11 | 11 |
+| 最大帧 | – | 6.40 MiB | 6.40 MiB | 6.40 MiB (6713936 字节) |
+
+原始扫描输出见
+[`resource/benchmark/2026-10-12_fc66f870_windows-resource/frames_scan_agentxx_cli_2026-10-12.txt`](../../../resource/benchmark/2026-10-12_fc66f870_windows-resource/frames_scan_agentxx_cli_2026-10-12.txt)。
+
+### 16.4 结论
+
+1. **本批无内存回退**: 运行时改动只有 6 个文件的协程捕获方式 (+39/-14 行, 不加数据结构),
+   进程内生 37 个采样点全部 ±0.2 MB, 长上下文 200K 稳态与上一批逐项一致
+   (专用工作集 16.99 vs 17.03, 提交 19.57 vs 19.56);
+2. **真实 server 侧低 2~3 MB 记作持平**: 两批的逐次极差本就覆盖这个幅度
+   (server_only 235 轮: 基线 38.85~47.54, 本批 35.65~37.53), 要判定真实改善需要
+   ≥6 次运行后比较分布 —— 这与第 3 节 "随分配器归还时机 ±20~30% 波动" 的既有记录一致;
+3. **新增 400K token 基线**: 200×8KB 两次给出 36.60/52.47 (专用工作集) 与
+   44.52/58.31 (提交), 每轮 62 ms, 供后续长上下文批次对照;
+4. **卡口保持**: 巨帧扫描逐项一致 (66 个 / 92.7 MiB / 最大 6.40 MiB);
+   线程与 fd 计数除 `real_tui` 首帧点外逐项一致;
+5. **遗留**: 15.4 的"真实逐轮段每轮成本波动"本批仍存在 (59~67 ms), 未收敛;
+   `real_tui` 首帧点 fd 计数的跨批浮动建议每批继续记录以便定位。
+
+
+## 17. 逐轮临时内存: 200K 档增幅高于 100K 档的成因与优化 (Windows release, 2026-10-12 / fc66f870 + 工作区改动)
+
+第 16 节确认了本批无回退, 但长上下文数据里一直有个未解释的现象: **200K token 档的
+增量明显大于 100K 档的两倍**。本节记录把这个现象查到底的过程、找到的两条每轮 O(上下文)
+的临时内存路径、据此做的两处优化, 以及"同一个 exe 内切换路径"的 A/B 数据。
+
+> 标注: 见第 16 节的标注段 (同日、同机器、同依赖、同构建开关); 本节运行时代码改动
+> 为工作区内的未提交改动 (7 个文件 +293/-26), 依赖与第 16 节完全相同。载荷仍是
+> `agentxx_cli cli` + 本地 mock LLM (5 插件或无插件), 每条消息 8KB = 一轮,
+> 稳态取"跑满轮次后空转 4 秒"的专用工作集 (与任务管理器"内存"列同一套定义)。原始数据:
+> [`resource/benchmark/2026-10-12_fc66f870_windows-resource/rounds_opt/`](../../../resource/benchmark/2026-10-12_fc66f870_windows-resource/rounds_opt/README.md)。
+
+### 17.1 现象与定位: 主因是"每轮都按上下文大小分配一次", 不是泄漏
+
+**(1) 轮数扫描 (无插件, 8KB/轮)**: 稳态专用工作集随轮数**超线性**, 每 50 轮的边际
+增量依次约 1.5 / 4 / 15 / 21 MB:
+
+| 轮数 | 25 | 50 | 100 | 150 | 200 |
+|---|---|---|---|---|---|
+| 稳态专用工作集 (MB, 2 次) | 6.92 / 6.84 | 8.39 / 8.64 | 15.61 / 17.70 | 23.93 / 44.99 | 51.41 / 59.38 |
+
+**(2) 判别实验: 把上下文压到最小**. 200 轮 × 1KB 消息 (整段上下文只有 1.08 MB,
+启动 RSS 19.68 MB) 仍然涨到 50.84 MB (**+31.2 MB**)。上下文本身只有 1 MB, 增量却是
+它的 30 倍 ⇒ **主因不是"上下文多大", 而是"每轮固定成本 × 轮数"**。
+
+**(3) 固定轮数 (200), 变单条消息大小**:
+
+| 单条消息 | 1 KB | 2 KB | 4 KB | 8 KB | 16 KB |
+|---|---|---|---|---|---|
+| 上下文 (MB) | 1.08 | 1.28 | 1.68 | 2.48 | 4.08 |
+| RSS 增量 (MB) | +31.2 | +30.2 | +35.0 | +41.4 | +42.5 |
+
+上下文从 1.08 涨到 4.08 MB (3.8 倍), 增量只多 11 MB (1.4 倍) —— 每轮成本**随上下文
+增长但远慢于上下文** (同一时刻只持有 1~2 份), 与"每轮按上下文大小分配/释放一次,
+把堆的峰值顶高"一致。
+
+**(4) 固定上下文 (~2.5 MB), 变轮数**: 100 / 200 / 400 / 800 轮 → RSS 增量
++23.7 / +36.3 / +53.8 / +71.0 MB; 换算每轮成本 0.24 / 0.18 / 0.13 / 0.09 MB ——
+**逐轮递减**。再用 256B × 200/400/800/1600 轮的饱和实验复核 (每轮成本
+137.9 / 104.8 / 70.0 / 59.8 KB), 结论一致: 这是**堆的峰值与碎片随时间抬升**,
+不是线性泄漏 (没有"跑得越久每轮越贵"的单调趋势)。
+
+### 17.2 两条每轮 O(上下文) 的临时内存路径
+
+按上面的画像去查"每轮都按上下文大小分配一次"的位置, 找到两条, 都在一轮的首尾:
+
+| # | 位置 | 优化前每轮发生的事 |
+|---|---|---|
+| ① | `agent/lib/src/protocol/openai_provider.cpp` 的请求体组装 | 流式请求先 `buildBody()` 把**整段** `messages` / `tools` 装成 `utilxx_base::Json` DOM, 再 `body.dump()` 出整段文本 —— 同一时刻"整段 DOM + 整段文本"两份 O(上下文) 临时内存 (DOM 的每节点开销使前者比文本还大几倍); 且 `dump()` 只按元素个数预留容量 (`size()*8+16`), 长消息数组会反复扩容并搬移 |
+| ② | `agent/lib/src/agent/context.cpp` 的轮末落盘 | `Session::saveLlmMessages()` 走 `llmMessagesJson()`: 生成**整段**上下文 DOM 并**长期缓存** (`llmMessagesJsonCache_`), 再 `.dump()` 交给 `SessionStore::saveLlmMessages` 走 `dumpJsonUtf8` —— 每轮重建一次整段 DOM + 一次整段 dump, 且 DOM 常驻 |
+
+两处的共同点: 每轮结束都会释放, 但**下一轮又要按当前上下文重新分配一整份**。轮数越多、
+上下文越大, 分配/释放的规模越大, 堆的峰值与碎片就越高 —— 这正是 17.1 里"每轮成本
+随轮数递减但总量超线性"的来源, 也解释了为什么 200K 档 (上下文 2.4 MB、轮数 200)
+比 100K 档 (1.2 MB、轮数 100) 的增量远大于 2 倍: 每轮的临时量翻倍 **且** 轮数翻倍。
+
+### 17.3 优化: 两条路径都改成"逐条追加文本"
+
+- **① 请求体**: 新增 `OpenAIProvider::buildBodyText()` 与
+  `provider_common.h` 的 `appendOpenAIMessagesJson()` / `appendOpenAIToolsJson()` ——
+  逐条消息走**同一份**转换逻辑 (`chatMessagesToOpenAIJson` / `chatToolsToOpenAIJson`)
+  再单独 dump、按 JSON 数组规则拼接, 输出与"整段 DOM 的 dump"**逐字节一致**;
+  容量按内容估算一次性预留 (`estimateBodyTextBytes`)。流式 `doStream` 的形参由
+  `const utilxx_base::Json&` 改为 `std::string`; 只有 `extra_fields` 与已写键重名、
+  或已有 `stream` / `stream_options` 键这类"原地覆盖"无法用追加表达的情形才返回
+  false, 由调用方回退原 DOM 路径 (行为不变)。
+- **② 落盘**: 新增 `Session::llmMessagesJsonText()` (逐条 `to_json` → `fromNeographJson`
+  → `dump` 后拼接, 同样与整段 dump 逐字节一致, 不构造整段数组 DOM);
+  `SessionStoreHooks::onSaveLlmMessages` 与 `SessionStore::saveLlmMessages` 的形参由
+  `const utilxx_base::Json&` 改为 `std::string_view`, 落盘直接 `bindText`
+  (仍保留非法 UTF-8 的修复, 与旧 `dumpJsonUtf8` 语义等价)。
+  `llmMessagesJson()` 保留给 `WireGetContext` / 子代理播种 / 插件查询等边界形态。
+
+效果上每轮的临时内存从 O(上下文) 降到 O(单条消息); 请求体与落库内容不变,
+因此下游 (HTTP 层、sqlite、客户端) 完全不受影响。
+
+### 17.4 同二进制 A/B (旧 DOM 路径 vs 文本路径)
+
+为了排除编译器/链接差异, A/B 用**同一个 exe** + 两个临时环境开关
+(`AGENTXX_AB_BODY_DOM` / `AGENTXX_AB_STORE_DOM`, 数据采完后已从源码删除) 在
+"旧实现 / 新实现"之间切换, 每组内交替顺序执行:
+
+| 组 (5 插件) | n | 旧两路径都走 DOM | 两条都走文本 | 差 |
+|---|---|---|---|---|
+| 100 轮 × 8KB | 6 / 6 | 17.88~35.57, 中位 **32.44** | 14.20~21.66, 中位 **15.60** | **-16.84 (-52%)** |
+| 150 轮 × 8KB | 6 / 6 | 23.95~49.34, 中位 **46.66** | 30.92~33.37, 中位 **32.56** | **-14.10 (-30%)** |
+
+分开强制单条路径 (150 轮 × 8KB, 各 5 次) 可以看出两条路径各自的份量:
+
+| 变体 | 稳态专用工作集 (min~max, 中位) | 峰值专用工作集 (中位) | 峰值提交 (中位) |
+|---|---|---|---|
+| 都走文本 (新) | 17.66 ~ 31.99, **19.11** | 60.68 | 76.99 |
+| 只请求体走 DOM (旧) | 18.65 ~ 35.73, **23.21** | 57.50 | 79.35 |
+| 只落盘走 DOM (旧) | 22.57 ~ 43.17, **40.44** | 56.08 | 78.20 |
+| 两条都走 DOM (旧) | 21.96 ~ 51.74, **46.00** | 56.49 | 77.64 |
+
+- 分层单调 (19.11 < 23.21 < 40.44 < 46.00): **落盘那条是主要贡献, 请求体那条次之**;
+- 峰值提交 / 峰值工作集四组几乎一样 (77~79 / 56~61 MB): 这两条路径抬高的是
+  **每轮分配与释放的规模**, 不是瞬时峰值 —— 与 17.1 的峰值/碎片结论互证;
+- 组内分散仍大 (同配置 5~6 次的最大差可达 15~30 MB, 双峰), 判定只用中位与区间;
+  不同时段的同变体也会漂移 (同为"都走文本"的 150 轮, 17.4 第一张表 32.56 对第二张
+  表 19.11) —— 所以结论只取**同批、同轮数、交替顺序**内的分层, 不跨时段比绝对值。
+
+### 17.5 改动前后对照 (跨二进制, 作参考)
+
+同一台机器、同一套脚本与配置, 改动前用旧二进制 (07:20~08:50), 改动后用新二进制:
+
+| 载荷 (5 插件) | 改动前 (旧二进制) | 只做① (请求体) | ①②都做 | 相对改动前 |
+|---|---|---|---|---|
+| 50 × 8KB | 中位 9.36 (n=3) | 中位 10.07 (n=3) | 中位 9.00 (n=6) | -0.36 |
+| 100 × 8KB | 中位 25.83 (n=6) | 中位 19.86 (n=9) | 中位 19.00 (n=6) | **-6.83 (-26%)** |
+| 150 × 8KB | 中位 41.23 (n=3) | 中位 37.52 (n=9) | 中位 18.98 (n=6) | **-22.25 (-54%)** |
+
+跨二进制比较含时间漂移 (本机非空载), 结论以 17.4 的同二进制 A/B 为准; 这一组的方向与
+量级与之吻合 (100 轮降 1/4, 150 轮降一半)。50 轮档上下文只有 400 KB, 优化量与噪声同量级,
+按持平看。
+
+### 17.6 测试
+
+- 新增 `test_openai_provider` 用例: 对同一组参数分别走"文本路径"与"DOM 路径",
+  把实际发出的请求体做**逐字节比对** (流式两态 `send_thinking` / 非流式含
+  `extraConfig` + `extra_fields` / 重名回退);
+- 新增 `test_session_persistence::testLlmMessagesTextMirror`: 对同一会话断言
+  `llmMessagesJsonText() == llmMessagesJson().dump()`, 覆盖空上下文 / 各类消息形态
+  (转义字符 / 图片 / tool_calls / 思考 / flags / extra) 与追加 / 截断 / 整批替换后的
+  缓存刷新;
+- `agentxx_test.exe` 全量: **passed=37617 failed=0** (Release, 含
+  `openai_provider` / `session_persistence` / `persist_semantics` / `session_schema`);
+- 落库内容不变: `onSaveLlmMessages` 传的是与旧路径逐字节相同的 JSON 文本,
+  非法 UTF-8 仍按原规则修复。
+
+### 17.7 结论与遗留
+
+1. **成因**: 一轮首尾各有一条 O(上下文) 的临时内存路径 (请求体整段 DOM+文本、轮末
+   整段上下文 DOM+文本落盘)。每轮分配/释放规模随上下文增长, 轮数越多, 堆的峰值与
+   碎片越高 —— 这是"200K 档增幅远高于 100K 档"的直接原因 (每轮临时量翻倍 **且**
+   轮数翻倍), 而**不是泄漏** (每轮成本随轮数递减: 137.9 → 59.8 KB);
+2. **优化**: 两条路径改成逐条追加文本, 输出逐字节不变; 同二进制 100 轮 -52%
+   (32.44 → 15.60), 150 轮 -30% (46.66 → 32.56), 归因顺序为落盘 > 请求体;
+3. **不影响的**: 瞬时峰值提交/峰值工作集不变 (77~79 MB), CPU 无可见变化
+   (每轮耗时仍 59~67 ms, 见第 16 节);
+4. **遗留**: ①长上下文档仍存在"少数运行偏高 8~30 MB"的双峰 (分配器归还时机),
+   Windows 侧 `releaseFreeHeapPages()` 走 `_heapmin` 偏弱, 若要压掉高簇需改
+   `HeapCompact` 或轮末适度收缩工作集 —— 需先做 A/B 量化 CPU 代价, 本轮未做;
+   ②第 16 节遗留的"真实逐轮段每轮成本跨批波动"与本节无关, 仍待"固定依赖、只变主仓"
+   的 A/B 收敛。
+
+
+

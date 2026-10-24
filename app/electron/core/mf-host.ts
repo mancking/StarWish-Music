@@ -246,13 +246,18 @@ export function importFromContent(
       file = `${base}-${i++}.js`
     }
   }
-  fs.writeFileSync(path.join(dir, file), content, 'utf8')
+  // Bug 124：原子安装 —— 先写 .tmp 再 rename，注册表写成功后生效（断电/磁盘满不留半截文件）
+  const tmp = path.join(dir, `${file}.tmp`)
+  fs.writeFileSync(tmp, content, 'utf8')
+  fs.renameSync(tmp, path.join(dir, file))
   const reg = readRegistry()
-  // 原地替换时保留原启用状态，避免更新后插件被意外停用
+  // 原地替换保留原启用状态；新装（市场/订阅/URL）默认启用（N26），本地导入默认关闭
+  const isNew = !reg.entries[file]
   reg.entries[file] = {
     ...(reg.entries[file] || {}),
     origin,
     sourceUrl: sourceUrl || reg.entries[file]?.sourceUrl,
+    enabled: isNew && origin !== 'local' ? true : reg.entries[file]?.enabled === true,
   }
   writeRegistry(reg)
   loadAll()
@@ -266,7 +271,51 @@ export async function importFromUrl(url: string, replaceFile?: string): Promise<
   const body: any = res.body
   const content = typeof body === 'string' ? body : res.raw || ''
   if (!content || content.length < 10) throw new Error('下载内容为空或过短，可能不是插件脚本')
+  if (replaceFile) {
+    // Bug 127：更新前备份 .bak.<ts>，失败可一键回滚
+    const dir = userPluginsDir()
+    const target = path.join(dir, path.basename(replaceFile))
+    if (fs.existsSync(target)) {
+      fs.copyFileSync(target, `${target}.bak.${Date.now()}`)
+      prunePluginBackups(dir)
+    }
+  }
   return importFromContent(content, 'url', url, replaceFile)
+}
+
+/** 保留最近 3 份备份 */
+function prunePluginBackups(dir: string): void {
+  try {
+    const baks = fs
+      .readdirSync(dir)
+      .filter(f => /\.bak\.\d+$/.test(f))
+      .sort()
+    for (const f of baks.slice(0, Math.max(0, baks.length - 3))) {
+      try {
+        fs.rmSync(path.join(dir, f), { force: true })
+      } catch {
+        /* ignore */
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
+/** 回滚到上一版（Bug 127：设置页「回滚到上一版」按钮） */
+export function rollbackPlugin(file: string): PluginInfo[] {
+  const dir = userPluginsDir()
+  const target = path.join(dir, path.basename(file))
+  if (!fs.existsSync(target)) throw new Error('插件不存在')
+  const baks = fs
+    .readdirSync(dir)
+    .filter(f => f.startsWith(`${path.basename(file)}.bak.`))
+    .sort()
+  if (!baks.length) throw new Error('没有可回滚的备份')
+  const latest = baks[baks.length - 1]!
+  fs.copyFileSync(path.join(dir, latest), target)
+  loadAll()
+  return list()
 }
 
 export function listSubscriptions(): PluginSubscription[] {
@@ -340,11 +389,49 @@ export async function importSubscription(url: string, name?: string): Promise<{ 
   return { added, updated, subscriptions: reg.subscriptions }
 }
 
-export function removeSubscription(url: string): PluginSubscription[] {
+/** F-26/F-30：移除订阅；uninstall=true 时同时卸载该订阅安装的插件，并刷新订阅 count */
+export function removeSubscription(url: string, uninstall = false): PluginSubscription[] {
   const reg = readRegistry()
+  if (uninstall) {
+    for (const [file, entry] of Object.entries(reg.entries)) {
+      if (entry.sourceUrl && subUrlMatches(entry.sourceUrl, url)) {
+        try {
+          fs.rmSync(path.join(userPluginsDir(), file), { force: true })
+        } catch {
+          /* ignore */
+        }
+        delete reg.entries[file]
+      }
+    }
+  }
   reg.subscriptions = reg.subscriptions.filter(s => s.url !== url)
   writeRegistry(reg)
+  loadAll()
   return reg.subscriptions
+}
+
+function subUrlMatches(sourceUrl: string, subUrl: string): boolean {
+  try {
+    return new URL(sourceUrl).pathname === new URL(subUrl).pathname
+  } catch {
+    return sourceUrl === subUrl
+  }
+}
+
+/** C-25：启动后距上次刷新 >24h 自动补拉一次订阅（错过周期优先补拉） */
+export async function refreshSubscriptionsIfStale(): Promise<void> {
+  const reg = readRegistry()
+  const DAY = 24 * 60 * 60_000
+  for (const sub of reg.subscriptions) {
+    if (Date.now() - (sub.updatedAt || 0) > DAY) {
+      try {
+        await importSubscription(sub.url, sub.name)
+        logger.info('订阅自动刷新完成', sub.name)
+      } catch (e: any) {
+        logger.warn('订阅自动刷新失败', sub.name, e?.message)
+      }
+    }
+  }
 }
 
 export interface MarketEntry {

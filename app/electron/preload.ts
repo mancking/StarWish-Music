@@ -14,6 +14,9 @@ const EVENT_WHITELIST = new Set([
   'lyric:payload',
   'player:sleep',
   'player:spectrum',
+  'download:progress',
+  'update:progress',
+  'audio:extract:progress',
 ])
 
 const api = {

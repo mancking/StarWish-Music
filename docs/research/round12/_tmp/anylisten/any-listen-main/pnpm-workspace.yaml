@@ -1,0 +1,60 @@
+packages:
+  - packages/*
+  - packages/shared/*
+  - packages/extensions/*
+  - '!**/test/**'
+
+allowBuilds:
+  better-sqlite3: true
+  core-js: false
+  electron: false
+  electron-winstaller: false
+  esbuild: false
+  svelte-preprocess: false
+
+auditConfig:
+  ignoreCves:
+    - CVE-2025-71330
+    - CVE-2025-71329
+
+minimumReleaseAge: 480
+minimumReleaseAgeExclude:
+  - typescript
+  - undici
+  - message2call
+  - better-sqlite3
+  - '@types/node'
+  - svelte
+  - svelte-check
+  - svelte-eslint-parser
+  - svelte-preprocess
+  - '@sveltejs/vite-plugin-svelte'
+  - eslint-plugin-svelte
+  - electron
+  - electron-builder
+  - electron-updater
+  - electron-to-chromium
+  - npm-check-updates
+  - vite
+  - rolldown
+  - '@rolldown/*'
+  - oxfmt
+
+overrides:
+  '@types/node': '24'
+  '@types/ws': 8.5.4
+  braces@<3.0.3: '>=3.0.3'
+  depd@<2.0.0: '>=2.0.0'
+  micromatch@<4.0.8: '>=4.0.8'
+  postcss@<7.0.36: '>=7.0.36'
+  ws>bufferutil: '-'
+  ws>utf-8-validate: '-'
+  yauzl@<3: '3'
+
+peerDependencyRules:
+  allowedVersions:
+    ts-node>@types/node: '24'
+    vite>@types/node: '24'
+
+publicHoistPattern:
+  - '*eslint*'

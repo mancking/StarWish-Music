@@ -1,0 +1,196 @@
+import { throttle } from '@any-listen/common/utils'
+
+import { winMainReadyEvent } from '../../common/event'
+import { musicListEvent, sendMusicListAction } from '../../modules/musicList'
+import { logs } from '../logs'
+import { songlistDetailAll, topSongsDetailAll } from '../resources'
+import { workers } from '../worker'
+import { extensionEvent } from './event'
+
+const state = {
+  initing: false,
+  loadedExtensions: [] as string[],
+  syncing: false,
+  waitingSyncLists: [] as AnyListen.List.OnlineListInfo[],
+}
+
+const detailAll = async (list: AnyListen.List.OnlineListInfo) => {
+  switch (list.meta.sourceType) {
+    case 'songlist':
+      return songlistDetailAll(list.meta.extensionId, list.meta.source, list.meta.syncId)
+    case 'topSongs':
+      return topSongsDetailAll(list.meta.extensionId, list.meta.source, list.meta.syncId, (list.meta.date as string) || '')
+    default:
+      throw new Error(`Unsupported list source type: ${list.meta.sourceType}`)
+  }
+}
+
+export const syncList = async (list: AnyListen.List.OnlineListInfo) => {
+  // logs.App.logcat.debug(`[Online List]Sync: ${list.name} (${list.id})`)
+  // console.log(`Sync list: ${list.name} (${list.id})`)
+  try {
+    const [localMusics, onlineMusics] = await Promise.all([
+      workers.dbService.getListMusics(list.id) as Promise<AnyListen.Music.MusicInfoOnline[]>,
+      detailAll(list),
+    ])
+    const localMusicMap = new Map<string, AnyListen.Music.MusicInfoOnline>()
+    for (const m of localMusics) localMusicMap.set(m.id, m)
+    let isUpdated = false
+    const newList = onlineMusics.map((m, i) => {
+      const local = localMusicMap.get(m.id)
+      if (localMusics[i]?.id !== m.id) isUpdated ||= true
+      if (local) return local
+      return m
+    })
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+    if (!isUpdated) return
+    await sendMusicListAction({
+      action: 'list_music_overwrite',
+      data: {
+        listId: list.id,
+        musicInfos: newList,
+      },
+    })
+    await sendMusicListAction({
+      action: 'list_update',
+      data: {
+        lists: [
+          {
+            ...list,
+            meta: {
+              ...list.meta,
+              syncTime: Date.now(),
+            },
+          },
+        ],
+        sync: true,
+      },
+    })
+  } catch (err) {
+    logs.App.logcat.error(`[Online List]Sync error: ${list.name} (${list.id})`, err)
+    throw err
+  }
+}
+const handleSyncList = async () => {
+  if (state.syncing || !state.waitingSyncLists.length) return
+  state.syncing = true
+  while (state.waitingSyncLists.length) {
+    // TODO multi sync
+    const list = state.waitingSyncLists.shift()!
+    await syncList(list).catch(() => {
+      // void showMessageBox({
+      //   detail: t('extension.list_provider.get_list_music_ids_error', {
+      //     name: list.name,
+      //     err: err.message,
+      //   }),
+      // })
+    })
+  }
+  state.syncing = false
+}
+
+export const syncAllList = throttle(async () => {
+  const extensionList = await workers.extensionService.getLocalExtensionList()
+  const userLists = (await workers.dbService.getAllUserLists()).userList
+  const filteredExts = new Map<string, Set<string>>()
+  for (const ext of extensionList) {
+    if (!ext.loaded || !ext.contributes.resource?.length) continue
+    let filteredExt = filteredExts.get(ext.id)
+    if (!filteredExt) filteredExts.set(ext.id, (filteredExt = new Set()))
+    for (const lp of ext.contributes.resource) {
+      if (lp.id && lp.resource.length) filteredExt.add(lp.id)
+    }
+  }
+  if (!filteredExts.size) return
+  state.waitingSyncLists = Array.from(
+    new Set([
+      ...state.waitingSyncLists,
+      ...(userLists.filter((l) => {
+        if (l.type !== 'online' || !l.meta.autoSync) return false
+        const ids = filteredExts.get(l.meta.extensionId)
+        if (!ids) return false
+        if (ids.has(l.meta.source)) return true
+        return false
+      }) as AnyListen.List.OnlineListInfo[]),
+    ])
+  )
+  void handleSyncList()
+}, 500)
+
+const runSyncLoadedExtensionList = throttle(async () => {
+  // console.log('run list provider sync', state.loadedExtensions.length, state.waitingSyncLists.length)
+  if (!state.loadedExtensions.length) return
+  const extensionList = await workers.extensionService.getLocalExtensionList()
+  const userLists = (await workers.dbService.getAllUserLists()).userList
+  const filteredExts = new Map<string, Set<string>>()
+  const exts = new Map(extensionList.map((e) => [e.id, e]))
+  while (state.loadedExtensions.length) {
+    const extId = state.loadedExtensions.shift()!
+    const ext = exts.get(extId)
+    if (!ext?.loaded || !ext.contributes.resource?.length) continue
+    let filteredExt = filteredExts.get(ext.id)
+    if (!filteredExt) filteredExts.set(ext.id, (filteredExt = new Set()))
+    for (const lp of ext.contributes.resource) {
+      if (lp.id && lp.resource.length) filteredExt.add(lp.id)
+    }
+  }
+  // console.log('filteredExts.size', filteredExts.size)
+  if (!filteredExts.size) return
+  state.waitingSyncLists = Array.from(
+    new Set([
+      ...state.waitingSyncLists,
+      ...(userLists.filter((l) => {
+        if (l.type !== 'online') return false
+        const ids = filteredExts.get(l.meta.extensionId)
+        if (!ids) return false
+        if (ids.has(l.meta.source)) return true
+        return false
+      }) as AnyListen.List.OnlineListInfo[]),
+    ])
+  )
+  // console.log('state.waitingSyncLists.length', state.waitingSyncLists.length)
+  void handleSyncList()
+}, 500)
+
+export const initListProvider = async () => {
+  let initCount = 0
+  const handleRunSyncList = () => {
+    initCount++
+    if (initCount < 2) runSyncLoadedExtensionList()
+  }
+  winMainReadyEvent.on(handleRunSyncList)
+  extensionEvent.on('extensionEvent', (event) => {
+    switch (event.action) {
+      case 'starting':
+        state.initing = true
+        break
+      case 'started':
+        state.initing = false
+        handleRunSyncList()
+        break
+      case 'loaded':
+        state.loadedExtensions.push(event.data.id)
+        if (!state.initing) runSyncLoadedExtensionList()
+        break
+      default:
+        break
+    }
+  })
+  musicListEvent.on('list_create', async (pos, lists) => {
+    for (const list of lists) {
+      if (list.type !== 'online') continue
+      state.waitingSyncLists.push(list)
+    }
+    // console.log('run list provider sync after create list', state.initing)
+    if (!state.initing) void handleSyncList()
+  })
+  musicListEvent.on('list_update', async (lists, isSync, isRemote) => {
+    if (isSync || isRemote) return
+    for (const list of lists) {
+      if (list.type !== 'online' || !list.meta.autoSync) continue
+      state.waitingSyncLists.push(list)
+    }
+    // console.log('run list provider sync after update list', state.initing)
+    if (!state.initing) void handleSyncList()
+  })
+}

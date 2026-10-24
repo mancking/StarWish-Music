@@ -12,14 +12,18 @@ import Icon from '@/components/Icon.vue'
 import ParticleField from '@/components/player/ParticleField.vue'
 import SpectrumBars from '@/components/player/SpectrumBars.vue'
 import EqPanel from '@/components/player/EqPanel.vue'
-import CoverStage from '@/player/components/CoverStage.vue'
-import LyricsPane from '@/player/components/LyricsPane.vue'
-import ProgressBar from '@/player/components/ProgressBar.vue'
-import TransportBar from '@/player/components/TransportBar.vue'
-import FunctionBar from '@/player/components/FunctionBar.vue'
-import { useLyricSync } from '@/player/lyrics'
-import { usePlaybackGestures } from '@/player/usePlaybackGestures'
-import { LOOP_ICON, STAGE_ICON, STAGE_LABEL, STAGE_ORDER } from '@/player/stages'
+import CoverStage from '@/player-music/components/CoverStage.vue'
+import LyricsPane from '@/player-music/components/LyricsPane.vue'
+import ProgressBar from '@/player-music/components/ProgressBar.vue'
+import TransportBar from '@/player-music/components/TransportBar.vue'
+import FunctionBar from '@/player-music/components/FunctionBar.vue'
+import { useLyricSync } from '@/player-music/lyrics'
+import { usePlaybackGestures } from '@/player-music/usePlaybackGestures'
+import GestureHud from '@/player-music/components/GestureHud.vue'
+import { useMvHint, mvFailToast } from '@/player-music/mv-hint'
+import PlayerBackground from '@/player-music/components/PlayerBackground.vue'
+import { registerPopupCloser } from '@/mobile/popup-stack'
+import { LOOP_ICON, STAGE_ICON, STAGE_LABEL, STAGE_ORDER } from '@/player-music/stages'
 import { usePlayerStore, type StageMode } from '@/stores/player'
 import { useLibraryStore } from '@/stores/library'
 import { useUiStore } from '@/stores/ui'
@@ -31,6 +35,7 @@ const library = useLibraryStore()
 const ui = useUiStore()
 
 const kind = computed(() => (platform.value.kind === 'pad' ? 'pad' : 'phone'))
+const settings = computed(() => ui.settings as { particle?: boolean } | undefined)
 const song = computed(() => player.song)
 const liked = computed(() => (song.value ? library.isFavorite(song.value.id) : false))
 const stage = computed<StageMode>(() => player.stage)
@@ -49,18 +54,49 @@ function cycleVisual(): void {
   player.setStage(STAGE_ORDER[(i + 1) % STAGE_ORDER.length]!)
 }
 
-/* ---------------- 手势（规格书 1.10） ---------------- */
-const brightness = ref(Number(lsGet('brightness') || 1))
+/* ---------------- 手势（规格书 1.10 / Bug 11/19/20/41 模块化重构） ---------------- */
 const gestures = usePlaybackGestures({
   getVolume: () => player.state.volume,
   onVolume: v => void player.setVolume(v),
-  onPrev: () => void player.prev(),
-  onNext: () => void player.next(),
   onToggle: () => void player.toggle(),
-  onTap: () => player.setStage(stage.value === 'lyrics' ? 'cover' : 'lyrics'),
+  onSwipeView: dir => player.setStage(dir === 'lyrics' ? 'lyrics' : 'cover'),
+  onCollapse: () => {
+    // Bug 11 上滑收起：开 Up Next 队列面板（返回键/下滑关闭，逐级退出由 back-handler 兜底）
+    queueOpen.value = true
+  },
+  view: () => (stage.value === 'lyrics' ? 'lyrics' : 'cover'),
+  enabled: () => platform.value.kind !== 'car',
+  onTapCover: () => player.setStage('lyrics'),
 })
 
 watch(gestures.brightness, v => lsSet('brightness', String(v)))
+
+/** 视图平移（规格书 1.10/6.9）：跟手 + 松手 200ms 回弹/翻页 */
+const viewStyle = computed(() => {
+  const dragging = gestures.viewShift.value !== 0
+  const base = stage.value === 'lyrics' ? -100 : 0
+  return {
+    transform: `translateX(calc(${base}% + ${gestures.viewShift.value}px))`,
+    transition: dragging ? 'none' : 'transform 200ms ease',
+  }
+})
+
+/* ---------------- 弹层登记（Bug 39：返回键先关弹层） ---------------- */
+registerPopupCloser(() => {
+  if (eqOpen.value) {
+    eqOpen.value = false
+    return true
+  }
+  if (moreOpen.value) {
+    moreOpen.value = false
+    return true
+  }
+  if (sleepOpen.value) {
+    sleepOpen.value = false
+    return true
+  }
+  return false
+})
 
 /* ---------------- 面板 ---------------- */
 const moreOpen = ref(false)
@@ -99,6 +135,18 @@ async function toggleLike(): Promise<void> {
 function back(): void {
   router.back()
 }
+
+/* ---------------- MV 按钮（规格书 2.18） ---------------- */
+const mvHint = useMvHint()
+watch(song, s => void mvHint.refresh(s), { immediate: true })
+
+function openMv(): void {
+  const item = mvHint.list.value[0]
+  if (!item) return
+  if (mvHint.cooling()) return
+  // 音乐音频流与 MV 视频流独立：跳转 MV 播放页，返回后歌曲进度保持
+  router.push(`/mv/${item.source || 'bili'}/${item.sourceId || item.bvid || ''}`)
+}
 </script>
 
 <template>
@@ -107,7 +155,8 @@ function back(): void {
     :class="`is-${kind}`"
     :style="{ filter: `brightness(${gestures.brightness.value})` }"
   >
-    <div class="bg" :style="player.coverUrl ? { backgroundImage: `url(${player.coverUrl})` } : undefined" />
+    <!-- 背景（规格书 4.7 背景四态，Bug 21 接线） -->
+    <PlayerBackground class="bg" :cover="player.coverUrl" />
     <div class="dim" />
 
     <header class="bar">
@@ -130,33 +179,35 @@ function back(): void {
         @touchmove="gestures.onTouchMove"
         @touchend="gestures.onTouchEnd"
       >
-        <LyricsPane
-          v-if="stage === 'lyrics'"
-          class="pane"
-          :lines="lyricSync.lines.value"
-          :active-index="lyricSync.activeIndex.value"
-          variant="phone"
-          @seek="seekLyric"
-        />
-        <CoverStage
-          v-else
-          :kind="kind"
-          :cover="player.coverUrl"
-          :name="song?.name"
-          :singer="song?.singer"
-          :playing="player.playing"
-          @tap="player.setStage('lyrics')"
-        />
-        <ParticleField
-          v-if="stage === 'particle'"
-          :count="Math.max(particleCount(), 50)"
-          :enabled="true"
-        />
-        <SpectrumBars v-if="stage === 'stage'" placement="top" />
-        <div v-if="gestures.hudKind.value" class="hud">
-          <Icon :name="gestures.hudKind.value === 'vol' ? 'volume' : 'sun'" :size="15" />
-          <span>{{ gestures.hudText.value }}</span>
+        <div class="views" :style="viewStyle">
+          <div class="view">
+            <CoverStage
+              :kind="kind"
+              :cover="player.coverUrl"
+              :name="song?.name"
+              :singer="song?.singer"
+              :playing="player.playing"
+              @tap="player.setStage('lyrics')"
+            />
+            <ParticleField
+              v-if="stage === 'particle'"
+              :count="particleCount()"
+              :enabled="settings?.particle !== false"
+            />
+            <SpectrumBars v-if="stage === 'stage'" placement="top" />
+          </div>
+          <div class="view">
+            <LyricsPane
+              v-if="stage === 'lyrics'"
+              class="pane"
+              :lines="lyricSync.lines.value"
+              :active-index="lyricSync.activeIndex.value"
+              variant="phone"
+              @seek="seekLyric"
+            />
+          </div>
         </div>
+        <GestureHud v-if="gestures.hudKind.value" :kind="gestures.hudKind.value" :percent="gestures.hudPercent.value" />
       </section>
 
       <section class="info">
@@ -166,7 +217,7 @@ function back(): void {
             <span class="singer">{{ song?.singer || '星河音乐' }}</span>
           </div>
           <button class="like" :class="{ on: liked }" aria-label="喜欢" @click="toggleLike">
-            <Icon :name="liked ? 'heart' : 'heart'" :size="20" />
+            <Icon :name="liked ? 'heart-filled' : 'heart'" :size="20" />
           </button>
         </div>
       </section>
@@ -197,11 +248,13 @@ function back(): void {
         :stage-active="stage !== 'cover'"
         :eq-active="eqOpen"
         :sleep-on="player.sleepUntil > 0"
+        :mv-on="mvHint.has.value"
         variant="phone"
         @eq="eqOpen = true"
         @rate="player.cycleRate()"
         @visual="cycleVisual()"
         @sleep="sleepOpen = true"
+        @mv="openMv"
       />
     </main>
 
@@ -360,20 +413,20 @@ function back(): void {
   width: 100%;
   height: 100%;
 }
-.hud {
-  position: absolute;
-  left: 50%;
-  top: 50%;
-  transform: translate(-50%, -50%);
+.views {
+  display: flex;
+  width: 100%;
+  height: 100%;
+  will-change: transform;
+}
+.view {
+  flex: none;
+  width: 100%;
+  height: 100%;
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 8px 14px;
-  border-radius: 999px;
-  background: rgba(11, 11, 16, 0.78);
-  backdrop-filter: blur(10px);
-  font-size: 13px;
-  color: #ececf1;
+  justify-content: center;
+  min-width: 0;
 }
 .info {
   flex: none;

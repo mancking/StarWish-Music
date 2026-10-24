@@ -1,0 +1,2260 @@
+#include "agentxx-test/core/test_http.h"
+#include "agentxx-test/test_coro_util.h"
+#include "utilxx/http_client.h"
+#include "utilxx/http_server.h"
+#if AGENTXX_BUILD_CLIENT
+// 启动更新检查 (客户端实现; 仅在编译 client 时可用, 见 CMakeLists 的 GLOB)
+#include "agentxx-client/update_check.h"
+#include "agentxx/version.h"
+#endif
+#include <asio/awaitable.hpp>
+#include <asio/bind_cancellation_slot.hpp>
+#include <asio/cancellation_signal.hpp>
+#include <asio/co_spawn.hpp>
+#include <asio/detached.hpp>
+#include <asio/io_context.hpp>
+#include <asio/ip/tcp.hpp>
+#include <asio/read.hpp>
+#include <asio/redirect_error.hpp>
+#include <asio/steady_timer.hpp>
+#include <asio/use_awaitable.hpp>
+#include <asio/write.hpp>
+#include <atomic>
+#include <boost/beast/core.hpp>
+#include <boost/beast/http.hpp>
+#include <chrono>
+#include <filesystem>
+#include <fmt/format.h>
+#include <fstream>
+#include <iostream>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <vector>
+
+namespace {
+// 本模块测试计数器 (仅本编译单元可见; 不经头文件 extern 导出)
+int g_http_passed = 0;
+int g_http_failed = 0;
+} // namespace
+
+// 断言计数宏覆盖: 将 test_framework.h 的 XX_TEST_EXPECT_* 映射到本模块计数器
+#define XX_TEST_PASSED g_http_passed
+#define XX_TEST_FAILED g_http_failed
+
+#if defined(__linux__)
+#include <unistd.h>
+#endif
+
+namespace agentxx {
+namespace test {
+
+// 原 agentxx::util 已拆分: 基础件在 utilxx_base, 重依赖工具在 utilxx
+using namespace utilxx_base;
+using namespace utilxx;
+
+template<typename T>
+void expect_has_value_impl(T&& expr, const char* file, int line) {
+    auto&& tmp = std::forward<T>(expr);
+    if (tmp.has_value()) {
+        ++XX_TEST_PASSED;
+    } else {
+        ++XX_TEST_FAILED;
+        if constexpr (requires { tmp.error(); }) {
+            TEST_FAIL << "expected has_value at " << file << ":" << line << " | " << tmp.error()
+                      << std::endl;
+        } else {
+            TEST_FAIL << "expected has_value at " << file << ":" << line << std::endl;
+        }
+    }
+}
+
+// 增强版 HAS_VALUE 断言: 失败时输出文件与错误详情 (仅本模块覆盖框架默认宏)
+#undef XX_TEST_EXPECT_HAS_VALUE
+#define XX_TEST_EXPECT_HAS_VALUE(expr) expect_has_value_impl(expr, __FILE__, __LINE__)
+
+void test_http_client_unit() {
+    {
+        XX_TEST_EXPECT_EQ(HttpClient::calcTimeoutBySize(0).count(), 30);
+        XX_TEST_EXPECT_EQ(HttpClient::calcTimeoutBySize(1).count(), 30);
+        XX_TEST_EXPECT_EQ(HttpClient::calcTimeoutBySize(65536).count(), 30);
+        XX_TEST_EXPECT_EQ(HttpClient::calcTimeoutBySize(65537).count(), 30);
+        XX_TEST_EXPECT_EQ(HttpClient::calcTimeoutBySize(65536 * 30).count(), 30);
+        XX_TEST_EXPECT_EQ(HttpClient::calcTimeoutBySize(65536 * 31).count(), 31);
+        XX_TEST_EXPECT_EQ(HttpClient::calcTimeoutBySize(65536 * 100).count(), 100);
+        XX_TEST_EXPECT_EQ(HttpClient::calcTimeoutBySize(65536 * 1024).count(), 1024);
+    }
+
+    {
+        // isTransientError: 瞬时传输错误分类 (响应截断/连接重置/超时)
+        // -- 响应被截断 (exchange 转换后的错误 / OpenSSL stream truncated)
+        XX_TEST_EXPECT_TRUE(HttpClient::isTransientError(
+            "HTTP response truncated: server closed connection before sending complete "
+            "response (status 200, 123 bytes received)"
+        ));
+        XX_TEST_EXPECT_TRUE(HttpClient::isTransientError("ssl stream truncated"));
+        // 最原始的 beast 错误 (兼容旧路径, 不含 exchange 转换时也命中)
+        XX_TEST_EXPECT_TRUE(HttpClient::isTransientError("partial message [beast.http:2]"));
+        // -- 连接被重置 / 管道破裂
+        XX_TEST_EXPECT_TRUE(HttpClient::isTransientError("Connection reset by peer"));
+        XX_TEST_EXPECT_TRUE(HttpClient::isTransientError("broken pipe"));
+        // -- 对端关闭连接
+        XX_TEST_EXPECT_TRUE(HttpClient::isTransientError("End of file"));
+        // -- 超时 (catchErrorAsync 包装 operation_aborted 为 "timeout: ...")
+        XX_TEST_EXPECT_TRUE(HttpClient::isTransientError("timeout: operation aborted"));
+        XX_TEST_EXPECT_TRUE(HttpClient::isTransientError("connect timed out"));
+        // -- 非瞬时错误不应被分类为可重试
+        XX_TEST_EXPECT_FALSE(HttpClient::isTransientError("HTTP 500: Internal Server Error"));
+        XX_TEST_EXPECT_FALSE(HttpClient::isTransientError("HTTP 404: not found"));
+        XX_TEST_EXPECT_FALSE(HttpClient::isTransientError("invalid JSON response: <html>"));
+        XX_TEST_EXPECT_FALSE(HttpClient::isTransientError("failed to start subprocess"));
+        XX_TEST_EXPECT_FALSE(HttpClient::isTransientError(""));
+        // 大小写不敏感: 大写首字母的错误消息同样命中
+        XX_TEST_EXPECT_TRUE(HttpClient::isTransientError("Connection reset by peer"));
+        XX_TEST_EXPECT_TRUE(HttpClient::isTransientError("End of file"));
+        // "timed out" 变体 (asio 原生消息 "connect timed out" 等) 同样命中;
+        // 超时即瞬时可重试 (含上层整体超时, 但 isTransientError 仅被传输层
+        // 错误路径调用, 上层超时错误不会进入此分类)
+        XX_TEST_EXPECT_TRUE(HttpClient::isTransientError("connect timed out"));
+        XX_TEST_EXPECT_TRUE(HttpClient::isTransientError("MCP tool call timed out after 120000ms"));
+    }
+
+    {
+        HttpResponse resp;
+        resp.status = 200;
+        XX_TEST_EXPECT_TRUE(resp.isSuccess());
+        resp.status = 201;
+        XX_TEST_EXPECT_TRUE(resp.isSuccess());
+        resp.status = 299;
+        XX_TEST_EXPECT_TRUE(resp.isSuccess());
+        resp.status = 301;
+        XX_TEST_EXPECT_FALSE(resp.isSuccess());
+        resp.status = 404;
+        XX_TEST_EXPECT_FALSE(resp.isSuccess());
+        resp.status = 500;
+        XX_TEST_EXPECT_FALSE(resp.isSuccess());
+        resp.status = 0;
+        XX_TEST_EXPECT_FALSE(resp.isSuccess());
+    }
+
+    {
+        HttpResponse resp;
+
+        XX_TEST_EXPECT_EQ(resp.contentType(), "");
+        resp.headers.set("content-type", "application/json");
+        XX_TEST_EXPECT_EQ(resp.contentType(), "application/json");
+        resp.headers.set("content-type", "application/json; charset=utf-8");
+        XX_TEST_EXPECT_EQ(resp.contentType(), "application/json");
+        resp.headers.set("content-type", "text/html; charset=utf-8");
+        XX_TEST_EXPECT_EQ(resp.contentType(), "text/html");
+        resp.headers.set("content-type", "  Text/Plain  ");
+        XX_TEST_EXPECT_EQ(resp.contentType(), "text/plain");
+        resp.headers.set("content-type", "application/ld+json");
+        XX_TEST_EXPECT_EQ(resp.contentType(), "application/ld+json");
+        resp.headers.set("content-type", "application/xml");
+        XX_TEST_EXPECT_EQ(resp.contentType(), "application/xml");
+        resp.headers.set("content-type", "application/octet-stream");
+        XX_TEST_EXPECT_EQ(resp.contentType(), "application/octet-stream");
+    }
+
+    {
+        XX_TEST_EXPECT_TRUE(HttpResponse::isJsonContentType("application/json"));
+        XX_TEST_EXPECT_TRUE(HttpResponse::isJsonContentType("application/ld+json"));
+        XX_TEST_EXPECT_TRUE(HttpResponse::isJsonContentType("application/vnd.api+json"));
+        XX_TEST_EXPECT_FALSE(HttpResponse::isJsonContentType("text/plain"));
+        XX_TEST_EXPECT_FALSE(HttpResponse::isJsonContentType("text/html"));
+        XX_TEST_EXPECT_FALSE(HttpResponse::isJsonContentType("application/xml"));
+        XX_TEST_EXPECT_FALSE(HttpResponse::isJsonContentType(""));
+        XX_TEST_EXPECT_FALSE(HttpResponse::isJsonContentType("application/octet-stream"));
+    }
+
+    {
+        XX_TEST_EXPECT_TRUE(HttpResponse::isTextContentType(""));
+        XX_TEST_EXPECT_TRUE(HttpResponse::isTextContentType("text/plain"));
+        XX_TEST_EXPECT_TRUE(HttpResponse::isTextContentType("text/html"));
+        XX_TEST_EXPECT_TRUE(HttpResponse::isTextContentType("text/css"));
+        XX_TEST_EXPECT_TRUE(HttpResponse::isTextContentType("text/javascript"));
+        XX_TEST_EXPECT_TRUE(HttpResponse::isTextContentType("application/json"));
+        XX_TEST_EXPECT_TRUE(HttpResponse::isTextContentType("application/ld+json"));
+        XX_TEST_EXPECT_TRUE(HttpResponse::isTextContentType("application/xml"));
+        XX_TEST_EXPECT_TRUE(HttpResponse::isTextContentType("application/rss+xml"));
+        XX_TEST_EXPECT_TRUE(HttpResponse::isTextContentType("application/x-www-form-urlencoded"));
+        XX_TEST_EXPECT_FALSE(HttpResponse::isTextContentType("application/octet-stream"));
+        XX_TEST_EXPECT_FALSE(HttpResponse::isTextContentType("image/png"));
+        XX_TEST_EXPECT_FALSE(HttpResponse::isTextContentType("audio/mpeg"));
+    }
+
+    {
+        HttpResponse resp;
+
+        resp.body = R"({"key": "value"})";
+        resp.headers.set("content-type", "application/json");
+        auto jsonResult = resp.bodyJson();
+        XX_TEST_EXPECT_HAS_VALUE(jsonResult);
+        if (jsonResult.has_value()) {
+            XX_TEST_EXPECT_EQ(jsonResult.value()["key"].get<std::string>(), "value");
+        }
+
+        resp.body = R"({"key": "value"})";
+        resp.headers.set("content-type", "application/ld+json");
+        auto jsonResult2 = resp.bodyJson();
+        XX_TEST_EXPECT_HAS_VALUE(jsonResult2);
+        if (jsonResult2.has_value()) {
+            XX_TEST_EXPECT_EQ(jsonResult2.value()["key"].get<std::string>(), "value");
+        }
+
+        resp.body = R"({"key": "value"})";
+        resp.headers.set("content-type", "text/html");
+        auto jsonResult3 = resp.bodyJson();
+        XX_TEST_EXPECT_NULLOPT(jsonResult3);
+
+        resp.body = "";
+        resp.headers.set("content-type", "application/json");
+        auto jsonResult4 = resp.bodyJson();
+        XX_TEST_EXPECT_NULLOPT(jsonResult4);
+
+        resp.body = "not valid json";
+        resp.headers.set("content-type", "application/json");
+        auto jsonResult5 = resp.bodyJson();
+        XX_TEST_EXPECT_NULLOPT(jsonResult5);
+    }
+
+    {
+        HttpResponse resp;
+
+        resp.body = "hello world";
+        resp.headers.set("content-type", "text/plain");
+        auto textResult = resp.bodyText();
+        XX_TEST_EXPECT_HAS_VALUE(textResult);
+        if (textResult.has_value()) {
+            XX_TEST_EXPECT_EQ(textResult.value(), "hello world");
+        }
+
+        resp.body = "<html></html>";
+        resp.headers.set("content-type", "text/html; charset=utf-8");
+        auto textResult2 = resp.bodyText();
+        XX_TEST_EXPECT_HAS_VALUE(textResult2);
+        if (textResult2.has_value()) {
+            XX_TEST_EXPECT_EQ(textResult2.value(), "<html></html>");
+        }
+
+        resp.body = "text content";
+        resp.headers.set("content-type", "");
+        auto textResult3 = resp.bodyText();
+        XX_TEST_EXPECT_HAS_VALUE(textResult3);
+
+        resp.body = "binary data";
+        resp.headers.set("content-type", "application/octet-stream");
+        auto textResult4 = resp.bodyText();
+        XX_TEST_EXPECT_NULLOPT(textResult4);
+
+        resp.body = "image data";
+        resp.headers.set("content-type", "image/png");
+        auto textResult5 = resp.bodyText();
+        XX_TEST_EXPECT_NULLOPT(textResult5);
+    }
+
+    {
+        HttpResponse resp;
+        resp.headers.set("X-Custom", "value123");
+        resp.headers.set("Content-Type", "application/json");
+
+        XX_TEST_EXPECT_EQ(resp.findHeader("X-Custom"), "value123");
+        XX_TEST_EXPECT_EQ(resp.findHeader("Content-Type"), "application/json");
+        XX_TEST_EXPECT_EQ(resp.findHeader("x-custom"), "value123");
+        XX_TEST_EXPECT_EQ(resp.findHeader("Non-Existent"), "");
+    }
+
+    {
+        XX_TEST_EXPECT_FALSE(HttpClient::isValidUrl(""));
+        XX_TEST_EXPECT_FALSE(HttpClient::isValidUrl("ftp://example.com"));
+        XX_TEST_EXPECT_FALSE(HttpClient::isValidUrl("ws://example.com"));
+        XX_TEST_EXPECT_TRUE(HttpClient::isValidUrl("http://example.com"));
+        XX_TEST_EXPECT_TRUE(HttpClient::isValidUrl("https://example.com"));
+        XX_TEST_EXPECT_TRUE(HttpClient::isValidUrl("http://example.com/path"));
+        XX_TEST_EXPECT_TRUE(HttpClient::isValidUrl("https://example.com:8080/path"));
+        XX_TEST_EXPECT_TRUE(HttpClient::isValidUrl("example.com"));
+        XX_TEST_EXPECT_TRUE(HttpClient::isValidUrl("example.com/path"));
+        XX_TEST_EXPECT_FALSE(HttpClient::isValidUrl("http://"));
+        XX_TEST_EXPECT_FALSE(HttpClient::isValidUrl("https://"));
+    }
+
+    {
+        auto [base, path] = HttpClient::splitUrl("http://example.com/path");
+        XX_TEST_EXPECT_EQ(base, "http://example.com");
+        XX_TEST_EXPECT_EQ(path, "/path");
+
+        auto [base2, path2] = HttpClient::splitUrl("https://example.com:8080/a/b");
+        XX_TEST_EXPECT_EQ(base2, "https://example.com:8080");
+        XX_TEST_EXPECT_EQ(path2, "/a/b");
+
+        auto [base3, path3] = HttpClient::splitUrl("http://example.com");
+        XX_TEST_EXPECT_EQ(base3, "http://example.com");
+        XX_TEST_EXPECT_EQ(path3, "/");
+
+        auto [base4, path4] = HttpClient::splitUrl("example.com/path");
+        XX_TEST_EXPECT_EQ(base4, "example.com/path");
+        XX_TEST_EXPECT_EQ(path4, "/");
+
+        auto [base5, path5] = HttpClient::splitUrl("http://example.com/");
+        XX_TEST_EXPECT_EQ(base5, "http://example.com");
+        XX_TEST_EXPECT_EQ(path5, "/");
+    }
+
+    {
+        auto p1 = HttpClient::parseUrl("https://example.com/a/b");
+        XX_TEST_EXPECT_HAS_VALUE(p1);
+        XX_TEST_EXPECT_EQ(p1->scheme, "https");
+        XX_TEST_EXPECT_EQ(p1->host, "example.com");
+        XX_TEST_EXPECT_EQ(p1->port, 443);
+        XX_TEST_EXPECT_EQ(p1->path, "/a/b");
+
+        auto p2 = HttpClient::parseUrl("http://example.com:8080/x");
+        XX_TEST_EXPECT_HAS_VALUE(p2);
+        XX_TEST_EXPECT_EQ(p2->scheme, "http");
+        XX_TEST_EXPECT_EQ(p2->host, "example.com");
+        XX_TEST_EXPECT_EQ(p2->port, 8080);
+        XX_TEST_EXPECT_EQ(p2->path, "/x");
+
+        auto p3 = HttpClient::parseUrl("http://example.com");
+        XX_TEST_EXPECT_HAS_VALUE(p3);
+        XX_TEST_EXPECT_EQ(p3->port, 80);
+        XX_TEST_EXPECT_EQ(p3->path, "/");
+
+        // IPv6 字面量: host 应去掉方括号以便 DNS 解析
+        auto p4 = HttpClient::parseUrl("http://[::1]:8080/v6");
+        XX_TEST_EXPECT_HAS_VALUE(p4);
+        XX_TEST_EXPECT_EQ(p4->host, "::1");
+        XX_TEST_EXPECT_EQ(p4->port, 8080);
+        XX_TEST_EXPECT_EQ(p4->path, "/v6");
+
+        auto p5 = HttpClient::parseUrl("https://[2001:db8::1]/");
+        XX_TEST_EXPECT_HAS_VALUE(p5);
+        XX_TEST_EXPECT_EQ(p5->host, "2001:db8::1");
+        XX_TEST_EXPECT_EQ(p5->port, 443);
+        XX_TEST_EXPECT_EQ(p5->path, "/");
+
+        XX_TEST_EXPECT_FALSE(HttpClient::parseUrl("ftp://example.com").has_value());
+        XX_TEST_EXPECT_FALSE(HttpClient::parseUrl("example.com/path").has_value());
+        XX_TEST_EXPECT_FALSE(HttpClient::parseUrl("http://").has_value());
+        XX_TEST_EXPECT_FALSE(HttpClient::parseUrl("http://[::1").has_value());
+        XX_TEST_EXPECT_FALSE(HttpClient::parseUrl("http://host:99999/").has_value());
+        XX_TEST_EXPECT_FALSE(HttpClient::parseUrl("http://:8080/").has_value());
+        // 回归: `]` 后非 ':' 的非法格式
+        XX_TEST_EXPECT_FALSE(HttpClient::parseUrl("http://[::1]abc/").has_value());
+        XX_TEST_EXPECT_FALSE(HttpClient::parseUrl("http://[::1]8080/").has_value());
+        // `[::1]` 无端口是合法 IPv6 URL
+        auto p6 = HttpClient::parseUrl("http://[::1]");
+        XX_TEST_EXPECT_HAS_VALUE(p6);
+        if (p6.has_value()) {
+            XX_TEST_EXPECT_EQ(p6->host, "::1");
+            XX_TEST_EXPECT_EQ(p6->port, 80);
+            XX_TEST_EXPECT_EQ(p6->path, "/");
+        }
+    }
+
+    {
+        XX_TEST_EXPECT_EQ(HttpClient::urlEncode("hello"), "hello");
+        XX_TEST_EXPECT_EQ(HttpClient::urlEncode("hello world"), "hello+world");
+        XX_TEST_EXPECT_EQ(HttpClient::urlEncode("abc123"), "abc123");
+        XX_TEST_EXPECT_EQ(HttpClient::urlEncode("a&b=c"), "a%26b%3dc");
+        XX_TEST_EXPECT_EQ(HttpClient::urlEncode(""), "");
+        XX_TEST_EXPECT_EQ(HttpClient::urlEncode("中文"), "%e4%b8%ad%e6%96%87");
+        // Additional edge cases
+        XX_TEST_EXPECT_EQ(HttpClient::urlEncode("!@#$%^&*()"), "%21%40%23%24%25%5e%26%2a%28%29");
+        XX_TEST_EXPECT_EQ(HttpClient::urlEncode("-_.~"), "-_.~");
+        XX_TEST_EXPECT_EQ(HttpClient::urlEncode("/path/to/file"), "%2fpath%2fto%2ffile");
+        XX_TEST_EXPECT_EQ(HttpClient::urlEncode("\n\t"), "%0a%09");
+    }
+
+    {
+        HttpResponse resp;
+        resp.status = 200;
+        XX_TEST_EXPECT_TRUE(HttpClient::respIsSucc(resp));
+        resp.status = 404;
+        XX_TEST_EXPECT_FALSE(HttpClient::respIsSucc(resp));
+        resp.status = 500;
+        XX_TEST_EXPECT_FALSE(HttpClient::respIsSucc(resp));
+    }
+
+    {
+        bool original = HttpClient::getSslVerify();
+        XX_TEST_EXPECT_FALSE(original); // default should be true (verify enabled)
+        HttpClient::setSslVerify(false);
+        XX_TEST_EXPECT_FALSE(HttpClient::getSslVerify());
+        HttpClient::setSslVerify(true);
+        XX_TEST_EXPECT_TRUE(HttpClient::getSslVerify());
+        // Restore original
+        HttpClient::setSslVerify(original);
+    }
+
+    {
+        // Protocol-relative URL: //host/path -> scheme://host/path
+        XX_TEST_EXPECT_EQ(
+            HttpClient::resolveRedirectUrl("https://example.com/a", "//other.com/b"),
+            "https://other.com/b"
+        );
+        XX_TEST_EXPECT_EQ(
+            HttpClient::resolveRedirectUrl("http://example.com/a", "//other.com:8080/c"),
+            "http://other.com:8080/c"
+        );
+    }
+}
+
+asio::awaitable<void> test_http_client() {
+    co_return;
+}
+
+void test_http_server_unit() {
+    {
+        XX_TEST_EXPECT_EQ(httpMethodIndex(boost::beast::http::verb::get), 0);
+        XX_TEST_EXPECT_EQ(httpMethodIndex(boost::beast::http::verb::head), 1);
+        XX_TEST_EXPECT_EQ(httpMethodIndex(boost::beast::http::verb::post), 2);
+        XX_TEST_EXPECT_EQ(httpMethodIndex(boost::beast::http::verb::put), 3);
+        XX_TEST_EXPECT_EQ(httpMethodIndex(boost::beast::http::verb::delete_), 4);
+        XX_TEST_EXPECT_EQ(httpMethodIndex(boost::beast::http::verb::connect), 5);
+        XX_TEST_EXPECT_EQ(httpMethodIndex(boost::beast::http::verb::options), 6);
+        XX_TEST_EXPECT_EQ(httpMethodIndex(boost::beast::http::verb::trace), 7);
+        XX_TEST_EXPECT_EQ(httpMethodIndex(boost::beast::http::verb::patch), 8);
+        XX_TEST_EXPECT_EQ(httpMethodIndex(static_cast<boost::beast::http::verb>(999)), -1);
+    }
+
+    {
+        XX_TEST_EXPECT_EQ(requestPath("/"), "/");
+        XX_TEST_EXPECT_EQ(requestPath("/path"), "/path");
+        XX_TEST_EXPECT_EQ(requestPath("/path?q=1"), "/path");
+        XX_TEST_EXPECT_EQ(requestPath("/a/b/c?x=y&z=w"), "/a/b/c");
+        XX_TEST_EXPECT_EQ(requestPath(""), "");
+        XX_TEST_EXPECT_EQ(requestPath("?alone"), "");
+        // absolute-form (代理风格请求目标)
+        XX_TEST_EXPECT_EQ(requestPath("http://example.com/path"), "/path");
+        XX_TEST_EXPECT_EQ(requestPath("http://example.com/path?q=1"), "/path");
+        XX_TEST_EXPECT_EQ(requestPath("https://example.com:8080/a/b"), "/a/b");
+        XX_TEST_EXPECT_EQ(requestPath("http://example.com"), "/");
+        XX_TEST_EXPECT_EQ(requestPath("http://example.com?root-query"), "/");
+        // 容忍非法携带的 fragment
+        XX_TEST_EXPECT_EQ(requestPath("/path#frag"), "/path");
+        XX_TEST_EXPECT_EQ(requestPath("/path?q=1#frag"), "/path");
+    }
+
+    {
+        XX_TEST_EXPECT_EQ(httpMethodName(0), "GET");
+        XX_TEST_EXPECT_EQ(httpMethodName(1), "HEAD");
+        XX_TEST_EXPECT_EQ(httpMethodName(2), "POST");
+        XX_TEST_EXPECT_EQ(httpMethodName(3), "PUT");
+        XX_TEST_EXPECT_EQ(httpMethodName(4), "DELETE");
+        XX_TEST_EXPECT_EQ(httpMethodName(5), "CONNECT");
+        XX_TEST_EXPECT_EQ(httpMethodName(6), "OPTIONS");
+        XX_TEST_EXPECT_EQ(httpMethodName(7), "TRACE");
+        XX_TEST_EXPECT_EQ(httpMethodName(8), "PATCH");
+        XX_TEST_EXPECT_EQ(httpMethodName(-1), "UNKNOWN");
+        XX_TEST_EXPECT_EQ(httpMethodName(9), "UNKNOWN");
+    }
+
+    {
+        XX_TEST_EXPECT_TRUE(HttpClient::isRedirectStatus(301));
+        XX_TEST_EXPECT_TRUE(HttpClient::isRedirectStatus(302));
+        XX_TEST_EXPECT_TRUE(HttpClient::isRedirectStatus(303));
+        XX_TEST_EXPECT_TRUE(HttpClient::isRedirectStatus(307));
+        XX_TEST_EXPECT_TRUE(HttpClient::isRedirectStatus(308));
+        XX_TEST_EXPECT_FALSE(HttpClient::isRedirectStatus(200));
+        XX_TEST_EXPECT_FALSE(HttpClient::isRedirectStatus(404));
+        XX_TEST_EXPECT_FALSE(HttpClient::isRedirectStatus(500));
+        XX_TEST_EXPECT_FALSE(HttpClient::isRedirectStatus(0));
+    }
+
+    {
+        XX_TEST_EXPECT_TRUE(HttpClient::redirectChangesToGet(301));
+        XX_TEST_EXPECT_TRUE(HttpClient::redirectChangesToGet(302));
+        XX_TEST_EXPECT_TRUE(HttpClient::redirectChangesToGet(303));
+        XX_TEST_EXPECT_FALSE(HttpClient::redirectChangesToGet(307));
+        XX_TEST_EXPECT_FALSE(HttpClient::redirectChangesToGet(308));
+        XX_TEST_EXPECT_FALSE(HttpClient::redirectChangesToGet(200));
+    }
+
+    {
+        // absolute URL
+        XX_TEST_EXPECT_EQ(
+            HttpClient::resolveRedirectUrl("http://example.com/a", "http://other.com/b"),
+            "http://other.com/b"
+        );
+        // absolute path
+        XX_TEST_EXPECT_EQ(
+            HttpClient::resolveRedirectUrl("http://example.com/a", "/b/c"),
+            "http://example.com/b/c"
+        );
+        // relative path
+        XX_TEST_EXPECT_EQ(
+            HttpClient::resolveRedirectUrl("http://example.com/a/b", "c"),
+            "http://example.com/a/c"
+        );
+        // relative path with no parent
+        XX_TEST_EXPECT_EQ(
+            HttpClient::resolveRedirectUrl("http://example.com/", "c"),
+            "http://example.com/c"
+        );
+        // root path
+        XX_TEST_EXPECT_EQ(
+            HttpClient::resolveRedirectUrl("http://example.com/a/b/c", "/"),
+            "http://example.com/"
+        );
+        // fragment 应被去除 (RFC 7231: Location 中的 fragment 不参与资源定位)
+        XX_TEST_EXPECT_EQ(
+            HttpClient::resolveRedirectUrl("http://example.com/a", "/b#section-2"),
+            "http://example.com/b"
+        );
+        XX_TEST_EXPECT_EQ(
+            HttpClient::resolveRedirectUrl("http://example.com/a", "http://other.com/c#frag"),
+            "http://other.com/c"
+        );
+        XX_TEST_EXPECT_EQ(
+            HttpClient::resolveRedirectUrl("http://example.com/a", "#only-fragment"),
+            "http://example.com/a"
+        );
+        // 回归: 相对 Location 含 "./"、"../" 段时做 URL 词法规范化
+        XX_TEST_EXPECT_EQ(
+            HttpClient::resolveRedirectUrl("http://example.com/a/b/c", "../d"),
+            "http://example.com/a/d"
+        );
+        XX_TEST_EXPECT_EQ(
+            HttpClient::resolveRedirectUrl("http://example.com/a/b/c", "../../d"),
+            "http://example.com/d"
+        );
+        XX_TEST_EXPECT_EQ(
+            HttpClient::resolveRedirectUrl("http://example.com/a/b/c", "./d"),
+            "http://example.com/a/b/d"
+        );
+        XX_TEST_EXPECT_EQ(
+            HttpClient::resolveRedirectUrl("http://example.com/a/b", "../.."),
+            "http://example.com/"
+        );
+        // 超过根的 "../" 丢弃
+        XX_TEST_EXPECT_EQ(
+            HttpClient::resolveRedirectUrl("http://example.com/a", "../../../x"),
+            "http://example.com/x"
+        );
+        // 混合路径 + query string
+        XX_TEST_EXPECT_EQ(
+            HttpClient::resolveRedirectUrl("http://example.com/a/b/c", "../d?x=1"),
+            "http://example.com/a/d?x=1"
+        );
+    }
+}
+
+asio::awaitable<void> test_http_client_beast_server() {
+    using Server = HttpServer;
+    using namespace boost::beast::http;
+
+    // Build a handler helper: returns Handler for a simple string response
+    auto strResp = [](const char* ct, std::string body, status st = status::ok
+                   ) -> std::shared_ptr<Server::Handler> {
+        return std::make_shared<Server::Handler>(
+            [ct, body = std::move(body), st](
+                Server::Request&,
+                Server::Response& resp,
+                std::string_view
+            ) -> asio::awaitable<void> {
+                resp.result(st);
+                resp.set(field::content_type, ct);
+                resp.body() = std::move(body);
+                resp.prepare_payload();
+                co_return;
+            }
+        );
+    };
+
+    Server server({.address = "127.0.0.1", .port = 0, .ioThreads = 1});
+
+    // GET /hello
+    server.router().add("/hello", 0, strResp("text/plain", "hello world"));
+
+    // GET /html-utf8 – HTML containing non-ASCII (UTF-8) bytes inside tags.
+    // Regression: ParseCharInTag called isspace()/tolower() with a negative
+    // char on Windows, which asserted in debug CRT (signal 22 crash)
+    server.router().add(
+        "/html-utf8",
+        0,
+        strResp(
+            "text/html",
+            "<html><head><title>标题</title></head>"
+            "<body><p title=\"中文属性\">段落内容😀</p></body></html>"
+        )
+    );
+
+    // GET /json
+    server.router().add("/json", 0, strResp("application/json", R"({"key":"value"})"));
+
+    // GET /empty
+    server.router().add("/empty", 0, strResp("text/plain", ""));
+
+    // GET /status/201
+    server.router().add("/status/201", 0, strResp("text/plain", "created", status::created));
+
+    // GET /status/500
+    server.router().add(
+        "/status/500",
+        0,
+        strResp("text/plain", "server error", status::internal_server_error)
+    );
+
+    // GET /headers – echo back X-Echo value
+    server.router().add(
+        "/headers",
+        0,
+        std::make_shared<Server::Handler>(
+            [](Server::Request& req, Server::Response& resp, std::string_view
+            ) -> asio::awaitable<void> {
+                resp.result(status::ok);
+                resp.set(field::content_type, "text/plain");
+                auto val    = req[field::x_forwarded_for];
+                resp.body() = val.empty() ? "(none)" : std::string(val);
+                resp.prepare_payload();
+                co_return;
+            }
+        )
+    );
+
+    // GET /search?q=xxx – use query params
+    server.router().add(
+        "/search",
+        0,
+        std::make_shared<Server::Handler>(
+            [](Server::Request& req, Server::Response& resp, std::string_view
+            ) -> asio::awaitable<void> {
+                resp.result(status::ok);
+                resp.set(field::content_type, "text/plain");
+                auto target = req.target();
+                resp.body() = std::string(target);
+                resp.prepare_payload();
+                co_return;
+            }
+        )
+    );
+
+    // POST /echo
+    server.router().add(
+        "/echo",
+        2,
+        std::make_shared<Server::Handler>(
+            [](Server::Request& req, Server::Response& resp, std::string_view
+            ) -> asio::awaitable<void> {
+                resp.result(status::ok);
+                resp.set(field::content_type, "text/plain");
+                resp.body() = req.body();
+                resp.prepare_payload();
+                co_return;
+            }
+        )
+    );
+
+    // PUT /echo – prefix with "put:"
+    server.router().add(
+        "/echo",
+        3,
+        std::make_shared<Server::Handler>(
+            [](Server::Request& req, Server::Response& resp, std::string_view
+            ) -> asio::awaitable<void> {
+                resp.result(status::ok);
+                resp.set(field::content_type, "text/plain");
+                resp.body() = "put:" + req.body();
+                resp.prepare_payload();
+                co_return;
+            }
+        )
+    );
+
+    // DELETE /data
+    server.router().add("/data", 4, strResp("text/plain", "deleted"));
+
+    // Redirect: GET /redirect-me -> 302 Location: /hello
+    server.router().add(
+        "/redirect-me",
+        0,
+        std::make_shared<Server::Handler>(
+            [](Server::Request&, Server::Response& resp, std::string_view
+            ) -> asio::awaitable<void> {
+                resp.result(status::found);
+                resp.set(field::location, "/hello");
+                resp.prepare_payload();
+                co_return;
+            }
+        )
+    );
+
+    // Redirect loop: GET /redirect-loop -> 302 Location: /redirect-loop
+    server.router().add(
+        "/redirect-loop",
+        0,
+        std::make_shared<Server::Handler>(
+            [](Server::Request&, Server::Response& resp, std::string_view
+            ) -> asio::awaitable<void> {
+                resp.result(status::found);
+                resp.set(field::location, "/redirect-loop");
+                resp.prepare_payload();
+                co_return;
+            }
+        )
+    );
+
+    // Wildcard: GET /wildcard/*
+    server.router().add(
+        "/wildcard/*",
+        0,
+        std::make_shared<Server::Handler>(
+            [](Server::Request&, Server::Response& resp, std::string_view matched_path
+            ) -> asio::awaitable<void> {
+                resp.result(status::ok);
+                resp.set(field::content_type, "text/plain");
+                resp.body() = fmt::format("matched:{}", matched_path);
+                resp.prepare_payload();
+                co_return;
+            }
+        )
+    );
+
+    // PATCH /echo – prefix with "patch:"
+    server.router().add(
+        "/echo",
+        8,
+        std::make_shared<Server::Handler>(
+            [](Server::Request& req, Server::Response& resp, std::string_view
+            ) -> asio::awaitable<void> {
+                resp.result(status::ok);
+                resp.set(field::content_type, "text/plain");
+                resp.body() = "patch:" + req.body();
+                resp.prepare_payload();
+                co_return;
+            }
+        )
+    );
+
+    // DELETE /echo – echo body
+    server.router().add(
+        "/echo",
+        4,
+        std::make_shared<Server::Handler>(
+            [](Server::Request& req, Server::Response& resp, std::string_view
+            ) -> asio::awaitable<void> {
+                resp.result(status::ok);
+                resp.set(field::content_type, "text/plain");
+                resp.body() = "delete:" + req.body();
+                resp.prepare_payload();
+                co_return;
+            }
+        )
+    );
+
+    // HEAD /hello – should return headers only, no body
+    server.router().add(
+        "/hello",
+        1,
+        std::make_shared<Server::Handler>(
+            [](Server::Request&, Server::Response& resp, std::string_view
+            ) -> asio::awaitable<void> {
+                resp.result(status::ok);
+                resp.set(field::content_type, "text/plain");
+                resp.body() = "hello world";
+                resp.prepare_payload();
+                co_return;
+            }
+        )
+    );
+
+    // GET /big-body – returns a configurable-size body for limit testing
+    server.router().add(
+        "/big-body",
+        0,
+        std::make_shared<Server::Handler>(
+            [](Server::Request& req, Server::Response& resp, std::string_view
+            ) -> asio::awaitable<void> {
+                resp.result(status::ok);
+                resp.set(field::content_type, "text/plain");
+                // Default 1000 bytes, or use ?size=NNNN
+                std::string target = std::string(req.target());
+                size_t      size   = 1000;
+                auto        pos    = target.find("size=");
+                if (pos != std::string::npos) {
+                    size = std::stoul(target.substr(pos + 5));
+                }
+                resp.body() = std::string(size, 'x');
+                resp.prepare_payload();
+                co_return;
+            }
+        )
+    );
+
+    // GET /redirect-proto-rel – not used (protocol-relative needs cross-host)
+
+    // Start server
+    std::thread serverThread([&server]() {
+        server.start();
+    });
+
+    // Wait for the server to be ready
+    uint16_t port = 0;
+    for (int i = 0; i < 100; ++i) {
+        port = server.port();
+        if (port != 0) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    if (port == 0) {
+        TEST_FAIL << "Server failed to start" << std::endl;
+        g_http_failed++;
+        server.stop();
+        serverThread.join();
+        co_return;
+    }
+
+    // Verify server is reachable
+    for (int i = 0; i < 100; ++i) {
+        try {
+            asio::io_context      tmpCtx;
+            asio::ip::tcp::socket sock(tmpCtx);
+            sock.connect(asio::ip::tcp::endpoint(asio::ip::make_address("127.0.0.1"), port));
+            sock.close();
+            break;
+        } catch (...) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    }
+
+    std::string baseUrl = "http://127.0.0.1:" + std::to_string(port);
+    std::cout << "Beast Server URL: " << baseUrl << std::endl;
+
+    // -----------------------------------------------------------------------
+    // Tests
+    // -----------------------------------------------------------------------
+
+    // {
+    //   HttpClient::setSslVerify(false);
+    //   auto resp = co_await
+    //   HttpClient::getAsync("https://blog.music.bool.run/");
+    //   XX_TEST_EXPECT_HAS_VALUE(resp);
+    //   if (resp.has_value()) {
+    //     XX_TEST_EXPECT_EQ(resp.value().status, 200);
+    //     XX_TEST_EXPECT_TRUE(resp.value().isSuccess());
+    //   }
+    // }
+
+    {
+        auto resp = co_await HttpClient::getAsync(baseUrl + "/hello");
+        XX_TEST_EXPECT_HAS_VALUE(resp);
+        if (resp.has_value()) {
+            XX_TEST_EXPECT_EQ(resp.value().status, 200);
+            XX_TEST_EXPECT_EQ(resp.value().body, "hello world");
+            XX_TEST_EXPECT_TRUE(resp.value().isSuccess());
+        }
+    }
+
+    {
+        auto resp = co_await HttpClient::getAsync(baseUrl + "/json");
+        XX_TEST_EXPECT_HAS_VALUE(resp);
+        if (resp.has_value()) {
+            XX_TEST_EXPECT_EQ(resp.value().status, 200);
+            auto j = resp.value().bodyJson();
+            XX_TEST_EXPECT_HAS_VALUE(j);
+            if (j.has_value()) {
+                XX_TEST_EXPECT_EQ(j.value()["key"].get<std::string>(), "value");
+            }
+        }
+    }
+
+    {
+        // HEAD: 服务端只发头部不发 body, 客户端 parser.skip 不等待 body,
+        // 双方都符合 RFC 7231 §4.3.2, 不会挂起
+        auto resp = co_await HttpClient::headAsync(baseUrl + "/hello");
+        XX_TEST_EXPECT_HAS_VALUE(resp);
+        if (resp.has_value()) {
+            XX_TEST_EXPECT_EQ(resp.value().status, 200);
+            XX_TEST_EXPECT_EQ(resp.value().body, "");
+            // Content-Length 保留 GET 响应的 body 长度
+            XX_TEST_EXPECT_EQ(resp.value().findHeader("content-length"), "11");
+        }
+    }
+
+    {
+        // HEAD 未注册专用 handler 时回退到 GET handler (RFC 7231)
+        auto resp = co_await HttpClient::headAsync(baseUrl + "/json");
+        XX_TEST_EXPECT_HAS_VALUE(resp);
+        if (resp.has_value()) {
+            XX_TEST_EXPECT_EQ(resp.value().status, 200);
+            XX_TEST_EXPECT_EQ(resp.value().body, "");
+        }
+    }
+
+    {
+        // 空 body 的 POST 也必须携带 Content-Length: 0, 服务端可正常处理
+        auto resp = co_await HttpClient::postAsync(baseUrl + "/echo", "", "text/plain");
+        XX_TEST_EXPECT_HAS_VALUE(resp);
+        if (resp.has_value()) {
+            XX_TEST_EXPECT_EQ(resp.value().status, 200);
+            XX_TEST_EXPECT_EQ(resp.value().body, "");
+        }
+    }
+
+    {
+        auto resp = co_await HttpClient::getAsync(baseUrl + "/empty");
+        XX_TEST_EXPECT_HAS_VALUE(resp);
+        if (resp.has_value()) {
+            XX_TEST_EXPECT_EQ(resp.value().status, 200);
+            XX_TEST_EXPECT_EQ(resp.value().body, "");
+        }
+    }
+
+    {
+        auto resp = co_await HttpClient::getAsync(baseUrl + "/status/201");
+        XX_TEST_EXPECT_HAS_VALUE(resp);
+        if (resp.has_value()) {
+            XX_TEST_EXPECT_EQ(resp.value().status, 201);
+            XX_TEST_EXPECT_TRUE(resp.value().isSuccess());
+        }
+    }
+
+    {
+        auto resp = co_await HttpClient::getAsync(baseUrl + "/status/500");
+        XX_TEST_EXPECT_HAS_VALUE(resp);
+        if (resp.has_value()) {
+            XX_TEST_EXPECT_EQ(resp.value().status, 500);
+            XX_TEST_EXPECT_FALSE(resp.value().isSuccess());
+        }
+    }
+
+    {
+        auto resp = co_await HttpClient::postAsync(baseUrl + "/echo", "body data", "text/plain");
+        XX_TEST_EXPECT_HAS_VALUE(resp);
+        if (resp.has_value()) {
+            XX_TEST_EXPECT_EQ(resp.value().status, 200);
+            XX_TEST_EXPECT_EQ(resp.value().body, "body data");
+        }
+    }
+
+    {
+        utilxx_base::Json j = {
+            {"msg", "hi"}
+        };
+        auto resp = co_await HttpClient::postAsync(baseUrl + "/echo", j);
+        XX_TEST_EXPECT_HAS_VALUE(resp);
+        if (resp.has_value()) {
+            XX_TEST_EXPECT_EQ(resp.value().status, 200);
+            XX_TEST_EXPECT_EQ(resp.value().body, R"({"msg":"hi"})");
+        }
+    }
+
+    {
+        auto resp = co_await HttpClient::putAsync(baseUrl + "/echo", "update");
+        XX_TEST_EXPECT_HAS_VALUE(resp);
+        if (resp.has_value()) {
+            XX_TEST_EXPECT_EQ(resp.value().body, "put:update");
+        }
+    }
+
+    {
+        // /data only has a DELETE handler; GET should return 405
+        auto resp = co_await HttpClient::getAsync(baseUrl + "/data");
+        XX_TEST_EXPECT_HAS_VALUE(resp);
+        if (resp.has_value()) {
+            XX_TEST_EXPECT_EQ(resp.value().status, 405);
+            // 405 必须携带 Allow 头, 且只列出该资源实际注册的方法
+            auto allow = resp.value().findHeader("allow");
+            XX_TEST_EXPECT_EQ(allow, "DELETE");
+        }
+    }
+
+    {
+        auto resp = co_await HttpClient::getAsync(baseUrl + "/wildcard/foo/bar");
+        XX_TEST_EXPECT_HAS_VALUE(resp);
+        if (resp.has_value()) {
+            XX_TEST_EXPECT_EQ(resp.value().status, 200);
+            // matched_path should contain the wildcard segment
+            XX_TEST_EXPECT_TRUE(resp.value().body.find("wildcard") != std::string::npos);
+        }
+    }
+
+    {
+        auto resp = co_await HttpClient::getAsync(baseUrl + "/nonexistent");
+        XX_TEST_EXPECT_HAS_VALUE(resp);
+        if (resp.has_value()) {
+            XX_TEST_EXPECT_EQ(resp.value().status, 404);
+            XX_TEST_EXPECT_FALSE(resp.value().isSuccess());
+        }
+    }
+
+    {
+        // POST to a GET-only route
+        auto resp = co_await HttpClient::postAsync(baseUrl + "/hello", "body", "text/plain");
+        XX_TEST_EXPECT_HAS_VALUE(resp);
+        if (resp.has_value()) {
+            XX_TEST_EXPECT_EQ(resp.value().status, 405);
+            XX_TEST_EXPECT_FALSE(resp.value().isSuccess());
+            // /hello 注册了 GET 与 HEAD
+            XX_TEST_EXPECT_EQ(resp.value().findHeader("allow"), "GET, HEAD");
+        }
+    }
+
+    {
+        auto resp = co_await HttpClient::getAsync(baseUrl + "/search?q=hello");
+        XX_TEST_EXPECT_HAS_VALUE(resp);
+        if (resp.has_value()) {
+            XX_TEST_EXPECT_EQ(resp.value().status, 200);
+            // The handler echoes the full target
+            XX_TEST_EXPECT_TRUE(resp.value().body.find("q=hello") != std::string::npos);
+        }
+    }
+
+    {
+        auto resp = co_await HttpClient::getAsync(
+            "http://192.0.2.1:9999/nonexistent",
+            {},
+            HttpClient::RequestConfig{.connectTimeout = std::chrono::milliseconds{50}}
+        );
+        XX_TEST_EXPECT_FALSE(resp.has_value());
+    }
+
+    { XX_TEST_EXPECT_FALSE(server.isStopped()); }
+
+    {
+        auto resp = co_await HttpClient::getAsync(
+            baseUrl + "/redirect-me",
+            {},
+            HttpClient::RequestConfig{
+                .readChunkTimeout = std::chrono::seconds{10},
+                .followRedirect   = 0
+            }
+        );
+        XX_TEST_EXPECT_HAS_VALUE(resp);
+        if (resp.has_value()) {
+            XX_TEST_EXPECT_EQ(resp.value().status, 302);
+            auto loc = resp.value().findHeader("location");
+            XX_TEST_EXPECT_EQ(loc, "/hello");
+        }
+    }
+
+    {
+        auto resp = co_await HttpClient::getAsync(
+            baseUrl + "/redirect-me",
+            {},
+            HttpClient::RequestConfig{
+                .readChunkTimeout = std::chrono::seconds{10},
+                .followRedirect   = 1
+            }
+        );
+        XX_TEST_EXPECT_HAS_VALUE(resp);
+        if (resp.has_value()) {
+            XX_TEST_EXPECT_EQ(resp.value().status, 200);
+            XX_TEST_EXPECT_EQ(resp.value().body, "hello world");
+        }
+    }
+
+    {
+        auto resp = co_await HttpClient::getAsync(
+            baseUrl + "/redirect-loop",
+            {},
+            HttpClient::RequestConfig{
+                .readChunkTimeout = std::chrono::seconds{10},
+                .followRedirect   = 3
+            }
+        );
+        XX_TEST_EXPECT_HAS_VALUE(resp);
+        if (resp.has_value()) {
+            // Should stop at the last redirect (302) since it exceeds max
+            XX_TEST_EXPECT_EQ(resp.value().status, 302);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // New tests for production readiness improvements
+    // -----------------------------------------------------------------------
+
+    {
+        auto resp = co_await HttpClient::deleteAsync(baseUrl + "/echo");
+        XX_TEST_EXPECT_HAS_VALUE(resp);
+        if (resp.has_value()) {
+            XX_TEST_EXPECT_EQ(resp.value().status, 200);
+            XX_TEST_EXPECT_EQ(resp.value().body, "delete:");
+        }
+    }
+
+    {
+        auto resp = co_await HttpClient::patchAsync(baseUrl + "/echo", "patchdata");
+        XX_TEST_EXPECT_HAS_VALUE(resp);
+        if (resp.has_value()) {
+            XX_TEST_EXPECT_EQ(resp.value().status, 200);
+            XX_TEST_EXPECT_EQ(resp.value().body, "patch:patchdata");
+        }
+    }
+
+    {
+        auto resp = co_await HttpClient::getAsync(baseUrl + "/hello");
+        XX_TEST_EXPECT_HAS_VALUE(resp);
+        if (resp.has_value()) {
+            auto date = resp.value().findHeader("date");
+            XX_TEST_EXPECT_FALSE(date.empty());
+            // Date should contain "GMT" per RFC 7231
+            XX_TEST_EXPECT_TRUE(date.find("GMT") != std::string_view::npos);
+        }
+    }
+
+    {
+        auto resp = co_await HttpClient::getAsync(baseUrl + "/hello");
+        XX_TEST_EXPECT_HAS_VALUE(resp);
+        if (resp.has_value()) {
+            auto srv = resp.value().findHeader("server");
+            XX_TEST_EXPECT_FALSE(srv.empty());
+        }
+    }
+
+    {
+        // Request a 100-byte body with a 50-byte limit → should fail
+        auto resp = co_await HttpClient::getAsync(
+            baseUrl + "/big-body?size=100",
+            {},
+            HttpClient::RequestConfig{
+                .readChunkTimeout = std::chrono::seconds{5},
+                .followRedirect   = 3,
+                .maxResponseBody  = 50
+            }
+        );
+        // Body limit exceeded should result in an error (no value)
+        XX_TEST_EXPECT_FALSE(resp.has_value());
+    }
+
+    {
+        // Request a 100-byte body with a 200-byte limit → should succeed
+        auto resp = co_await HttpClient::getAsync(
+            baseUrl + "/big-body?size=100",
+            {},
+            HttpClient::RequestConfig{
+                .readChunkTimeout = std::chrono::seconds{5},
+                .followRedirect   = 3,
+                .maxResponseBody  = 200
+            }
+        );
+        XX_TEST_EXPECT_HAS_VALUE(resp);
+        if (resp.has_value()) {
+            XX_TEST_EXPECT_EQ(resp.value().status, 200);
+            XX_TEST_EXPECT_EQ(resp.value().body.size(), (size_t)100);
+        }
+    }
+
+    {
+        // Wait for pending connection cleanup (server-side coroutine teardown)
+        size_t conn = 1;
+        for (size_t i = 0; i < 50; ++i) {
+            conn = server.activeConnections();
+            if (conn == 0) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        XX_TEST_EXPECT_EQ(conn, (size_t)0);
+    }
+
+    {
+        // fetchMarkdown should return error (not UB) for 404
+        auto result = co_await HttpClient::fetchMarkdown(
+            baseUrl + "/nonexistent",
+            HttpClient::RequestConfig{.readChunkTimeout = std::chrono::seconds{5}}
+        );
+        XX_TEST_EXPECT_FALSE(result.has_value());
+    }
+
+    {
+        // Register an HTML route for markdown conversion
+        // Using /hello which returns "hello world" (text/plain)
+        // fetchMarkdown checks success status, not content-type
+        auto result = co_await HttpClient::fetchMarkdown(
+            baseUrl + "/hello",
+            HttpClient::RequestConfig{.readChunkTimeout = std::chrono::seconds{5}}
+        );
+        XX_TEST_EXPECT_HAS_VALUE(result);
+    }
+
+    {
+        // fetchMarkdown on HTML containing non-ASCII (UTF-8) bytes inside tags
+        // (regression: ParseCharInTag passed negative char to isspace/tolower,
+        //  which crashed in debug CRT on Windows)
+        auto result = co_await HttpClient::fetchMarkdown(
+            baseUrl + "/html-utf8",
+            HttpClient::RequestConfig{.readChunkTimeout = std::chrono::seconds{5}}
+        );
+        XX_TEST_EXPECT_HAS_VALUE(result);
+        if (result.has_value()) {
+            XX_TEST_EXPECT_TRUE(result.value().find("段落内容") != std::string::npos);
+        }
+    }
+
+    {
+        // requestSseAsync: 非 2xx 响应 (404) 应抛异常并报出状态码
+        bool threw = false;
+        try {
+            co_await HttpClient::requestSseAsync(
+                "GET",
+                baseUrl + "/nonexistent",
+                "",
+                "",
+                {},
+                HttpClient::RequestConfig{.readChunkTimeout = std::chrono::seconds{5}},
+                [](std::string_view) -> bool {
+                    return false;
+                }
+            );
+        } catch (const std::exception& e) {
+            threw = true;
+            XX_TEST_EXPECT_TRUE(std::string(e.what()).find("404") != std::string::npos);
+        }
+        XX_TEST_EXPECT_TRUE(threw);
+    }
+
+    server.stop();
+    serverThread.join();
+}
+
+/// Expect: 100-continue 兼容: 服务端必须先回 100 Continue, 客户端才发送 body
+asio::awaitable<void> test_http_server_expect_100_continue() {
+    using Server = HttpServer;
+    Server server({.address = "127.0.0.1", .port = 0, .ioThreads = 1});
+    server.router().add(
+        "/echo",
+        2,
+        std::make_shared<Server::Handler>(
+            [](Server::Request& req, Server::Response& resp, std::string_view
+            ) -> asio::awaitable<void> {
+                resp.result(boost::beast::http::status::ok);
+                resp.set(boost::beast::http::field::content_type, "text/plain");
+                resp.body() = req.body();
+                resp.prepare_payload();
+                co_return;
+            }
+        )
+    );
+
+    std::thread serverThread([&server]() {
+        server.start();
+    });
+    uint16_t    port = 0;
+    for (int i = 0; i < 100; ++i) {
+        port = server.port();
+        if (port != 0) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    if (port == 0) {
+        XX_TEST_FAILED++;
+        server.stop();
+        serverThread.join();
+        co_return;
+    }
+
+    auto executor = co_await asio::this_coro::executor;
+    try {
+        asio::ip::tcp::socket sock(executor);
+        co_await sock.async_connect(
+            asio::ip::tcp::endpoint(asio::ip::make_address("127.0.0.1"), port),
+            asio::use_awaitable
+        );
+
+        // 只发头部, 携带 Expect: 100-continue, body 等收到 100 后再发
+        std::string head = fmt::format(
+            "POST /echo HTTP/1.1\r\n"
+            "Host: 127.0.0.1:{}\r\n"
+            "Content-Type: text/plain\r\n"
+            "Content-Length: 11\r\n"
+            "Expect: 100-continue\r\n"
+            "Connection: close\r\n"
+            "\r\n",
+            port
+        );
+        co_await asio::async_write(sock, asio::buffer(head), asio::use_awaitable);
+
+        // 读取到 100 响应 (空行结尾) 为止
+        std::string interim;
+        char        buf[2048];
+        while (interim.find("\r\n\r\n") == std::string::npos) {
+            size_t n = co_await sock.async_read_some(asio::buffer(buf), asio::use_awaitable);
+            if (n == 0) {
+                break;
+            }
+            interim.append(buf, n);
+        }
+        XX_TEST_EXPECT_TRUE(interim.find("100") != std::string::npos);
+
+        // 收到 100 后再发送 body
+        co_await asio::async_write(sock, asio::buffer("hello-100ca"), asio::use_awaitable);
+
+        // 读取最终响应 (Connection: close, 读到 EOF)
+        std::string                finalResp = interim;
+        utilxx_base::AsioErrorCode ec;
+        for (;;) {
+            size_t n = co_await sock.async_read_some(
+                asio::buffer(buf),
+                asio::redirect_error(asio::use_awaitable, ec)
+            );
+            if (n > 0) {
+                finalResp.append(buf, n);
+            }
+            if (ec || n == 0) {
+                break;
+            }
+        }
+        XX_TEST_EXPECT_TRUE(finalResp.find("200") != std::string::npos);
+        XX_TEST_EXPECT_TRUE(finalResp.find("hello-100ca") != std::string::npos);
+    } catch (const std::exception& e) {
+        XX_TEST_FAILED++;
+        TEST_FAIL << "expect 100-continue test failed: " << e.what() << std::endl;
+    }
+
+    server.stop();
+    serverThread.join();
+}
+
+/// absolute-form 请求目标 (代理风格): "GET http://host/path HTTP/1.1" 应正确路由
+asio::awaitable<void> test_http_server_absolute_form_target() {
+    using Server = HttpServer;
+    Server server({.address = "127.0.0.1", .port = 0, .ioThreads = 1});
+    server.router().add(
+        "/hello",
+        0,
+        std::make_shared<Server::Handler>(
+            [](Server::Request&, Server::Response& resp, std::string_view
+            ) -> asio::awaitable<void> {
+                resp.result(boost::beast::http::status::ok);
+                resp.set(boost::beast::http::field::content_type, "text/plain");
+                resp.body() = "hello world";
+                resp.prepare_payload();
+                co_return;
+            }
+        )
+    );
+
+    std::thread serverThread([&server]() {
+        server.start();
+    });
+    uint16_t    port = 0;
+    for (int i = 0; i < 100; ++i) {
+        port = server.port();
+        if (port != 0) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    if (port == 0) {
+        XX_TEST_FAILED++;
+        server.stop();
+        serverThread.join();
+        co_return;
+    }
+
+    auto executor = co_await asio::this_coro::executor;
+    try {
+        asio::ip::tcp::socket sock(executor);
+        co_await sock.async_connect(
+            asio::ip::tcp::endpoint(asio::ip::make_address("127.0.0.1"), port),
+            asio::use_awaitable
+        );
+
+        std::string req = fmt::format(
+            "GET http://127.0.0.1:{}/hello?q=1 HTTP/1.1\r\n"
+            "Host: 127.0.0.1:{}\r\n"
+            "Connection: close\r\n"
+            "\r\n",
+            port,
+            port
+        );
+        co_await asio::async_write(sock, asio::buffer(req), asio::use_awaitable);
+
+        std::string                resp;
+        char                       buf[2048];
+        utilxx_base::AsioErrorCode ec;
+        for (;;) {
+            size_t n = co_await sock.async_read_some(
+                asio::buffer(buf),
+                asio::redirect_error(asio::use_awaitable, ec)
+            );
+            if (n > 0) {
+                resp.append(buf, n);
+            }
+            if (ec || n == 0) {
+                break;
+            }
+        }
+        XX_TEST_EXPECT_TRUE(resp.find("200") != std::string::npos);
+        XX_TEST_EXPECT_TRUE(resp.find("hello world") != std::string::npos);
+    } catch (const std::exception& e) {
+        XX_TEST_FAILED++;
+        TEST_FAIL << "absolute-form target test failed: " << e.what() << std::endl;
+    }
+
+    server.stop();
+    serverThread.join();
+}
+
+/// 原始 socket SSE 测试服务器: 用于模拟 HttpClient::requestSseAsync 的各种异常场景
+/// - Complete:    正常发完事件并发送 chunked 终止块
+/// - AbruptClose: 发送部分事件后直接关闭连接 (不发 chunked 终止块, 模拟对端中断)
+/// - Stall:       发送部分事件后保持静默 (模拟卡死, 用于触发 readChunkTimeout)
+class SseTestServer {
+public:
+
+    enum class Mode {
+        Complete,
+        AbruptClose,
+        Stall,
+    };
+
+    std::thread              thread;
+    uint16_t                 boundPort = 0;
+    Mode                     mode      = Mode::Complete;
+    std::vector<std::string> events; // 原始 SSE 事件块 (含结尾 "\n\n")
+    std::atomic<bool>        stopped{false};
+
+private:
+
+    asio::io_context                         ioCtx;
+    std::unique_ptr<asio::ip::tcp::acceptor> acceptor;
+    asio::ip::tcp::endpoint                  ep;
+
+public:
+
+    void start() {
+        acceptor = std::make_unique<asio::ip::tcp::acceptor>(
+            ioCtx,
+            asio::ip::tcp::endpoint(asio::ip::make_address("127.0.0.1"), 0)
+        );
+        ep        = acceptor->local_endpoint();
+        boundPort = ep.port();
+
+        thread = std::thread([this]() {
+            while (!stopped.load()) {
+                utilxx_base::AsioErrorCode ec;
+                asio::ip::tcp::socket      sock(ioCtx);
+                acceptor->accept(sock, ec);
+                if (ec) {
+                    break;
+                }
+                if (stopped.load()) {
+                    break;
+                }
+                handleConn(sock);
+            }
+        });
+    }
+
+    void stop() {
+        stopped.store(true);
+        if (acceptor) {
+            utilxx_base::AsioErrorCode ec;
+            asio::ip::tcp::socket      dummy(ioCtx);
+            dummy.connect(ep, ec);
+            acceptor->close(ec);
+        }
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+
+private:
+
+    static std::string chunkFrame(const std::string& payload) {
+        return fmt::format("{:x}\r\n{}\r\n", payload.size(), payload);
+    }
+
+    void handleConn(asio::ip::tcp::socket& sock) {
+        namespace http = boost::beast::http;
+        utilxx_base::AsioErrorCode ec;
+
+        boost::beast::flat_buffer        buf;
+        http::request<http::string_body> req;
+        http::read(sock, buf, req, ec);
+        if (ec) {
+            return;
+        }
+
+        std::string header = "HTTP/1.1 200 OK\r\n"
+                             "Content-Type: text/event-stream\r\n"
+                             "Transfer-Encoding: chunked\r\n"
+                             "\r\n";
+        asio::write(sock, asio::buffer(header), ec);
+        if (ec) {
+            return;
+        }
+
+        for (const auto& ev : events) {
+            auto framed = chunkFrame(ev);
+            asio::write(sock, asio::buffer(framed), ec);
+            if (ec) {
+                return;
+            }
+        }
+
+        switch (mode) {
+            case Mode::Complete: {
+                // chunked 终止块, 正常结束响应
+                asio::write(sock, asio::buffer(std::string{"0\r\n\r\n"}), ec);
+                break;
+            }
+            case Mode::AbruptClose:
+                // 不发终止块直接关闭 (FIN), 客户端应收到 eof/partial_message 错误
+                break;
+            case Mode::Stall:
+                for (int i = 0; i < 300 && !stopped.load(); ++i) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+                break;
+        }
+    }
+};
+
+/// requestSseAsync: 正常完成 / 中途连接中断 / 无数据超时 三种场景
+asio::awaitable<void> test_http_client_sse_interruption() {
+    // 1) 正常完成: 所有事件都应通过 onChunk 送达, 不抛异常
+    {
+        SseTestServer srv;
+        srv.mode   = SseTestServer::Mode::Complete;
+        srv.events = {"data: one\n\n", "data: two\n\n"};
+        srv.start();
+
+        std::string url = "http://127.0.0.1:" + std::to_string(srv.boundPort) + "/sse";
+        std::string received;
+        bool        threw = false;
+        try {
+            co_await HttpClient::requestSseAsync(
+                "POST",
+                url,
+                "{}",
+                "application/json",
+                {},
+                HttpClient::RequestConfig{
+                    .connectTimeout   = std::chrono::seconds{5},
+                    .readChunkTimeout = std::chrono::seconds{5},
+                },
+                [&](std::string_view chunk) -> bool {
+                    received += chunk;
+                    return false;
+                }
+            );
+        } catch (const std::exception& e) {
+            threw = true;
+            TEST_FAIL << "sse complete case threw: " << e.what() << std::endl;
+        }
+        XX_TEST_EXPECT_FALSE(threw);
+        XX_TEST_EXPECT_EQ(received, "data: one\n\ndata: two\n\n");
+
+        srv.stop();
+    }
+
+    // 2) 中途连接突然中断: 已发送的部分事件应先送达 onChunk, 随后抛出传输错误
+    {
+        SseTestServer srv;
+        srv.mode   = SseTestServer::Mode::AbruptClose;
+        srv.events = {"data: partial\n\n"};
+        srv.start();
+
+        std::string url = "http://127.0.0.1:" + std::to_string(srv.boundPort) + "/sse";
+        std::string received;
+        bool        threw = false;
+        try {
+            co_await HttpClient::requestSseAsync(
+                "POST",
+                url,
+                "{}",
+                "application/json",
+                {},
+                HttpClient::RequestConfig{
+                    .connectTimeout   = std::chrono::seconds{5},
+                    .readChunkTimeout = std::chrono::seconds{5},
+                },
+                [&](std::string_view chunk) -> bool {
+                    received += chunk;
+                    return false;
+                }
+            );
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        XX_TEST_EXPECT_TRUE(threw);
+        XX_TEST_EXPECT_TRUE(received.find("data: partial") != std::string::npos);
+
+        srv.stop();
+    }
+
+    // 3) 服务端发送部分事件后卡死: readChunkTimeout 内无新数据应超时抛错,
+    //    且超时前已送达的数据不丢失
+    {
+        SseTestServer srv;
+        srv.mode   = SseTestServer::Mode::Stall;
+        srv.events = {"data: first\n\n"};
+        srv.start();
+
+        std::string url = "http://127.0.0.1:" + std::to_string(srv.boundPort) + "/sse";
+        std::string received;
+        bool        threw = false;
+        auto        start = std::chrono::steady_clock::now();
+        try {
+            co_await HttpClient::requestSseAsync(
+                "POST",
+                url,
+                "{}",
+                "application/json",
+                {},
+                HttpClient::RequestConfig{
+                    .connectTimeout   = std::chrono::seconds{5},
+                    .readChunkTimeout = std::chrono::milliseconds{800},
+                },
+                [&](std::string_view chunk) -> bool {
+                    received += chunk;
+                    return false;
+                }
+            );
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now() - start
+        )
+                           .count();
+        XX_TEST_EXPECT_TRUE(threw);
+        XX_TEST_EXPECT_TRUE(received.find("data: first") != std::string::npos);
+        XX_TEST_EXPECT_TRUE(elapsed >= 700);
+        XX_TEST_EXPECT_TRUE(elapsed < 5000);
+
+        srv.stop();
+    }
+}
+
+/// DNS 黑洞下 requestSseAsync / requestAsync 不应无限挂起:
+/// - connectTimeout 到期应立即报 "DNS resolve timeout" (getaddrinfo 阻塞无法被
+///   取消/超时中断, 见
+///   [http_client.cpp](/agent/lib/src/util/http_client.cpp) startDnsResolve 注释,
+///   故解析放后台协程, 请求协程超时即放弃等待)
+/// - 外部取消应立即中止
+///
+/// 需要 root 权限临时替换 /etc/resolv.conf 指向黑洞 DNS, 否则跳过 (不影响其它测试)
+asio::awaitable<void> test_http_client_dns_timeout() {
+#if defined(__linux__)
+    if (geteuid() != 0) {
+        std::cout << "[dns_timeout] skip: need root to swap /etc/resolv.conf" << std::endl;
+        co_return;
+    }
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    if (!fs::exists("/etc/resolv.conf", ec) || ec) {
+        co_return;
+    }
+    auto backup = fs::temp_directory_path(ec) / "agentxx_resolv_backup.conf";
+    fs::copy_file("/etc/resolv.conf", backup, fs::copy_options::overwrite_existing, ec);
+    if (ec) {
+        std::cout << "[dns_timeout] skip: cannot backup resolv.conf: " << ec.message() << std::endl;
+        co_return;
+    }
+
+    struct RestoreGuard {
+        std::filesystem::path backup;
+
+        ~RestoreGuard() {
+            std::error_code ec2;
+            std::filesystem::copy_file(
+                backup,
+                "/etc/resolv.conf",
+                std::filesystem::copy_options::overwrite_existing,
+                ec2
+            );
+            if (ec2) {
+                std::cerr << "[dns_timeout] FAILED to restore /etc/resolv.conf: " << ec2.message()
+                          << std::endl;
+            }
+        }
+    } guard{backup};
+
+    // 黑洞 DNS: 指向非路由地址 (UDP 查询无响应, getaddrinfo 阻塞到系统超时)
+    // glibc 对 timeout:3 attempts:1 约 6s 才失败 (A + AAAA 两次查询);
+    // 测试用 connectTimeout=1s < 6s, 确保走 HttpClient 自身的 DNS 超时路径
+    {
+        std::ofstream ofs("/etc/resolv.conf", std::ios::trunc);
+        ofs << "nameserver 10.255.255.1\noptions timeout:3 attempts:1\n";
+    }
+
+    // 唯一主机名, 避免 /etc/hosts 命中导致不走 DNS
+    std::string host
+        = "agentxx-dns-hang-" + std::to_string(static_cast<long>(::getpid())) + ".example.com";
+
+    // 1) connectTimeout 到期应立即报 DNS timeout (不等系统 DNS 超时 ~6s)
+    {
+        HttpClient::RequestConfig cfg;
+        cfg.connectTimeout = std::chrono::seconds{1};
+        auto st            = std::chrono::steady_clock::now();
+        bool ok            = false;
+        try {
+            co_await HttpClient::requestSseAsync(
+                "GET",
+                "http://" + host + "/",
+                "",
+                "",
+                {},
+                cfg,
+                [](std::string_view) -> bool {
+                    return false;
+                }
+            );
+        } catch (const std::exception& e) {
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now() - st
+            )
+                               .count();
+            std::string msg = e.what();
+            ok              = (elapsed >= 700 && elapsed < 2500)
+                 && msg.find("DNS resolve timeout") != std::string::npos;
+            if (!ok) {
+                // 环境前提不满足: 黑洞 DNS 未生效 (如 WSL 下 UDP 查询被立即拒绝/
+                // 提前返回, 未发生预期的挂起), 无法验证 DNS 超时路径, 跳过整个测试;
+                // 仅当耗时明显超过 glibc 黑洞解析超时 (~6s, A+AAAA 两次查询) 且错误
+                // 仍不符时才判失败 (真 bug: HttpClient 的 DNS 超时路径未生效)
+                if (elapsed < 7000 || msg.find("DNS resolve timeout") == std::string::npos) {
+                    std::cout << "[dns_timeout] skip: blackhole DNS not effective (" << elapsed
+                              << " ms, err: " << msg << ")" << std::endl;
+                    co_return;
+                }
+                TEST_FAIL << "dns_timeout: expected DNS timeout in [0.7s, 2.5s), got " << elapsed
+                          << " ms, err: " << msg << std::endl;
+            }
+        }
+        if (!ok) {
+            ++g_http_failed;
+        } else {
+            ++g_http_passed;
+        }
+    }
+
+    // 2) 外部取消应立即中止挂起的 DNS 解析
+    {
+        HttpClient::RequestConfig cfg;
+        cfg.connectTimeout = std::chrono::seconds{30};
+        asio::cancellation_signal sig;
+        std::atomic<bool>         finished{false};
+        auto                      ex = co_await asio::this_coro::executor;
+        asio::co_spawn(
+            ex,
+            keepAliveRun([&]() -> asio::awaitable<void> {
+                try {
+                    co_await HttpClient::requestSseAsync(
+                        "GET",
+                        "http://" + host + "/",
+                        "",
+                        "",
+                        {},
+                        cfg,
+                        [](std::string_view) -> bool {
+                            return false;
+                        }
+                    );
+                } catch (...) {
+                    // 取消产生的 operation_aborted 在此吞掉, 由 finished 标志验证结束
+                }
+                finished.store(true);
+            }),
+            asio::bind_cancellation_slot(sig.slot(), asio::detached)
+        );
+
+        // 1s 后取消
+        asio::steady_timer cancelTimer(ex);
+        cancelTimer.expires_after(std::chrono::seconds{1});
+        co_await cancelTimer.async_wait(asio::use_awaitable);
+        sig.emit(asio::cancellation_type::all);
+
+        // 等待协程结束 (最多 3s)
+        auto st = std::chrono::steady_clock::now();
+        while (!finished.load() && std::chrono::steady_clock::now() - st < std::chrono::seconds{3}
+        ) {
+            asio::steady_timer poll(ex, std::chrono::milliseconds(20));
+            co_await poll.async_wait(asio::use_awaitable);
+        }
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now() - st
+        )
+                           .count();
+        bool ok = finished.load() && elapsed < 2500; // 取消后应立即结束, 不允许拖到 connectTimeout
+        if (!ok) {
+            TEST_FAIL << "dns_timeout: cancel did not abort DNS wait (finished=" << finished.load()
+                      << ", wait-after-cancel=" << elapsed << " ms)" << std::endl;
+        }
+        if (!ok) {
+            ++g_http_failed;
+        } else {
+            ++g_http_passed;
+        }
+    }
+#endif
+    co_return;
+}
+
+/// 模拟"响应 keep-alive 但服务端随后立即关闭连接"的场景 (如网关空闲回收):
+/// 每个连接只服务一个请求, 响应携带 keep-alive 头, 处理完立即关闭。
+/// 客户端会把连接放回池, 下次复用该连接时发现已被关闭, 触发自动重试。
+class OneShotKeepAliveServer {
+public:
+
+    std::thread       thread;
+    uint16_t          boundPort = 0;
+    std::atomic<bool> stopped{false};
+    std::atomic<int>  connections{0};
+
+private:
+
+    asio::io_context                         ioCtx;
+    std::unique_ptr<asio::ip::tcp::acceptor> acceptor;
+    asio::ip::tcp::endpoint                  ep;
+
+public:
+
+    void start() {
+        acceptor = std::make_unique<asio::ip::tcp::acceptor>(
+            ioCtx,
+            asio::ip::tcp::endpoint(asio::ip::make_address("127.0.0.1"), 0)
+        );
+        ep        = acceptor->local_endpoint();
+        boundPort = ep.port();
+
+        thread = std::thread([this]() {
+            while (!stopped.load()) {
+                utilxx_base::AsioErrorCode ec;
+                asio::ip::tcp::socket      sock(ioCtx);
+                acceptor->accept(sock, ec);
+                if (ec) {
+                    break;
+                }
+                if (stopped.load()) {
+                    break;
+                }
+                ++connections;
+                handleConn(sock);
+            }
+        });
+    }
+
+    void stop() {
+        stopped.store(true);
+        if (acceptor) {
+            utilxx_base::AsioErrorCode ec;
+            asio::ip::tcp::socket      dummy(ioCtx);
+            dummy.connect(ep, ec);
+            acceptor->close(ec);
+        }
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+
+private:
+
+    void handleConn(asio::ip::tcp::socket& sock) {
+        namespace http = boost::beast::http;
+        utilxx_base::AsioErrorCode ec;
+
+        boost::beast::flat_buffer        buf;
+        http::request<http::string_body> req;
+        http::read(sock, buf, req, ec);
+        if (ec) {
+            return;
+        }
+
+        // 响应显式声明 keep-alive (HTTP/1.1 默认), 但处理完立即关闭连接,
+        // 模拟服务端空闲回收 keep-alive 连接的行为
+        std::string resp = "HTTP/1.1 200 OK\r\n"
+                           "Content-Type: text/plain\r\n"
+                           "Content-Length: 5\r\n"
+                           "Connection: keep-alive\r\n"
+                           "\r\n"
+                           "hello";
+        asio::write(sock, asio::buffer(resp), ec);
+        sock.close(ec);
+    }
+};
+
+/// 连接池: keep-alive 连接复用 / 并发上限 / 失效连接自动重试 / SSE 复用
+asio::awaitable<void> test_http_client_connection_pool() {
+    using Server = HttpServer;
+
+    auto executor = co_await asio::this_coro::executor;
+
+    // 带可选延迟的响应 handler (制造并发排队场景)
+    auto strRespDelay = [](const char* ct, std::string body, int delayMs) {
+        return std::make_shared<Server::Handler>(
+            [ct, body = std::move(body), delayMs](
+                Server::Request&,
+                Server::Response& resp,
+                std::string_view
+            ) -> asio::awaitable<void> {
+                if (delayMs > 0) {
+                    auto               ex = co_await asio::this_coro::executor;
+                    asio::steady_timer t(ex, std::chrono::milliseconds(delayMs));
+                    co_await t.async_wait(asio::use_awaitable);
+                }
+                resp.result(boost::beast::http::status::ok);
+                resp.set(boost::beast::http::field::content_type, ct);
+                resp.body() = std::move(body);
+                resp.prepare_payload();
+                co_return;
+            }
+        );
+    };
+
+    Server server({.address = "127.0.0.1", .port = 0, .ioThreads = 1});
+    server.router().add("/hello", 0, strRespDelay("text/plain", "hello world", 0));
+    server.router().add("/slow", 0, strRespDelay("text/plain", "slow", 400));
+
+    std::thread serverThread([&server]() {
+        server.start();
+    });
+    uint16_t    port = 0;
+    for (int i = 0; i < 100; ++i) {
+        port = server.port();
+        if (port != 0) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    if (port == 0) {
+        TEST_FAIL << "Server failed to start" << std::endl;
+        g_http_failed++;
+        server.stop();
+        serverThread.join();
+        co_return;
+    }
+
+    std::string baseUrl = "http://127.0.0.1:" + std::to_string(port);
+
+    HttpClient::RequestConfig poolCfg;
+    poolCfg.keepAlive                = true;
+    poolCfg.maxConcurrentConnections = 5;
+
+    // 1) keepAlive=false (默认): 不启用连接池, 池统计保持全 0
+    {
+        HttpClient::clearConnectionPool();
+        for (int i = 0; i < 2; ++i) {
+            auto resp = co_await HttpClient::getAsync(baseUrl + "/hello");
+            XX_TEST_EXPECT_HAS_VALUE(resp);
+        }
+        auto s = HttpClient::poolStats(baseUrl);
+        XX_TEST_EXPECT_EQ(s.created, size_t{0});
+        XX_TEST_EXPECT_EQ(s.reused, size_t{0});
+        XX_TEST_EXPECT_EQ(s.idle, size_t{0});
+    }
+
+    // 2) keepAlive=true: 连续 3 次请求复用同一条连接 (created==1, reused==2)
+    {
+        HttpClient::clearConnectionPool();
+        for (int i = 0; i < 3; ++i) {
+            auto resp = co_await HttpClient::getAsync(baseUrl + "/hello", {}, poolCfg);
+            XX_TEST_EXPECT_HAS_VALUE(resp);
+            if (resp.has_value()) {
+                XX_TEST_EXPECT_EQ(resp->status, 200);
+                XX_TEST_EXPECT_EQ(resp->body, "hello world");
+                XX_TEST_EXPECT_TRUE(resp->keepAlive);
+            }
+        }
+        auto s = HttpClient::poolStats(baseUrl);
+        XX_TEST_EXPECT_EQ(s.created, size_t{1});
+        XX_TEST_EXPECT_EQ(s.reused, size_t{2});
+        XX_TEST_EXPECT_EQ(s.idle, size_t{1});
+        XX_TEST_EXPECT_EQ(s.peakActive, size_t{1});
+    }
+
+    // 3) 并发上限: maxConcurrentConnections=2, 5 个并发慢请求,
+    //    峰值并发连接数不得超过 2, 全部请求成功
+    {
+        HttpClient::clearConnectionPool();
+        HttpClient::RequestConfig cfg;
+        cfg.keepAlive                = true;
+        cfg.maxConcurrentConnections = 2;
+
+        // 记录基线 (同一端点在测试 2 已产生统计), 用增量断言本测试的新建数
+        auto base = HttpClient::poolStats(baseUrl);
+
+        std::atomic<int> ok{0};
+        auto             run = [&]() -> asio::awaitable<void> {
+            auto resp = co_await HttpClient::getAsync(baseUrl + "/slow", {}, cfg);
+            if (resp.has_value() && resp->status == 200 && resp->body == "slow") {
+                ++ok;
+            }
+        };
+        for (int i = 0; i < 5; ++i) {
+            // run 是本作用域内的命名闭包 (非临时闭包), 且下面的循环等到 5 个请求全部
+            // 完成才离开作用域 → 闭包与它捕获的局部量都还在, 不需要 keepAliveRun
+            asio::co_spawn(executor, run, asio::detached);
+        }
+        asio::steady_timer poll(executor);
+        while (ok.load() < 5) {
+            poll.expires_after(std::chrono::milliseconds(10));
+            co_await poll.async_wait(asio::use_awaitable);
+        }
+        auto s = HttpClient::poolStats(baseUrl);
+        XX_TEST_EXPECT_EQ(ok.load(), 5);
+        XX_TEST_EXPECT_EQ(s.peakActive, size_t{2});             // 历史峰值受限于上限
+        XX_TEST_EXPECT_EQ(s.created - base.created, size_t{2}); // 本次仅新建 2 条
+        XX_TEST_EXPECT_TRUE(s.queuedWaits > base.queuedWaits);  // 第 3 个请求开始必须排队
+    }
+
+    // 4) 失效连接自动重试: 服务端响应 keep-alive 但立即关闭 (模拟空闲回收),
+    //    第二次请求复用失败后自动用新连接重试, 请求仍成功
+    {
+        HttpClient::clearConnectionPool();
+        OneShotKeepAliveServer srv;
+        srv.start();
+        std::string oneShotUrl = "http://127.0.0.1:" + std::to_string(srv.boundPort) + "/";
+
+        // 第一次: 新连接, 响应 keep-alive → 放回池
+        auto resp1 = co_await HttpClient::getAsync(oneShotUrl, {}, poolCfg);
+        XX_TEST_EXPECT_HAS_VALUE(resp1);
+        if (resp1.has_value()) {
+            XX_TEST_EXPECT_EQ(resp1->body, "hello");
+            XX_TEST_EXPECT_TRUE(resp1->keepAlive);
+        }
+        // 第二次: 复用池中连接 → 服务端已关闭 → 自动重试新连接 → 成功
+        auto resp2 = co_await HttpClient::getAsync(oneShotUrl, {}, poolCfg);
+        XX_TEST_EXPECT_HAS_VALUE(resp2);
+        if (resp2.has_value()) {
+            XX_TEST_EXPECT_EQ(resp2->body, "hello");
+        }
+        auto s = HttpClient::poolStats(oneShotUrl);
+        XX_TEST_EXPECT_EQ(s.created, size_t{2}); // 1 次新建 + 1 次重试新建
+        XX_TEST_EXPECT_EQ(s.reused, size_t{1});  // 复用 1 次 (失败)
+        XX_TEST_EXPECT_EQ(srv.connections.load(), 2);
+
+        srv.stop();
+    }
+
+    // 5) SSE 复用与失效重试: 第一次 SSE 完整结束后连接放回池 (服务端 keep-alive),
+    //    第二次 SSE 复用失败 → 自动重试新连接 → 数据完整送达
+    {
+        HttpClient::clearConnectionPool();
+        SseTestServer srv;
+        srv.mode   = SseTestServer::Mode::Complete;
+        srv.events = {"data: one\n\n", "data: two\n\n"};
+        srv.start();
+        std::string sseUrl = "http://127.0.0.1:" + std::to_string(srv.boundPort) + "/sse";
+
+        HttpClient::RequestConfig cfg;
+        cfg.keepAlive                = true;
+        cfg.maxConcurrentConnections = 5;
+        cfg.connectTimeout           = std::chrono::seconds{5};
+        cfg.readChunkTimeout         = std::chrono::seconds{5};
+
+        for (int i = 0; i < 2; ++i) {
+            std::string received;
+            bool        threw = false;
+            try {
+                co_await HttpClient::requestSseAsync(
+                    "POST",
+                    sseUrl,
+                    "{}",
+                    "application/json",
+                    {},
+                    cfg,
+                    [&](std::string_view chunk) -> bool {
+                        received += chunk;
+                        return false;
+                    }
+                );
+            } catch (const std::exception& e) {
+                threw = true;
+                TEST_FAIL << "sse pool retry case " << i << " threw: " << e.what() << std::endl;
+            }
+            XX_TEST_EXPECT_FALSE(threw);
+            XX_TEST_EXPECT_EQ(received, "data: one\n\ndata: two\n\n");
+        }
+        auto s = HttpClient::poolStats(sseUrl);
+        XX_TEST_EXPECT_EQ(s.created, size_t{2}); // 1 次新建 + 1 次重试新建
+        XX_TEST_EXPECT_EQ(s.reused, size_t{1});  // 复用 1 次 (失败后重试)
+
+        srv.stop();
+    }
+
+    HttpClient::clearConnectionPool();
+    server.stop();
+    serverThread.join();
+}
+
+// ---------------------------------------------------------------------------
+// 启动更新检查 (agentxx-client/update_check.h): 本地服务端到端
+//  1) 302 + Location (GitHub /releases/latest 的真实行为) -> 取标签与发布页 URL,
+//     并与当前版本比较得出 hasUpdate
+//  2) 直接返回 JSON (GitHub API) -> 取 tag_name / html_url
+//  3) 404 -> ok=false 且带原因 (不抛异常)
+// ---------------------------------------------------------------------------
+#if AGENTXX_BUILD_CLIENT
+asio::awaitable<void> test_update_check_with_local_server() {
+    using Server = HttpServer;
+    using namespace boost::beast::http;
+
+    Server server({.address = "127.0.0.1", .port = 0, .ioThreads = 1});
+
+    // 夹具标签按当前版本推算, 不写死数值: 版本号已改为日期式 (如 2026.1011.0),
+    // 写死的 9.9.9 / 8.0.0 会低于当前版本, "有更新" 判定必然失败。
+    // major + 1 保证高于当前版本 (minor/patch 只用于区分两个夹具)
+    const std::string newerTag     = fmt::format("v{}.0.0", agentxx::kVersionMajor + 1);
+    const std::string newerJsonTag = fmt::format("v{}.1.0", agentxx::kVersionMajor + 1);
+    const auto        releasePageUrl = [](const std::string& tag) {
+        return fmt::format("https://github.com/coolight7/agentxx/releases/tag/{}", tag);
+    };
+
+    // 1) /releases/latest: 302 -> 绝对 Location (与 GitHub 一致)
+    server.router().add(
+        "/releases/latest",
+        0,
+        std::make_shared<Server::Handler>(
+            [location = releasePageUrl(newerTag)](
+                Server::Request&,
+                Server::Response& resp,
+                std::string_view
+            ) -> asio::awaitable<void> {
+                resp.result(status::found);
+                resp.set(field::location, location);
+                resp.prepare_payload();
+                co_return;
+            }
+        )
+    );
+    // 2) /api/releases/latest: 200 JSON (GitHub API 形态)
+    server.router().add(
+        "/api/releases/latest",
+        0,
+        std::make_shared<Server::Handler>(
+            [tag = newerJsonTag, url = releasePageUrl(newerJsonTag)](
+                Server::Request&,
+                Server::Response& resp,
+                std::string_view
+            ) -> asio::awaitable<void> {
+                resp.result(status::ok);
+                resp.set(field::content_type, "application/json");
+                resp.body() = fmt::format(R"({{"tag_name":"{}","html_url":"{}"}})", tag, url);
+                resp.prepare_payload();
+                co_return;
+            }
+        )
+    );
+    // 3) /releases/older: 302 -> 低于当前版本的标签 (不提示更新)
+    server.router().add(
+        "/releases/older",
+        0,
+        std::make_shared<Server::Handler>(
+            [](Server::Request&, Server::Response& resp, std::string_view
+            ) -> asio::awaitable<void> {
+                resp.result(status::found);
+                resp.set(
+                    field::location,
+                    "https://github.com/coolight7/agentxx/releases/tag/v0.0.0"
+                );
+                resp.prepare_payload();
+                co_return;
+            }
+        )
+    );
+    // 4) 404
+    server.router().add(
+        "/missing",
+        0,
+        std::make_shared<Server::Handler>(
+            [](Server::Request&, Server::Response& resp, std::string_view
+            ) -> asio::awaitable<void> {
+                resp.result(status::not_found);
+                resp.body() = "not found";
+                resp.prepare_payload();
+                co_return;
+            }
+        )
+    );
+
+    // 服务端在独立线程运行 (start() 阻塞直到 stop()):
+    // - 本测试是协程, 不能阻塞在 start(); 端口绑定是异步的, 轮询等待
+    // - 路由必须在服务启动前注册完 (router 只在服务线程读会与外层写竞争)
+    // - 服务对象必须在所有连接协程结束后才析构: stop() + join 保证这一点
+    //   (直接在协程栈上 startAsync 会让连接协程活过本协程, 触发 use-after-free)
+    std::thread serverThread([&server] {
+        server.start();
+    });
+    uint16_t port = 0;
+    for (int i = 0; i < 200 && port == 0; ++i) {
+        port = server.port();
+        if (port == 0) {
+            asio::steady_timer timer(co_await asio::this_coro::executor);
+            timer.expires_after(std::chrono::milliseconds{10});
+            co_await timer.async_wait(asio::use_awaitable);
+        }
+    }
+    if (port == 0) {
+        TEST_FAIL << "update check test server failed to start" << std::endl;
+        g_http_failed++;
+        server.stop();
+        serverThread.join();
+        co_return;
+    }
+    const auto baseUrl = fmt::format("http://127.0.0.1:{}", port);
+
+    // 1) 302 -> 标签与发布页 URL (不跟随重定向, 从 Location 取) + 与当前版本比较
+    {
+        auto res = co_await agentxx::client::checkLatestRelease(baseUrl + "/releases/latest");
+        XX_TEST_EXPECT_TRUE(res.ok);
+        XX_TEST_EXPECT_EQ(res.latestTag, newerTag);
+        XX_TEST_EXPECT_EQ(res.url, releasePageUrl(newerTag));
+        XX_TEST_EXPECT_TRUE(res.latestVersion.has_value());
+        if (res.latestVersion.has_value()) {
+            XX_TEST_EXPECT_EQ((*res.latestVersion)[0], agentxx::kVersionMajor + 1);
+            XX_TEST_EXPECT_EQ((*res.latestVersion)[1], 0);
+            XX_TEST_EXPECT_EQ((*res.latestVersion)[2], 0);
+        }
+        // 高于当前版本 (agentxx::kVersion): 判定为有更新
+        XX_TEST_EXPECT_TRUE(res.hasUpdate);
+    }
+
+    // 2) JSON 形态 (GitHub API): tag_name / html_url
+    {
+        auto res = co_await agentxx::client::checkLatestRelease(baseUrl + "/api/releases/latest");
+        XX_TEST_EXPECT_TRUE(res.ok);
+        XX_TEST_EXPECT_EQ(res.latestTag, newerJsonTag);
+        XX_TEST_EXPECT_EQ(res.url, releasePageUrl(newerJsonTag));
+        XX_TEST_EXPECT_TRUE(res.hasUpdate);
+    }
+
+    // 3) 低于当前版本: 不提示更新
+    {
+        auto res = co_await agentxx::client::checkLatestRelease(baseUrl + "/releases/older");
+        XX_TEST_EXPECT_TRUE(res.ok);
+        XX_TEST_EXPECT_EQ(res.latestTag, std::string("v0.0.0"));
+        XX_TEST_EXPECT_FALSE(res.hasUpdate);
+    }
+
+    // 4) 404: 失败结果 (ok=false + 原因), 不抛异常
+    {
+        auto res = co_await agentxx::client::checkLatestRelease(baseUrl + "/missing");
+        XX_TEST_EXPECT_FALSE(res.ok);
+        XX_TEST_EXPECT_FALSE(res.hasUpdate);
+        XX_TEST_EXPECT_TRUE(res.error.find("404") != std::string::npos);
+    }
+
+    server.stop();
+    serverThread.join();
+    co_return;
+}
+#endif // AGENTXX_BUILD_CLIENT
+
+asio::awaitable<TestResult> run_http_client_tests() {
+    test_http_client_unit();
+    test_http_server_unit();
+    co_await test_http_client();
+    co_await test_http_client_beast_server();
+    co_await test_http_server_expect_100_continue();
+    co_await test_http_server_absolute_form_target();
+    co_await test_http_client_sse_interruption();
+    co_await test_http_client_connection_pool();
+    co_await test_http_client_dns_timeout();
+#if AGENTXX_BUILD_CLIENT
+    co_await test_update_check_with_local_server();
+#endif
+    co_return TestResult{g_http_passed, g_http_failed};
+}
+
+} // namespace test
+} // namespace agentxx

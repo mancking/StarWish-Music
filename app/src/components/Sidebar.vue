@@ -6,6 +6,7 @@ import { useLibraryStore } from '@/stores/library'
 import { useUiStore } from '@/stores/ui'
 import { useDownloadStore } from '@/stores/download'
 import brand from '@/assets/brand-icon.png'
+import { lsGet, lsSet } from '@/platform'
 
 const route = useRoute()
 const router = useRouter()
@@ -17,10 +18,10 @@ const creating = ref(false)
 const newName = ref('')
 
 /** 侧栏折叠：只留图标，给宽屏下的列表腾空间；状态存 localStorage */
-const collapsed = ref(localStorage.getItem('sw.sidebar.collapsed') === '1')
+const collapsed = ref(lsGet('sidebar_collapsed') === '1')
 function toggleCollapse(): void {
   collapsed.value = !collapsed.value
-  localStorage.setItem('sw.sidebar.collapsed', collapsed.value ? '1' : '0')
+  lsSet('sidebar_collapsed', collapsed.value ? '1' : '0')
 }
 
 const online = [

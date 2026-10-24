@@ -1,0 +1,47 @@
+name: ✨ Feature request
+description: Suggest an idea for this project. Please search existing issues and discussions first.
+title: '[Feature] '
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to fill out this issue. Please write a concise and appropriate title for this issue in the title field, and then fill out the form below step by step.
+
+  - type: checkboxes
+    id: check-answer
+    attributes:
+      label: Solution checklist
+      description: To avoid duplicate requests, please confirm the following. Duplicate issues may be closed directly.
+      options:
+        - label: I have searched the [Issue list](https://github.com/any-listen/any-listen/issues?q=is%3Aissue+) and found no similar issue.
+          required: true
+        - label: I have searched the [Discussions](https://github.com/any-listen/any-listen/discussions) and found no similar topic.
+          required: true
+        - label: I agree to follow the [Code of Conduct](https://github.com/any-listen/any-listen/blob/main/CODE_OF_CONDUCT.md).
+          required: true
+
+  - type: dropdown
+    id: check-app-type
+    attributes:
+      label: App type
+      description: Which edition of Any Listen is this feature request for?
+      options:
+        - Desktop
+        - Web server
+        - Both (Desktop & Web server)
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem-description
+    attributes:
+      label: Problem description and expected solution
+      description: Clearly describe your problem and expected solution.
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional-information
+    attributes:
+      label: Additional information
+      description: Add more details here if your request needs further explanation or you want to share anything else. (You can drag images/videos directly into the editor)

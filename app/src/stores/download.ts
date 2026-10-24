@@ -95,7 +95,7 @@ export const useDownloadStore = defineStore('download', () => {
     await call('download:cancel', { id })
   }
 
-  /** 规格书 3.5：暂停 / 继续（不做断点续传，继续即从头重下） */
+  /** 规格书 1.12 / Bug 7：暂停 / 继续（.part 断点续传，进度不从 0 开始） */
   async function pause(id: string): Promise<void> {
     await call('download:pause', { id })
     const t = tasks.value.find(x => x.id === id)
@@ -106,11 +106,8 @@ export const useDownloadStore = defineStore('download', () => {
   async function resume(id: string): Promise<void> {
     await call('download:resume', { id })
     const t = tasks.value.find(x => x.id === id)
-    if (t) {
-      t.status = 'queued'
-      t.progress = 0
-      t.received = 0
-    }
+    if (t) t.status = 'queued'
+    // progress/received 不清零：主进程按 .part 断点续传，进度事件随后覆盖
     mirror()
   }
 

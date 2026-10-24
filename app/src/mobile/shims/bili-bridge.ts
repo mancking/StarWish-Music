@@ -11,8 +11,8 @@ import type { Song } from '../../../shared/types'
 import { request, qs, UA } from '../../../electron/core/http'
 import { rsaEncryptB64 } from '../../../electron/core/bili-rsa'
 
-const KEY = 'starwish.bili-login'
-const BUV_KEY = 'starwish.buvid'
+const KEY = 'xinyuan_bili_login'
+const BUV_KEY = 'xinyuan_bili_buvid'
 
 interface LoginState {
   sessdata: string

@@ -6,9 +6,10 @@ import { useUiStore } from './stores/ui'
 import { usePlayerStore } from './stores/player'
 import { useLibraryStore } from './stores/library'
 import { initPlatform } from './platform'
-import { registerEqBackend } from './audio/eq'
+import { registerEqBackend } from './player-core/eq'
 import { call } from './api'
 import './styles/main.css'
+import './styles/car.css'
 
 // 设计 token 按端切换：桌面用紧凑尺寸，移动端用大圆角/大行高。
 // data-os 细分操作系统（styles/platform.css 按此适配各端 HIG 细节）：
@@ -73,16 +74,26 @@ async function bootstrap(): Promise<void> {
 
   const splash = document.getElementById('splash')
   const hideSplash = (): void => {
-    if (!splash) return
+    if (!splash || splash.classList.contains('splash-out')) return
     splash.classList.add('splash-out')
     setTimeout(() => splash.remove(), 450)
   }
 
+  // Bug 55：splash 8s 超时兜底（任一 init 挂起时强制淡出，不永驻）
+  const splashGuard = window.setTimeout(hideSplash, 8000)
+
   // 设置最优先（决定主题），其余并行；任何一个失败都不阻塞界面
   await ui.init().catch(() => {})
-  hideSplash()
 
+  // F-21：首次启动引导（onboarded=false → /welcome 三屏）
+  if ((ui.settings as any).onboarded === false && router.currentRoute.value.path !== '/welcome') {
+    void router.replace('/welcome')
+  }
+
+  // Bug 54：播放器/曲库就绪后再撤 splash，避免露出空骨架
   void Promise.allSettled([player.init(), library.init()]).then(() => {
+    window.clearTimeout(splashGuard)
+    hideSplash()
     // 便于自动化冒烟测试读取状态（不参与业务逻辑）
     ;(window as any).__swStores = { player, library, ui }
   })

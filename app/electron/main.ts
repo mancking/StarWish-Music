@@ -416,6 +416,8 @@ app.whenReady().then(() => {
 })
 
 app.on('window-all-closed', () => {
+  // Bug 63：macOS 惯例 —— 关窗不退出，保 Dock 常驻
+  if (process.platform === 'darwin') return
   if (!getSettings().closeToTray) app.quit()
 })
 

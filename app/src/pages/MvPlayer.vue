@@ -10,16 +10,18 @@ import { useRoute, useRouter } from 'vue-router'
 import Icon from '@/components/Icon.vue'
 import DanmakuLayer from '@/components/DanmakuLayer.vue'
 import EqPanel from '@/components/player/EqPanel.vue'
-import AudioModeView from '@/components/video/AudioModeView.vue'
-import VideoStage from '@/video/components/VideoStage.vue'
-import PlaySettingsSheet from '@/video/components/PlaySettingsSheet.vue'
-import ProgressBar from '@/player/components/ProgressBar.vue'
-import { useVideoSession } from '@/video/useVideoSession'
+import AudioModeView from '@/player-video/components/AudioModeView.vue'
+import VideoStage from '@/player-video/components/VideoStage.vue'
+import PlaySettingsSheet from '@/player-video/components/PlaySettingsSheet.vue'
+import ProgressBar from '@/player-music/components/ProgressBar.vue'
+import { useVideoSession } from '@/player-video/useVideoSession'
+import { parseSubtitles, activeCueAt, nudgeSubtitleOffset, type SubCue } from '@/player-video/subtitles'
+import SubtitleOverlay from '@/player-video/components/SubtitleOverlay.vue'
 import { useUiStore } from '@/stores/ui'
-import { call, isDesktop } from '@/api'
+import { call, isDesktop, on } from '@/api'
 import { platform } from '@/platform'
 import type { MvItem } from '@shared/types'
-import type { QualityOption } from '@/video/components/PlaySettingsSheet.vue'
+import type { QualityOption } from '@/player-video/components/PlaySettingsSheet.vue'
 
 defineOptions({ name: 'MvPlayer' })
 
@@ -29,7 +31,9 @@ const ui = useUiStore()
 
 const car = computed(() => platform.value.car)
 const bvid = computed(() => String(route.params.bvid || ''))
-const session = useVideoSession(bvid)
+// MV/视频统一路由（规格书 2.19 / C-16）：/mv/:source/:id；旧 /mv/:bvid 视作 bili
+const source = computed(() => String((route.params as any).source || 'bili'))
+const session = useVideoSession(source, bvid)
 
 const stage = ref<InstanceType<typeof VideoStage> | null>(null)
 const videoEl = computed(() => stage.value?.el || null)
@@ -49,9 +53,41 @@ const audioMode = ref(false)
 const frameCover = ref('')
 const caching = ref(false)
 const cached = ref(false)
+/* 规格 2.12 / Bug 8：音频提取（进度 + 可取消） */
+const extractId = ref('')
+const extractPct = ref<number | undefined>(undefined)
+
+/* 规格 2.11 / Bug 16：外挂字幕（srt/ass 解析 + 延迟 ±0.5s 跨视频记忆） */
+const subCues = ref<SubCue[]>([])
+const subOffset = ref(Number(localStorage.getItem('xinyuan_subtitle_offset') || '0') || 0)
+const activeSub = computed(() => activeCueAt(subCues.value, curTime.value, subOffset.value)?.text || '')
+const subFileInput = ref<HTMLInputElement | null>(null)
+
+function onSubtitle(delta: number): void {
+  subOffset.value = nudgeSubtitleOffset(subOffset.value, delta)
+  localStorage.setItem('xinyuan_subtitle_offset', String(subOffset.value))
+  ui.toast(`字幕偏移 ${subOffset.value > 0 ? '+' : ''}${subOffset.value}s`, 'info', 1400)
+}
+
+async function onSubtitleFile(e: Event): Promise<void> {
+  const input = e.target as HTMLInputElement
+  const file = input.files?.[0]
+  if (!file) return
+  try {
+    const raw = await file.text()
+    subCues.value = parseSubtitles(raw)
+    subOffset.value = 0
+    ui.toast(subCues.value.length ? `已加载字幕（${subCues.value.length} 条）` : '字幕解析失败', subCues.value.length ? 'success' : 'error', 2000)
+  } catch {
+    ui.toast('字幕读取失败', 'error', 1800)
+  } finally {
+    input.value = ''
+  }
+}
 
 let hideTimer = 0
 let resumeTimer = 0
+let offExtract: (() => void) | null = null
 
 const LOOP_LABEL: Record<'off' | 'one' | 'list', string> = { off: '不循环', one: '单片循环', list: '列表循环' }
 const LOOP_ORDER = ['off', 'one', 'list'] as const
@@ -163,6 +199,39 @@ function toggleFullscreen(): void {
   else void v.requestFullscreen?.().catch(() => undefined)
 }
 
+/* ---------------- 截图（规格书 2.15）：只截视频画面，不含控件与弹幕 ---------------- */
+async function screenshot(): Promise<void> {
+  const v = videoEl.value
+  if (!v || !v.videoWidth) {
+    ui.toast('当前没有可截图的画面', 'info', 1600)
+    return
+  }
+  try {
+    const c = document.createElement('canvas')
+    c.width = v.videoWidth
+    c.height = v.videoHeight
+    const ctx = c.getContext('2d')
+    if (!ctx) throw new Error('画布不可用')
+    ctx.drawImage(v, 0, 0, c.width, c.height)
+    const dataUrl = c.toDataURL('image/png')
+    if (isDesktop) {
+      const r = await call<{ file: string }>('app:saveImage', { name: session.title.value || '视频截图', dataUrl })
+      ui.toast(`已保存：${r.file}`, 'success', 2600)
+    } else if (__MOBILE__) {
+      // 移动端：base64 交给原生 saveToMedia 入系统媒体库（桌面构建 DCE 掉原生桥依赖）
+      const { nativeCall } = await import('@/mobile/bridge')
+      await nativeCall('SwBridge', 'saveToMedia', {
+        name: `${session.title.value || '视频截图'}.png`,
+        mime: 'image/png',
+        data: dataUrl.split(',')[1] || '',
+      })
+      ui.toast('截图已保存到媒体库', 'success', 2000)
+    }
+  } catch (e: any) {
+    ui.toast(e?.message || '截图失败', 'error', 2000)
+  }
+}
+
 /* ---------------- 离线缓存（规格书 3.5 / 2.x 视频缓存） ---------------- */
 async function toggleCache(): Promise<void> {
   const p = session.current.value
@@ -170,11 +239,19 @@ async function toggleCache(): Promise<void> {
   caching.value = true
   try {
     if (cached.value) {
+      // Bug 109：remove 传 manifest 键（bvid+cid 由主进程统一算）
       await call('video:offline:remove', { bvid: bvid.value, cid: p.cid })
       cached.value = false
       ui.toast('已移除离线缓存', 'info', 1600)
     } else {
-      await call('video:offline:save', { bvid: bvid.value, cid: p.cid, qn: session.qn.value, title: session.title.value })
+      // Bug 109/T-02：save 全字段透传（url 必带）
+      await call('video:offline:save', {
+        bvid: bvid.value,
+        cid: p.cid,
+        url: session.rawUrl.value,
+        quality: session.qn.value,
+        title: session.title.value,
+      })
       cached.value = true
       ui.toast('已缓存到本地', 'success', 1800)
     }
@@ -212,6 +289,28 @@ function enterAudioMode(): void {
 function exitAudioMode(): void {
   audioMode.value = false
   poke()
+}
+
+async function startExtract(): Promise<void> {
+  if (extractId.value) return
+  const url = session.rawUrl.value
+  if (!url) {
+    ui.toast('当前没有可提取的音频流', 'error', 1800)
+    return
+  }
+  try {
+    const r = await call<{ id: string }>('audio:extract', { url, title: session.title.value })
+    extractId.value = r.id
+    extractPct.value = 0
+  } catch (e: any) {
+    ui.toast(e?.message || '提取失败', 'error', 2000)
+  }
+}
+
+function cancelExtractTask(): void {
+  if (extractId.value) void call('audio:extractCancel', { id: extractId.value }).catch(() => undefined)
+  extractId.value = ''
+  extractPct.value = undefined
 }
 
 function cycleLoopMode(): void {
@@ -252,6 +351,9 @@ async function onLoaded(dur: number): Promise<void> {
   const v = videoEl.value
   if (!v) return
   v.playbackRate = rate.value
+  // Bug 37 / F-15：MV 音量设置真实生效（schema 为 0~100 滑条，scale 100）
+  const mvVol = Number((ui.settings as any).mvVolume)
+  if (Number.isFinite(mvVol) && mvVol > 0) v.volume = Math.max(0, Math.min(1, mvVol / 100))
   const cid = session.current.value?.cid
   const resume = cid ? session.savedPosition(cid) : 0
   if (resume > 15) {
@@ -264,7 +366,10 @@ async function onLoaded(dur: number): Promise<void> {
 function onTime(t: number): void {
   curTime.value = t
   const cid = session.current.value?.cid
-  if (cid) session.rememberPosition(cid, t, duration.value || 0)
+  // F-15：「记忆播放进度」开关关闭时不写续播点
+  if (cid && (ui.settings as any).mvRememberProgress !== false) {
+    session.rememberPosition(cid, t, duration.value || 0)
+  }
 }
 
 function onEnded(): void {
@@ -277,8 +382,20 @@ function onEnded(): void {
   const list = session.parts.value
   const cur = session.current.value
   const i = cur ? list.findIndex(p => p.cid === cur.cid) : -1
-  if (loopMode.value === 'list' && i >= 0 && i < list.length - 1) void pickPart(list[i + 1]!)
-  else showControls.value = true
+  if (loopMode.value === 'list' && i >= 0 && i < list.length - 1) {
+    void pickPart(list[i + 1]!)
+    return
+  }
+  // 规格 2.14 自动连播：分P 播完且无下一P → 相关推荐第一条（toast 可取消）
+  if ((ui.settings as any).mvAutoNext !== false && session.related.value.length) {
+    const nextVideo = session.related.value[0]!
+    ui.toast(`即将播放：${nextVideo.title || '相关推荐'}`, 'info', 3000)
+    window.setTimeout(() => {
+      if (!playing.value && curTime.value >= (duration.value || 0) - 0.6) openVideo(nextVideo)
+    }, 3000)
+    return
+  }
+  showControls.value = true
 }
 
 function openVideo(item: MvItem): void {
@@ -334,7 +451,27 @@ function fmt(t: number): string {
 
 /* ---------------- 生命周期 ---------------- */
 onMounted(async () => {
+  // F-15：默认画质按设置（0=自动走源默认档）
+  const defaultQn = Number((ui.settings as any).mvQuality) || 0
+  offExtract = on('audio:extract:progress', (p: any) => {
+    if (!p || p.id !== extractId.value) return
+    if (p.error) {
+      ui.toast(p.error, 'error', 2200)
+      extractId.value = ''
+      extractPct.value = undefined
+      return
+    }
+    extractPct.value = Number(p.pct) || 0
+    if (p.pct >= 100 || p.file) {
+      extractId.value = ''
+      extractPct.value = undefined
+      ui.toast('已保存为 MP3 并加入本地曲库', 'success', 2400)
+    }
+  })
   const resume = await session.load(Number(route.query.p) || 1)
+  if (defaultQn && !session.qn.value && session.current.value) {
+    await session.selectPart(session.current.value, defaultQn)
+  }
   poke()
   window.addEventListener('keydown', onKey)
   window.clearInterval(resumeTimer)
@@ -349,6 +486,7 @@ onBeforeUnmount(() => {
   window.clearTimeout(hideTimer)
   window.clearInterval(resumeTimer)
   window.removeEventListener('keydown', onKey)
+  if (offExtract) offExtract()
   if (isDesktop) {
     const url = session.src.value
     if (url) void call('video:cache:release', { url }).catch(() => undefined)
@@ -384,17 +522,18 @@ watch(playing, v => {
       @volume="() => undefined"
     >
       <template #overlay>
+        <SubtitleOverlay :text="activeSub" :car="car" />
         <DanmakuLayer
           v-if="ui.settings.danmakuEnabled && !car"
           :video="videoEl"
           :items="session.danmaku.value"
           :enabled="ui.settings.danmakuEnabled"
-          :opacity="1"
-          font-size="medium"
-          speed="normal"
-          area="quarter"
-          :anti-subtitle="false"
-          block-words=""
+          :opacity="Number((ui.settings as any).danmakuOpacity ?? 100) / 100"
+          :font-size="(ui.settings as any).danmakuFontSize || 'medium'"
+          :speed="(ui.settings as any).danmakuSpeed || 'normal'"
+          :area="(ui.settings as any).danmakuArea || 'quarter'"
+          :anti-subtitle="!!(ui.settings as any).danmakuAntiSubtitle"
+          :block-words="(ui.settings as any).danmakuBlockWords || ''"
         />
 
         <div class="top" :class="{ hide: !showControls }">
@@ -450,6 +589,9 @@ watch(playing, v => {
               <button class="ghost" aria-label="画中画" @click="togglePip">
                 <Icon name="pip" :size="17" />
               </button>
+              <button class="ghost" aria-label="截图" @click="screenshot">
+                <Icon name="camera" :size="17" />
+              </button>
               <button class="ghost" aria-label="缓存" @click="toggleCache">
                 <Icon :name="cached ? 'download-filled' : 'download'" :size="17" />
               </button>
@@ -488,6 +630,9 @@ watch(playing, v => {
       @cycle-rate="cycleRateMode"
       @open-eq="eqOpen = true"
       @exit="exitAudioMode"
+      @extract="startExtract"
+      @extract-cancel="cancelExtractTask"
+      :extract-pct="extractPct"
     />
 
     <PlaySettingsSheet
@@ -510,8 +655,14 @@ watch(playing, v => {
       @ab="markAB"
       @pip="togglePip"
       @audio="enterAudioMode"
-      @subtitle="() => undefined"
+      @subtitle="onSubtitle"
+      @subtitle-load="subFileInput?.click()"
+      @shot="screenshot"
+      @audio-only="startExtract"
+      :subtitle-delay="subOffset"
     />
+
+    <input ref="subFileInput" type="file" accept=".srt,.ass,.vtt,text/plain" style="display: none" @change="onSubtitleFile" />
 
     <section v-if="!audioMode" class="below">
       <div class="parts" v-if="session.parts.value.length > 1">

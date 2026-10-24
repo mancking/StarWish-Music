@@ -40,12 +40,32 @@ export async function checkUpdate(currentVersion: string): Promise<UpdateInfo> {
   // Android 安装包直链：优先 debug APK 之外命名规范的 release 产物
   const assets: Array<{ name?: string; browser_download_url?: string }> = Array.isArray(data.assets) ? data.assets : []
   const apk = assets.find(a => /\.(apk)$/i.test(String(a.name || ''))) || null
-  // 桌面端安装包：Windows 便携 exe / macOS zip（产物名含中文时会被打包器净化，按后缀匹配更稳）
-  const isMac = /mac/i.test(String((navigator as any)?.userAgent || '')) || /Mac/.test(String((navigator as any)?.platform || ''))
-  const desktop =
-    (isMac
-      ? assets.find(a => /mac/i.test(String(a.name || '')) && /\.zip$/i.test(String(a.name || '')))
-      : assets.find(a => /\.exe$/i.test(String(a.name || '')))) || null
+  // Bug 12：按运行平台匹配产物 —— Win *.exe / macOS arm64|x64 dmg|zip / Linux AppImage|deb
+  const ua = String((navigator as any)?.userAgent || '')
+  const plat = String((navigator as any)?.userAgentData?.platform || (navigator as any)?.platform || ua)
+  const isMac = /mac/i.test(ua) || /Mac/.test(plat)
+  const isLinux = !isMac && (/linux/i.test(ua) || /Linux/.test(plat))
+  const isArm = /arm|aarch64/i.test(ua) || /arm/i.test(String((navigator as any)?.platform || ''))
+  let desktop: { browser_download_url?: string } | null = null
+  if (isMac) {
+    const dmgZip = assets.filter(a => /\.(dmg|zip)$/i.test(String(a.name || '')))
+    desktop =
+      dmgZip.find(a => (isArm ? /arm64/i : /x64|intel/i).test(String(a.name || ''))) ||
+      dmgZip.find(a => (isArm ? /x64|intel/i : /arm64/i).test(String(a.name || ''))) ||
+      dmgZip[0] ||
+      null
+  } else if (isLinux) {
+    desktop =
+      assets.find(a => /\.appimage$/i.test(String(a.name || ''))) ||
+      assets.find(a => /\.deb$/i.test(String(a.name || ''))) ||
+      null
+  } else {
+    // Windows：优先 portable，其次 NSIS 安装器
+    desktop =
+      assets.find(a => /portable/i.test(String(a.name || '')) && /\.exe$/i.test(String(a.name || ''))) ||
+      assets.find(a => /\.exe$/i.test(String(a.name || ''))) ||
+      null
+  }
   return {
     hasUpdate: cmp(version, currentVersion) > 0,
     version,

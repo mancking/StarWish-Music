@@ -1,0 +1,390 @@
+#include "ffi_client_io.h"
+
+#include "agentxx/util/exception.h"
+#include "asio/co_spawn.hpp"
+#include "asio/detached.hpp"
+#include "asio/post.hpp"
+#include "asio/this_coro.hpp"
+#include "asio/use_awaitable.hpp"
+#include "fmt/format.h"
+#include "utilxx_base/log.h"
+#include <thread>
+#include <utility>
+
+namespace agentxx {
+namespace ffi {
+
+FfiClientAgentIO::FfiClientAgentIO(asio::any_io_executor ex, AgentxxFFICallbacks callbacks) :
+    ex_(std::move(ex)),
+    callbacks_(callbacks) {}
+
+FfiClientAgentIO::~FfiClientAgentIO() {
+    failAllPendingInterrupts();
+}
+
+void FfiClientAgentIO::setSessionId(std::string sessionId) {
+    sessionId_ = std::move(sessionId);
+}
+
+void FfiClientAgentIO::setClientThreadId(std::thread::id tid) {
+    clientThreadId_ = tid;
+}
+
+void FfiClientAgentIO::setAgentThreadId(std::thread::id tid) {
+    agentThreadId_ = tid;
+}
+
+bool FfiClientAgentIO::isOnClientThread() const {
+    return clientThreadId_ != std::thread::id{} && std::this_thread::get_id() == clientThreadId_;
+}
+
+bool FfiClientAgentIO::isOnAgentThread() const {
+    return agentThreadId_ != std::thread::id{} && std::this_thread::get_id() == agentThreadId_;
+}
+
+void FfiClientAgentIO::notifyServerReady() {
+    if (isOnClientThread()) {
+        onServerReady();
+    } else {
+        asio::post(ex_, [self = shared_from_this()]() {
+            self->onServerReady();
+        });
+    }
+}
+
+void FfiClientAgentIO::notifyError(int code, std::string message) {
+    auto emit = [this, code, message = std::move(message)]() {
+        utilxx_base::Json j = utilxx_base::Json::object();
+        j["code"]           = code;
+        j["message"]        = message;
+        emitEvent(AGENTXX_FFI_EVT_ERROR, dump(j));
+    };
+    if (isOnClientThread()) {
+        emit();
+    } else {
+        asio::post(ex_, std::move(emit));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AgentIOBase 纯虚实现
+// ---------------------------------------------------------------------------
+
+asio::awaitable<std::optional<std::string>> FfiClientAgentIO::getInput() {
+    co_return std::nullopt;
+}
+
+asio::awaitable<utilxx_base::Json> FfiClientAgentIO::handleInterrupt(
+    std::string_view /*sessionId*/,
+    std::string_view /*interruptNode*/,
+    std::string_view /*interruptValue*/,
+    std::string_view /*interruptArgJson*/
+) {
+    co_return utilxx_base::Json::array();
+}
+
+// ---------------------------------------------------------------------------
+// FFI 应答通道 (Lock-Free 无锁设计)
+// ---------------------------------------------------------------------------
+
+bool FfiClientAgentIO::hasPendingInterrupt(int64_t interruptId) const {
+    return interruptId > 0
+           && currentPendingInterruptId_.load(std::memory_order_acquire) == interruptId;
+}
+
+bool FfiClientAgentIO::submitInterruptResponse(int64_t interruptId, utilxx_base::Json values) {
+    int64_t expected = interruptId;
+    if (!currentPendingInterruptId_
+             .compare_exchange_strong(expected, 0, std::memory_order_acq_rel)) {
+        return false;
+    }
+    auto it = pending_.find(interruptId);
+    if (it == pending_.end()) {
+        return false;
+    }
+    // try_send: 容量 1, 嵌入方程序重复应答会被丢弃 (以首次为准) 并释放 channel
+    it->second->try_send(ErrorCode{}, std::move(values));
+    return true;
+}
+
+void FfiClientAgentIO::failAllPendingInterrupts() {
+    currentPendingInterruptId_.store(0, std::memory_order_release);
+    for (auto& [id, ch] : pending_) {
+        if (ch) {
+            ch->close();
+        }
+    }
+    pending_.clear();
+    for (int64_t id : pendingHostToolCalls_) {
+        utilxx_base::Json j = {
+            {"callId", id},
+            {"reason", "cancelled"},
+        };
+        emitEvent(AGENTXX_FFI_EVT_HOST_TOOL_CANCELLED, dump(j));
+    }
+    pendingHostToolCalls_.clear();
+    flushDeltaBatch();
+}
+
+void FfiClientAgentIO::setDeltaBatch(int32_t maxDelayMs) {
+    deltaBatchMs_ = maxDelayMs;
+    if (deltaBatchMs_ <= 0) {
+        flushDeltaBatch();
+        if (deltaBatchTimer_) {
+            deltaBatchTimer_->cancel();
+        }
+    } else if (!deltaBatchTimer_) {
+        deltaBatchTimer_ = std::make_shared<asio::steady_timer>(ex_);
+    }
+}
+
+bool FfiClientAgentIO::submitHostToolResponse(int64_t callId, int32_t isError, std::string resultJson) {
+    pendingHostToolCalls_.erase(callId);
+    sendToPeer(agent::WireHostToolResult{
+        .callId       = callId,
+        .ok           = (isError == 0),
+        .resultJson   = (isError == 0 ? std::move(resultJson) : ""),
+        .errorMessage = (isError != 0 ? std::move(resultJson) : ""),
+    });
+    return true;
+}
+
+void FfiClientAgentIO::flushDeltaBatch() {
+    if (pendingDeltaText_.empty()) {
+        return;
+    }
+    utilxx_base::Json j = {
+        {"kind", pendingDeltaKind_},
+        {"text", std::move(pendingDeltaText_)},
+    };
+    pendingDeltaText_.clear();
+    emitEvent(AGENTXX_FFI_EVT_DELTA_TEXT_BATCH, dump(j));
+}
+
+// ---------------------------------------------------------------------------
+// 被动接收回调
+// ---------------------------------------------------------------------------
+
+void FfiClientAgentIO::onDelta(const agent::WireDelta& delta) {
+    using T = agent::WireDelta::Type;
+    if (deltaBatchMs_ > 0 && (delta.type == T::TextToken || delta.type == T::ThinkToken)) {
+        const std::string kind = (delta.type == T::TextToken) ? "text" : "thinking";
+        if (!pendingDeltaText_.empty() && pendingDeltaKind_ != kind) {
+            flushDeltaBatch();
+        }
+        pendingDeltaKind_ = kind;
+        pendingDeltaText_ += delta.text;
+        if (deltaBatchTimer_) {
+            deltaBatchTimer_->expires_after(std::chrono::milliseconds(deltaBatchMs_));
+            auto weakSelf = std::weak_ptr<FfiClientAgentIO>{shared_from_this()};
+            deltaBatchTimer_->async_wait([weakSelf](const utilxx_base::AsioErrorCode& ec) {
+                if (!ec) {
+                    if (auto self = weakSelf.lock()) {
+                        self->flushDeltaBatch();
+                    }
+                }
+            });
+        }
+        return;
+    }
+    flushDeltaBatch();
+    emitEvent(AGENTXX_FFI_EVT_DELTA, dump(agent::io::makeDeltaMsg(delta)));
+}
+
+void FfiClientAgentIO::onSync(const agent::WireSyncPayload& payload) {
+    emitEvent(AGENTXX_FFI_EVT_SYNC, dump(agent::io::syncToJson(payload)));
+}
+
+void FfiClientAgentIO::onTurnResult(const agent::WireTurnResult& result) {
+    flushDeltaBatch();
+    emitEvent(
+        AGENTXX_FFI_EVT_TURN_END,
+        dump(agent::io::makeTurnResult(
+            result.sessionId,
+            result.hasError,
+            result.errorMessage,
+            result.interrupted,
+            result.startTimeMs,
+            result.durationMs
+        ))
+    );
+}
+
+void FfiClientAgentIO::onContextStats(const agent::WireContextStats& stats) {
+    if (stats.contextTokens == 0 && stats.maxContextTokens == 0 && stats.tps <= 0.0) {
+        return;
+    }
+    emitEvent(
+        AGENTXX_FFI_EVT_CONTEXT_STATS,
+        dump(agent::io::makeContextStats(stats))
+    );
+}
+
+void FfiClientAgentIO::onServerReady() {
+    utilxx_base::Json j = utilxx_base::Json::object();
+    j["sessionId"]      = sessionId_;
+    emitEvent(AGENTXX_FFI_EVT_READY, dump(j));
+}
+
+void FfiClientAgentIO::onPeerMessage(agent::WireMessage msg) {
+    std::visit(
+        [this](auto&& m) {
+            using T = std::decay_t<decltype(m)>;
+            if constexpr (std::is_same_v<T, agent::WireInterruptRequest>) {
+                auto    ch   = std::make_shared<RespChannel>(ex_, 1);
+                int64_t id   = m.id;
+                pending_[id] = ch;
+                currentPendingInterruptId_.store(id, std::memory_order_release);
+
+                // 事件: 完整中断信息
+                utilxx_base::Json j = utilxx_base::Json::object();
+                j["interruptId"]    = id;
+                j["sessionId"]      = m.sessionId;
+                j["node"]           = m.node;
+                j["value"]          = m.value;
+                j["argJson"]        = m.argJson;
+                emitEvent(AGENTXX_FFI_EVT_INTERRUPT_REQ, dump(j));
+
+                // 挂起等待嵌入方程序 agentxx_ffi_interrupt_respond
+                auto self = shared_from_this();
+                asio::co_spawn(
+                    ex_,
+                    [self, ch, id, sessionId = m.sessionId]() mutable -> asio::awaitable<void> {
+                        auto [answered, result] = co_await self->waitHostInterrupt(id, ch);
+                        if (answered) {
+                            self->sendToPeer(agent::WireInterruptResponse{id, std::move(result)});
+                        }
+                        co_return;
+                    },
+                    asio::detached
+                );
+            } else if constexpr (std::is_same_v<T, agent::WireInterruptExpired>) {
+                int64_t expected = m.id;
+                currentPendingInterruptId_
+                    .compare_exchange_strong(expected, 0, std::memory_order_acq_rel);
+                auto it = pending_.find(m.id);
+                if (it != pending_.end()) {
+                    it->second->close();
+                    pending_.erase(it);
+                }
+                utilxx_base::Json j = utilxx_base::Json::object();
+                j["interruptId"]    = m.id;
+                emitEvent(AGENTXX_FFI_EVT_INTERRUPT_EXPIRED, dump(j));
+            } else if constexpr (std::is_same_v<T, agent::WireModelInfo>) {
+                // 能力清单 (各模型多模态输入支持) 一并下发: 嵌入方程序据此判断
+                // 是否展示图片/音频/视频输入入口 (与 TUI 的附件按钮判定同源)
+                auto j = agent::io::makeModelInfo(m.currentModel, m.models, m.capabilities);
+                emitEvent(AGENTXX_FFI_EVT_MODEL_INFO, dump(j));
+                if (onSyncReply) {
+                    onSyncReply(SyncKind::ModelInfo, std::move(j));
+                }
+            } else if constexpr (std::is_same_v<T, agent::WireContextMessages>) {
+                auto j = agent::io::makeContextMessages(m.messages);
+                if (onSyncReply) {
+                    onSyncReply(SyncKind::ContextMessages, std::move(j));
+                }
+            } else if constexpr (std::is_same_v<T, agent::WireSessionList>) {
+                auto j = agent::io::makeSessionList(m.sessions, m.totalCount, m.hasMore);
+                if (onSyncReply) {
+                    onSyncReply(SyncKind::SessionList, std::move(j));
+                }
+            } else if constexpr (std::is_same_v<T, agent::WireAppendComponentInfo>) {
+                emitEvent(
+                    AGENTXX_FFI_EVT_COMPONENTS,
+                    dump(agent::io::makeAppendComponentInfo(m.notifications))
+                );
+            } else if constexpr (std::is_same_v<T, agent::WirePluginData>) {
+                emitEvent(AGENTXX_FFI_EVT_PLUGIN_DATA, dump(agent::io::makePluginData(m)));
+            } else if constexpr (std::is_same_v<T, agent::WireError>) {
+                utilxx_base::Json j = utilxx_base::Json::object();
+                j["code"]           = m.code;
+                j["message"]        = m.message;
+                emitEvent(AGENTXX_FFI_EVT_ERROR, dump(j));
+            } else if constexpr (std::is_same_v<T, agent::WireHostToolCall>) {
+                pendingHostToolCalls_.insert(m.callId);
+                utilxx_base::Json j = {
+                    {"callId",     m.callId},
+                    {"name",       m.name},
+                    {"argsJson",   m.argsJson},
+                    {"sessionId",  m.sessionId},
+                    {"timeoutSec", m.timeoutSec},
+                };
+                emitEvent(AGENTXX_FFI_EVT_HOST_TOOL_CALL, dump(j));
+            } else if constexpr (std::is_same_v<T, agent::WireAddModelResult>) {
+                // 模型增删回执: 走同步查询应答路由 (嵌入方程序 agentxx_ffi_add_model/
+                // remove_model 在等待), 同时作为 EVT_WIRE 透传给嵌入方程序
+                auto j = agent::io::toJson(m);
+                if (onSyncReply) {
+                    onSyncReply(SyncKind::AddModelResult, j);
+                }
+                emitEvent(AGENTXX_FFI_EVT_WIRE, dump(j));
+            } else if constexpr (std::is_same_v<T, agent::WireRemoveModelResult>) {
+                auto j = agent::io::toJson(m);
+                if (onSyncReply) {
+                    onSyncReply(SyncKind::RemoveModelResult, j);
+                }
+                emitEvent(AGENTXX_FFI_EVT_WIRE, dump(j));
+            } else if constexpr (
+                std::is_same_v<T, agent::WireListDirResult>
+                || std::is_same_v<T, agent::WireViewMessagesPage>
+                || std::is_same_v<T, agent::WireMessageQueueUpdate>
+                || std::is_same_v<T, agent::WirePermissionState>
+                || std::is_same_v<T, agent::WireRenameSessionResult>
+                || std::is_same_v<T, agent::WireInputAck>
+            ) {
+                // 输入受理回执也走这条: 嵌入方程序据此区分"已开始 / 已排队 / 被拒绝"
+                // (被拒绝时 reason 给出结构化原因, 如 attachment_too_large)
+                emitEvent(AGENTXX_FFI_EVT_WIRE, dump(agent::io::toJson(m)));
+            } else {
+                agent::AgentIOBase::onPeerMessage(agent::WireMessage{std::move(m)});
+            }
+        },
+        std::move(msg)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 内部
+// ---------------------------------------------------------------------------
+
+asio::awaitable<std::pair<bool, utilxx_base::Json>>
+    FfiClientAgentIO::waitHostInterrupt(int64_t id, std::shared_ptr<RespChannel> ch) {
+    utilxx_base::Json result  = utilxx_base::Json::array();
+    bool              gotResp = false;
+    co_await agentxx::util::catchErrorAsync<bool>(
+        [&]() -> asio::awaitable<bool> {
+            result  = co_await ch->async_receive(asio::use_awaitable);
+            gotResp = true;
+            co_return true;
+        },
+        [&](std::string errmsg) -> asio::awaitable<bool> {
+            XX_LOGW("[ffi] interrupt #{} ended early: {}", id, errmsg);
+            co_return false;
+        }
+    );
+    int64_t expected = id;
+    currentPendingInterruptId_.compare_exchange_strong(expected, 0, std::memory_order_acq_rel);
+    pending_.erase(id);
+    co_return std::make_pair(gotResp, std::move(result));
+}
+
+void FfiClientAgentIO::emitEvent(AgentxxFFIEventType type, std::string json) {
+    if (callbacks_.on_event == nullptr) {
+        return; // headless
+    }
+    AgentxxStringView sv{json.data(), static_cast<uint64_t>(json.size())};
+    try {
+        callbacks_.on_event(static_cast<int32_t>(type), &sv, callbacks_.user_data);
+    } catch (const std::exception& e) {
+        XX_LOGE("[ffi] on_event callback threw: {}", e.what());
+    } catch (...) {
+        XX_LOGE("[ffi] on_event callback threw unknown exception");
+    }
+}
+
+std::string FfiClientAgentIO::dump(const utilxx_base::Json& j) {
+    return j.dump();
+}
+
+} // namespace ffi
+} // namespace agentxx

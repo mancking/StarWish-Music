@@ -1,0 +1,1118 @@
+#include "agentxx-client/config_loader.h"
+#include "agentxx-client/io/jsonl/jsonl_mode.h"
+#include "agentxx-client/io/stdio/agent_stdio.h"
+#include "agentxx-client/io/tui/agent_tui.h"
+#include "agentxx-client/io/tui/framework/tui_settings.h"
+#include "agentxx-client/mode_runners.h"
+#include "agentxx-client/train/train.h"
+#include "agentxx-client/util/util.h"
+#include "agentxx/agent/code_agent.h"
+#include "agentxx/agent/assembly_snapshot.h"
+#include "agentxx/agent/config_static.h"
+#include "agentxx/agent/config_validation.h"
+#include "agentxx/agent/io/agent_server.h"
+#include "agentxx/protocol/acp_server.h"
+#include "agentxx/util/diagnostics.h"
+#include "agentxx/util/exception.h"
+#include "agentxx/util/settings_db.h"
+#include "agentxx/version.h"
+#include "asio/co_spawn.hpp"
+#include "asio/detached.hpp"
+#include "asio/signal_set.hpp"
+#include "utilxx/http_client.h"
+#include "utilxx_base/env.h"
+#include "utilxx_base/string_util.h"
+#include <cstdlib>
+#include <filesystem>
+#include <functional>
+#include <iostream>
+#include <stdlib.h>
+#include <string>
+#include <vector>
+
+#if defined(AGENTXX_ENABLE_MIMALLOC_D)
+// 最终程序接入的内存分配器 (构建时经 cmake/agentxx_mimalloc.cmake 链接, 见
+// agent/CMakeLists.txt 的 AGENTXX_ENABLE_MIMALLOC / AGENTXX_MIMALLOC_LINK)
+#include <mimalloc.h>
+#endif
+
+#if XX_IS_WIN_D
+#include <crtdbg.h>
+#include <windows.h> // GetModuleFileNameW / MAX_PATH
+#elif XX_IS_MACOS_D || XX_IS_IOS_D
+#include <mach-o/dyld.h> // _NSGetExecutablePath
+#endif
+
+using namespace agentxx::client;
+
+// ASan 默认选项 (仅在链接了 AddressSanitizer 时生效;  release/无 ASan 构建中为无害的弱符号)。
+//
+// 背景: TUI 全屏模式会切到备用屏 (alternate screen) + raw 模式 + 鼠标捕获。
+// ASan 检测到错误后默认以 _exit() 结束进程, 绕过 ftxui 注册的退出/信号清理,
+// 导致终端停留在备用屏/raw 模式: 备用屏无回滚缓冲、raw 模式滚轮失效 -> 终端"卡住",
+// 且备用屏上的 ASan 报告无法滚动查看完整。
+//
+// 对策:
+// - abort_on_error=1: ASan 改用 abort() 结束 -> 触发 SIGABRT -> ftxui 的信号处理
+//   恢复终端 (退出备用屏/恢复 termios/显示光标), 终端不再卡住。
+// - log_path=agentxx_asan: ASan 报告写入工作目录下 agentxx_asan.<pid> 文件
+//   (恢复终端会退出备用屏, 屏上报告随之消失, 故必须落盘才能看完整报告)。
+//   崩溃后用 `less agentxx_asan.*` 查看。
+// 注: 环境变量 ASAN_OPTIONS 会整体覆盖此默认值。
+//
+// macOS/iOS 附加: 本项目每个插件动态库静态链接一份 cxx_utilxx(_base), 使
+// simdjson 等全局符号在 libagentxx 与插件 dylib 间重复; Apple 平台 ASan 的
+// 跨镜像全局处理会误报 (odr-violation 中止 / 全局红区误判越界) 导致插件加载
+// 崩溃。故在 Apple 平台关闭 ODR 检查与全局变量登记 (堆/栈/越界检查不受影响)。
+extern "C" const char* __asan_default_options() {
+#if XX_IS_MACOS_D || XX_IS_IOS_D
+    return "abort_on_error=1:log_path=agentxx_asan:detect_odr_violation=0:report_globals=0";
+#else
+    return "abort_on_error=1:log_path=agentxx_asan";
+#endif
+}
+
+/// 获取当前可执行程序 (agentxx_cli) 所在目录
+/// - Windows: GetModuleFileNameW 获取 exe 全路径后取目录
+/// - Unix (Linux/Android): 读取 /proc/self/exe 符号链接后取目录
+/// - 统一返回正斜杠 (generic_string), 与 AGENTXX_WORK_DIR 一致 (yaml 拼接无转义问题)
+/// - 取不到时返回空串 (main 中注入空值 = 清除该内置变量)
+static std::string getExecutableDir() noexcept {
+#if XX_IS_WIN_D
+    std::wstring buf(MAX_PATH, L'\0');
+    for (;;) {
+        DWORD len = ::GetModuleFileNameW(nullptr, buf.data(), static_cast<DWORD>(buf.size()));
+        if (len == 0) {
+            XX_LOGW("GetModuleFileNameW failed");
+            return "";
+        }
+        if (len < buf.size()) {
+            buf.resize(len);
+            break;
+        }
+        // 缓冲不足 (长路径): 扩容重试
+        buf.resize(buf.size() * 2);
+    }
+    return std::filesystem::path(buf).parent_path().generic_string();
+#elif XX_IS_MACOS_D || XX_IS_IOS_D
+    // macOS/iOS: _NSGetExecutablePath 返回的路径可能含符号链接/相对段,
+    // 经 weakly_canonical 归一化为绝对路径后取目录
+    uint32_t size = 0;
+    (void)::_NSGetExecutablePath(nullptr, &size);
+    std::vector<char> buf(size + 1, '\0');
+    if (::_NSGetExecutablePath(buf.data(), &size) != 0) {
+        XX_LOGW("_NSGetExecutablePath failed");
+        return "";
+    }
+    std::error_code ec;
+    auto            exe = std::filesystem::weakly_canonical(std::filesystem::path(buf.data()), ec);
+    if (ec) {
+        return std::filesystem::path(buf.data()).parent_path().generic_string();
+    }
+    return exe.parent_path().generic_string();
+#else
+    std::error_code ec;
+    auto            exe = std::filesystem::read_symlink("/proc/self/exe", ec);
+    if (ec) {
+        XX_LOGW("read_symlink(/proc/self/exe) failed: {}", ec.message());
+        return "";
+    }
+    return exe.parent_path().generic_string();
+#endif
+}
+
+/// 检查配置中是否存在可用 LLM 模型; 无可用模型时输出启动引导并返回 false
+/// - 用于无 agentxx-config.yaml / 配置中未配置有效模型的启动场景:
+///   在构造 CodeAgent 之前拦截, 输出配置引导后退出,
+///   避免携带无效模型进入 BaseAgent 构造触发断言 abort 崩溃
+///   (base_agent.cpp: assert(in_config->model.isValid()))
+/// - overlayPath/basePath: 两层配置的候选路径 (base 为 data_dir 下的配置;
+///   basePath 为空表示数据目录无法确定), 仅用于引导文案
+/// - configLoaded: 是否有任一层配置文件成功加载
+///   (区分"文件缺失"与"文件内未配置"引导文案)
+static bool ensureModelConfigured(
+    const std::map<std::string, agentxx::agent::ModelConfig>& models,
+    std::string_view                                          useModelKey,
+    std::string_view                                          roleDesc,
+    std::string_view                                          overlayPath,
+    std::string_view                                          basePath,
+    bool                                                      configLoaded
+) {
+    if (resolveModelConfig(models, useModelKey).isValid()) {
+        return true;
+    }
+    // 配置路径描述: overlay (工作目录/--config 指定的配置)
+    // + base (data_dir 目录下的配置, 不存在时省略)
+    std::string pathDesc = std::string{overlayPath};
+    if (!basePath.empty()) {
+        pathDesc += " (base: ";
+        pathDesc += basePath;
+        pathDesc += ")";
+    }
+    if (!configLoaded) {
+        XX_LOGE(
+            R"_([Config] .yaml config file '{}' not found. 
+Please copy the template to create one (agentxx-config.yaml in the project root directory, or refer to the README for usage instructions), and configure `models` and `use_model`.)_",
+            pathDesc
+        );
+        return false;
+    }
+    XX_LOGE(
+        "[Config] No available LLM model configured: {} (use_model.{}), startup aborted.",
+        roleDesc,
+        useModelKey
+    );
+    XX_LOGE(
+        R"_([Config] No valid model entry found in .yaml config file(s) '{}' (model.use.{} = '{}'). 
+Please add a model to the `model.list` and specify the model to use in `model.use`.
+For example:
+
+model:
+    list:
+        - name: my-model
+          type: openai
+          base_url: https://api.openai.com/v1
+          api_key: ${{LLM_API_KEY}}
+    use:
+        default: my-model
+)_",
+        pathDesc,
+        useModelKey,
+        useModelKey
+    );
+    return false;
+}
+
+static std::string extractTokenFromUrl(std::string& url) {
+    auto q = url.find('?');
+    if (q == std::string::npos) {
+        return "";
+    }
+    std::string query = url.substr(q + 1);
+    url               = url.substr(0, q);
+    std::string token;
+    size_t      pos = 0;
+    while (pos < query.size()) {
+        auto        amp = query.find('&', pos);
+        std::string kv
+            = query.substr(pos, amp == std::string::npos ? std::string::npos : amp - pos);
+        auto eq = kv.find('=');
+        if (eq != std::string::npos && kv.substr(0, eq) == "token") {
+            token = utilxx::HttpClient::urlDecode(kv.substr(eq + 1));
+        }
+        if (amp == std::string::npos) {
+            break;
+        }
+        pos = amp + 1;
+    }
+    return token;
+}
+
+/// 应用各模式共享的运行时装配 (MCP / Skill / Memory / 权限 / 子代理 / 插件)
+/// - tui / cli / server / acp 模式共用: 分离进程启动 agent (server/acp) 时
+///   同样需要完整装配, 否则 agent 侧不加载插件等扩展组件
+/// - 相对路径按程序工作目录解析为绝对路径 (resolvePath 由 main 注入)
+static void applySharedRuntimeConfig(
+    std::shared_ptr<agentxx::agent::AgentConfig>&            config,
+    const YamlAppConfig&                                     yamlCfg,
+    const std::function<std::string(std::string_view path)>& resolvePath
+) {
+    // MCP 服务器 (来自 config.yaml 的 mcp, key 为命名空间)
+    config->mcpServerUrls = yamlCfg.mcpServers;
+
+    for (const auto& p : yamlCfg.skillDirPaths) {
+        config->skillDirPaths.push_back(resolvePath(p));
+    }
+    for (const auto& p : yamlCfg.memoryFilePaths) {
+        config->memoryFilePaths.push_back(resolvePath(p));
+    }
+    // CodeGraph 参数经 plugins 配置传递 (主程序不解析 args 字段语义;
+    // 所有插件统一经 path 外置指定加载)
+
+    // 权限配置 (模式 + 白/黑名单; CodeAgent 启动时按此注册文件系统读写规则)
+    config->permissionMode       = yamlCfg.permissionMode;
+    config->permissionAllowPaths = yamlCfg.permissionAllowPaths;
+    config->permissionDenyPaths  = yamlCfg.permissionDenyPaths;
+
+    // 子代理开关 (yaml `subagent.enable`, 默认 true)
+    config->enableSubagent = yamlCfg.enableSubagent;
+    // git worktree 模式 (yaml `worktree.enable`, 默认 false)
+    config->enableWorktree = yamlCfg.worktreeEnable;
+    // 开发者模式 (yaml `dev_mode`, 默认 false): 只控制"记录数据"的收集
+    // (功能点调用统计 / 钩子派发记录 / 成功调用日志), 启动时冻结
+    config->devMode = yamlCfg.devMode;
+    // 会话语言 (yaml `language`): 显式配置后客户端界面语言不再覆盖 (见
+    // docs/zh-cn/design/configuration.md "语言" 一节)
+    if (!yamlCfg.language.empty()) {
+        config->language         = agentxx::agent::normalizeLanguage(yamlCfg.language);
+        config->languageExplicit = true;
+    }
+    // 插件配置 (yaml `plugins` 段): 相对路径按程序工作目录解析为绝对路径
+    // (与 skill/memory 一致; BaseAgent::init 按此加载, 拓扑排序见 PluginManager)
+    // - path 前缀 `builtin://` 为内置插件简写, 保留原样不做文件路径解析
+    // - config 支持 `~` 展开与相对路径解析 (可指向文件或目录), 归一化后透传
+    auto resolvePluginPath = [&](std::string_view p) -> std::string {
+        if (p.starts_with("builtin://")) {
+            return std::string{p};
+        }
+        return resolvePath(p);
+    };
+    for (const auto& pc : yamlCfg.plugins) {
+        agentxx::agent::PluginConfig pluginCfg;
+        pluginCfg.path    = resolvePluginPath(pc.path);
+        pluginCfg.enabled = pc.enabled;
+        pluginCfg.sides   = pc.sides;
+        pluginCfg.args    = pc.args;
+        if (!pc.configPath.empty()) {
+            auto                  expanded = utilxx_base::expandUserHomePath(pc.configPath);
+            std::filesystem::path cp{expanded};
+            if (cp.is_absolute()) {
+                pluginCfg.configPath = cp.lexically_normal().generic_string();
+            } else {
+                pluginCfg.configPath
+                    = (std::filesystem::current_path() / cp).lexically_normal().generic_string();
+            }
+        }
+        config->plugins.push_back(std::move(pluginCfg));
+    }
+    if (!config->plugins.empty()) {
+        XX_LOGI("[Config] plugins: {}", config->plugins.size());
+    }
+}
+
+/// 打印生效装配快照
+///
+/// `--dump-diagnostics` 的实现: 装配一次 agent 后导出诊断包文本
+///
+/// 与 [dumpConfigAndExit] 共用装配路径, 但导出的是"报障包": 环境与版本、关键指标、
+/// 装配快照 (配置含"是否已设置 Key"、不含 Key 取值)、会话摘要、日志尾部 (脱敏)。
+/// - 不做任何网络请求、不进入交互模式, 打印完退出
+/// - 装配失败时仍会打印已生成的部分并附上失败原因, 依然有排查价值
+static int dumpDiagnosticsAndExit(
+    const std::string&                                       mode,
+    const YamlAppConfig&                                     yamlCfg,
+    const std::string&                                       resolvedDataDir,
+    const std::string&                                       resolvedWorkDir,
+    const std::function<std::string(std::string_view path)>& resolvePath,
+    std::string_view                                         configPath,
+    const std::string&                                       baseConfigPath
+) {
+    auto config     = buildDefaultConfig();
+    config->dataDir = resolvedDataDir;
+    config->workDir = resolvedWorkDir;
+    applyModelToConfig(config, yamlCfg.models, yamlCfg.useModelDefault);
+    applySubagentModelToConfig(config, yamlCfg.models, yamlCfg.useModelSubagent);
+    applyWebSearchModelToConfig(config, yamlCfg.models, yamlCfg.useModelWebSearch);
+    applyAvailableModelsToConfig(config, yamlCfg.models, yamlCfg.useModelDefault);
+    applySharedRuntimeConfig(config, yamlCfg, resolvePath);
+
+    // 日志尾部: 先装捕获再装配, 这样 init 期间的日志也进包
+    agentxx::util::enableLogCapture(200);
+
+    XX_OUT("=== agentxx dump-diagnostics (mode={}) ===\n", mode);
+    XX_OUT("config file : {}\n", configPath);
+    if (!baseConfigPath.empty()) {
+        XX_OUT("base config : {}\n", baseConfigPath);
+    }
+    XX_OUT("\n");
+
+    auto agent     = std::make_shared<agentxx::agent::CodeAgent>(config);
+    auto initError = std::make_shared<std::string>();
+    asio::co_spawn(
+        *agent->ioCtx,
+        [agent, initError]() -> asio::awaitable<void> {
+            co_await agentxx::util::catchErrorAsync<bool>(
+                [&]() -> asio::awaitable<bool> {
+                    co_await agent->init();
+                    co_return true;
+                },
+                [&](std::string errmsg) -> asio::awaitable<bool> {
+                    *initError = std::move(errmsg);
+                    co_return false;
+                },
+                [&](std::string& errmsg) -> std::optional<bool> {
+                    *initError = std::move(errmsg);
+                    return std::optional<bool>{false};
+                }
+            );
+            co_return;
+        },
+        asio::detached
+    );
+    agent->ioCtx->run();
+
+    // 不带会话: CLI 的一次性导出没有"当前会话"; 带会话的导出由库调用方按需传入
+    XX_OUT(
+        "{}\n",
+        agentxx::util::buildDiagnosticsText(
+            *agent->agentContext,
+            std::string_view{},
+            agentxx::util::DiagnosticsOptions{}
+        )
+    );
+    if (!initError->empty()) {
+        XX_OUT("\n[init failed] {}\n", *initError);
+        return 1;
+    }
+    if (agentxx::agent::validateAgentConfigWithPaths(*config).hasFatal()) {
+        return 1;
+    }
+    return 0;
+}
+
+/// `--dump-config` 的实现: 先打印配置侧快照 (不需要可用模型, 配置写错时也能看),
+/// 有可用模型时再构造一次 CodeAgent 并 init, 补上运行侧快照 (模型注册表 /
+/// 中间件顺序 / 工具清单与来源 / 插件加载结果 / 执行图 / 持久化)。
+/// - 不启动任何交互界面, 不监听端口, 打印完直接退出
+/// - 打印的是"实际装配结果", 与启动日志中的装配快照同源
+static int dumpConfigAndExit(
+    const std::string&                                       mode,
+    const YamlAppConfig&                                     yamlCfg,
+    const std::string&                                       resolvedDataDir,
+    const std::string&                                       resolvedWorkDir,
+    const std::function<std::string(std::string_view path)>& resolvePath,
+    std::string_view                                         configPath,
+    const std::string&                                       baseConfigPath
+) {
+    // 与正常启动一致地构建配置 (模式相关的日志开关不生效, 快照需要完整信息)
+    auto config     = buildDefaultConfig();
+    config->dataDir = resolvedDataDir;
+    config->workDir = resolvedWorkDir;
+    applyModelToConfig(config, yamlCfg.models, yamlCfg.useModelDefault);
+    applySubagentModelToConfig(config, yamlCfg.models, yamlCfg.useModelSubagent);
+    applyWebSearchModelToConfig(config, yamlCfg.models, yamlCfg.useModelWebSearch);
+    applyAvailableModelsToConfig(config, yamlCfg.models, yamlCfg.useModelDefault);
+    applySharedRuntimeConfig(config, yamlCfg, resolvePath);
+
+    XX_OUT("=== agentxx dump-config (mode={}) ===\n", mode);
+    XX_OUT("config file : {}", configPath);
+    if (!baseConfigPath.empty()) {
+        XX_OUT("base config : {}", baseConfigPath);
+    }
+    XX_OUT("\n");
+
+    auto configSnapshot = agentxx::agent::buildConfigSnapshot(*config);
+    for (const auto& line : agentxx::agent::renderAssemblySnapshot(configSnapshot)) {
+        XX_OUT("{}\n", line);
+    }
+
+    // 配置校验结果: 键路径 + 严重级别, 配置排查时先看这一段
+    auto report = agentxx::agent::validateAgentConfigWithPaths(*config);
+    report.setSource(std::string{configPath});
+    XX_OUT("\nconfig issues[{}]:\n", report.issues.size());
+    for (const auto& line : report.render()) {
+        XX_OUT("  {}\n", line);
+    }
+
+    if (!resolveModelConfig(yamlCfg.models, yamlCfg.useModelDefault).isValid()) {
+        XX_OUT(
+            "\n[assembly snapshot skipped] no usable default model configured "
+            "(see `model.list` / `model.use` above)\n"
+        );
+        // 配置有致命问题时以非零码退出, 便于在脚本/CI 中当作配置校验使用
+        return report.hasFatal() ? 1 : 0;
+    }
+
+    XX_OUT("\n=== effective assembly (init once, then exit) ===\n");
+    auto                          agent = std::make_shared<agentxx::agent::CodeAgent>(config);
+    utilxx_base::Json             runtimeSnapshot;
+    std::string                   initError;
+    asio::co_spawn(
+        *agent->ioCtx,
+        [agent, &runtimeSnapshot, &initError]() -> asio::awaitable<void> {
+            co_await agentxx::util::catchErrorAsync<bool>(
+                [&]() -> asio::awaitable<bool> {
+                    co_await agent->init();
+                    runtimeSnapshot = agentxx::agent::buildRuntimeSnapshot(*agent->agentContext);
+                    co_return true;
+                },
+                [&](std::string errmsg) -> asio::awaitable<bool> {
+                    initError = std::move(errmsg);
+                    co_return false;
+                },
+                [&](std::string& errmsg) -> std::optional<bool> {
+                    // 控制流异常 (取消/中断) 在 init 阶段不应出现; 记录后同样停止
+                    initError = std::move(errmsg);
+                    return std::optional<bool>{false};
+                }
+            );
+            co_return;
+        },
+        asio::detached
+    );
+    agent->ioCtx->run();
+    if (!initError.empty()) {
+        XX_OUT("[init failed] {}\n", initError);
+        return 1;
+    }
+    for (const auto& line : agentxx::agent::renderAssemblySnapshot(runtimeSnapshot)) {
+        XX_OUT("{}\n", line);
+    }
+    // 插件关闭: agent 局部对象析构时经 AgentContext → PluginManager 同步关闭全部实例
+    // 配置有致命问题时返回非零 (快照照常打印完, 便于一次性看到全部问题)
+    return report.hasFatal() ? 1 : 0;
+}
+
+/// 启动期配置校验
+///
+/// 打印结构化问题 (键路径 + 严重级别 + 来源), 致命问题返回 false 由调用方终止启动。
+/// 校验规则只有一份实现 (agentxx::agent::validateAgentConfigWithPaths), 与
+/// `AgentConfig::validate()` 同源。
+static bool validateStartupConfig(
+    const std::shared_ptr<agentxx::agent::AgentConfig>& config,
+    std::string_view                                    sourceLabel
+) {
+    auto report = agentxx::agent::validateAgentConfigWithPaths(*config);
+    report.setSource(sourceLabel);
+    for (const auto& line : report.render()) {
+        if (line.starts_with("[fatal]")) {
+            XX_LOGE("[Config] {}", line);
+        } else {
+            XX_LOGW("[Config] {}", line);
+        }
+    }
+    if (report.hasFatal()) {
+        XX_LOGE(
+            "[Config] {} fatal config problem(s) found, startup aborted",
+            report.count(agentxx::agent::ConfigIssueLevel::Fatal)
+        );
+        return false;
+    }
+    const auto warnings = report.count(agentxx::agent::ConfigIssueLevel::Warning);
+    if (warnings > 0) {
+        XX_LOGI("[Config] {} config warning(s) reported above, startup continues", warnings);
+    }
+    return true;
+}
+
+int main(int argn, char** argv) {
+#if XX_IS_WIN_D
+    SetConsoleOutputCP(CP_UTF8);
+    // === 将部分错误弹窗改为 输出/ExitCode
+    // 将断言错误报告重定向到标准错误输出(stderr)
+    _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
+    _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
+#if XX_IS_DEBUG_D
+    // SEM_FAILCRITICALERRORS: 禁止严重错误对话框 (如DLL加载失败)
+    // SEM_NOGPFAULTERRORBOX: 禁止Windows错误报告对话框[reference:8]
+    // SEM_NOOPENFILEERRORBOX: 禁止OpenFile失败时的对话框
+    SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
+    // _WRITE_ABORT_MSG: 控制是否打印错误消息[reference:14]
+    // _CALL_REPORTFAULT: 控制是否调用Windows错误报告[reference:15]
+    _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+#endif
+#endif
+
+#if XX_IS_DEBUG_D && (XX_IS_LINUX_D || XX_IS_WIN_D)
+    utilxx_base::signalError(argv[0]);
+#endif
+
+    // 注入程序内置环境变量 (启动后立即捕获, 供 yaml 配置 ${VAR} 展开使用)
+    // - 预设环境变量经全局单例 ApplicationEnv 存储 (优先级高于系统环境变量),
+    //   Windows 侧经 _dupenv_s 安全读取以消除 C4996 警告
+    // - AGENTXX_WORK_DIR: 程序启动后的工作目录 (当前目录)
+    //   yaml 中可写 `data_dir: ${AGENTXX_WORK_DIR}/...` 等相对启动目录的路径
+    // - 统一使用正斜杠 (generic_string): yaml 字符串中 `\` 需转义, 正斜杠无此问题
+    {
+        auto workDir = agentxx::util::catchError<std::string>(
+            []() -> std::string {
+                return std::filesystem::current_path().generic_string();
+            },
+            [](std::string errinfo) -> std::string {
+                XX_LOGW("[Config] failed to capture AGENTXX_WORK_DIR: {}", errinfo);
+                return "";
+            }
+        );
+        if (!workDir.empty()) {
+            utilxx_base::ApplicationEnv::instance().set(kBuiltinWorkDirEnv, workDir);
+        } else {
+            utilxx_base::ApplicationEnv::instance().remove(kBuiltinWorkDirEnv);
+        }
+        // 同步兼容层 (供旧代码/测试经 setBuiltinEnvVar 查询)
+        setBuiltinEnvVar(kBuiltinWorkDirEnv, workDir);
+    }
+
+    // - AGENTXX_EXEC_DIR: agentxx_cli 可执行程序所在目录
+    //   yaml 中可写模型/插件/数据等相对 exe 目录的路径 (如 `${AGENTXX_EXEC_DIR}/plugins`)
+    {
+        auto execDir = getExecutableDir();
+        if (!execDir.empty()) {
+            utilxx_base::ApplicationEnv::instance().set(kBuiltinExecDirEnv, execDir);
+        } else {
+            utilxx_base::ApplicationEnv::instance().remove(kBuiltinExecDirEnv);
+        }
+        setBuiltinEnvVar(kBuiltinExecDirEnv, execDir);
+    }
+
+    /// 默认启动 stdio 作为日志输出，对于 tui 等自己拦截日志的可以移除后添加自己的日志拦截器
+    auto defaultLogSink = std::make_shared<StderrLogSink>();
+    utilxx_base::LogDispatcher::instance().addSink(defaultLogSink);
+
+    // 按模块调日志级别: `AGENTXX_LOG_MODULES=前缀=级别,...`
+    // - 例: `modelcall=debug,toolcall=trace,plugin.=warn`
+    // - 未命中任何条目的模块照常输出 (由 sink 侧按全局级别过滤)
+    // - 非法段跳过并告警, 不影响其它段
+    if (const auto* spec = std::getenv("AGENTXX_LOG_MODULES"); spec != nullptr) {
+        std::vector<std::string> invalid;
+        const auto               applied = utilxx_base::applyLogModuleLevelSpec(spec, &invalid);
+        if (applied > 0) {
+            XX_OUT(
+                "[Log] module levels applied: {} (from AGENTXX_LOG_MODULES)\n",
+                applied
+            );
+        }
+        for (const auto& bad : invalid) {
+            XX_OUT(
+                "[Log] warning: invalid AGENTXX_LOG_MODULES entry `{}` (expect `prefix=level`)\n",
+                bad
+            );
+        }
+    }
+
+#if defined(AGENTXX_ENABLE_MIMALLOC_D)
+    // 记录实际接入的内存分配器 (mimalloc 版本号编码: 主版本 + 2 位次版本 + 2 位修订)
+    // - 日志中可直接确认进程用的是 mimalloc 而不是 glibc/CRT
+    // - 该调用同时确保动态链接模式 (libmimalloc.so / mimalloc.dll) 下分配器被真正
+    //   加载, 而非被 --as-needed / 按需导入优化掉 (见 cmake/agentxx_mimalloc.cmake)
+    {
+        const int miVersion = mi_version();
+        XX_LOGI(
+            "[Allocator] mimalloc {}.{}.{}",
+            miVersion / 10000,
+            (miVersion / 100) % 100,
+            miVersion % 100
+        );
+    }
+#endif
+
+    std::string configPath = std::string{kDefaultConfigFileName};
+    bool configExplicit = false; ///< --config 是否被显式指定 (指定但文件不存在时报错)
+    bool dumpConfig     = false; ///< --dump-config: 打印生效装配快照后退出
+    bool dumpDiagnostics = false; ///< --dump-diagnostics: 打印诊断包后退出
+    std::string overrideEnvPath;
+    std::string mode = "tui";
+    std::string agentUrl;
+    std::string agentToken;
+    std::string remoteModel;
+    std::string jsonlSessionId; ///< jsonl 模式使用的会话 id (空 = 自动生成)
+    std::string srvHost = "127.0.0.1";
+    uint16_t    srvPort = 7007;
+    for (int i = 1; i < argn; ++i) {
+        auto arg = std::string_view{argv[i]};
+        if (arg == "--version" || arg == "-v") {
+            XX_OUT("Agentxx v{}\n", agentxx::kVersion);
+            return 0;
+        } else if (arg == "--help" || arg == "-h") {
+            XX_OUT(R"_(
+Usage: agentxx_cli [mode] [options]
+
+Modes:
+    tui                  TUI 交互模式 (默认)
+    cli                  命令行 stdio 交互模式
+    server               启动 WebSocket agent 服务
+    jsonl                stdin/stdout 逐行 JSON (Wire 协议) 一次性运行模式
+    acp                  ACP stdio 服务模式
+    train                训练模式
+
+Options:
+    -h, --help           显示帮助信息
+    -v, --version        显示版本信息
+    --config <path>      配置文件路径 (默认: agentxx-config.yaml)
+    --env <path>         覆盖式环境变量文件路径
+    --agent <url>        远程 agent server 地址 (ws://host:port/agent)
+    --token <token>      认证 token (也可通过 url 查询串携带)
+    --model <model>      远程模型名称
+    --host <host>        服务监听地址 (默认: 127.0.0.1)
+    --port <port>        服务监听端口 (默认: 7007)
+    --session-id <id>    jsonl 模式使用的会话 id (默认自动生成, 见 hello_ack)
+    --dump-config        打印生效装配快照 (配置 + 模型/中间件/工具/插件/图/持久化) 后退出
+    --dump-diagnostics   打印诊断包 (环境/关键指标/装配/会话摘要/日志尾部, 已脱敏) 后退出
+)_");
+            return 0;
+        } else if (arg == "--config" && i + 1 < argn) {
+            ++i;
+            configPath     = argv[i];
+            configExplicit = true;
+        } else if (arg == "--env" && i + 1 < argn) {
+            ++i;
+            overrideEnvPath = argv[i];
+        } else if (arg == "--agent" && i + 1 < argn) {
+            ++i;
+            agentUrl = argv[i];
+        } else if (arg == "--token" && i + 1 < argn) {
+            ++i;
+            agentToken = argv[i];
+        } else if (arg == "--model" && i + 1 < argn) {
+            ++i;
+            remoteModel = argv[i];
+        } else if (arg == "--session-id" && i + 1 < argn) {
+            ++i;
+            jsonlSessionId = argv[i];
+        } else if (arg == "--host" && i + 1 < argn) {
+            ++i;
+            srvHost = argv[i];
+        } else if (arg == "--dump-diagnostics") {
+            dumpDiagnostics = true;
+        } else if (arg == "--dump-config") {
+            dumpConfig = true;
+        } else if (arg == "--port" && i + 1 < argn) {
+            ++i;
+            // 容错解析: 非法值报错退出, 避免 std::stoi 抛异常崩溃
+            auto portArg = std::string_view{argv[i]};
+            if (auto r = utilxx_base::parseNumberFromString(portArg, srvPort);
+                r.ec != std::errc{} || srvPort == 0) {
+                XX_LOGE("Invalid --port value: `{}`", portArg);
+                return 1;
+            }
+        } else if (arg == "tui" || arg == "cli" || arg == "server" || arg == "acp"
+                   || arg == "train" || arg == "jsonl") {
+            mode = arg;
+        } else {
+            XX_LOGE("Unknown arg: `{}`", arg);
+        }
+    }
+
+    // token 可经 url 查询串携带: ws://host:port/path?token=xxx
+    if (!agentUrl.empty() && agentToken.empty()) {
+        agentToken = extractTokenFromUrl(agentUrl);
+    }
+
+    // ======================== 分层配置加载 ========================
+    // - overlay 层: `--config` 指定的配置文件 (默认 `工作目录/agentxx-config.yaml`)
+    //   与其所在目录的 .env
+    // - base 层: overlay 的 `data_dir` 目录下的 `agentxx-config.yaml` / `.env`
+    //   (overlay 未配置 data_dir 时取系统数据目录, 即工作目录无配置时
+    //   直接加载数据目录下的配置); base 不存在时仅用 overlay
+    // - 合并: base 为底, overlay 覆盖 (同名标量/映射键覆盖; models/mcp/plugins
+    //   按键归并; skill/memory/permission 白黑名单追加合并; .env 同名舍弃 base 值)
+    // - 只加载一层 base (base 内的 data_dir 不再向下查找)
+    if (configExplicit && !std::filesystem::exists(configPath)) {
+        // 显式 --config 指定的文件不存在: 大概率是路径拼写错误, 直接报错
+        XX_LOGE("[Config] Config file not found: {}", configPath);
+        return 1;
+    }
+
+    LayeredConfigOptions loadOpts;
+    loadOpts.overlayConfigPath = configPath;
+    loadOpts.overrideEnvPath   = overrideEnvPath;
+    // .env 查找: 工作目录/.env, 其次 overlay 配置所在目录/.env (后者覆盖前者)
+    loadOpts.overlayEnvPaths.push_back(".env");
+    {
+        auto configDir = std::filesystem::path(configPath).parent_path();
+        if (!configDir.empty()) {
+            loadOpts.overlayEnvPaths.push_back(
+                (configDir / agentxx::client::kDefaultEnvFileName).string()
+            );
+        }
+    }
+
+    LayeredConfigLoad loadedCfg;
+    auto              loadCode = agentxx::util::catchError<int>(
+        [&]() -> int {
+            loadedCfg = loadLayeredConfig(loadOpts);
+            return 0;
+        },
+        [&](std::string errmsg) -> int {
+            XX_LOGE("[Config] Failed to load config: {}, {}", configPath, errmsg);
+            return 1;
+        }
+    );
+    if (0 != loadCode) {
+        return loadCode;
+    }
+
+    const YamlAppConfig& yamlCfg      = loadedCfg.cfg;
+    bool                 configLoaded = loadedCfg.overlayLoaded || loadedCfg.baseLoaded;
+    if (loadedCfg.overlayLoaded && loadedCfg.baseLoaded) {
+        XX_LOGI(
+            "[Config] Loaded layered config: base={} + overlay={} (overlay overrides base)",
+            loadedCfg.baseConfigPath,
+            configPath
+        );
+    } else if (loadedCfg.baseLoaded) {
+        XX_LOGI(
+            "[Config] Loaded config from base (data_dir): {} (no overlay config: {})",
+            loadedCfg.baseConfigPath,
+            configPath
+        );
+    } else if (loadedCfg.overlayLoaded) {
+        XX_LOGI("[Config] Loaded config from: {}", configPath);
+    }
+    if (!loadedCfg.dotEnvVars.empty()) {
+        XX_LOGI(
+            "[Config] Loaded {} variables from .env (base .env: {}, dropped by overlay: {})",
+            loadedCfg.dotEnvVars.size(),
+            loadedCfg.baseEnvTotal,
+            loadedCfg.baseEnvDropped
+        );
+    }
+    if (!loadedCfg.overrideEnvVars.empty()) {
+        XX_LOGI(
+            "[Config] Loaded {} override variables from: {}",
+            loadedCfg.overrideEnvVars.size(),
+            overrideEnvPath
+        );
+    }
+
+    // 统一数据根目录: 可在 yaml 配置 data_dir 指定
+    // - tui/cli 模式支持关键字 `default`: 使用当前系统数据目录 (平台惯例,
+    //   Linux/macOS: ~/.agentxx/, Windows: %APPDATA%/agentxx/)
+    // - 其他值: 展开 `~` 为用户主目录; 相对路径按程序工作目录解析为绝对路径
+    // - 数据子路径: {dataDir}/sqlite/global.db (全局设置),
+    //   {dataDir}/sqlite/sessions/{sessionId}/ (会话数据),
+    //   {dataDir}/sqlite/codegraph/... (CodeGraph 索引)
+    std::string resolvedDataDir = resolveDataDirValue(yamlCfg.dataDir);
+    if (!yamlCfg.dataDir.empty()) {
+        if (yamlCfg.dataDir == agentxx::agent::AgentConfigStatic::kDefaultDataDirKey) {
+            XX_LOGI("[Config] data_dir: default -> {}", resolvedDataDir);
+        } else {
+            XX_LOGI("[Config] data_dir: {}", resolvedDataDir);
+        }
+    }
+
+    // 会话工作目录: 可在 yaml 配置 work_dir 指定 (AgentConfig::workDir)
+    // - 为空 (默认): agent 使用进程当前工作目录 (旧行为)
+    // - 非空: 展开 `~`; 相对路径按程序工作目录解析为绝对路径
+    // - 生效范围: permission Ask 默认放行规则 / filesystem 工具与权限校验的
+    //   相对路径解析基准 / 命令执行子进程初始目录 / 插件 projectRoot
+    std::string resolvedWorkDir;
+    if (!yamlCfg.workDir.empty()) {
+        auto                  workDirExpanded = utilxx_base::expandUserHomePath(yamlCfg.workDir);
+        std::filesystem::path wp{workDirExpanded};
+        resolvedWorkDir
+            = wp.is_absolute()
+                  ? wp.lexically_normal().generic_string()
+                  : (std::filesystem::current_path() / wp).lexically_normal().generic_string();
+        XX_LOGI("[Config] work_dir: {}", resolvedWorkDir);
+    }
+
+    // 权限询问处理模式启动提示 (yaml `permission.mode`, 默认 ask):
+    // ask = 工作目录内允许/其他询问; all_ask = 全部询问; pass = 全部放行; deny = 全部拒绝
+    XX_LOGI(
+        "[Config] permission.mode: {} ({})",
+        agentxx::client::permissionModeName(yamlCfg.permissionMode),
+        agentxx::client::permissionModeDepict(yamlCfg.permissionMode)
+    );
+    if (!yamlCfg.permissionAllowPaths.empty()) {
+        XX_LOGI(
+            "[Config] permission.whitelist (始终放行): {}",
+            yamlCfg.permissionAllowPaths.size()
+        );
+    }
+    if (!yamlCfg.permissionDenyPaths.empty()) {
+        XX_LOGI("[Config] permission.blacklist (始终拒绝): {}", yamlCfg.permissionDenyPaths.size());
+    }
+
+    // 解析路径：相对路径按程序工作目录解析为绝对路径
+    // (用于 skill/memory/codegraph 加载与忽略路径; 放在模式分支前定义, acp 模式也可用)
+    auto resolvePath = [](std::string_view p) -> std::string {
+        std::filesystem::path fp{p};
+        if (fp.is_absolute()) {
+            return fp.lexically_normal().string();
+        }
+        return (std::filesystem::current_path() / fp).lexically_normal().string();
+    };
+
+    // `--dump-diagnostics`: 打印诊断包后退出
+    // - 与 --dump-config 同一位置与同一装配路径, 导出的是"报障包"
+    // - 只读导出: 不发网络请求、不写会话库
+    if (dumpDiagnostics) {
+        return dumpDiagnosticsAndExit(
+            mode,
+            yamlCfg,
+            resolvedDataDir,
+            resolvedWorkDir,
+            resolvePath,
+            configPath,
+            loadedCfg.baseConfigPath
+        );
+    }
+
+    // `--dump-config`: 打印生效装配快照后退出
+    // - 不进入任何交互模式, 不监听端口; 配置写错 (无可用模型) 时也打印配置侧快照
+    if (dumpConfig) {
+        return dumpConfigAndExit(
+            mode,
+            yamlCfg,
+            resolvedDataDir,
+            resolvedWorkDir,
+            resolvePath,
+            configPath,
+            loadedCfg.baseConfigPath
+        );
+    }
+
+    if (mode == "train") {
+        // 训练模式需要 训练/评分/优化 三个模型, 任一缺失即引导退出
+        // (避免无效模型进入 BaseAgent 构造断言 abort 崩溃)
+        if (!ensureModelConfigured(
+                yamlCfg.models,
+                yamlCfg.useModelTrain,
+                "train model",
+                configPath,
+                loadedCfg.baseConfigPath,
+                configLoaded
+            )
+            || !ensureModelConfigured(
+                yamlCfg.models,
+                yamlCfg.useModelTrainScorer,
+                "train scorer model",
+                configPath,
+                loadedCfg.baseConfigPath,
+                configLoaded
+            )
+            || !ensureModelConfigured(
+                yamlCfg.models,
+                yamlCfg.useModelTrainOptimizer,
+                "train ooptimizer model",
+                configPath,
+                loadedCfg.baseConfigPath,
+                configLoaded
+            )) {
+            return 1;
+        }
+
+        auto config                                    = buildDefaultConfig();
+        config->dataDir                                = resolvedDataDir;
+        config->workDir                                = resolvedWorkDir;
+        config->logPrintToolcall                       = false;
+        config->logPrintMessagesBeforeLLM              = false;
+        config->logPrintMessagesBeforeLLMWithSystemMsg = false;
+        config->logPrintSummarizationResultTokenCount  = false;
+        applyModelToConfig(config, yamlCfg.models, yamlCfg.useModelTrain);
+
+        auto scorerConfig                                    = buildDefaultConfig();
+        scorerConfig->dataDir                                = resolvedDataDir;
+        scorerConfig->workDir                                = resolvedWorkDir;
+        scorerConfig->logPrintToolcall                       = false;
+        scorerConfig->logPrintMessagesBeforeLLM              = false;
+        scorerConfig->logPrintMessagesBeforeLLMWithSystemMsg = false;
+        scorerConfig->logPrintSummarizationResultTokenCount  = false;
+        applyModelToConfig(scorerConfig, yamlCfg.models, yamlCfg.useModelTrainScorer);
+
+        auto optimizerConfig                                    = buildDefaultConfig();
+        optimizerConfig->dataDir                                = resolvedDataDir;
+        optimizerConfig->workDir                                = resolvedWorkDir;
+        optimizerConfig->logPrintToolcall                       = false;
+        optimizerConfig->logPrintMessagesBeforeLLM              = false;
+        optimizerConfig->logPrintMessagesBeforeLLMWithSystemMsg = false;
+        optimizerConfig->logPrintSummarizationResultTokenCount  = false;
+        applyModelToConfig(optimizerConfig, yamlCfg.models, yamlCfg.useModelTrainOptimizer);
+
+        runTrainingMode(config, scorerConfig, optimizerConfig);
+        return 0;
+    }
+
+    if (mode == "acp") {
+        if (!ensureModelConfigured(
+                yamlCfg.models,
+                yamlCfg.useModelAcp,
+                "ACP model",
+                configPath,
+                loadedCfg.baseConfigPath,
+                configLoaded
+            )) {
+            return 1;
+        }
+
+        auto config                                   = buildDefaultConfig();
+        config->dataDir                               = resolvedDataDir;
+        config->workDir                               = resolvedWorkDir;
+        config->logPrintToolcall                      = false;
+        config->logPrintMessagesBeforeLLM             = false;
+        config->logPrintSummarizationResultTokenCount = false;
+        applyModelToConfig(config, yamlCfg.models, yamlCfg.useModelAcp);
+        applySubagentModelToConfig(config, yamlCfg.models, yamlCfg.useModelSubagent);
+        applyWebSearchModelToConfig(config, yamlCfg.models, yamlCfg.useModelWebSearch);
+        // 共享运行时装配 (插件/MCP/Skill/Memory/权限/子代理): ACP 模式下 agent
+        // 运行在独立进程 (分离进程启动), 与 server/tui 模式一致需要完整装配;
+        // 曾缺失导致 acp 启动的 agent 不加载任何插件
+        applySharedRuntimeConfig(config, yamlCfg, resolvePath);
+        // CodeGraph 参数经 plugins 配置传递 (主程序不解析 args 字段语义)
+        if (!validateStartupConfig(config, configPath)) {
+            return 1;
+        }
+        auto agent = std::make_shared<agentxx::agent::CodeAgent>(config);
+        asio::co_spawn(
+            *agent->ioCtx,
+            [agent]() -> asio::awaitable<void> {
+                co_await agent->init();
+                agentxx::protocol::StdioAcpServer server(agent, utilxx_base::Json::object());
+                server.run();
+                co_return;
+            },
+            asio::detached
+        );
+        agent->ioCtx->run();
+        return 0;
+    }
+
+    auto config     = buildDefaultConfig();
+    config->dataDir = resolvedDataDir;
+    config->workDir = resolvedWorkDir;
+    applyModelToConfig(config, yamlCfg.models, yamlCfg.useModelDefault);
+    applySubagentModelToConfig(config, yamlCfg.models, yamlCfg.useModelSubagent);
+    applyWebSearchModelToConfig(config, yamlCfg.models, yamlCfg.useModelWebSearch);
+    applyAvailableModelsToConfig(config, yamlCfg.models, yamlCfg.useModelDefault);
+    applySharedRuntimeConfig(config, yamlCfg, resolvePath);
+
+    // 配置校验: 结构/语义 + 路径存在性与权限组合
+    // - 致命问题 (无可用模型 / 必需绝对路径写错 / 持久化目录不可用) 在此终止启动
+    // - 警告照常启动 (内存降级、会被夹取的取值、白黑名单重复等)
+    if (!validateStartupConfig(config, configPath)) {
+        return 1;
+    }
+
+    // ======================== JSONL stdio 一次性运行模式 ========================
+    // 与 server 模式同一套 Wire 协议与同一份会话驱动实现, 传输换成 stdin/stdout 逐行 JSON:
+    // - stdout 只写协议行 (可被外部脚本逐行解析), 日志与诊断走 stderr
+    // - 对端从 hello_ack 的 sessionId 读回会话 id; 输入受理回执不等于轮次完成,
+    //   轮次结束以 turn_result 为准 (见 agentxx-client/io/jsonl/jsonl_mode.h)
+    if (mode == "jsonl") {
+        if (!ensureModelConfigured(
+                yamlCfg.models,
+                yamlCfg.useModelDefault,
+                "default model",
+                configPath,
+                loadedCfg.baseConfigPath,
+                configLoaded
+            )) {
+            return 1;
+        }
+        // 与 cli 模式一致: 关闭工具调用/消息正文的日志打印, 让 stderr 只剩诊断信息
+        config->logPrintToolcall                       = false;
+        config->logPrintMessagesBeforeLLM              = false;
+        config->logPrintMessagesBeforeLLMWithSystemMsg = false;
+        config->logPrintSummarizationResultTokenCount  = false;
+        auto agent = std::make_shared<agentxx::agent::CodeAgent>(config);
+        agentxx::client::runJsonlStdio(agent, jsonlSessionId);
+        return 0;
+    }
+
+    // ======================== TUI 全局设置持久化 ========================
+    // 全局设置 (主题/动画等级/日志等级/末尾思考/界面语言等) 存于 {dataDir}/sqlite/global.db,
+    // 绑定到 TUISettings 单例, 设置变更时同步落库, 重启后恢复
+    // - dataDir 未配置 (为空) 时: 回退使用系统默认数据目录 (Platform Default),
+    // 确保设置可靠持久化到数据库
+    // - 注意: 系统资源显示开关已迁移到 agentxx_system_monitor 插件 (命令 /sysinfo)
+    if (mode == "tui") {
+        const std::string globalDbDir = resolvedDataDir.empty()
+                                            ? agentxx::agent::AgentConfigStatic::systemDataDir()
+                                            : resolvedDataDir;
+        auto              settingsDb  = std::make_shared<agentxx::util::SettingsDb>(
+            agentxx::agent::AgentConfigStatic::getGlobalSettingsDbPath(globalDbDir)
+        );
+        TUISettings::instance().attachDb(std::move(settingsDb));
+        // 本地会话 Agent 语言默认同步为 TUI 设置项恢复出的实际生效语言 ("zh-cn" 或 "en")
+        config->language = TUISettings::instance().languageCode();
+    }
+
+    // ======================== CodeAgent Websocket Server 服务模式 ========================
+    if (mode == "server") {
+        if (!ensureModelConfigured(
+                yamlCfg.models,
+                yamlCfg.useModelDefault,
+                "default model",
+                configPath,
+                loadedCfg.baseConfigPath,
+                configLoaded
+            )) {
+            return 1;
+        }
+
+        config->logPrintToolcall                       = false;
+        config->logPrintMessagesBeforeLLM              = false;
+        config->logPrintMessagesBeforeLLMWithSystemMsg = false;
+        config->logPrintSummarizationResultTokenCount  = false;
+
+        auto agent = std::make_shared<agentxx::agent::CodeAgent>(config);
+
+        agentxx::agent::io::AgentServer::Config srvCfg;
+        srvCfg.http.address = srvHost;
+        srvCfg.http.port    = srvPort;
+        srvCfg.token        = agentToken;
+        auto server         = std::make_shared<agentxx::agent::io::AgentServer>(agent, srvCfg);
+
+        asio::co_spawn(
+            *agent->ioCtx,
+            [agent, server]() -> asio::awaitable<void> {
+                co_await agent->init();
+                server->start(co_await asio::this_coro::executor);
+                co_return;
+            },
+            asio::detached
+        );
+        asio::co_spawn(
+            *agent->ioCtx,
+            [agent, server]() -> asio::awaitable<void> {
+                asio::signal_set           signals(*agent->ioCtx, SIGINT, SIGTERM);
+                utilxx_base::AsioErrorCode ec;
+                co_await signals.async_wait(asio::redirect_error(asio::use_awaitable, ec));
+                XX_LOGI("[agent_server] signal received, shutting down ({})...", ec.message());
+                server->stop();
+                agent->ioCtx->stop();
+                co_return;
+            },
+            asio::detached
+        );
+        agent->ioCtx->run();
+        return 0;
+    }
+
+    // ======================== 远程 client + agent server模式 (--agent) ========================
+    // client 和 agent 不在同一个进程中，使用网络交互
+    if (!agentUrl.empty()) {
+        utilxx_base::LogDispatcher::instance().removeSink(defaultLogSink);
+        if (mode == "tui") {
+            config->logPrintToolcall                       = false;
+            config->logPrintMessagesBeforeLLM              = false;
+            config->logPrintMessagesBeforeLLMWithSystemMsg = false;
+            config->logPrintSummarizationResultTokenCount  = true;
+            // 远程 client 进程只加载 client 侧插件 (yaml plugins 段经 sides
+            // 过滤, 见 ClientPluginManager::loadConfiguredClientPlugins)
+            runRemoteTui(agentUrl, agentToken, remoteModel, config->plugins);
+        } else {
+            config->logPrintToolcall                       = false;
+            config->logPrintMessagesBeforeLLM              = false;
+            config->logPrintMessagesBeforeLLMWithSystemMsg = false;
+            config->logPrintSummarizationResultTokenCount  = false;
+            runRemoteCli(agentUrl, agentToken, remoteModel, config->plugins);
+        }
+        return 0;
+    }
+
+    // ======================== 同一进程内 client + agent 模式 ========================
+    // client 和 agent 在同一个进程中，使用线程间数据交互
+    // (remote 模式已在上面 return, 此处为本地 tui/cli, 均需本地模型)
+    if (!ensureModelConfigured(
+            yamlCfg.models,
+            yamlCfg.useModelDefault,
+            "default model",
+            configPath,
+            loadedCfg.baseConfigPath,
+            configLoaded
+        )) {
+        return 1;
+    }
+
+    if (mode == "tui") {
+        utilxx_base::LogDispatcher::instance().removeSink(defaultLogSink);
+        config->logPrintToolcall                       = false;
+        config->logPrintMessagesBeforeLLM              = false;
+        config->logPrintMessagesBeforeLLMWithSystemMsg = false;
+        config->logPrintSummarizationResultTokenCount  = true;
+        auto agent = std::make_shared<agentxx::agent::CodeAgent>(config);
+        // 双端插件: agent 侧经 BaseAgent::init 加载 (同 config->plugins),
+        // client 侧经 runLocalTuiUnified 加载 (sides 过滤)
+        runLocalTuiUnified(agent, config->plugins);
+    } else {
+        utilxx_base::LogDispatcher::instance().removeSink(defaultLogSink);
+        config->logPrintToolcall                       = false;
+        config->logPrintMessagesBeforeLLM              = false;
+        config->logPrintMessagesBeforeLLMWithSystemMsg = false;
+        config->logPrintSummarizationResultTokenCount  = false;
+        auto agent = std::make_shared<agentxx::agent::CodeAgent>(config);
+        runLocalCliUnified(agent, config->plugins);
+    }
+    return 0;
+}

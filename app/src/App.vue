@@ -15,6 +15,7 @@ import ImportPlaylistModal from '@/components/ImportPlaylistModal.vue'
 import { usePlayerStore } from '@/stores/player'
 import { useLibraryStore } from '@/stores/library'
 import { useUiStore } from '@/stores/ui'
+import { installGlobalShortcuts } from '@/platform/useGlobalShortcuts'
 import { useDownloadStore } from '@/stores/download'
 import { on } from '@/api'
 
@@ -80,64 +81,19 @@ watch(
   { immediate: true }
 )
 
-function isTyping(e: KeyboardEvent): boolean {
-  const t = e.target as HTMLElement | null
-  if (!t) return false
-  const tag = t.tagName
-  return tag === 'INPUT' || tag === 'TEXTAREA' || t.isContentEditable
-}
-
-function onKey(e: KeyboardEvent): void {
-  if (isLyric.value) return
-  const mod = e.ctrlKey || e.metaKey
-  if (mod && e.key.toLowerCase() === 'k') {
-    e.preventDefault()
-    topbar.value?.focusSearch()
-    return
-  }
-  // 规格书 v2.7 · 1.9：输入框聚焦时所有播放快捷键都不响应
-  if (isTyping(e)) return
-  const key = e.key.toLowerCase()
-  if (e.code === 'Space') {
-    e.preventDefault()
-    void player.toggle()
-  } else if (e.key === 'Escape') {
-    player.queueOpen = false
-  } else if (mod && e.key === 'ArrowRight') {
-    e.preventDefault()
-    void player.next()
-  } else if (mod && e.key === 'ArrowLeft') {
-    e.preventDefault()
-    void player.prev()
-  } else if (e.key === 'ArrowRight') {
-    e.preventDefault()
-    void player.seekTo(Math.min(player.duration, player.displayPosition + 5))
-  } else if (e.key === 'ArrowLeft') {
-    e.preventDefault()
-    void player.seekTo(Math.max(0, player.displayPosition - 5))
-  } else if (e.key === 'ArrowUp') {
-    e.preventDefault()
-    void player.setVolume(Math.min(1, Math.round((player.state.volume + 0.05) * 100) / 100))
-  } else if (e.key === 'ArrowDown') {
-    e.preventDefault()
-    void player.setVolume(Math.max(0, Math.round((player.state.volume - 0.05) * 100) / 100))
-  } else if (mod && key === 'l') {
-    e.preventDefault()
-    void player.cycleMode()
-  } else if (mod && key === 'd') {
-    e.preventDefault()
-    void ui.patch({ showDesktopLyric: !ui.settings.showDesktopLyric })
-  } else if (e.key === 'ArrowRight' && e.altKey) {
-    void player.next()
-  } else if (e.key === 'ArrowLeft' && e.altKey) {
-    void player.prev()
-  }
-}
+/** Bug 6：桌面快捷键统一走 useGlobalShortcuts 模块（App 内不再内联重复实现） */
+let offShortcuts: (() => void) | null = null
 
 let offNavigate: (() => void) | null = null
 
 onMounted(() => {
-  window.addEventListener('keydown', onKey)
+  offShortcuts = installGlobalShortcuts({
+    player,
+    ui,
+    router,
+    focusSearch: () => topbar.value?.focusSearch(),
+    disabled: () => isLyric.value,
+  })
   // 下载队列全局初始化：侧栏计数、进度事件从启动就生效，不必等进入下载页
   void download.init()
   // 移动端：全局边缘右滑返回（Android 肌肉记忆手势）
@@ -148,7 +104,8 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
-  window.removeEventListener('keydown', onKey)
+  offShortcuts?.()
+  offShortcuts = null
   offNavigate?.()
 })
 </script>
@@ -162,7 +119,8 @@ onBeforeUnmount(() => {
   <div v-else-if="isMobileApp" class="m-shell">
     <main ref="content" class="m-content">
       <RouterView v-slot="{ Component, route: r }">
-        <KeepAlive :include="['Home', 'Discover', 'Mv']">
+        <!-- Bug 72：KeepAlive 扩展到全部 Tab 根页（返回保留列表状态） -->
+        <KeepAlive :include="['Home', 'Discover', 'Mv', 'Mine', 'Search', 'Local', 'Downloads', 'Offline', 'History', 'Favorites']">
           <component :is="Component" :key="r.name === 'playlist' || r.name === 'toplist' ? r.fullPath : undefined" />
         </KeepAlive>
       </RouterView>
@@ -178,7 +136,8 @@ onBeforeUnmount(() => {
       <TopBar ref="topbar" />
       <main ref="content" class="content">
         <RouterView v-slot="{ Component, route: r }">
-          <KeepAlive :include="['Home', 'Discover', 'Mv']">
+          <!-- Bug 72：KeepAlive 扩展到全部 Tab 根页（返回保留列表状态） -->
+        <KeepAlive :include="['Home', 'Discover', 'Mv', 'Mine', 'Search', 'Local', 'Downloads', 'Offline', 'History', 'Favorites']">
             <component :is="Component" :key="r.name === 'playlist' || r.name === 'toplist' ? r.fullPath : undefined" />
           </KeepAlive>
         </RouterView>

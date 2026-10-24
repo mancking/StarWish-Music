@@ -1,0 +1,1389 @@
+//
+// 测试方式: 直接链接 libagentxx (静态副本也含 ffi_api 实现, 符号一致) 并以
+// 纯 C 方式调用 agentxx_* 导出接口; mock OpenAI 兼容 HTTP 服务器模拟 LLM。
+// 覆盖:
+//  1. 版本/内存/错误串
+//  2. create 错误路径 (非法 JSON/缺模型) → NULL + AgentxxString log 详情
+//  3. 生命周期 + 会话对话: create→start→EVT_READY→send_input→流式 DELTA→TURN_END
+//  4. 同步查询: get_model_info / get_context_messages / list_sessions
+//  5. HIL 权限中断: mock 返回工具调用 → EVT_INTERRUPT_REQ → 后台线程应答 → 轮次恢复
+//  6. 取消: 慢 LLM 响应中 agentxx_ffi_cancel → TURN_END interrupted
+//  7. 状态错误: stop 后 send_input → AGENTXX_FFI_ERR_STATE; drain_logs
+//  8. 事件队列: agentxx_ffi_event_queue_* 往返测试
+#include "agentxx-test/test_ffi_c_api.h"
+
+#include "agentxx/ffi_api.h"
+#include "agentxx/version.h"
+#include "utilxx/http_server.h"
+#include "utilxx_base/json.h"
+
+#if XX_IS_WIN_D
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
+#include <atomic>
+#include <chrono>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace {
+
+static std::string findPluginDir(const char* pluginName) {
+    namespace fs = std::filesystem;
+    std::error_code       ec;
+    std::vector<fs::path> candidates;
+    if (auto exeDir = agentxx::test::executableDir()) {
+        candidates.push_back(*exeDir / "plugins" / pluginName);
+    }
+    candidates.push_back(fs::current_path(ec) / "plugins" / pluginName);
+    auto hasLibFile = [](const fs::path& dir) {
+        std::error_code                     ec2;
+        std::filesystem::directory_iterator it(dir, ec2);
+        std::filesystem::directory_iterator end;
+        for (; it != end; it.increment(ec2)) {
+            auto ext = it->path().extension().string();
+            if (ext == ".so" || ext == ".dll" || ext == ".dylib") {
+                return true;
+            }
+        }
+        return false;
+    };
+    for (const auto& c : candidates) {
+        if (fs::is_directory(c, ec) && hasLibFile(c)) {
+            return c.string();
+        }
+    }
+    return std::string{"plugins/"} + pluginName;
+}
+
+// 本模块测试计数器 (仅本编译单元可见; 不经头文件 extern 导出)
+int g_ffi_passed = 0;
+int g_ffi_failed = 0;
+
+// 断言计数宏覆盖: 将 test_framework.h 的 XX_TEST_EXPECT_* 映射到本模块计数器
+#define XX_TEST_PASSED g_ffi_passed
+#define XX_TEST_FAILED g_ffi_failed
+
+// ---------------------------------------------------------------------------
+// 事件记录器 (C 回调 → 线程安全事件列表)
+// ---------------------------------------------------------------------------
+
+struct FfiEventRecorder {
+    mutable std::mutex                                       m;
+    std::vector<std::pair<AgentxxFFIEventType, std::string>> events;
+
+    static void AGENTXX_FFI_CALL onEvent(int32_t type, const AgentxxStringView* payload, void* ud) {
+        auto* self = static_cast<FfiEventRecorder*>(ud);
+        if (self == nullptr) {
+            return;
+        }
+        std::string s;
+        if (payload != nullptr && payload->data != nullptr && payload->size > 0) {
+            s.assign(payload->data, static_cast<size_t>(payload->size));
+        }
+        std::lock_guard<std::mutex> lock(self->m);
+        self->events.emplace_back(static_cast<AgentxxFFIEventType>(type), std::move(s));
+    }
+
+    bool has(AgentxxFFIEventType t) const {
+        std::lock_guard<std::mutex> lock(m);
+        for (const auto& [type, payload] : events) {
+            if (type == t) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// 等待某种事件出现 (轮询, 最多 timeoutMs)
+    bool wait(AgentxxFFIEventType t, int timeoutMs) {
+        const auto deadline
+            = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (has(t)) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        return has(t);
+    }
+
+    /// 返回首个匹配事件的 payload
+    std::string first(AgentxxFFIEventType t) const {
+        std::lock_guard<std::mutex> lock(m);
+        for (const auto& [type, payload] : events) {
+            if (type == t) {
+                return payload;
+            }
+        }
+        return {};
+    }
+
+    /// 出现过 kind=xxx 的 delta
+    bool hasDeltaKind(const char* kind) const {
+        std::lock_guard<std::mutex> lock(m);
+        for (const auto& [type, payload] : events) {
+            if (type != AGENTXX_FFI_EVT_DELTA) {
+                continue;
+            }
+            try {
+                auto j = utilxx_base::Json::parse(payload);
+                if (j.value("kind", std::string{}) == kind) {
+                    return true;
+                }
+            } catch (...) {
+            }
+        }
+        return false;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// mock OpenAI 兼容 LLM 服务器 (非流式 /chat/completions)
+// ---------------------------------------------------------------------------
+
+struct FfiMockLLM {
+    std::unique_ptr<utilxx::HttpServer> server;
+    std::thread                         thread;
+    std::atomic<int>                    requestCount{0};
+    /// 首个请求返回工具调用 (模拟需要权限/输入的工具选择)
+    bool firstIsToolCall = false;
+    /// >0 时响应前延迟 (取消测试用)
+    int slowMs = 0;
+
+    /// 最近一次 /chat/completions 的请求体 (供测试断言上下文与附件组装)
+    std::mutex  bodyMutex;
+    std::string lastRequestBody;
+
+    std::string capturedBody() {
+        std::lock_guard<std::mutex> lock(bodyMutex);
+        return lastRequestBody;
+    }
+
+    ~FfiMockLLM() {
+        stop();
+    }
+
+    /// 文本流式 SSE chunks (openai chat completion 流式格式)
+    static std::string textSse(std::string_view content) {
+        const std::string id = "chatcmpl-ffi-mock";
+        return std::string("data: ") + utilxx_base::Json{
+            {"id", id},
+            {"object", "chat.completion.chunk"},
+            {"model", "ffi-mock"},
+            {"choices", utilxx_base::Json::array({
+                utilxx_base::Json{{"index", 0}, {"delta", {{"role", "assistant"}, {"content", ""}}}},
+            })},
+        }.dump() + "\n\n"
+        + "data: " + utilxx_base::Json{
+            {"id", id},
+            {"object", "chat.completion.chunk"},
+            {"model", "ffi-mock"},
+            {"choices", utilxx_base::Json::array({
+                utilxx_base::Json{{"index", 0}, {"delta", {{"content", content}}}},
+            })},
+        }.dump() + "\n\n"
+        + "data: " + utilxx_base::Json{
+            {"id", id},
+            {"object", "chat.completion.chunk"},
+            {"model", "ffi-mock"},
+            {"choices", utilxx_base::Json::array({
+                utilxx_base::Json{{"index", 0}, {"delta", utilxx_base::Json::object()}, {"finish_reason", "stop"}},
+            })},
+        }.dump() + "\n\n"
+        + "data: [DONE]\n\n";
+    }
+
+    /// 工具调用流式 SSE chunks
+    static std::string toolCallSse(const char* toolName, std::string_view argsJson) {
+        const std::string id = "chatcmpl-ffi-tool";
+        return std::string("data: ") + utilxx_base::Json{
+            {"id", id},
+            {"object", "chat.completion.chunk"},
+            {"model", "ffi-mock"},
+            {"choices", utilxx_base::Json::array({
+                utilxx_base::Json{
+                    {"index", 0},
+                    {"delta", {
+                        {"role", "assistant"},
+                        {"tool_calls", utilxx_base::Json::array({
+                            utilxx_base::Json{
+                                {"index", 0},
+                                {"id", "call-ffi-1"},
+                                {"type", "function"},
+                                {"function", {{"name", toolName}, {"arguments", argsJson}}},
+                            },
+                        })},
+                    }},
+                },
+            })},
+        }.dump() + "\n\n"
+        + "data: " + utilxx_base::Json{
+            {"id", id},
+            {"object", "chat.completion.chunk"},
+            {"model", "ffi-mock"},
+            {"choices", utilxx_base::Json::array({
+                utilxx_base::Json{{"index", 0}, {"delta", utilxx_base::Json::object()}, {"finish_reason", "tool_calls"}},
+            })},
+        }.dump() + "\n\n"
+        + "data: [DONE]\n\n";
+    }
+
+    bool start(uint16_t& outPort) {
+        server = std::make_unique<utilxx::HttpServer>(
+            utilxx::HttpServer::Config{.address = "127.0.0.1", .port = 0, .ioThreads = 1}
+        );
+        auto handler = std::make_shared<utilxx::HttpServer::Handler>(
+            [this](
+                utilxx::HttpServer::Request& req,
+                utilxx::HttpServer::Response& resp,
+                std::string_view
+            ) -> asio::awaitable<void> {
+                {
+                    // 记录请求体: 附件/上下文组装断言的数据来源
+                    std::lock_guard<std::mutex> lock(bodyMutex);
+                    lastRequestBody = std::string{req.body()};
+                }
+                const int n = requestCount.fetch_add(1);
+                if (slowMs > 0) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(slowMs));
+                }
+                resp.result(boost::beast::http::status::ok);
+                resp.set(boost::beast::http::field::content_type, "text/event-stream");
+                resp.set(boost::beast::http::field::cache_control, "no-cache");
+                resp.keep_alive(false);
+                if (n == 0 && firstIsToolCall) {
+                    resp.body()
+                        = toolCallSse("agentxx_filesystem_read", R"({"path": "/etc/hostname"})");
+                } else {
+                    resp.body() = textSse("hello from ffi mock");
+                }
+                resp.prepare_payload();
+                co_return;
+            }
+        );
+        server->router().add("/chat/completions", 2, handler);
+        server->router().add("/v1/chat/completions", 2, handler);
+        thread = std::thread([s = server.get()]() {
+            s->start();
+        });
+        for (int i = 0; i < 100; ++i) {
+            outPort = server->port();
+            if (outPort != 0) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        stop();
+        return false;
+    }
+
+    void stop() {
+        if (server) {
+            server->stop();
+        }
+        if (thread.joinable()) {
+            thread.join();
+            thread = std::thread{};
+        }
+        server.reset();
+    }
+
+    /// 构造 model_json 指向本 mock
+    /// - `multimodal` 为 true 时声明多模态输入能力 (对齐 yaml 的
+    ///   image_input/audio_input/video_input), 用于校验能力经
+    ///   EVT_MODEL_INFO / get_model_info 的 capabilities 下发
+    std::string modelJson(bool multimodal = false) const {
+        auto j = utilxx_base::Json{
+            {"name",      "ffi-mock"                                          },
+            {"type",      "openai"                                            },
+            {"baseUrl",   "http://127.0.0.1:" + std::to_string(server->port())},
+            {"apiKey",    "EMPTY"                                             },
+            {"modelName", "ffi-mock"                                          },
+        };
+        if (multimodal) {
+            j["imageInput"] = true;
+            j["videoInput"] = true;
+        }
+        return j.dump();
+    }
+};
+
+// ---------------------------------------------------------------------------
+// 测试用例
+// ---------------------------------------------------------------------------
+
+/// 1) 版本 / 内存 / 错误串
+void testVersionAndMemory() {
+    XX_TEST_EXPECT_GE(agentxx_ffi_api_version(), AGENTXX_FFI_API_VERSION);
+    AgentxxStringView libVer{};
+    XX_TEST_EXPECT_EQ(agentxx_ffi_library_version(&libVer), AGENTXX_FFI_OK);
+    XX_TEST_EXPECT_TRUE(libVer.data != nullptr && libVer.size > 0);
+    XX_TEST_EXPECT_EQ(std::string_view(libVer.data, libVer.size), agentxx::kVersion);
+
+    AgentxxStringView errOk{};
+    XX_TEST_EXPECT_EQ(agentxx_ffi_strerror(AGENTXX_FFI_OK, &errOk), AGENTXX_FFI_OK);
+    XX_TEST_EXPECT_TRUE(std::string_view(errOk.data, errOk.size) == "success");
+
+    AgentxxStringView errInv{};
+    XX_TEST_EXPECT_EQ(agentxx_ffi_strerror(AGENTXX_FFI_ERR_INVALID, &errInv), AGENTXX_FFI_OK);
+    XX_TEST_EXPECT_TRUE(std::string_view(errInv.data, errInv.size) == "invalid argument");
+
+    // strdup_n / free 往返
+    const char*   text   = "hello ffi";
+    auto          textSv = agentxx_string_view_cstr(text);
+    AgentxxString dup{};
+    XX_TEST_EXPECT_EQ(agentxx_ffi_strdup_n(&textSv, &dup), AGENTXX_FFI_OK);
+    XX_TEST_EXPECT_TRUE(dup.data != nullptr && dup.size == std::strlen(text));
+    XX_TEST_EXPECT_TRUE(std::strcmp(dup.data, text) == 0);
+    agentxx_ffi_string_free(&dup);
+
+    // 带 NUL 的任意字节段
+    const char    bytes[] = {'a', 'b', '\0', 'c', 'd'};
+    auto          bytesSv = agentxx_string_view(bytes, sizeof(bytes));
+    AgentxxString p{};
+    XX_TEST_EXPECT_EQ(agentxx_ffi_strdup_n(&bytesSv, &p), AGENTXX_FFI_OK);
+    XX_TEST_EXPECT_TRUE(p.data != nullptr && p.size == sizeof(bytes));
+    XX_TEST_EXPECT_TRUE(std::memcmp(p.data, bytes, sizeof(bytes)) == 0);
+    agentxx_ffi_string_free(&p);
+}
+
+/// 2) create 错误路径 → NULL + AgentxxString log
+void testCreateInvalid() {
+    AgentxxString log{};
+
+    // 无模型配置
+    AgentxxFFIAgent* a = agentxx_ffi_create(nullptr, nullptr, nullptr, &log);
+    XX_TEST_EXPECT_TRUE(a == nullptr);
+    XX_TEST_EXPECT_TRUE(log.data != nullptr && std::strstr(log.data, "模型配置") != nullptr);
+    agentxx_ffi_string_free(&log);
+
+    // config_json 非法 JSON
+    auto badConfigSv  = agentxx_string_view_cstr("{not json");
+    auto emptyModelSv = agentxx_string_view_cstr("{}");
+    a                 = agentxx_ffi_create(&badConfigSv, &emptyModelSv, nullptr, &log);
+    XX_TEST_EXPECT_TRUE(a == nullptr);
+    XX_TEST_EXPECT_TRUE(log.data != nullptr && std::strstr(log.data, "非法 JSON") != nullptr);
+    agentxx_ffi_string_free(&log);
+
+    // model_json 非法 (无 baseUrl/apiKey → isValid() 失败)
+    auto badModelSv = agentxx_string_view_cstr("{\"name\":\"x\"}");
+    a               = agentxx_ffi_create(nullptr, &badModelSv, nullptr, &log);
+    XX_TEST_EXPECT_TRUE(a == nullptr);
+    XX_TEST_EXPECT_TRUE(log.data != nullptr && std::strstr(log.data, "模型配置非法") != nullptr);
+    agentxx_ffi_string_free(&log);
+
+    // NULL 句柄校验
+    XX_TEST_EXPECT_EQ(agentxx_ffi_destroy(nullptr, &log), AGENTXX_FFI_ERR_INVALID);
+    agentxx_ffi_string_free(&log);
+}
+
+/// 3) 生命周期 + 会话对话 + 同步查询 (mock LLM)
+void testLifecycleAndConversation() {
+    FfiMockLLM mock;
+    uint16_t   port = 0;
+    if (!mock.start(port)) {
+        TEST_FAIL << "mock LLM server start failed" << std::endl;
+        g_ffi_failed++;
+        return;
+    }
+
+    FfiEventRecorder    rec;
+    AgentxxFFICallbacks cb;
+    std::memset(&cb, 0, sizeof(cb));
+    cb.on_event  = FfiEventRecorder::onEvent;
+    cb.user_data = &rec;
+
+    // 本用例声明多模态能力: 校验能力清单经 get_model_info / EVT_MODEL_INFO 下发
+    AgentxxString    log{};
+    auto             modelJsonStr = mock.modelJson(/*multimodal=*/true);
+    auto             modelJsonSv  = agentxx_string_view(modelJsonStr.data(), modelJsonStr.size());
+    AgentxxFFIAgent* a            = agentxx_ffi_create(nullptr, &modelJsonSv, &cb, &log);
+    if (a == nullptr) {
+        TEST_FAIL << "create failed: " << (log.data ? log.data : "?") << std::endl;
+        agentxx_ffi_string_free(&log);
+        g_ffi_failed++;
+        mock.stop();
+        return;
+    }
+
+    // start → 等待 EVT_READY
+    XX_TEST_EXPECT_EQ(agentxx_ffi_start(a, &log), AGENTXX_FFI_OK);
+    XX_TEST_EXPECT_TRUE(rec.wait(AGENTXX_FFI_EVT_READY, 20000));
+    // READY payload 含 sessionId
+    {
+        auto ready = rec.first(AGENTXX_FFI_EVT_READY);
+        XX_TEST_EXPECT_TRUE(ready.find("\"sessionId\"") != std::string::npos);
+    }
+
+    // 同步查询: 模型信息 (含各模型多模态能力清单)
+    AgentxxString mi{};
+    XX_TEST_EXPECT_EQ(agentxx_ffi_get_model_info(a, &mi, &log), AGENTXX_FFI_OK);
+    XX_TEST_EXPECT_TRUE(mi.data != nullptr && std::strstr(mi.data, "currentModel") != nullptr);
+    // 能力清单: model_json 的 imageInput/videoInput 声明应原样出现在 capabilities 中
+    // (嵌入方程序据此判断是否展示图片/视频输入入口; 缺失时能力判定失效)
+    XX_TEST_EXPECT_TRUE(mi.data != nullptr && std::strstr(mi.data, "capabilities") != nullptr);
+    if (mi.data != nullptr) {
+        try {
+            auto j      = utilxx_base::Json::parse(std::string_view(mi.data, mi.size));
+            auto caps   = j.value("capabilities", utilxx_base::Json::array());
+            bool hasCap = false;
+            for (const auto& c : caps) {
+                if (c.value("name", std::string{}) != "ffi-mock") {
+                    continue;
+                }
+                hasCap = true;
+                XX_TEST_EXPECT_TRUE(c.value("image_input", false));
+                XX_TEST_EXPECT_TRUE(c.value("video_input", false));
+                // 未声明的能力保持 false (音频输入)
+                XX_TEST_EXPECT_FALSE(c.value("audio_input", true));
+            }
+            XX_TEST_EXPECT_TRUE(hasCap);
+        } catch (...) {
+            g_ffi_failed++;
+            TEST_FAIL << "model_info payload not JSON" << std::endl;
+        }
+    }
+    agentxx_ffi_string_free(&mi);
+
+    // 发送输入 → 流式 delta → 轮次结束
+    auto inputSv = agentxx_string_view_cstr(R"({"text":"hello"})");
+    XX_TEST_EXPECT_EQ(agentxx_ffi_send_input(a, &inputSv, &log), AGENTXX_FFI_OK);
+    XX_TEST_EXPECT_TRUE(rec.wait(AGENTXX_FFI_EVT_TURN_END, 30000));
+    XX_TEST_EXPECT_TRUE(rec.hasDeltaKind("text_token"));
+    // TURN_END 无错误
+    {
+        auto turn = rec.first(AGENTXX_FFI_EVT_TURN_END);
+        try {
+            auto j = utilxx_base::Json::parse(turn);
+            XX_TEST_EXPECT_TRUE(j.value("hasError", true) == false);
+        } catch (...) {
+            g_ffi_failed++;
+            TEST_FAIL << "TURN_END payload not JSON: " << turn << std::endl;
+        }
+    }
+    // 应收到过 EVT_MODEL_INFO (启动时自动请求); 事件载荷同样带能力清单
+    XX_TEST_EXPECT_TRUE(rec.has(AGENTXX_FFI_EVT_MODEL_INFO));
+    {
+        auto info = rec.first(AGENTXX_FFI_EVT_MODEL_INFO);
+        try {
+            auto j = utilxx_base::Json::parse(info);
+            XX_TEST_EXPECT_TRUE(j.contains("capabilities"));
+            auto caps = j.value("capabilities", utilxx_base::Json::array());
+            XX_TEST_EXPECT_FALSE(caps.empty());
+            bool imageInput = false;
+            for (const auto& c : caps) {
+                if (c.value("image_input", false)) {
+                    imageInput = true;
+                }
+            }
+            XX_TEST_EXPECT_TRUE(imageInput);
+        } catch (...) {
+            g_ffi_failed++;
+            TEST_FAIL << "MODEL_INFO payload not JSON: " << info << std::endl;
+        }
+    }
+
+    // 同步查询: LLM 上下文 (一轮后应有 user/assistant 消息)
+    AgentxxString ctx{};
+    XX_TEST_EXPECT_EQ(agentxx_ffi_get_context_messages(a, &ctx, &log), AGENTXX_FFI_OK);
+    XX_TEST_EXPECT_TRUE(ctx.data != nullptr);
+    if (ctx.data != nullptr) {
+        try {
+            auto j = utilxx_base::Json::parse(std::string_view(ctx.data, ctx.size));
+            XX_TEST_EXPECT_TRUE(j.contains("messages") && j["messages"].is_array());
+            XX_TEST_EXPECT_TRUE(j["messages"].size() > 0);
+        } catch (...) {
+            g_ffi_failed++;
+            TEST_FAIL << "context payload not JSON: " << ctx.data << std::endl;
+        }
+        agentxx_ffi_string_free(&ctx);
+    }
+
+    // 同步查询: 持久化会话列表 (未开启持久化 → 空数组)
+    AgentxxString sess{};
+    XX_TEST_EXPECT_EQ(agentxx_ffi_list_sessions(a, &sess, &log), AGENTXX_FFI_OK);
+    XX_TEST_EXPECT_TRUE(sess.data != nullptr);
+    if (sess.data != nullptr) {
+        try {
+            auto j = utilxx_base::Json::parse(std::string_view(sess.data, sess.size));
+            XX_TEST_EXPECT_TRUE(j.contains("sessions") && j["sessions"].is_array());
+        } catch (...) {
+            g_ffi_failed++;
+            TEST_FAIL << "sessions payload not JSON: " << sess.data << std::endl;
+        }
+        agentxx_ffi_string_free(&sess);
+    }
+
+    // 日志 drain (至少返回合法 JSON 数组)
+    AgentxxString logs{};
+    XX_TEST_EXPECT_EQ(agentxx_ffi_drain_logs(a, &logs, &log), AGENTXX_FFI_OK);
+    XX_TEST_EXPECT_TRUE(logs.data != nullptr);
+    if (logs.data != nullptr) {
+        try {
+            auto j = utilxx_base::Json::parse(std::string_view(logs.data, logs.size));
+            XX_TEST_EXPECT_TRUE(j.is_array());
+        } catch (...) {
+            g_ffi_failed++;
+            TEST_FAIL << "drain_logs not JSON array: " << logs.data << std::endl;
+        }
+        agentxx_ffi_string_free(&logs);
+    }
+
+    // 停止 → 销毁 (幂等 stop)
+    XX_TEST_EXPECT_EQ(agentxx_ffi_stop(a, &log), AGENTXX_FFI_OK);
+    XX_TEST_EXPECT_EQ(agentxx_ffi_stop(a, &log), AGENTXX_FFI_OK);
+    XX_TEST_EXPECT_EQ(agentxx_ffi_destroy(a, &log), AGENTXX_FFI_OK);
+
+    // 停止后: 状态错误
+    auto xSv = agentxx_string_view_cstr(R"({"text":"x"})");
+    XX_TEST_EXPECT_EQ(agentxx_ffi_send_input(nullptr, &xSv, &log), AGENTXX_FFI_ERR_INVALID);
+    agentxx_ffi_string_free(&log);
+    mock.stop();
+}
+
+/// 4) HIL 权限中断: mock 首轮返回工具调用 → 权限询问 → 后台应答 → 轮次恢复
+void testHilInterrupt() {
+    FfiMockLLM mock;
+    mock.firstIsToolCall = true;
+    uint16_t port        = 0;
+    if (!mock.start(port)) {
+        TEST_FAIL << "mock LLM server start failed" << std::endl;
+        g_ffi_failed++;
+        return;
+    }
+
+    FfiEventRecorder    rec;
+    AgentxxFFICallbacks cb;
+    std::memset(&cb, 0, sizeof(cb));
+    cb.on_event  = FfiEventRecorder::onEvent;
+    cb.user_data = &rec;
+
+    std::string pluginDir  = findPluginDir("agentxx_filesystem");
+    std::string configJson = R"({"permissionMode": "all_ask"})";
+    if (!pluginDir.empty()) {
+        try {
+            auto cfg       = utilxx_base::Json::parse(configJson);
+            cfg["plugins"] = utilxx_base::Json::array({utilxx_base::Json{{"path", pluginDir}}});
+            configJson     = cfg.dump();
+        } catch (...) {
+            TEST_FAIL << "inject plugins config failed" << std::endl;
+            g_ffi_failed++;
+            mock.stop();
+            return;
+        }
+    }
+
+    AgentxxString    log{};
+    auto             cfgSv   = agentxx_string_view(configJson.data(), configJson.size());
+    auto             mjson   = mock.modelJson();
+    auto             mjsonSv = agentxx_string_view(mjson.data(), mjson.size());
+    AgentxxFFIAgent* a       = agentxx_ffi_create(&cfgSv, &mjsonSv, &cb, &log);
+    if (a == nullptr) {
+        TEST_FAIL << "create failed: " << (log.data ? log.data : "?") << std::endl;
+        agentxx_ffi_string_free(&log);
+        mock.stop();
+        g_ffi_failed++;
+        return;
+    }
+    XX_TEST_EXPECT_EQ(agentxx_ffi_start(a, &log), AGENTXX_FFI_OK);
+    XX_TEST_EXPECT_TRUE(rec.wait(AGENTXX_FFI_EVT_READY, 20000));
+
+    auto cmdSv = agentxx_string_view_cstr(R"({"text":"read /etc/hostname"})");
+    XX_TEST_EXPECT_EQ(agentxx_ffi_send_input(a, &cmdSv, &log), AGENTXX_FFI_OK);
+
+    // 等待权限中断请求
+    XX_TEST_EXPECT_TRUE(rec.wait(AGENTXX_FFI_EVT_INTERRUPT_REQ, 30000));
+    XX_TEST_EXPECT_FALSE(rec.has(AGENTXX_FFI_EVT_INTERRUPT_EXPIRED));
+
+    // 校验中断 payload 并取 interruptId
+    int64_t interruptId = -1;
+    {
+        auto payload = rec.first(AGENTXX_FFI_EVT_INTERRUPT_REQ);
+        try {
+            auto j      = utilxx_base::Json::parse(payload);
+            interruptId = j.value("interruptId", int64_t{-1});
+            XX_TEST_EXPECT_TRUE(interruptId > 0);
+            std::string argJson = j.value("argJson", std::string{});
+            XX_TEST_EXPECT_TRUE(argJson.find("permission") != std::string::npos);
+            // UI 描述必填: 权限询问下发权限卡片描述 (分段头/勾选项/一键按钮)
+            // - 文案只带 i18n 键 (字面文本由客户端词表提供), 故按键校验
+            XX_TEST_EXPECT_TRUE(argJson.find("\"ui\"") != std::string::npos);
+            XX_TEST_EXPECT_TRUE(argJson.find("interrupt.permissionBadge") != std::string::npos);
+        } catch (...) {
+            g_ffi_failed++;
+            TEST_FAIL << "interrupt payload not JSON: " << payload << std::endl;
+        }
+    }
+
+    // 在独立线程延迟应答 allow (模拟嵌入方程序 UI 异步操作)
+    int32_t     respondRc = -999;
+    std::thread responder([a, interruptId, &respondRc]() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        AgentxxString lg{};
+        // 应答载荷恒为对象形态 {"values": {"<控件 id>": 值}}
+        auto valSv = agentxx_string_view_cstr(R"({"values":{"decision":"true","remember":false}})");
+        respondRc  = agentxx_ffi_interrupt_respond(a, interruptId, &valSv, &lg);
+        agentxx_ffi_string_free(&lg);
+    });
+
+    // 轮次应恢复并结束
+    XX_TEST_EXPECT_TRUE(rec.wait(AGENTXX_FFI_EVT_TURN_END, 30000));
+    XX_TEST_EXPECT_TRUE(respondRc == 0);
+    responder.join();
+    {
+        auto turn = rec.first(AGENTXX_FFI_EVT_TURN_END);
+        try {
+            auto j = utilxx_base::Json::parse(turn);
+            XX_TEST_EXPECT_TRUE(j.value("hasError", true) == false);
+        } catch (...) {
+            g_ffi_failed++;
+            TEST_FAIL << "TURN_END payload not JSON: " << turn << std::endl;
+        }
+    }
+
+    // 已应答后, 再次应答同一 id 应报无效
+    AgentxxString lg{};
+    auto          valSv = agentxx_string_view_cstr(R"({"values":{"decision":"true"}})");
+    XX_TEST_EXPECT_EQ(
+        agentxx_ffi_interrupt_respond(a, interruptId, &valSv, &lg),
+        AGENTXX_FFI_ERR_INTERRUPT
+    );
+    agentxx_ffi_string_free(&lg);
+
+    // 契约外载荷 (非对象/values 非对象) 应被拒绝 (不兼容旧的数组应答)
+    {
+        AgentxxString lg2{};
+        auto          arrSv = agentxx_string_view_cstr(R"(["true"])");
+        XX_TEST_EXPECT_EQ(
+            agentxx_ffi_interrupt_respond(a, interruptId, &arrSv, &lg2),
+            AGENTXX_FFI_ERR_INVALID
+        );
+        agentxx_ffi_string_free(&lg2);
+
+        AgentxxString lg3{};
+        auto          oldSv = agentxx_string_view_cstr(R"({"values":["true"],"options":{}})");
+        XX_TEST_EXPECT_EQ(
+            agentxx_ffi_interrupt_respond(a, interruptId, &oldSv, &lg3),
+            AGENTXX_FFI_ERR_INVALID
+        );
+        agentxx_ffi_string_free(&lg3);
+    }
+
+    XX_TEST_EXPECT_EQ(agentxx_ffi_stop(a, &log), AGENTXX_FFI_OK);
+    XX_TEST_EXPECT_EQ(agentxx_ffi_destroy(a, &log), AGENTXX_FFI_OK);
+    mock.stop();
+}
+
+/// 5) 取消: 慢 LLM 响应中取消 → TURN_END interrupted
+void testCancel() {
+    FfiMockLLM mock;
+    mock.slowMs   = 1500;
+    uint16_t port = 0;
+    if (!mock.start(port)) {
+        TEST_FAIL << "mock LLM server start failed" << std::endl;
+        g_ffi_failed++;
+        return;
+    }
+
+    FfiEventRecorder    rec;
+    AgentxxFFICallbacks cb;
+    std::memset(&cb, 0, sizeof(cb));
+    cb.on_event  = FfiEventRecorder::onEvent;
+    cb.user_data = &rec;
+
+    AgentxxString    log{};
+    auto             mjson   = mock.modelJson();
+    auto             mjsonSv = agentxx_string_view(mjson.data(), mjson.size());
+    AgentxxFFIAgent* a       = agentxx_ffi_create(nullptr, &mjsonSv, &cb, &log);
+    if (a == nullptr) {
+        TEST_FAIL << "create failed" << std::endl;
+        agentxx_ffi_string_free(&log);
+        mock.stop();
+        g_ffi_failed++;
+        return;
+    }
+    XX_TEST_EXPECT_EQ(agentxx_ffi_start(a, &log), AGENTXX_FFI_OK);
+    XX_TEST_EXPECT_TRUE(rec.wait(AGENTXX_FFI_EVT_READY, 20000));
+
+    auto runSv = agentxx_string_view_cstr(R"({"text":"run slow"})");
+    XX_TEST_EXPECT_EQ(agentxx_ffi_send_input(a, &runSv, &log), AGENTXX_FFI_OK);
+    // 模拟用户提前取消
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    XX_TEST_EXPECT_EQ(agentxx_ffi_cancel(a, &log), AGENTXX_FFI_OK);
+
+    XX_TEST_EXPECT_TRUE(rec.wait(AGENTXX_FFI_EVT_TURN_END, 20000));
+    {
+        auto turn = rec.first(AGENTXX_FFI_EVT_TURN_END);
+        try {
+            auto j = utilxx_base::Json::parse(turn);
+            XX_TEST_EXPECT_TRUE(j.value("hasError", false) == true);
+            XX_TEST_EXPECT_TRUE(
+                j.value("errorMessage", std::string{}).find("Cancelled") != std::string::npos
+            );
+        } catch (...) {
+            g_ffi_failed++;
+            TEST_FAIL << "TURN_END payload not JSON: " << turn << std::endl;
+        }
+    }
+
+    XX_TEST_EXPECT_EQ(agentxx_ffi_stop(a, &log), AGENTXX_FFI_OK);
+    XX_TEST_EXPECT_EQ(agentxx_ffi_destroy(a, &log), AGENTXX_FFI_OK);
+    mock.stop();
+}
+
+/// 6) 多 Runtime 并发独立运行测试 (独立线程模型)
+void testMultipleRuntimesConcurrent() {
+    FfiMockLLM mock;
+    uint16_t   port = 0;
+    if (!mock.start(port)) {
+        TEST_FAIL << "mock LLM server start failed" << std::endl;
+        g_ffi_failed++;
+        return;
+    }
+
+    constexpr size_t kRuntimeCount = 3;
+
+    struct RuntimeSlot {
+        AgentxxFFIAgent* agent = nullptr;
+        FfiEventRecorder rec;
+    };
+
+    std::vector<RuntimeSlot> slots(kRuntimeCount);
+
+    for (size_t i = 0; i < kRuntimeCount; ++i) {
+        AgentxxFFICallbacks cb;
+        std::memset(&cb, 0, sizeof(cb));
+        cb.on_event  = FfiEventRecorder::onEvent;
+        cb.user_data = &slots[i].rec;
+
+        AgentxxString log{};
+        auto          mjson   = mock.modelJson();
+        auto          mjsonSv = agentxx_string_view(mjson.data(), mjson.size());
+        slots[i].agent        = agentxx_ffi_create(nullptr, &mjsonSv, &cb, &log);
+        XX_TEST_EXPECT_TRUE(slots[i].agent != nullptr);
+        XX_TEST_EXPECT_EQ(agentxx_ffi_start(slots[i].agent, &log), AGENTXX_FFI_OK);
+        agentxx_ffi_string_free(&log);
+    }
+
+    // 等待所有 runtime 就绪
+    for (size_t i = 0; i < kRuntimeCount; ++i) {
+        XX_TEST_EXPECT_TRUE(slots[i].rec.wait(AGENTXX_FFI_EVT_READY, 20000));
+    }
+
+    // 并发发送输入
+    for (size_t i = 0; i < kRuntimeCount; ++i) {
+        AgentxxString log{};
+        auto          slotSv = agentxx_string_view_cstr(R"({"text":"Hello from slot"})");
+        XX_TEST_EXPECT_EQ(agentxx_ffi_send_input(slots[i].agent, &slotSv, &log), AGENTXX_FFI_OK);
+        agentxx_ffi_string_free(&log);
+    }
+
+    // 等待各 slot 独立收到 TURN_END
+    for (size_t i = 0; i < kRuntimeCount; ++i) {
+        XX_TEST_EXPECT_TRUE(slots[i].rec.wait(AGENTXX_FFI_EVT_TURN_END, 20000));
+    }
+
+    // 并发停止与销毁
+    for (size_t i = 0; i < kRuntimeCount; ++i) {
+        AgentxxString log{};
+        XX_TEST_EXPECT_EQ(agentxx_ffi_stop(slots[i].agent, &log), AGENTXX_FFI_OK);
+        agentxx_ffi_string_free(&log);
+        XX_TEST_EXPECT_EQ(agentxx_ffi_destroy(slots[i].agent, &log), AGENTXX_FFI_OK);
+        agentxx_ffi_string_free(&log);
+    }
+
+    mock.stop();
+}
+
+/// 7) send_input 的 JSON 参数: 附件透传、本地限额校验、拒绝回执
+void testSendInputJsonAndAttachments() {
+    FfiMockLLM mock;
+    uint16_t   port = 0;
+    if (!mock.start(port)) {
+        TEST_FAIL << "mock LLM server start failed" << std::endl;
+        g_ffi_failed++;
+        return;
+    }
+
+    FfiEventRecorder    rec;
+    AgentxxFFICallbacks cb;
+    std::memset(&cb, 0, sizeof(cb));
+    cb.on_event  = FfiEventRecorder::onEvent;
+    cb.user_data = &rec;
+
+    AgentxxString    log{};
+    auto             mjson   = mock.modelJson(/*multimodal=*/true);
+    auto             mjsonSv = agentxx_string_view(mjson.data(), mjson.size());
+    AgentxxFFIAgent* a       = agentxx_ffi_create(nullptr, &mjsonSv, &cb, &log);
+    XX_TEST_EXPECT_TRUE(a != nullptr);
+    XX_TEST_EXPECT_EQ(agentxx_ffi_start(a, &log), AGENTXX_FFI_OK);
+    XX_TEST_EXPECT_TRUE(rec.wait(AGENTXX_FFI_EVT_READY, 20000));
+
+    // ---- 参数校验 (同步返回, 不产生轮次) ----
+    {
+        // 非法 JSON
+        auto badSv = agentxx_string_view_cstr("{not json");
+        XX_TEST_EXPECT_EQ(agentxx_ffi_send_input(a, &badSv, &log), AGENTXX_FFI_ERR_JSON);
+        agentxx_ffi_string_free(&log);
+
+        // 非对象
+        auto arrSv = agentxx_string_view_cstr(R"(["hello"])");
+        XX_TEST_EXPECT_EQ(agentxx_ffi_send_input(a, &arrSv, &log), AGENTXX_FFI_ERR_INVALID);
+        agentxx_ffi_string_free(&log);
+
+        // text 与 attachments 都为空
+        auto emptySv = agentxx_string_view_cstr(R"({"text":""})");
+        XX_TEST_EXPECT_EQ(agentxx_ffi_send_input(a, &emptySv, &log), AGENTXX_FFI_ERR_INVALID);
+        XX_TEST_EXPECT_TRUE(
+            log.data != nullptr && std::strstr(log.data, "至少需要") != nullptr
+        );
+        agentxx_ffi_string_free(&log);
+
+        // attachments 不是数组
+        auto badAttSv = agentxx_string_view_cstr(R"({"text":"x","attachments":"oops"})");
+        XX_TEST_EXPECT_EQ(agentxx_ffi_send_input(a, &badAttSv, &log), AGENTXX_FFI_ERR_INVALID);
+        agentxx_ffi_string_free(&log);
+
+        // 附件条数超限 (上限 5): log 写明是条数问题
+        std::string tooMany = R"({"text":"x","attachments":[)";
+        for (int i = 0; i < 6; ++i) {
+            tooMany += (i == 0 ? "" : ",");
+            tooMany += fmt::format(R"({{"type":"image","name":"i{}.png","size":10}})", i);
+        }
+        tooMany += "]}";
+        auto tooManySv = agentxx_string_view(tooMany.data(), tooMany.size());
+        XX_TEST_EXPECT_EQ(agentxx_ffi_send_input(a, &tooManySv, &log), AGENTXX_FFI_ERR_INVALID);
+        XX_TEST_EXPECT_TRUE(
+            log.data != nullptr && std::strstr(log.data, "条数") != nullptr
+        );
+        agentxx_ffi_string_free(&log);
+
+        // 单个附件超大小上限 (图片 10MB; 声明 15MB)
+        auto oversizeSv = agentxx_string_view_cstr(
+            R"({"text":"x","attachments":[{"type":"image","name":"big.png","size":15728640}]})"
+        );
+        XX_TEST_EXPECT_EQ(agentxx_ffi_send_input(a, &oversizeSv, &log), AGENTXX_FFI_ERR_INVALID);
+        XX_TEST_EXPECT_TRUE(
+            log.data != nullptr && std::strstr(log.data, "上限") != nullptr
+        );
+        agentxx_ffi_string_free(&log);
+
+        // 以上非法输入都不应开启轮次
+        XX_TEST_EXPECT_FALSE(rec.has(AGENTXX_FFI_EVT_TURN_END));
+    }
+
+    // ---- 合法附件: 组装进 LLM 请求体 (1x1 PNG, dataUrl 直传) ----
+    const std::string dataUrl
+        = "data:image/png;base64,"
+          "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9"
+          "awAAAABJRU5ErkJggg==";
+    std::string inputJson = fmt::format(
+        R"({{"text":"看一下这张图","attachments":[{{"kind":"image","name":"diagram.png",)"
+        R"("mimeType":"image/png","dataUrl":"{}","size":68}}]}})",
+        dataUrl
+    );
+    auto inputSv = agentxx_string_view(inputJson.data(), inputJson.size());
+    XX_TEST_EXPECT_EQ(agentxx_ffi_send_input(a, &inputSv, &log), AGENTXX_FFI_OK);
+    XX_TEST_EXPECT_TRUE(rec.wait(AGENTXX_FFI_EVT_TURN_END, 30000));
+
+    // 受理回执 (input_ack) 经 EVT_WIRE 透出: 嵌入方程序据此展示受理状态与拒绝原因
+    {
+        bool sawAck = false;
+        for (const auto& [type, payload] : [&]() {
+                 std::lock_guard<std::mutex> lock(rec.m);
+                 return rec.events;
+             }()) {
+            if (type != AGENTXX_FFI_EVT_WIRE) {
+                continue;
+            }
+            auto j = utilxx_base::Json::parse(payload);
+            if (j.value("type", std::string{}) != "input_ack") {
+                continue;
+            }
+            sawAck = true;
+            // 附件输入按 next-turn 排队, 空闲时即开始执行
+            XX_TEST_EXPECT_TRUE(j.contains("requestId"));
+            XX_TEST_EXPECT_FALSE(j.value("status", std::string{}).empty());
+            XX_TEST_EXPECT_TRUE(j.value("reason", std::string{}).empty());
+        }
+        XX_TEST_EXPECT_TRUE(sawAck);
+    }
+
+    // LLM 请求体应带图片内容段: content 为数组且含 image_url 分片
+    {
+        auto body = mock.capturedBody();
+        XX_TEST_EXPECT_TRUE(!body.empty());
+        bool found = false;
+        if (!body.empty()) {
+            auto j     = utilxx_base::Json::parse(body);
+            auto msgs  = j.value("messages", utilxx_base::Json::array());
+            for (const auto& m : msgs) {
+                if (!m.contains("content") || !m["content"].is_array()) {
+                    continue;
+                }
+                for (const auto& part : m["content"]) {
+                    if (!part.is_object() || !part.contains("type")) {
+                        continue;
+                    }
+                    if (part["type"].get<std::string>() != "image_url") {
+                        continue;
+                    }
+                    found = true;
+                    XX_TEST_EXPECT_EQ(
+                        part["image_url"].value("url", std::string{}),
+                        dataUrl
+                    );
+                }
+            }
+        }
+        XX_TEST_EXPECT_TRUE(found);
+    }
+
+    XX_TEST_EXPECT_EQ(agentxx_ffi_destroy(a, &log), AGENTXX_FFI_OK);
+    mock.stop();
+}
+
+/// 7) 事件队列往返测试
+void testEventQueue() {
+    auto* q = agentxx_ffi_event_queue_create();
+    XX_TEST_EXPECT_TRUE(q != nullptr);
+
+    // 探测空队列超时
+    int32_t       type = -1;
+    AgentxxString jsonOut{};
+    XX_TEST_EXPECT_EQ(agentxx_ffi_event_queue_pop(q, &type, &jsonOut, 50), AGENTXX_FFI_ERR_TIMEOUT);
+
+    // 模拟投递事件
+    auto evtJson = agentxx_string_view_cstr(R"({"sessionId":"test_sess_123"})");
+    agentxx_ffi_event_queue_on_event(AGENTXX_FFI_EVT_READY, &evtJson, q);
+
+    // 出队成功
+    XX_TEST_EXPECT_EQ(agentxx_ffi_event_queue_pop(q, &type, &jsonOut, 100), AGENTXX_FFI_OK);
+    XX_TEST_EXPECT_EQ(type, AGENTXX_FFI_EVT_READY);
+    XX_TEST_EXPECT_TRUE(jsonOut.data != nullptr);
+    if (jsonOut.data != nullptr) {
+        XX_TEST_EXPECT_TRUE(std::strstr(jsonOut.data, "test_sess_123") != nullptr);
+        agentxx_ffi_string_free(&jsonOut);
+    }
+
+    agentxx_ffi_event_queue_free(q);
+}
+
+} // namespace
+
+namespace agentxx {
+namespace test {
+
+void testLanguageApis() {
+    FfiMockLLM mock;
+    uint16_t   port = 0;
+    if (!mock.start(port)) {
+        TEST_FAIL << "mock LLM server start failed" << std::endl;
+        g_ffi_failed++;
+        return;
+    }
+    auto mjson   = mock.modelJson();
+    auto mjsonSv = agentxx_string_view(mjson.data(), mjson.size());
+
+    // 1. 默认语言测试: 未配置 language 时默认 "en"
+    {
+        AgentxxString    log{};
+        AgentxxFFIAgent* a = agentxx_ffi_create(nullptr, &mjsonSv, nullptr, &log);
+        XX_TEST_EXPECT_TRUE(a != nullptr);
+
+        // 启动前读取语言
+        AgentxxString langOut{};
+        XX_TEST_EXPECT_EQ(agentxx_ffi_get_language(a, &langOut, &log), AGENTXX_FFI_OK);
+        XX_TEST_EXPECT_TRUE(langOut.data != nullptr);
+        if (langOut.data != nullptr) {
+            XX_TEST_EXPECT_EQ(std::string(langOut.data, langOut.size), std::string("en"));
+        }
+        agentxx_ffi_string_free(&langOut);
+
+        // 启动
+        XX_TEST_EXPECT_EQ(agentxx_ffi_start(a, &log), AGENTXX_FFI_OK);
+
+        // 切换为 zh-cn
+        auto zhSv = agentxx_string_view_cstr("zh-cn");
+        XX_TEST_EXPECT_EQ(agentxx_ffi_set_language(a, &zhSv, &log), AGENTXX_FFI_OK);
+
+        XX_TEST_EXPECT_EQ(agentxx_ffi_get_language(a, &langOut, &log), AGENTXX_FFI_OK);
+        XX_TEST_EXPECT_TRUE(langOut.data != nullptr);
+        if (langOut.data != nullptr) {
+            XX_TEST_EXPECT_EQ(std::string(langOut.data, langOut.size), std::string("zh-cn"));
+        }
+        agentxx_ffi_string_free(&langOut);
+
+        // 不支持 auto: 设为 auto 自动回退为 en
+        auto autoSv = agentxx_string_view_cstr("auto");
+        XX_TEST_EXPECT_EQ(agentxx_ffi_set_language(a, &autoSv, &log), AGENTXX_FFI_OK);
+
+        XX_TEST_EXPECT_EQ(agentxx_ffi_get_language(a, &langOut, &log), AGENTXX_FFI_OK);
+        XX_TEST_EXPECT_TRUE(langOut.data != nullptr);
+        if (langOut.data != nullptr) {
+            XX_TEST_EXPECT_EQ(std::string(langOut.data, langOut.size), std::string("en"));
+        }
+        agentxx_ffi_string_free(&langOut);
+
+        // 错误参数校验
+        XX_TEST_EXPECT_EQ(
+            agentxx_ffi_get_language(nullptr, &langOut, nullptr),
+            AGENTXX_FFI_ERR_INVALID
+        );
+        XX_TEST_EXPECT_EQ(agentxx_ffi_get_language(a, nullptr, nullptr), AGENTXX_FFI_ERR_INVALID);
+        XX_TEST_EXPECT_EQ(
+            agentxx_ffi_set_language(nullptr, &zhSv, nullptr),
+            AGENTXX_FFI_ERR_INVALID
+        );
+
+        // 未声明多模态的模型 (本用例的 model_json 无 imageInput/audioInput/videoInput):
+        // 能力清单仍在, 但各项均为 false (不误报可用)
+        AgentxxString mi{};
+        XX_TEST_EXPECT_EQ(agentxx_ffi_get_model_info(a, &mi, &log), AGENTXX_FFI_OK);
+        if (mi.data != nullptr) {
+            try {
+                auto j = utilxx_base::Json::parse(std::string_view(mi.data, mi.size));
+                XX_TEST_EXPECT_TRUE(j.contains("capabilities"));
+                for (const auto& c : j.value("capabilities", utilxx_base::Json::array())) {
+                    if (c.value("name", std::string{}) != "ffi-mock") {
+                        continue;
+                    }
+                    XX_TEST_EXPECT_FALSE(c.value("image_input", true));
+                    XX_TEST_EXPECT_FALSE(c.value("audio_input", true));
+                    XX_TEST_EXPECT_FALSE(c.value("video_input", true));
+                }
+            } catch (...) {
+                g_ffi_failed++;
+                TEST_FAIL << "model_info payload not JSON" << std::endl;
+            }
+        }
+        agentxx_ffi_string_free(&mi);
+
+        XX_TEST_EXPECT_EQ(agentxx_ffi_stop(a, &log), AGENTXX_FFI_OK);
+        XX_TEST_EXPECT_EQ(agentxx_ffi_destroy(a, &log), AGENTXX_FFI_OK);
+    }
+
+    // 2. config_json 指定初始 language: "zh-cn"
+    {
+        AgentxxString    log{};
+        std::string      cfgStr = "{\"language\": \"zh-cn\"}";
+        auto             cfgSv  = agentxx_string_view_cstr(cfgStr.c_str());
+        AgentxxFFIAgent* a      = agentxx_ffi_create(&cfgSv, &mjsonSv, nullptr, &log);
+        XX_TEST_EXPECT_TRUE(a != nullptr);
+
+        AgentxxString langOut{};
+        XX_TEST_EXPECT_EQ(agentxx_ffi_get_language(a, &langOut, &log), AGENTXX_FFI_OK);
+        XX_TEST_EXPECT_TRUE(langOut.data != nullptr);
+        if (langOut.data != nullptr) {
+            XX_TEST_EXPECT_EQ(std::string(langOut.data, langOut.size), std::string("zh-cn"));
+        }
+        agentxx_ffi_string_free(&langOut);
+
+        XX_TEST_EXPECT_EQ(agentxx_ffi_destroy(a, &log), AGENTXX_FFI_OK);
+    }
+    mock.stop();
+}
+
+/// 9) 能力清单查询: agentxx_ffi_get_capabilities
+void testCapabilities() {
+    AgentxxString log{};
+    AgentxxString capsOut{};
+
+    // 1. 无 handle 时亦可查询库基础能力
+    XX_TEST_EXPECT_EQ(agentxx_ffi_get_capabilities(nullptr, &capsOut, &log), AGENTXX_FFI_OK);
+    XX_TEST_EXPECT_TRUE(capsOut.data != nullptr);
+    if (capsOut.data != nullptr) {
+        try {
+            auto j = utilxx_base::Json::parse(std::string_view(capsOut.data, capsOut.size));
+            XX_TEST_EXPECT_EQ(j.value("apiVersion", 0), AGENTXX_FFI_API_VERSION);
+            XX_TEST_EXPECT_TRUE(j.contains("capabilities"));
+            auto caps = j["capabilities"];
+            XX_TEST_EXPECT_TRUE(caps.is_array());
+            auto hasCap = [&](const char* name) {
+                for (const auto& c : caps) {
+                    if (c.is_string() && c.get<std::string>() == name) {
+                        return true;
+                    }
+                }
+                return false;
+            };
+            XX_TEST_EXPECT_TRUE(hasCap(AGENTXX_FFI_CAP_ADD_MODEL));
+            XX_TEST_EXPECT_TRUE(hasCap(AGENTXX_FFI_CAP_REMOVE_MODEL));
+            XX_TEST_EXPECT_TRUE(hasCap(AGENTXX_FFI_CAP_LIST_MODELS));
+            XX_TEST_EXPECT_TRUE(hasCap(AGENTXX_FFI_CAP_HOST_TOOLS));
+            XX_TEST_EXPECT_TRUE(hasCap(AGENTXX_FFI_CAP_WIRE_PASSTHROUGH));
+            XX_TEST_EXPECT_TRUE(hasCap(AGENTXX_FFI_CAP_DELTA_BATCH));
+        } catch (...) {
+            g_ffi_failed++;
+            TEST_FAIL << "capabilities payload not valid JSON" << std::endl;
+        }
+    }
+    agentxx_ffi_string_free(&capsOut);
+
+    // 2. 参数校验: null out
+    XX_TEST_EXPECT_EQ(
+        agentxx_ffi_get_capabilities(nullptr, nullptr, &log),
+        AGENTXX_FFI_ERR_INVALID
+    );
+    agentxx_ffi_string_free(&log);
+}
+
+/// 10) 模型管理: add_model / remove_model / list_models
+/// - 用临时 dataDir: 模型配置会落到 {dataDir}/agentxx-config.yaml, 必须与真实
+///   用户数据目录隔离 (否则污染 ~/.agentxx 的配置, 重复运行还因同名模型失败)
+void testModelManagement() {
+    FfiMockLLM mock;
+    uint16_t   port = 0;
+    if (!mock.start(port)) {
+        TEST_FAIL << "mock LLM server start failed" << std::endl;
+        g_ffi_failed++;
+        return;
+    }
+
+    namespace fs = std::filesystem;
+    const auto tmpDataDir
+        = fs::temp_directory_path()
+          / ("ffi_model_mgmt_"
+             + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::error_code ec;
+    fs::remove_all(tmpDataDir, ec);
+    fs::create_directories(tmpDataDir, ec);
+    const std::string cfgJson
+        = utilxx_base::Json{{"dataDir", tmpDataDir.generic_string()}}.dump();
+
+    AgentxxString    log{};
+    auto             cfgSv   = agentxx_string_view(cfgJson.data(), cfgJson.size());
+    auto             mjson   = mock.modelJson();
+    auto             mjsonSv = agentxx_string_view(mjson.data(), mjson.size());
+    AgentxxFFIAgent* a       = agentxx_ffi_create(&cfgSv, &mjsonSv, nullptr, &log);
+    XX_TEST_EXPECT_TRUE(a != nullptr);
+    XX_TEST_EXPECT_EQ(agentxx_ffi_start(a, &log), AGENTXX_FFI_OK);
+
+    // 1. 列举初始模型
+    AgentxxString listOut{};
+    XX_TEST_EXPECT_EQ(agentxx_ffi_list_models(a, &listOut, &log), AGENTXX_FFI_OK);
+    XX_TEST_EXPECT_TRUE(listOut.data != nullptr);
+    agentxx_ffi_string_free(&listOut);
+
+    // 2. 添加模型配置
+    std::string newModelJson = fmt::format(
+        R"({{"name":"new-mock-model","type":"openai","baseUrl":"http://127.0.0.1:{}/v1","apiKey":"EMPTY"}})",
+        port
+    );
+    auto newModelSv = agentxx_string_view(newModelJson.data(), newModelJson.size());
+    XX_TEST_EXPECT_EQ(agentxx_ffi_add_model(a, &newModelSv, &log), AGENTXX_FFI_OK);
+
+    // 2b. 落盘校验: 模型已写入临时 dataDir 的 yaml (先落盘后注册)
+    {
+        const auto yamlPath = tmpDataDir / "agentxx-config.yaml";
+        XX_TEST_EXPECT_TRUE(fs::exists(yamlPath, ec));
+        if (auto text = [&]() -> std::string {
+                std::ifstream f(yamlPath, std::ios::binary);
+                return f ? std::string((std::istreambuf_iterator<char>(f)), {}) : std::string{};
+            }();
+            !text.empty()) {
+            XX_TEST_EXPECT_TRUE(text.find("new-mock-model") != std::string::npos);
+        }
+    }
+
+    // 3. 再次列举模型, 校验新模型存在
+    XX_TEST_EXPECT_EQ(agentxx_ffi_list_models(a, &listOut, &log), AGENTXX_FFI_OK);
+    if (listOut.data != nullptr) {
+        std::string s(listOut.data, listOut.size);
+        XX_TEST_EXPECT_TRUE(s.find("new-mock-model") != std::string::npos);
+    }
+    agentxx_ffi_string_free(&listOut);
+
+    // 3b. 重名添加应被拒绝 (配置里已有同名模型)
+    XX_TEST_EXPECT_TRUE(
+        agentxx_ffi_add_model(a, &newModelSv, &log) != AGENTXX_FFI_OK
+    );
+    agentxx_ffi_string_free(&log);
+
+    // 4. 尝试删除当前正在使用的模型 (应被拒绝):
+    // - add_model 成功即把发起会话切到新模型, 因此这里先验证"正在使用"这一保护,
+    //   再切回 ffi-mock 才能删掉新模型
+    auto addModelSv = agentxx_string_view_cstr("new-mock-model");
+    XX_TEST_EXPECT_EQ(agentxx_ffi_remove_model(a, &addModelSv, &log), AGENTXX_FFI_ERR_CONFIG);
+    agentxx_ffi_string_free(&log);
+
+    // 4b. 配置里的主模型 (currentModelName) 同样不可删除
+    auto curModelSv = agentxx_string_view_cstr("ffi-mock");
+    XX_TEST_EXPECT_EQ(agentxx_ffi_remove_model(a, &curModelSv, &log), AGENTXX_FFI_ERR_CONFIG);
+    agentxx_ffi_string_free(&log);
+
+    // 4c. 切回主模型 (select_model 走同一 client io 队列, 与后续删除保持先后序)
+    XX_TEST_EXPECT_EQ(agentxx_ffi_select_model(a, &curModelSv, &log), AGENTXX_FFI_OK);
+    // 确认切换已生效 (查询是同步应答, 排在 select_model 之后)
+    {
+        AgentxxString mi{};
+        XX_TEST_EXPECT_EQ(agentxx_ffi_get_model_info(a, &mi, &log), AGENTXX_FFI_OK);
+        if (mi.data != nullptr) {
+            auto j = utilxx_base::Json::parse(std::string_view(mi.data, mi.size));
+            XX_TEST_EXPECT_EQ(j.value("currentModel", std::string{}), std::string{"ffi-mock"});
+        }
+        agentxx_ffi_string_free(&mi);
+    }
+
+    // 5. 成功删除新模型
+    auto delModelSv = agentxx_string_view_cstr("new-mock-model");
+    XX_TEST_EXPECT_EQ(agentxx_ffi_remove_model(a, &delModelSv, &log), AGENTXX_FFI_OK);
+
+    // 5b. 落盘校验: 条目已从 yaml 移除 (重启后不会复现)
+    {
+        std::ifstream f(tmpDataDir / "agentxx-config.yaml", std::ios::binary);
+        const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        XX_TEST_EXPECT_TRUE(text.find("new-mock-model") == std::string::npos);
+    }
+
+    // 5c. 删除后列表里不再有该模型
+    XX_TEST_EXPECT_EQ(agentxx_ffi_list_models(a, &listOut, &log), AGENTXX_FFI_OK);
+    if (listOut.data != nullptr) {
+        std::string s(listOut.data, listOut.size);
+        XX_TEST_EXPECT_TRUE(s.find("new-mock-model") == std::string::npos);
+    }
+    agentxx_ffi_string_free(&listOut);
+
+    // 6. 再次删除已不存在的模型 (应报错)
+    XX_TEST_EXPECT_EQ(agentxx_ffi_remove_model(a, &delModelSv, &log), AGENTXX_FFI_ERR_CONFIG);
+    agentxx_ffi_string_free(&log);
+
+    // 7. 参数校验: 非法 JSON / 空名称
+    {
+        auto badSv = agentxx_string_view_cstr("{not json");
+        XX_TEST_EXPECT_EQ(agentxx_ffi_add_model(a, &badSv, &log), AGENTXX_FFI_ERR_JSON);
+        agentxx_ffi_string_free(&log);
+
+        auto noNameSv = agentxx_string_view_cstr(R"({"baseUrl":"http://127.0.0.1:1/v1"})");
+        XX_TEST_EXPECT_EQ(agentxx_ffi_add_model(a, &noNameSv, &log), AGENTXX_FFI_ERR_CONFIG);
+        agentxx_ffi_string_free(&log);
+
+        auto emptyNameSv = agentxx_string_view_cstr("");
+        XX_TEST_EXPECT_EQ(
+            agentxx_ffi_remove_model(a, &emptyNameSv, &log),
+            AGENTXX_FFI_ERR_INVALID
+        );
+        agentxx_ffi_string_free(&log);
+    }
+
+    XX_TEST_EXPECT_EQ(agentxx_ffi_destroy(a, &log), AGENTXX_FFI_OK);
+    mock.stop();
+
+    std::error_code cleanupEc;
+    fs::remove_all(tmpDataDir, cleanupEc);
+}
+
+/// 11) Wire 透传: agentxx_ffi_send_wire (黑白名单校验)
+void testSendWire() {
+    FfiMockLLM mock;
+    uint16_t   port = 0;
+    if (!mock.start(port)) {
+        TEST_FAIL << "mock LLM server start failed" << std::endl;
+        g_ffi_failed++;
+        return;
+    }
+
+    AgentxxString    log{};
+    auto             mjson   = mock.modelJson();
+    auto             mjsonSv = agentxx_string_view(mjson.data(), mjson.size());
+    AgentxxFFIAgent* a       = agentxx_ffi_create(nullptr, &mjsonSv, nullptr, &log);
+    XX_TEST_EXPECT_TRUE(a != nullptr);
+    XX_TEST_EXPECT_EQ(agentxx_ffi_start(a, &log), AGENTXX_FFI_OK);
+
+    // 1. 黑名单拦截测试: user_input 应被拒绝并提示使用专用接口
+    auto blackSv = agentxx_string_view_cstr(R"({"type":"user_input","text":"hi"})");
+    XX_TEST_EXPECT_EQ(agentxx_ffi_send_wire(a, &blackSv, &log), AGENTXX_FFI_ERR_INVALID);
+    if (log.data != nullptr) {
+        std::string err(log.data, log.size);
+        XX_TEST_EXPECT_TRUE(err.find("agentxx_ffi_send_input") != std::string::npos);
+    }
+    agentxx_ffi_string_free(&log);
+
+    // 2. 白名单放行测试: compact_context
+    auto whiteSv = agentxx_string_view_cstr(R"({"type":"compact_context"})");
+    XX_TEST_EXPECT_EQ(agentxx_ffi_send_wire(a, &whiteSv, &log), AGENTXX_FFI_OK);
+
+    // 3. 非法类型
+    auto invalidSv = agentxx_string_view_cstr(R"({"type":"unknown_custom_type"})");
+    XX_TEST_EXPECT_EQ(agentxx_ffi_send_wire(a, &invalidSv, &log), AGENTXX_FFI_ERR_INVALID);
+    agentxx_ffi_string_free(&log);
+
+    XX_TEST_EXPECT_EQ(agentxx_ffi_destroy(a, &log), AGENTXX_FFI_OK);
+    mock.stop();
+}
+
+/// 12) 嵌入方程序工具与文本合批接口: tool_register / tool_unregister / tool_respond / set_delta_batch
+void testHostToolAndDeltaBatch() {
+    FfiMockLLM mock;
+    uint16_t   port = 0;
+    if (!mock.start(port)) {
+        TEST_FAIL << "mock LLM server start failed" << std::endl;
+        g_ffi_failed++;
+        return;
+    }
+
+    AgentxxString    log{};
+    auto             mjson   = mock.modelJson();
+    auto             mjsonSv = agentxx_string_view(mjson.data(), mjson.size());
+    AgentxxFFIAgent* a       = agentxx_ffi_create(nullptr, &mjsonSv, nullptr, &log);
+    XX_TEST_EXPECT_TRUE(a != nullptr);
+    XX_TEST_EXPECT_EQ(agentxx_ffi_start(a, &log), AGENTXX_FFI_OK);
+
+    // 1. 注册嵌入方程序工具
+    std::string toolJson = R"({
+        "tools": [{
+            "name": "my_host_tool",
+            "description": "test tool",
+            "inputSchema": {"type":"object","properties":{"p":{"type":"string"}}},
+            "timeoutSec": 30
+        }]
+    })";
+    auto toolSv = agentxx_string_view(toolJson.data(), toolJson.size());
+    XX_TEST_EXPECT_EQ(agentxx_ffi_tool_register(a, &toolSv, &log), AGENTXX_FFI_OK);
+
+    // 2. 响应工具
+    auto resSv = agentxx_string_view_cstr(R"({"output":"ok"})");
+    XX_TEST_EXPECT_EQ(agentxx_ffi_tool_respond(a, 999, 0, &resSv, &log), AGENTXX_FFI_OK);
+
+    // 3. 注销工具
+    auto nameSv = agentxx_string_view_cstr("my_host_tool");
+    XX_TEST_EXPECT_EQ(agentxx_ffi_tool_unregister(a, &nameSv, &log), AGENTXX_FFI_OK);
+
+    // 4. 设置文本合批
+    XX_TEST_EXPECT_EQ(agentxx_ffi_set_delta_batch(a, 50, &log), AGENTXX_FFI_OK);
+    XX_TEST_EXPECT_EQ(agentxx_ffi_set_delta_batch(a, 0, &log), AGENTXX_FFI_OK);
+
+    XX_TEST_EXPECT_EQ(agentxx_ffi_destroy(a, &log), AGENTXX_FFI_OK);
+    mock.stop();
+}
+
+agentxx::test::TestResult testFfiCApi() {
+    testVersionAndMemory();
+    testCreateInvalid();
+    testLifecycleAndConversation();
+    testLanguageApis();
+    testHilInterrupt();
+    testCancel();
+    testMultipleRuntimesConcurrent();
+    testSendInputJsonAndAttachments();
+    testEventQueue();
+    testCapabilities();
+    testModelManagement();
+    testSendWire();
+    testHostToolAndDeltaBatch();
+    return TestResult(g_ffi_passed, g_ffi_failed);
+}
+
+} // namespace test
+} // namespace agentxx

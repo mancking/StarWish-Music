@@ -10,14 +10,16 @@ import { useRoute, useRouter } from 'vue-router'
 import Icon from '@/components/Icon.vue'
 import DanmakuLayer from '@/components/DanmakuLayer.vue'
 import EqPanel from '@/components/player/EqPanel.vue'
-import AudioModeView from '@/components/video/AudioModeView.vue'
-import VideoStage from '@/video/components/VideoStage.vue'
-import PlaySettingsSheet from '@/video/components/PlaySettingsSheet.vue'
-import ProgressBar from '@/player/components/ProgressBar.vue'
-import { useVideoSession } from '@/video/useVideoSession'
+import AudioModeView from '@/player-video/components/AudioModeView.vue'
+import VideoStage from '@/player-video/components/VideoStage.vue'
+import PlaySettingsSheet from '@/player-video/components/PlaySettingsSheet.vue'
+import ProgressBar from '@/player-music/components/ProgressBar.vue'
+import { useVideoSession } from '@/player-video/useVideoSession'
+import { parseSubtitles, activeCueAt, nudgeSubtitleOffset, type SubCue } from '@/player-video/subtitles'
+import SubtitleOverlay from '@/player-video/components/SubtitleOverlay.vue'
 import { useUiStore } from '@/stores/ui'
 import type { MvItem } from '@shared/types'
-import type { QualityOption } from '@/video/components/PlaySettingsSheet.vue'
+import type { QualityOption } from '@/player-video/components/PlaySettingsSheet.vue'
 
 defineOptions({ name: 'MobileMvPlayer' })
 
@@ -26,7 +28,9 @@ const router = useRouter()
 const ui = useUiStore()
 
 const bvid = computed(() => String(route.params.bvid || ''))
-const session = useVideoSession(bvid)
+// MV/视频统一路由（规格书 2.19 / C-16）：/mv/:source/:id；旧 /mv/:bvid 视作 bili
+const source = computed(() => String((route.params as any).source || 'bili'))
+const session = useVideoSession(source, bvid)
 
 const stage = ref<InstanceType<typeof VideoStage> | null>(null)
 const videoEl = computed(() => stage.value?.el || null)
@@ -44,6 +48,91 @@ const sheetOpen = ref(false)
 const partsOpen = ref(false)
 const eqOpen = ref(false)
 const audioMode = ref(false)
+
+/* 规格 2.11 / Bug 16：外挂字幕（srt/ass 解析 + 延迟 ±0.5s），替换僵尸按钮 */
+const subCues = ref<SubCue[]>([])
+const subOffset = ref(Number(localStorage.getItem('xinyuan_subtitle_offset') || '0') || 0)
+const subFileInput = ref<HTMLInputElement | null>(null)
+const activeSub = computed(() => activeCueAt(subCues.value, curTime.value, subOffset.value)?.text || '')
+
+function onSubtitle(delta: number): void {
+  subOffset.value = nudgeSubtitleOffset(subOffset.value, delta)
+  localStorage.setItem('xinyuan_subtitle_offset', String(subOffset.value))
+  ui.toast(`字幕偏移 ${subOffset.value > 0 ? '+' : ''}${subOffset.value}s`, 'info', 1400)
+}
+
+/* 规格 2.12：仅下载音频 —— 拉音频流直存媒体库（不转码，原容器保存） */
+const extractingAudio = ref(false)
+async function startExtract(): Promise<void> {
+  if (extractingAudio.value) return
+  const url = session.rawUrl.value
+  if (!url) {
+    ui.toast('当前没有可提取的音频流', 'error', 1800)
+    return
+  }
+  extractingAudio.value = true
+  try {
+    const res = await fetch(`/swmedia/?u=${encodeURIComponent(url)}`)
+    if (!res.ok) throw new Error(`音频获取失败（HTTP ${res.status}）`)
+    const buf = new Uint8Array(await res.arrayBuffer())
+    const ext = /\.m4a(\?|$)/i.test(url) ? 'm4a' : /\.flac(\?|$)/i.test(url) ? 'flac' : 'mp3'
+    const mime = ext === 'm4a' ? 'audio/mp4' : ext === 'flac' ? 'audio/flac' : 'audio/mpeg'
+    const { nativeCall } = await import('@/mobile/bridge')
+    await nativeCall('SwBridge', 'saveToMedia', {
+      name: `${(session.title.value || '视频音频').replace(/[\/:*?"<>|]/g, '_')}.${ext}`,
+      mime,
+      data: btoa(String.fromCharCode(...buf.subarray(0, 8 * 1024 * 1024))),
+    })
+    ui.toast('音频已保存到媒体库', 'success', 2000)
+  } catch (e: any) {
+    ui.toast(e?.message || '提取失败', 'error', 2000)
+  } finally {
+    extractingAudio.value = false
+  }
+}
+
+/* 规格 2.15：截图（移动端存系统媒体库） */
+async function screenshot(): Promise<void> {
+  const v = videoEl.value
+  if (!v || !v.videoWidth) {
+    ui.toast('当前没有可截图的画面', 'info', 1600)
+    return
+  }
+  try {
+    const c = document.createElement('canvas')
+    c.width = v.videoWidth
+    c.height = v.videoHeight
+    const ctx = c.getContext('2d')
+    if (!ctx) throw new Error('画布不可用')
+    ctx.drawImage(v, 0, 0, c.width, c.height)
+    const dataUrl = c.toDataURL('image/png')
+    const { nativeCall } = await import('@/mobile/bridge')
+    await nativeCall('SwBridge', 'saveToMedia', {
+      name: `${session.title.value || '视频截图'}.png`,
+      mime: 'image/png',
+      data: dataUrl.split(',')[1] || '',
+    })
+    ui.toast('截图已保存到媒体库', 'success', 2000)
+  } catch (e: any) {
+    ui.toast(e?.message || '截图失败', 'error', 2000)
+  }
+}
+
+async function onSubtitleFile(e: Event): Promise<void> {
+  const input = e.target as HTMLInputElement
+  const file = input.files?.[0]
+  if (!file) return
+  try {
+    const raw = await file.text()
+    subCues.value = parseSubtitles(raw)
+    subOffset.value = 0
+    ui.toast(subCues.value.length ? `已加载字幕（${subCues.value.length} 条）` : '字幕解析失败', subCues.value.length ? 'success' : 'error', 2000)
+  } catch {
+    ui.toast('字幕读取失败', 'error', 1800)
+  } finally {
+    input.value = ''
+  }
+}
 const frameCover = ref('')
 
 let hideTimer = 0
@@ -217,6 +306,13 @@ function nextPart(): void {
 
 /* ---------------- 事件 ---------------- */
 async function onLoaded(dur: number): Promise<void> {
+  // Bug 37 / F-15：MV 音量设置真实生效
+  {
+    const mvVol = Number((ui.settings as any).mvVolume)
+    if (Number.isFinite(mvVol) && mvVol > 0 && videoEl.value) {
+      videoEl.value.volume = Math.max(0, Math.min(1, mvVol / 100))
+    }
+  }
   duration.value = dur
   const v = videoEl.value
   if (!v) return
@@ -246,8 +342,20 @@ function onEnded(): void {
   const list = session.parts.value
   const cur = session.current.value
   const i = cur ? list.findIndex(p => p.cid === cur.cid) : -1
-  if (loopMode.value === 'list' && i >= 0 && i < list.length - 1) void pickPart(list[i + 1]!)
-  else showControls.value = true
+  if (loopMode.value === 'list' && i >= 0 && i < list.length - 1) {
+    void pickPart(list[i + 1]!)
+    return
+  }
+  // 规格 2.14 自动连播：相关推荐第一条（3 秒 toast，可返回取消）
+  if ((ui.settings as any).mvAutoNext !== false && session.related.value.length) {
+    const nextVideo = session.related.value[0]!
+    ui.toast(`即将播放：${nextVideo.title || '相关推荐'}`, 'info', 3000)
+    window.setTimeout(() => {
+      if (!playing.value && curTime.value >= (duration.value || 0) - 0.6) onOpenVideo(nextVideo)
+    }, 3000)
+    return
+  }
+  showControls.value = true
 }
 
 function onOpenVideo(item: MvItem): void {
@@ -313,13 +421,14 @@ watch(playing, v => {
           :video="videoEl"
           :items="session.danmaku.value"
           :enabled="ui.settings.danmakuEnabled"
-          :opacity="1"
-          font-size="medium"
-          speed="normal"
-          area="quarter"
-          :anti-subtitle="false"
-          block-words=""
+          :opacity="Number((ui.settings as any).danmakuOpacity ?? 100) / 100"
+          :font-size="((ui.settings as any).danmakuFontSize || 'medium')"
+          :speed="((ui.settings as any).danmakuSpeed || 'normal')"
+          :area="((ui.settings as any).danmakuArea || 'quarter')"
+          :anti-subtitle="!!(ui.settings as any).danmakuAntiSubtitle"
+          :block-words="(ui.settings as any).danmakuBlockWords || ''"
         />
+        <SubtitleOverlay :text="activeSub" />
 
         <div class="topbar" :class="{ hide: !showControls }">
           <button class="ibtn" aria-label="返回" @click="router.back()">
@@ -422,8 +531,14 @@ watch(playing, v => {
       @ab="markAB"
       @pip="togglePip"
       @audio="enterAudioMode"
-      @subtitle="() => undefined"
+      @subtitle="onSubtitle"
+      @subtitle-load="subFileInput?.click()"
+      @shot="screenshot"
+      @audio-only="startExtract"
+      :subtitle-delay="subOffset"
     />
+
+    <input ref="subFileInput" type="file" accept=".srt,.ass,.vtt,text/plain" style="display: none" @change="onSubtitleFile" />
 
     <!-- 分集列表 -->
     <div v-if="partsOpen" class="mask" @click.self="partsOpen = false">

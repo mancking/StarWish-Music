@@ -6,6 +6,7 @@ import { Readable } from 'node:stream'
 import { protocol, net } from 'electron'
 import { createLogger } from './log'
 import { ensureDir, mediaCacheDir } from './paths'
+import { audioCacheFile, putAudioCache, pruneVideoCache } from './cache'
 
 const logger = createLogger('media')
 
@@ -56,6 +57,7 @@ export function mediaUrl(target: string): string {
  * 临时性：关闭视频页 / 切分P 由渲染层调 releaseMediaCache 清除，应用启动时整体清空。
  * ponytail: 不做 LRU/容量上限（临时目录，关页即删）；写冲突（乱序 Range）时放弃该次缓存，播放不受影响。 */
 const VIDEO_EXT = new Set(['.mp4', '.webm', '.m4v'])
+const AUDIO_EXT = new Set(['.mp3', '.m4a', '.aac', '.flac', '.ogg', '.opus', '.wav'])
 
 function streamDir(): string {
   return path.join(mediaCacheDir(), 'stream')
@@ -70,6 +72,25 @@ function isVideoUrl(target: string): boolean {
     return VIDEO_EXT.has(path.extname(new URL(target).pathname).toLowerCase())
   } catch {
     return false
+  }
+}
+
+/** 音频类资源（规格书 v2.8 · 1.12 播放缓存只处理音频） */
+function isAudioUrl(target: string): boolean {
+  try {
+    const ext = path.extname(new URL(target).pathname).toLowerCase()
+    return AUDIO_EXT.has(ext)
+  } catch {
+    return false
+  }
+}
+
+function extOf(target: string): string {
+  try {
+    const ext = path.extname(new URL(target).pathname).toLowerCase()
+    return AUDIO_EXT.has(ext) ? ext : '.m4a'
+  } catch {
+    return '.m4a'
   }
 }
 
@@ -149,6 +170,11 @@ function offlineManifestPath(): string {
 }
 
 function offlineKey(bvid: string, cid: string): string {
+  return offlineKeyOf(bvid, cid)
+}
+
+/** 离线缓存 manifest 键（Bug 109 三端统一契约：渲染层可自行计算或传 bvid+cid） */
+export function offlineKeyOf(bvid: string, cid: string): string {
   return crypto.createHash('sha1').update(`${bvid}:${cid}`).digest('hex')
 }
 
@@ -317,6 +343,45 @@ export function registerMediaProtocol(getBiliCookie: () => string): void {
       }
     }
 
+    // 规格书 v2.8 · 1.12：在线歌曲播放缓存（命中直接本地服务，不再请求远端）
+    if (!isVideoUrl(target)) {
+      const cached = audioCacheFile(target)
+      if (cached) {
+        try {
+          const size = fs.statSync(cached).size
+          const type = mimeOf(cached)
+          const range = req.headers.get('Range') || req.headers.get('range')
+          const m = /bytes=(\d*)-(\d*)/.exec(range || '')
+          if (m && size > 0) {
+            const start = m[1] ? parseInt(m[1], 10) : 0
+            const end = m[2] ? Math.min(parseInt(m[2], 10), size - 1) : size - 1
+            const stream = fs.createReadStream(cached, { start, end })
+            return new Response(Readable.toWeb(stream) as any, {
+              status: 206,
+              headers: {
+                'Content-Type': type,
+                'Content-Length': String(end - start + 1),
+                'Content-Range': `bytes ${start}-${end}/${size}`,
+                'Accept-Ranges': 'bytes',
+                'Access-Control-Allow-Origin': '*',
+              },
+            })
+          }
+          return new Response(Readable.toWeb(fs.createReadStream(cached)) as any, {
+            status: 200,
+            headers: {
+              'Content-Type': type,
+              'Content-Length': String(size),
+              'Accept-Ranges': 'bytes',
+              'Access-Control-Allow-Origin': '*',
+            },
+          })
+        } catch {
+          /* 缓存读取失败则回落到远端 */
+        }
+      }
+    }
+
     // 远程流：透传 Range，注入 Referer / Cookie
     const headers: Record<string, string> = {
       'User-Agent':
@@ -400,9 +465,11 @@ export function registerMediaProtocol(getBiliCookie: () => string): void {
                 if (done) {
                   await state.fh.close().catch(() => {})
                   streamStates.delete(key)
-                  if (state.total && state.written >= state.total) {
-                    // 下载完整 → 升格为完整缓存
+                  // Bug 82：无 Content-Length（total=0）按已收字节升格缓存，不再丢弃
+                  if ((!state.total && state.written > 0) || (state.total && state.written >= state.total)) {
                     await fsp.rename(state.file, path.join(streamDir(), `${key}${state.ext}`)).catch(() => {})
+                    // 规格书 v2.8 · 1.12：视频缓存总量上限 1GB，超出清理最旧
+                    pruneVideoCache()
                   }
                   controller.close()
                   return
@@ -426,6 +493,28 @@ export function registerMediaProtocol(getBiliCookie: () => string): void {
           logger.warn('视频缓存写入异常，降级为透传', e?.message)
           body = res.body
         }
+      }
+
+      // 规格书 v2.8 · 1.12：在线歌曲播放缓存——边播边收集，播完落盘（上限 50 首 / 500MB）
+      if (body && isAudioUrl(target) && res.status === 200 && !range) {
+        const chunks: Buffer[] = []
+        const src = body
+        const reader = src.getReader()
+        body = new ReadableStream<Uint8Array>({
+          async pull(controller) {
+            const { done, value } = await reader.read().catch(() => ({ done: true, value: undefined }))
+            if (done) {
+              void putAudioCache(target, Buffer.concat(chunks), extOf(target))
+              controller.close()
+              return
+            }
+            if (value) chunks.push(Buffer.from(value))
+            controller.enqueue(value!)
+          },
+          cancel(reason) {
+            reader.cancel(reason).catch(() => {})
+          },
+        })
       }
       return new Response(body as any, { status: res.status, headers: outHeaders })
     } catch (e: any) {

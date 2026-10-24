@@ -22,6 +22,15 @@ const routes = [
     component: () => (__MOBILE__ ? import('@/pages/mobile/Mv.vue') : import('@/pages/Mv.vue')),
     meta: { title: '视频 / MV' },
   },
+  { path: '/welcome', name: 'welcome', component: () => import('@/pages/Welcome.vue'), meta: { title: '欢迎' } },
+  {
+    // MV/视频统一播放路由（规格书 2.19 / C-16）：/mv/:source/:id；
+    // 保留 /mv/:bvid 兼容旧链接（单段视为 bili）
+    path: '/mv/:source/:id',
+    name: 'mv-player-source',
+    component: () => (__MOBILE__ ? import('@/pages/mobile/MvPlayer.vue') : import('@/pages/MvPlayer.vue')),
+    meta: { title: '视频播放' },
+  },
   {
     path: '/mv/:bvid',
     name: 'mv-player',

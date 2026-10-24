@@ -1,0 +1,68 @@
+{
+    "configurations": [
+        {
+            "name": "(gdb) agentxx_cli",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/agent/build/linux-debug/exec/agentxx_cli",
+            "preLaunchTask": "compileLinuxDebugCxx",
+            "args": [
+                "tui"
+            ],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}/",
+            "environment": [
+                {
+                    "name": "ASAN_OPTIONS",
+                    "value": "detect_leaks=0"
+                }
+            ],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "setupCommands": []
+        },
+        {
+            "name": "(gdb) agentxx_test",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/agent/build/linux-debug/exec/agentxx_test",
+            "preLaunchTask": "compileLinuxDebugCxx",
+            "args": [],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}/",
+            "environment": [
+                {
+                    "name": "ASAN_OPTIONS",
+                    "value": "detect_leaks=0"
+                }
+            ],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "setupCommands": []
+        },
+        {
+            "name": "(MSVC) agentxx_cli",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/agent/build/windows-debug/exec/agentxx_cli.exe",
+            "preLaunchTask": "compileWindowsDebugCxx",
+            "args": [],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}/",
+            "environment": [],
+            "console": "internalConsole"
+        },
+        {
+            "name": "(MSVC) agentxx_test",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/agent/build/windows-debug/exec/agentxx_test.exe",
+            "preLaunchTask": "compileWindowsDebugCxx",
+            "args": [],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}/",
+            "environment": [],
+            "console": "internalConsole"
+        }
+    ]
+}

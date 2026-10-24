@@ -1,7 +1,17 @@
 import type { LyricResult, MvItem, PlaylistMeta, PlaylistTagGroup, Song, ToplistTree } from '../../shared/types'
 import { parseLyric } from '../../shared/lrc'
+import fs from 'node:fs'
 import { createLogger } from './log'
 import { lxHost } from './lx-host'
+import {
+  searchMvBySource,
+  wyMvBySong,
+  wyMvDetail,
+  wyMvUrl,
+  qqMvBySong,
+  qqMvDetail,
+  qqMvUrl,
+} from './mv-sources'
 import {
   biliAudioUrl,
   biliParts,
@@ -24,6 +34,7 @@ import {
   searchBiliVideo,
   searchKugou,
   searchNetease,
+  searchPlaylists,
   searchQQ,
   toplistSongs,
   toplistTree,
@@ -323,6 +334,26 @@ async function kugouLyric(hash: string): Promise<string> {
   }
 }
 
+/** N12：本地歌词编码探测 —— UTF-8 失败回退 GBK/BIG5（车机乱码修复） */
+function readLrcSmart(p: string): string {
+  const buf = fs.readFileSync(p)
+  const utf8 = buf.toString('utf8')
+  // UTF-8 解码遇到非法字节会产生 U+FFFD；出现替换符则尝试 GBK
+  if (!utf8.includes('�')) return utf8
+  try {
+    // Node 内置不支持 gbk：用 iconv-lite 不可得时做 BOM/UTF-16 探测，最终退回 utf8
+    if (buf[0] === 0xff && buf[1] === 0xfe) return buf.toString('utf16le')
+    if (buf[0] === 0xfe && buf[1] === 0xff) {
+      const be = Buffer.from(buf)
+      be.swap16()
+      return be.toString('utf16le')
+    }
+  } catch {
+    /* ignore */
+  }
+  return utf8
+}
+
 /** 歌词：插件 → 平台官方 → 网易云同名匹配，多路候选取行数最多的一份 */
 export async function getLyric(song: Song): Promise<LyricResult> {
   const empty: LyricResult = { lines: [], raw: '', offset: 0, hasTrans: false, hasWordByWord: false }
@@ -344,7 +375,7 @@ export async function getLyric(song: Song): Promise<LyricResult> {
         const fs = await import('node:fs')
         const path = await import('node:path')
         const lrcPath = song.localPath.replace(path.extname(song.localPath), '.lrc')
-        if (fs.existsSync(lrcPath)) push(fs.readFileSync(lrcPath, 'utf8'), '同目录歌词')
+        if (fs.existsSync(lrcPath)) push(readLrcSmart(lrcPath), '同目录歌词')
       } catch {
         /* ignore */
       }
@@ -528,20 +559,85 @@ export async function importPlaylist(input: string, platform?: string) {
   return importPlaylistByLink(input, platform)
 }
 
-export async function searchMv(keyword: string, page = 1): Promise<MvItem[]> {
-  return searchBiliVideo(keyword, page)
+/** 歌单关键词搜索（规格书 3.7 / Bug 17）：供搜索页歌单 Tab */
+export async function searchPlaylistList(keyword: string, page = 1): Promise<PlaylistMeta[]> {
+  try {
+    return await searchPlaylists(keyword, page, 20)
+  } catch {
+    return []
+  }
 }
 
-export async function getMvInfo(bvid: string) {
-  return biliVideoInfo(bvid)
+/**
+ * MV 多音源（规格书 2.17 / 3.10 / C-16）：source 决定平台；
+ * B 站为默认兜底；外部音源走 lx-host mvSearch/mvUrl 分发。
+ */
+export async function searchMv(keyword: string, page = 1, source = 'bili'): Promise<MvItem[]> {
+  const src = source || 'bili'
+  if (src === 'bili') return searchBiliVideo(keyword, page)
+  if (src === 'wy' || src === 'qq' || src === 'kg' || src === 'kw') {
+    return searchMvBySource(src, keyword, page)
+  }
+  // 外部视频源 / 音源 MV 协议（0.9.6）
+  try {
+    return await lxHost.dispatchMvSearch(src, keyword, page)
+  } catch {
+    return []
+  }
 }
 
-export async function getMvParts(bvid: string) {
-  return biliParts(bvid)
+/** MV 详情（统一到 {id,title,pic,author,play,danmaku,durationSec,qualities} 形状） */
+export async function getMvInfo(source: string, id: string) {
+  if (!source || source === 'bili') return biliVideoInfo(id)
+  if (source === 'wy') {
+    const d = await wyMvDetail(id)
+    return { ...d, cid: '', play: d.play, danmaku: 0, duration: d.durationSec }
+  }
+  if (source === 'qq') {
+    // QQ MV 详情由取链接口顺带返回；这里补一次搜索拿元数据（标题/封面）
+    const d = await qqMvDetail(id)
+    return { ...d, cid: '', duration: d.durationSec }
+  }
+  // 外部音源 MV：详情字段可缺省，取链仍可工作
+  return { id, title: '', pic: '', author: '', cid: '', play: 0, danmaku: 0, duration: 0, qualities: [] }
 }
 
-export async function getMvUrl(bvid: string, cid: string, qn?: number) {
-  return biliPlayUrl(bvid, cid, qn)
+/** MV 分 P（网易/QQ 无分 P，返回空数组走统一播放器兜底分支） */
+export async function getMvParts(source: string, id: string) {
+  if (!source || source === 'bili') return biliParts(id)
+  return []
+}
+
+/** MV 播放地址（档位收敛 ≤6 档；切档不重头由渲染层记忆进度实现） */
+export async function getMvUrl(source: string, id: string, cid: string, qn?: number) {
+  if (!source || source === 'bili') return biliPlayUrl(id, cid, qn)
+  if (source === 'wy') return wyMvUrl(id, qn)
+  if (source === 'qq') {
+    const r = await qqMvUrl(id, qn)
+    const want = qn && r.qualities.some(x => x.qn === qn) ? qn : r.qn
+    const hit = r.qualities.find(x => x.qn === want)
+    return { url: (r as any).url, qn: want, qualities: r.qualities }
+  }
+  const r = await lxHost.dispatchMvUrl(source, id)
+  return { url: r.url, qn: qn || 0, qualities: r.qualities || [] }
+}
+
+/**
+ * 歌曲相关 MV（规格书 2.18 播放页 MV 按钮）：
+ * 命中返回非空数组即亮起按钮；查询缓存 5 分钟（xinyuan_mv_hint_<songHash>）。
+ */
+const mvHintCache = new Map<string, { at: number; list: MvItem[] }>()
+export async function mvBySong(song: Song): Promise<MvItem[]> {
+  if (!song?.id) return []
+  const key = `${song.source}:${song.songId || song.id}`
+  const hit = mvHintCache.get(key)
+  if (hit && Date.now() - hit.at < 5 * 60_000) return hit.list
+  let list: MvItem[] = []
+  if (song.source === 'wy') list = await wyMvBySong(String(song.songId || '')).catch(() => [])
+  else if (song.source === 'qq') list = await qqMvBySong(song.name || '', String(song.singer || '').split('/')[0] || '').catch(() => [])
+  if (mvHintCache.size > 120) mvHintCache.clear()
+  mvHintCache.set(key, { at: Date.now(), list })
+  return list
 }
 
 export async function itunesFallbackCover(term: string): Promise<string> {

@@ -10,6 +10,65 @@ import { request, UA } from './http'
 import { sourcesDir, userSourcesDir } from './paths'
 
 const logger = createLogger('lx-host')
+
+/* ================= 0.8 内置音源治理 =================
+ * 0.8.1 随包白名单：sources/ 仅自研 3 源（package.json extraResources filter）；
+ * 0.8.2 沙箱 request 域名白名单（C-23）+ 加载期禁远程自更新（C-19，野草/野花/长青类启动 GET 一律拦截）
+ *      + setTimeout/Interval 受限代理（下限 100ms 防忙等）；
+ * 0.8.3 debug 日志开关（F-17）：logs/sources/<源名>.log 按源记录请求明细；
+ * 默认禁用（Bug 113/114）：oiapi 依赖源与未实现 wbi 签名的 B 站音源默认 disabled、可手动启用。
+ */
+
+/** 沙箱出站域名白名单（官方域 + 用户导入时确认追加） */
+const SANDBOX_HOST_ALLOW = new Set<string>([
+  'music.163.com', 'interface.music.163.com', 'music.126.net',
+  'u.y.qq.com', 'c.y.qq.com', 'dl.stream.qqmusic.qq.com', 'isure.stream.qqmusic.qq.com', 'aqqmusic.tc.qq.com',
+  'm3ws.kugou.com', 'mobilecdn.kugou.com', 'www.kugou.com', 'service.kugou.com',
+  'www.kuwo.cn', 'nmobi.kuwo.cn', 'kuwo.cn', 'oiapi.net',
+  'api.bilibili.com', 'api.bilibili.tv', 'upos-sz-mirror08c.bilivideo.com',
+  'itunes.apple.com', 'miguvideo.com', 'music.migu.cn',
+])
+const sandboxAllowExtra = new Set<string>()
+export function addSandboxHosts(hosts: string[]): void {
+  for (const h of hosts || []) {
+    const clean = String(h || '').trim().toLowerCase()
+    if (clean) sandboxAllowExtra.add(clean)
+  }
+}
+function sandboxHostAllowed(url: string): boolean {
+  try {
+    const host = new URL(String(url)).hostname.toLowerCase()
+    if (SANDBOX_HOST_ALLOW.has(host) || sandboxAllowExtra.has(host)) return true
+    // 官方域的子域（如 v1.itunes.apple.com）
+    for (const d of [...SANDBOX_HOST_ALLOW, ...sandboxAllowExtra]) {
+      if (host.endsWith(`.${d}`)) return true
+    }
+    return false
+  } catch {
+    return false
+  }
+}
+
+/** F-17：debug 开关下的按源日志（由 ipc 接 settings.sourceDebug 接线） */
+let sourceDebugSink: ((sourceName: string, line: string) => void) | null = null
+export function setSourceDebugSink(fn: ((sourceName: string, line: string) => void) | null): void {
+  sourceDebugSink = fn
+}
+function debugLog(sourceName: string, line: string): void {
+  try {
+    sourceDebugSink?.(sourceName, `[${new Date().toISOString()}] ${line}`)
+  } catch {
+    /* ignore */
+  }
+}
+
+/** 受限定时器：下限 100ms，防沙箱脚本忙等占满事件循环 */
+function limitedTimer(fn: (cb: (...a: any[]) => void, ms?: number, ...rest: any[]) => any): (...a: any[]) => any {
+  return (cb: any, ms?: number, ...rest: any[]) => fn(cb, Math.max(100, Number(ms) || 0), ...rest)
+}
+
+/** Bug 113/114：默认禁用的内置源（oiapi 单点依赖 / B 站无 wbi 签名）；用户手动启用后不再回退 */
+const DEFAULT_DISABLED = new Set(['星愿内置音源.js', 'starwish-bilibili.js'])
 const inflateP = promisify(zlib.inflate)
 const inflateRawP = promisify(zlib.inflateRaw)
 const deflateP = promisify(zlib.deflate)
@@ -178,6 +237,8 @@ class LxHost {
   private sources: LoadedSource[] = []
   private disabled = new Set<string>()
   private deleted = new Set<string>()
+  /** 用户显式启用过的源（持久化）：默认禁用列表不覆盖用户选择 */
+  private userEnabled = new Set<string>()
   private loading = false
   private loaded = false
 
@@ -209,6 +270,7 @@ class LxHost {
     }
     this.loaded = true
     this.loading = false
+    this.applyDefaultDisabled()
     const ok = this.sources.filter(s => !s.loadError).length
     logger.info(`音源加载完成 ${ok}/${this.sources.length}`)
   }
@@ -217,10 +279,17 @@ class LxHost {
     const meta = parseHeaderMeta(code)
     const state: LxState = { inited: [], updateAlerts: [], requestHandler: null }
     const sandbox: any = {
-      console: { log() {}, warn() {}, error() {}, info() {}, debug() {} },
-      setTimeout,
+      // F-17：debug 开启时转发沙箱 console 到按源日志
+      console: {
+        log: (...a: any[]) => debugLog(meta.name || file, a.map(String).join(' ')),
+        warn: (...a: any[]) => debugLog(meta.name || file, `[warn] ${a.map(String).join(' ')}`),
+        error: (...a: any[]) => debugLog(meta.name || file, `[error] ${a.map(String).join(' ')}`),
+        info: (...a: any[]) => debugLog(meta.name || file, a.map(String).join(' ')),
+        debug: (...a: any[]) => debugLog(meta.name || file, a.map(String).join(' ')),
+      },
+      setTimeout: limitedTimer(setTimeout),
       clearTimeout,
-      setInterval,
+      setInterval: limitedTimer(setInterval),
       clearInterval,
       Buffer,
       TextEncoder,
@@ -260,6 +329,30 @@ class LxHost {
     }
     sandbox.globalThis = sandbox
     sandbox.lx = makeLxApi(state)
+    // C-23/C-19：request 白名单 + debug 日志包装（白名单外出站拒绝并记日志）
+    const rawRequest = sandbox.lx.request.bind(sandbox.lx)
+    sandbox.lx.request = (u: string, o: any, c: any) => {
+      const ustr = String(u || '')
+      if (!sandboxHostAllowed(ustr)) {
+        debugLog(meta.name || file, `[blocked] 白名单外出站请求：${ustr.slice(0, 120)}`)
+        try {
+          c?.(new Error('请求被沙箱白名单拦截'), null, null)
+        } catch {
+          /* ignore */
+        }
+        return () => {}
+      }
+      const t0 = Date.now()
+      debugLog(meta.name || file, `[req] ${ustr.slice(0, 160)}`)
+      return rawRequest(u, o, (err: any, res: any, body: any) => {
+        debugLog(meta.name || file, `[res] ${res?.statusCode ?? 0} ${Date.now() - t0}ms ${ustr.slice(0, 100)}`)
+        try {
+          c?.(err, res, body)
+        } catch {
+          /* ignore */
+        }
+      })
+    }
     sandbox.request = (u: string, o: any, c: any) => sandbox.lx.request(u, o, c)
     sandbox.send = (n: any, d: any) => sandbox.lx.send(n, d)
     sandbox.on = (n: any, h: any) => sandbox.lx.on(n, h)
@@ -310,12 +403,34 @@ class LxHost {
   }
 
   setEnabled(file: string, enabled: boolean): void {
-    if (enabled) this.disabled.delete(file)
-    else this.disabled.add(file)
+    if (enabled) {
+      this.disabled.delete(file)
+      this.userEnabled.add(file)
+    } else {
+      this.disabled.add(file)
+      this.userEnabled.delete(file)
+    }
   }
 
   setDisabledList(list: string[]): void {
     this.disabled = new Set(list || [])
+    // Bug 113/114：默认禁用不受列表覆盖（用户显式启用过的源除外）
+    this.applyDefaultDisabled()
+  }
+
+  /** 默认禁用合并：oiapi 依赖源 / 无 wbi 签名 B 站源默认 disabled（用户启用过则不覆盖） */
+  private applyDefaultDisabled(): void {
+    for (const f of DEFAULT_DISABLED) {
+      if (this.sources.some(s => s.file === f) && !this.userEnabled.has(f)) this.disabled.add(f)
+    }
+  }
+
+  setUserEnabledList(list: string[]): void {
+    this.userEnabled = new Set(list || [])
+  }
+
+  getUserEnabledList(): string[] {
+    return [...this.userEnabled]
   }
 
   setDeletedList(list: string[]): void {
@@ -326,10 +441,9 @@ class LxHost {
     return [...this.deleted]
   }
 
-  /** 恢复所有被删除的内置音源 */
+  /** 恢复内置音源（F-25）：只清 deleted，保留用户 disabled 选择 */
   restoreBuiltin(): void {
     this.deleted.clear()
-    this.disabled.clear()
     this.load()
   }
 
@@ -462,28 +576,134 @@ class LxHost {
     return out.slice(0, Math.max(pageSize, 20))
   }
 
+  /**
+   * MV 协议分发（规格书 2.17 / C-17）：音源 JS 声明 capabilities.mvSearch/mvUrl
+   * （或 platforms[p].actions 含 mvSearch/mvUrl）即接入；未声明返回空/抛错。
+   * action 命名统一 mvSearch/mvUrl（复用社区既有名）。
+   */
+  hasMvSupport(platform: string, action: 'mvSearch' | 'mvUrl'): boolean {
+    return this.active().some(
+      s => s.platforms[platform]?.actions.includes(action) || (s as any).capabilities?.mvSearch === true
+    )
+  }
+
+  async dispatchMvSearch(platform: string, keyword: string, page = 1): Promise<any[]> {
+    for (const src of this.active()) {
+      const actions = src.platforms[platform]?.actions
+      if (!actions?.includes('mvSearch')) continue
+      try {
+        const res = await Promise.race([
+          src.handler!({
+            source: platform,
+            action: 'mvSearch',
+            info: { keyword, page, pagesize: 20 },
+          }),
+          new Promise((_, rej) => setTimeout(() => rej(new Error('MV 搜索超时')), 15_000)),
+        ])
+        const list: any[] = Array.isArray(res) ? res : (res && (res.list || res.mvs)) || []
+        return list
+          .map((m: any) => ({
+            source: platform,
+            sourceId: String(m.mvId || m.id || m.vid || ''),
+            title: String(m.name || m.title || ''),
+            author: String(m.singer || m.artist || ''),
+            pic: String(m.pic || m.cover || ''),
+            duration: String(m.intervalLabel || m.duration || ''),
+            durationSec: Number(m.interval || m.durationSec || 0),
+            play: Number(m.playCount || m.play || 0),
+            danmaku: 0,
+          }))
+          .filter((m: any) => m.sourceId)
+      } catch (e: any) {
+        console.warn('[lx-host] mvSearch 失败', platform, e?.message)
+      }
+    }
+    return []
+  }
+
+  async dispatchMvUrl(platform: string, id: string, quality?: string): Promise<{ url: string; headers?: Record<string, string>; userAgent?: string; qualities?: { qn: number; label: string }[] }> {
+    for (const src of this.active()) {
+      const actions = src.platforms[platform]?.actions
+      if (!actions?.includes('mvUrl')) continue
+      try {
+        const res = await Promise.race([
+          src.handler!({
+            source: platform,
+            action: 'mvUrl',
+            info: { mvId: id, quality },
+          }),
+          new Promise((_, rej) => setTimeout(() => rej(new Error('MV 取链超时')), 15_000)),
+        ])
+        if (typeof res === 'string') return { url: res }
+        if (res && typeof res === 'object' && res.url) {
+          return { url: String(res.url), headers: res.headers, userAgent: res.userAgent, qualities: res.qualities }
+        }
+      } catch (e: any) {
+        console.warn('[lx-host] mvUrl 失败', platform, e?.message)
+      }
+    }
+    throw new Error('音源不支持该 MV 或取链失败')
+  }
+
   async resolveUrl(song: Song, quality: string): Promise<{ url: string; from: string }> {
     const direct = song.extra?._url
     if (typeof direct === 'string' && /^https?:\/\//i.test(direct)) return { url: direct, from: 'direct' }
     if (song.localPath) return { url: song.localPath, from: 'local' }
     const platform = song.source
-    const candidates = this.active().filter(s => s.platforms[platform]?.actions.includes('musicUrl'))
+    const samePlatform = this.active().filter(s => s.platforms[platform]?.actions.includes('musicUrl'))
+    // F-24 跨平台降级：同平台取不到时扩大到所有支持 musicUrl 的源（音源侧按歌名匹配）
+    const others = this.active().filter(
+      s => !samePlatform.includes(s) && Object.values(s.platforms).some(p => p.actions.includes('musicUrl'))
+    )
+    const candidates = [...samePlatform, ...others]
     if (!candidates.length) throw new Error(`平台 ${platform} 没有可用的取链音源`)
+
+    const tryOne = async (src: LoadedSource, crossPlatform: boolean): Promise<string> => {
+      const info: any = { ...song, ...(song.extra || {}) }
+      if (crossPlatform) {
+        // 跨源取链：把歌名/歌手交给音源自行匹配（F-24）
+        info.keyword = `${song.name} ${song.singer || ''}`.trim()
+      }
+      const url = await Promise.race([
+        src.handler!({ source: platform, action: 'musicUrl', info }),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('取链超时')), 15_000)),
+      ])
+      if (typeof url === 'string' && /^https?:\/\//i.test(url.trim())) return url.trim()
+      throw new Error('返回无效')
+    }
+
+    // Bug 117：取链总预算 30s 硬顶 + 前 3 候选竞速择优 + 429 类错误立即停手
+    const deadline = Date.now() + 30_000
     const errors: string[] = []
-    for (const src of candidates) {
+    let stopped429 = false
+    for (let start = 0; start < candidates.length; start += 3) {
+      if (stopped429) break
+      const batch = candidates.slice(start, start + 3)
+      const tasks = batch.map(async (src, i) => {
+        const crossPlatform = start + i >= samePlatform.length
+        const url = await tryOne(src, crossPlatform)
+        return { url, from: src.name }
+      })
       try {
-        const info = { ...song, ...(song.extra || {}) }
-        const url = await Promise.race([
-          src.handler!({ source: platform, action: 'musicUrl', info: { musicInfo: info, type: quality } }),
-          new Promise((_, rej) => setTimeout(() => rej(new Error('取链超时')), 15000)),
+        const winner = await Promise.race([
+          Promise.any(tasks),
+          new Promise<never>((_, rej) =>
+            setTimeout(() => rej(new Error('竞速超时')), Math.max(1000, deadline - Date.now()))
+          ),
         ])
-        if (typeof url === 'string' && /^https?:\/\//i.test(url.trim())) return { url: url.trim(), from: src.name }
-        errors.push(`${src.name}: 返回无效`)
+        return winner
       } catch (e: any) {
-        errors.push(`${src.name}: ${e?.message || e}`)
+        const agg = e as AggregateError
+        for (const err of agg?.errors || [e]) {
+          const msg = String((err as Error)?.message || err)
+          errors.push(msg)
+          // 429 / 限频：立即停手不再轮询（0.8.2 熔断）
+          if (/429|too many|限频|rate.?limit/i.test(msg)) stopped429 = true
+        }
+        if (Date.now() >= deadline) break
       }
     }
-    throw new Error(errors.slice(0, 3).join('；') || '取链失败')
+    throw new Error((stopped429 ? '音源限频，已停止尝试；' : '') + errors.slice(0, 3).join('；') || '取链失败')
   }
 
   async getLyric(song: Song): Promise<string> {
@@ -532,6 +752,8 @@ class LxHost {
       content = res.raw
     }
     if (!content.trim()) throw new Error('音源内容为空')
+    // F-18：512KB 上限
+    if (Buffer.byteLength(content, 'utf8') > 512 * 1024) throw new Error('音源脚本超过 512KB 上限')
     if (!/lx\.|EVENT_NAMES|module\.exports|exports\./.test(content)) {
       throw new Error('不是有效的 lx-music 音源脚本（缺少 lx API 调用）')
     }
@@ -555,10 +777,19 @@ class LxHost {
         file = `${safe}-${i++}.js`
       }
     }
+    // N25：写盘后校验，loadError 立即 unlink 回滚（不留坏脚本）
     fs.writeFileSync(path.join(dir, file), content, 'utf8')
     this.load()
     const loaded = this.sources.find(s => s.file === file)
-    if (loaded?.loadError) throw new Error(`脚本加载失败：${loaded.loadError}`)
+    if (loaded?.loadError) {
+      try {
+        fs.rmSync(path.join(dir, file), { force: true })
+      } catch {
+        /* ignore */
+      }
+      this.load()
+      throw new Error(`脚本加载失败（已回滚）：${loaded.loadError}`)
+    }
     return { file }
   }
 

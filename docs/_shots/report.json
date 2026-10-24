@@ -1,0 +1,692 @@
+{
+  "src": "D:\\music\\docs\\星河音乐-全端播放模块开发规格书.html",
+  "url": "file:///D:/music/docs/%E6%98%9F%E6%B2%B3%E9%9F%B3%E4%B9%90-%E5%85%A8%E7%AB%AF%E6%92%AD%E6%94%BE%E6%A8%A1%E5%9D%97%E5%BC%80%E5%8F%91%E8%A7%84%E6%A0%BC%E4%B9%A6.html",
+  "outdir": "D:\\music\\docs\\_shots",
+  "include": [
+    "lint",
+    "screenshots",
+    "structure"
+  ],
+  "shots": {
+    "desktop": {
+      "screenshot": "D:\\music\\docs\\_shots\\星河音乐-全端播放模块开发规格书_desktop.jpg",
+      "screenshotBytes": 430761,
+      "truncated": false,
+      "structure": {
+        "title": "星河音乐 · 全端播放模块开发规格书 v3.0",
+        "firstH1": "星河音乐 · 全端播放模块开发规格书",
+        "viewport": {
+          "w": 1422,
+          "h": 748
+        },
+        "fullpage": {
+          "w": 1422,
+          "h": 5011
+        },
+        "counts": {
+          "section": 14,
+          "h1": 1,
+          "h2": 14,
+          "img": 0,
+          "canvas": 0,
+          "svg": 0,
+          "links": 0,
+          "buttons": 8
+        }
+      },
+      "consoleErrors": [],
+      "consoleWarnings": [],
+      "horizontalOverflow": [],
+      "resourceErrors": [],
+      "emojiUsageWarning": [
+        {
+          "tag": "div",
+          "chars": "⚠",
+          "contextText": "；超出星河基线（iOS13+/Android12+/车机7+/Win10+）的能力逐组 ⚠ 标注，实现时降级或提基线。六"
+        },
+        {
+          "tag": "th",
+          "chars": "⚠",
+          "contextText": "⚠ 版本"
+        },
+        {
+          "tag": "th",
+          "chars": "⚠",
+          "contextText": "⚠ 版本"
+        },
+        {
+          "tag": "th",
+          "chars": "⚠",
+          "contextText": "⚠ 版本"
+        },
+        {
+          "tag": "th",
+          "chars": "⚠",
+          "contextText": "⚠ 版本"
+        },
+        {
+          "tag": "th",
+          "chars": "⚠",
+          "contextText": "⚠ 版本"
+        },
+        {
+          "tag": "th",
+          "chars": "⚠",
+          "contextText": "⚠ 版本"
+        },
+        {
+          "tag": "th",
+          "chars": "⚠",
+          "contextText": "⚠ 版本"
+        },
+        {
+          "tag": "td",
+          "chars": "❤",
+          "contextText": "桌面 4：WebDAV 下载/恢复合并、本地数据导出/导入、托盘❤+音量±5%、Web Media Session；移动"
+        },
+        {
+          "tag": "li",
+          "chars": "☐",
+          "contextText": "☐ 手机/平板/桌面封面统一圆形唱片，播放旋转 12s、暂停停转（Bug 9 修复后复验）"
+        },
+        {
+          "tag": "li",
+          "chars": "☐",
+          "contextText": "☐ 卡拉OK 逐字高亮歌词 + 点击歌词行跳转"
+        },
+        {
+          "tag": "li",
+          "chars": "☐",
+          "contextText": "☐ 歌词滚动当前行垂直居中、无歌词显示占位"
+        },
+        {
+          "tag": "li",
+          "chars": "☐",
+          "contextText": "☐ 视觉模式四态（封面/歌词/粒子/舞台）循环切换并持久化"
+        },
+        {
+          "tag": "li",
+          "chars": "☐",
+          "contextText": "☐ 粒子按性能档位：桌面 200 / 平板 80 / 手机 50 可关 / 车机 0"
+        },
+        {
+          "tag": "li",
+          "chars": "☐",
+          "contextText": "☐ 舞台频谱：桌面 64 / 平板 32 / 手机 16 / 车机 0"
+        }
+      ],
+      "emojiUsageHint": "warning · 含义：页面正文里检出 emoji 字符（U+1F300–U+1FAFF 或 U+2600–U+27BF 平面）。SKILL.md 视觉设计段明确禁用 emoji——不作图标、不作装饰、不放进数据。 | 修法：换成内联 SVG 图标（<svg viewBox=\"0 0 24 24\">）建立风格连贯的图标语言。 | 豁免：(1) **用户品牌资产明确包含 emoji**（罕见，但如即时通讯、社交媒体主题的产物合理）；(2) 主题本身就是关于 emoji 的（emoji 历史 / 表情包研究 / Unicode 演进）；(3) 引用某条真实文本原文（如推文截图的文字版），emoji 是内容而非装饰——保留原文可接受，但仍应权衡；(4) 装饰性 dingbat（如 U+2713 勾选符 ✓、U+2192 箭头 →、U+2605 星 ★）落入 U+2600–U+27BF 平面被误报的，如确认是符号非 emoji 可忽略。",
+      "reportSource": "cdp"
+    },
+    "mobile": {
+      "slices": [
+        "D:\\music\\docs\\_shots\\星河音乐-全端播放模块开发规格书_mobile_p1of3.jpg",
+        "D:\\music\\docs\\_shots\\星河音乐-全端播放模块开发规格书_mobile_p2of3.jpg",
+        "D:\\music\\docs\\_shots\\星河音乐-全端播放模块开发规格书_mobile_p3of3.jpg"
+      ],
+      "sliceHint": "按顺序 Read slices 里的各分片。",
+      "truncated": false,
+      "structure": {
+        "title": "星河音乐 · 全端播放模块开发规格书 v3.0",
+        "firstH1": "星河音乐 · 全端播放模块开发规格书",
+        "viewport": {
+          "w": 500,
+          "h": 692
+        },
+        "fullpage": {
+          "w": 500,
+          "h": 8100
+        },
+        "counts": {
+          "section": 14,
+          "h1": 1,
+          "h2": 14,
+          "img": 0,
+          "canvas": 0,
+          "svg": 0,
+          "links": 0,
+          "buttons": 8
+        }
+      },
+      "consoleErrors": [],
+      "consoleWarnings": [],
+      "horizontalOverflow": [],
+      "resourceErrors": [],
+      "emojiUsageWarning": [
+        {
+          "tag": "div",
+          "chars": "⚠",
+          "contextText": "；超出星河基线（iOS13+/Android12+/车机7+/Win10+）的能力逐组 ⚠ 标注，实现时降级或提基线。六"
+        },
+        {
+          "tag": "th",
+          "chars": "⚠",
+          "contextText": "⚠ 版本"
+        },
+        {
+          "tag": "th",
+          "chars": "⚠",
+          "contextText": "⚠ 版本"
+        },
+        {
+          "tag": "th",
+          "chars": "⚠",
+          "contextText": "⚠ 版本"
+        },
+        {
+          "tag": "th",
+          "chars": "⚠",
+          "contextText": "⚠ 版本"
+        },
+        {
+          "tag": "th",
+          "chars": "⚠",
+          "contextText": "⚠ 版本"
+        },
+        {
+          "tag": "th",
+          "chars": "⚠",
+          "contextText": "⚠ 版本"
+        },
+        {
+          "tag": "th",
+          "chars": "⚠",
+          "contextText": "⚠ 版本"
+        },
+        {
+          "tag": "td",
+          "chars": "❤",
+          "contextText": "桌面 4：WebDAV 下载/恢复合并、本地数据导出/导入、托盘❤+音量±5%、Web Media Session；移动"
+        },
+        {
+          "tag": "li",
+          "chars": "☐",
+          "contextText": "☐ 手机/平板/桌面封面统一圆形唱片，播放旋转 12s、暂停停转（Bug 9 修复后复验）"
+        },
+        {
+          "tag": "li",
+          "chars": "☐",
+          "contextText": "☐ 卡拉OK 逐字高亮歌词 + 点击歌词行跳转"
+        },
+        {
+          "tag": "li",
+          "chars": "☐",
+          "contextText": "☐ 歌词滚动当前行垂直居中、无歌词显示占位"
+        },
+        {
+          "tag": "li",
+          "chars": "☐",
+          "contextText": "☐ 视觉模式四态（封面/歌词/粒子/舞台）循环切换并持久化"
+        },
+        {
+          "tag": "li",
+          "chars": "☐",
+          "contextText": "☐ 粒子按性能档位：桌面 200 / 平板 80 / 手机 50 可关 / 车机 0"
+        },
+        {
+          "tag": "li",
+          "chars": "☐",
+          "contextText": "☐ 舞台频谱：桌面 64 / 平板 32 / 手机 16 / 车机 0"
+        }
+      ],
+      "emojiUsageHint": "warning · 含义：页面正文里检出 emoji 字符（U+1F300–U+1FAFF 或 U+2600–U+27BF 平面）。SKILL.md 视觉设计段明确禁用 emoji——不作图标、不作装饰、不放进数据。 | 修法：换成内联 SVG 图标（<svg viewBox=\"0 0 24 24\">）建立风格连贯的图标语言。 | 豁免：(1) **用户品牌资产明确包含 emoji**（罕见，但如即时通讯、社交媒体主题的产物合理）；(2) 主题本身就是关于 emoji 的（emoji 历史 / 表情包研究 / Unicode 演进）；(3) 引用某条真实文本原文（如推文截图的文字版），emoji 是内容而非装饰——保留原文可接受，但仍应权衡；(4) 装饰性 dingbat（如 U+2713 勾选符 ✓、U+2192 箭头 →、U+2605 星 ★）落入 U+2600–U+27BF 平面被误报的，如确认是符号非 emoji 可忽略。",
+      "reportSource": "cdp"
+    }
+  },
+  "engine": "chrome_cli",
+  "chromiumExec": "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+  "engineDegraded": true,
+  "engineDegradedReason": "playwright 未装",
+  "elapsedSec": 8.18,
+  "schemaVersion": 2,
+  "status": "warning",
+  "engineInfo": {
+    "name": "chrome_cli",
+    "degraded": true,
+    "degradedReasons": [
+      "playwright 未装"
+    ]
+  },
+  "input": {
+    "original": "D:\\music\\docs\\星河音乐-全端播放模块开发规格书.html",
+    "resolvedPath": "D:\\music\\docs\\星河音乐-全端播放模块开发规格书.html",
+    "baseUrl": "file:///D:/music/docs/%E6%98%9F%E6%B2%B3%E9%9F%B3%E4%B9%90-%E5%85%A8%E7%AB%AF%E6%92%AD%E6%94%BE%E6%A8%A1%E5%9D%97%E5%BC%80%E5%8F%91%E8%A7%84%E6%A0%BC%E4%B9%A6.html",
+    "protocol": "file",
+    "cwd": "D:\\music",
+    "mediaMode": {
+      "reducedMotion": true
+    }
+  },
+  "artifacts": {
+    "screenshots": [
+      {
+        "viewport": "desktop",
+        "path": "D:\\music\\docs\\_shots\\星河音乐-全端播放模块开发规格书_desktop.jpg",
+        "size": 430761,
+        "visualCoverage": {
+          "complete": true,
+          "reason": null
+        }
+      },
+      {
+        "viewport": "mobile",
+        "tiles": [
+          "D:\\music\\docs\\_shots\\星河音乐-全端播放模块开发规格书_mobile_p1of3.jpg",
+          "D:\\music\\docs\\_shots\\星河音乐-全端播放模块开发规格书_mobile_p2of3.jpg",
+          "D:\\music\\docs\\_shots\\星河音乐-全端播放模块开发规格书_mobile_p3of3.jpg"
+        ],
+        "visualCoverage": {
+          "complete": true,
+          "reason": null
+        }
+      }
+    ]
+  },
+  "summary": {
+    "blocker": 0,
+    "error": 0,
+    "warning": 30,
+    "info": 0
+  },
+  "findings": [
+    {
+      "ruleId": "emojiUsageWarning",
+      "severity": "warning",
+      "kind": "typography",
+      "viewport": "desktop",
+      "selector": "div",
+      "evidence": {
+        "tag": "div",
+        "chars": "⚠",
+        "contextText": "；超出星河基线（iOS13+/Android12+/车机7+/Win10+）的能力逐组 ⚠ 标注，实现时降级或提基线。六"
+      },
+      "dedupeKey": "emojiUsageWarning|desktop|div|0"
+    },
+    {
+      "ruleId": "emojiUsageWarning",
+      "severity": "warning",
+      "kind": "typography",
+      "viewport": "desktop",
+      "selector": "th",
+      "evidence": {
+        "tag": "th",
+        "chars": "⚠",
+        "contextText": "⚠ 版本"
+      },
+      "dedupeKey": "emojiUsageWarning|desktop|th|1"
+    },
+    {
+      "ruleId": "emojiUsageWarning",
+      "severity": "warning",
+      "kind": "typography",
+      "viewport": "desktop",
+      "selector": "th",
+      "evidence": {
+        "tag": "th",
+        "chars": "⚠",
+        "contextText": "⚠ 版本"
+      },
+      "dedupeKey": "emojiUsageWarning|desktop|th|2"
+    },
+    {
+      "ruleId": "emojiUsageWarning",
+      "severity": "warning",
+      "kind": "typography",
+      "viewport": "desktop",
+      "selector": "th",
+      "evidence": {
+        "tag": "th",
+        "chars": "⚠",
+        "contextText": "⚠ 版本"
+      },
+      "dedupeKey": "emojiUsageWarning|desktop|th|3"
+    },
+    {
+      "ruleId": "emojiUsageWarning",
+      "severity": "warning",
+      "kind": "typography",
+      "viewport": "desktop",
+      "selector": "th",
+      "evidence": {
+        "tag": "th",
+        "chars": "⚠",
+        "contextText": "⚠ 版本"
+      },
+      "dedupeKey": "emojiUsageWarning|desktop|th|4"
+    },
+    {
+      "ruleId": "emojiUsageWarning",
+      "severity": "warning",
+      "kind": "typography",
+      "viewport": "desktop",
+      "selector": "th",
+      "evidence": {
+        "tag": "th",
+        "chars": "⚠",
+        "contextText": "⚠ 版本"
+      },
+      "dedupeKey": "emojiUsageWarning|desktop|th|5"
+    },
+    {
+      "ruleId": "emojiUsageWarning",
+      "severity": "warning",
+      "kind": "typography",
+      "viewport": "desktop",
+      "selector": "th",
+      "evidence": {
+        "tag": "th",
+        "chars": "⚠",
+        "contextText": "⚠ 版本"
+      },
+      "dedupeKey": "emojiUsageWarning|desktop|th|6"
+    },
+    {
+      "ruleId": "emojiUsageWarning",
+      "severity": "warning",
+      "kind": "typography",
+      "viewport": "desktop",
+      "selector": "th",
+      "evidence": {
+        "tag": "th",
+        "chars": "⚠",
+        "contextText": "⚠ 版本"
+      },
+      "dedupeKey": "emojiUsageWarning|desktop|th|7"
+    },
+    {
+      "ruleId": "emojiUsageWarning",
+      "severity": "warning",
+      "kind": "typography",
+      "viewport": "desktop",
+      "selector": "td",
+      "evidence": {
+        "tag": "td",
+        "chars": "❤",
+        "contextText": "桌面 4：WebDAV 下载/恢复合并、本地数据导出/导入、托盘❤+音量±5%、Web Media Session；移动"
+      },
+      "dedupeKey": "emojiUsageWarning|desktop|td|8"
+    },
+    {
+      "ruleId": "emojiUsageWarning",
+      "severity": "warning",
+      "kind": "typography",
+      "viewport": "desktop",
+      "selector": "li",
+      "evidence": {
+        "tag": "li",
+        "chars": "☐",
+        "contextText": "☐ 手机/平板/桌面封面统一圆形唱片，播放旋转 12s、暂停停转（Bug 9 修复后复验）"
+      },
+      "dedupeKey": "emojiUsageWarning|desktop|li|9"
+    },
+    {
+      "ruleId": "emojiUsageWarning",
+      "severity": "warning",
+      "kind": "typography",
+      "viewport": "desktop",
+      "selector": "li",
+      "evidence": {
+        "tag": "li",
+        "chars": "☐",
+        "contextText": "☐ 卡拉OK 逐字高亮歌词 + 点击歌词行跳转"
+      },
+      "dedupeKey": "emojiUsageWarning|desktop|li|10"
+    },
+    {
+      "ruleId": "emojiUsageWarning",
+      "severity": "warning",
+      "kind": "typography",
+      "viewport": "desktop",
+      "selector": "li",
+      "evidence": {
+        "tag": "li",
+        "chars": "☐",
+        "contextText": "☐ 歌词滚动当前行垂直居中、无歌词显示占位"
+      },
+      "dedupeKey": "emojiUsageWarning|desktop|li|11"
+    },
+    {
+      "ruleId": "emojiUsageWarning",
+      "severity": "warning",
+      "kind": "typography",
+      "viewport": "desktop",
+      "selector": "li",
+      "evidence": {
+        "tag": "li",
+        "chars": "☐",
+        "contextText": "☐ 视觉模式四态（封面/歌词/粒子/舞台）循环切换并持久化"
+      },
+      "dedupeKey": "emojiUsageWarning|desktop|li|12"
+    },
+    {
+      "ruleId": "emojiUsageWarning",
+      "severity": "warning",
+      "kind": "typography",
+      "viewport": "desktop",
+      "selector": "li",
+      "evidence": {
+        "tag": "li",
+        "chars": "☐",
+        "contextText": "☐ 粒子按性能档位：桌面 200 / 平板 80 / 手机 50 可关 / 车机 0"
+      },
+      "dedupeKey": "emojiUsageWarning|desktop|li|13"
+    },
+    {
+      "ruleId": "emojiUsageWarning",
+      "severity": "warning",
+      "kind": "typography",
+      "viewport": "desktop",
+      "selector": "li",
+      "evidence": {
+        "tag": "li",
+        "chars": "☐",
+        "contextText": "☐ 舞台频谱：桌面 64 / 平板 32 / 手机 16 / 车机 0"
+      },
+      "dedupeKey": "emojiUsageWarning|desktop|li|14"
+    },
+    {
+      "ruleId": "emojiUsageWarning",
+      "severity": "warning",
+      "kind": "typography",
+      "viewport": "mobile",
+      "selector": "div",
+      "evidence": {
+        "tag": "div",
+        "chars": "⚠",
+        "contextText": "；超出星河基线（iOS13+/Android12+/车机7+/Win10+）的能力逐组 ⚠ 标注，实现时降级或提基线。六"
+      },
+      "dedupeKey": "emojiUsageWarning|mobile|div|0"
+    },
+    {
+      "ruleId": "emojiUsageWarning",
+      "severity": "warning",
+      "kind": "typography",
+      "viewport": "mobile",
+      "selector": "th",
+      "evidence": {
+        "tag": "th",
+        "chars": "⚠",
+        "contextText": "⚠ 版本"
+      },
+      "dedupeKey": "emojiUsageWarning|mobile|th|1"
+    },
+    {
+      "ruleId": "emojiUsageWarning",
+      "severity": "warning",
+      "kind": "typography",
+      "viewport": "mobile",
+      "selector": "th",
+      "evidence": {
+        "tag": "th",
+        "chars": "⚠",
+        "contextText": "⚠ 版本"
+      },
+      "dedupeKey": "emojiUsageWarning|mobile|th|2"
+    },
+    {
+      "ruleId": "emojiUsageWarning",
+      "severity": "warning",
+      "kind": "typography",
+      "viewport": "mobile",
+      "selector": "th",
+      "evidence": {
+        "tag": "th",
+        "chars": "⚠",
+        "contextText": "⚠ 版本"
+      },
+      "dedupeKey": "emojiUsageWarning|mobile|th|3"
+    },
+    {
+      "ruleId": "emojiUsageWarning",
+      "severity": "warning",
+      "kind": "typography",
+      "viewport": "mobile",
+      "selector": "th",
+      "evidence": {
+        "tag": "th",
+        "chars": "⚠",
+        "contextText": "⚠ 版本"
+      },
+      "dedupeKey": "emojiUsageWarning|mobile|th|4"
+    },
+    {
+      "ruleId": "emojiUsageWarning",
+      "severity": "warning",
+      "kind": "typography",
+      "viewport": "mobile",
+      "selector": "th",
+      "evidence": {
+        "tag": "th",
+        "chars": "⚠",
+        "contextText": "⚠ 版本"
+      },
+      "dedupeKey": "emojiUsageWarning|mobile|th|5"
+    },
+    {
+      "ruleId": "emojiUsageWarning",
+      "severity": "warning",
+      "kind": "typography",
+      "viewport": "mobile",
+      "selector": "th",
+      "evidence": {
+        "tag": "th",
+        "chars": "⚠",
+        "contextText": "⚠ 版本"
+      },
+      "dedupeKey": "emojiUsageWarning|mobile|th|6"
+    },
+    {
+      "ruleId": "emojiUsageWarning",
+      "severity": "warning",
+      "kind": "typography",
+      "viewport": "mobile",
+      "selector": "th",
+      "evidence": {
+        "tag": "th",
+        "chars": "⚠",
+        "contextText": "⚠ 版本"
+      },
+      "dedupeKey": "emojiUsageWarning|mobile|th|7"
+    },
+    {
+      "ruleId": "emojiUsageWarning",
+      "severity": "warning",
+      "kind": "typography",
+      "viewport": "mobile",
+      "selector": "td",
+      "evidence": {
+        "tag": "td",
+        "chars": "❤",
+        "contextText": "桌面 4：WebDAV 下载/恢复合并、本地数据导出/导入、托盘❤+音量±5%、Web Media Session；移动"
+      },
+      "dedupeKey": "emojiUsageWarning|mobile|td|8"
+    },
+    {
+      "ruleId": "emojiUsageWarning",
+      "severity": "warning",
+      "kind": "typography",
+      "viewport": "mobile",
+      "selector": "li",
+      "evidence": {
+        "tag": "li",
+        "chars": "☐",
+        "contextText": "☐ 手机/平板/桌面封面统一圆形唱片，播放旋转 12s、暂停停转（Bug 9 修复后复验）"
+      },
+      "dedupeKey": "emojiUsageWarning|mobile|li|9"
+    },
+    {
+      "ruleId": "emojiUsageWarning",
+      "severity": "warning",
+      "kind": "typography",
+      "viewport": "mobile",
+      "selector": "li",
+      "evidence": {
+        "tag": "li",
+        "chars": "☐",
+        "contextText": "☐ 卡拉OK 逐字高亮歌词 + 点击歌词行跳转"
+      },
+      "dedupeKey": "emojiUsageWarning|mobile|li|10"
+    },
+    {
+      "ruleId": "emojiUsageWarning",
+      "severity": "warning",
+      "kind": "typography",
+      "viewport": "mobile",
+      "selector": "li",
+      "evidence": {
+        "tag": "li",
+        "chars": "☐",
+        "contextText": "☐ 歌词滚动当前行垂直居中、无歌词显示占位"
+      },
+      "dedupeKey": "emojiUsageWarning|mobile|li|11"
+    },
+    {
+      "ruleId": "emojiUsageWarning",
+      "severity": "warning",
+      "kind": "typography",
+      "viewport": "mobile",
+      "selector": "li",
+      "evidence": {
+        "tag": "li",
+        "chars": "☐",
+        "contextText": "☐ 视觉模式四态（封面/歌词/粒子/舞台）循环切换并持久化"
+      },
+      "dedupeKey": "emojiUsageWarning|mobile|li|12"
+    },
+    {
+      "ruleId": "emojiUsageWarning",
+      "severity": "warning",
+      "kind": "typography",
+      "viewport": "mobile",
+      "selector": "li",
+      "evidence": {
+        "tag": "li",
+        "chars": "☐",
+        "contextText": "☐ 粒子按性能档位：桌面 200 / 平板 80 / 手机 50 可关 / 车机 0"
+      },
+      "dedupeKey": "emojiUsageWarning|mobile|li|13"
+    },
+    {
+      "ruleId": "emojiUsageWarning",
+      "severity": "warning",
+      "kind": "typography",
+      "viewport": "mobile",
+      "selector": "li",
+      "evidence": {
+        "tag": "li",
+        "chars": "☐",
+        "contextText": "☐ 舞台频谱：桌面 64 / 平板 32 / 手机 16 / 车机 0"
+      },
+      "dedupeKey": "emojiUsageWarning|mobile|li|14"
+    }
+  ],
+  "prioritizedActions": [
+    {
+      "ruleId": "emojiUsageWarning",
+      "severity": "warning",
+      "viewport": "desktop",
+      "selector": "div"
+    }
+  ],
+  "reportPath": "D:\\music\\docs\\_shots\\report.json"
+}

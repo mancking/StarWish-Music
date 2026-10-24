@@ -1,0 +1,764 @@
+#include "agentxx/event/event_stream.h"
+#include "agentxx/util/neograph_json_bridge.h"
+
+#include "agentxx/agent/io/agent_io_transport.h"
+#include "agentxx/agent/io/context_stats_wire.h"
+#include "agentxx/middlewares/summarization.h"
+#include "agentxx/protocol/provider_common.h"
+#include "agentxx/util/task_scope.h"
+#include "fmt/format.h"
+#include "utilxx_base/container_util.h"
+#include "utilxx_base/log.h"
+
+namespace agentxx {
+namespace events {
+
+EventStreamInterface::EventStreamInterface(
+    std::string_view      in_name,
+    const std::type_info& elementType
+) :
+    name(in_name),
+    elementType_(elementType) {}
+
+EventBus::EventBus(asio::any_io_executor executor) :
+    executor_(executor) {}
+
+bool EventBus::remove(std::string_view topic) {
+    return utilxx_base::eraseHeterogeneous(streams_, topic);
+}
+
+// ---------------------------------------------------------------------------
+// EventBridge: GraphEvent -> 会话增量 WireDelta + EventBus 发布
+// ---------------------------------------------------------------------------
+
+EventBridge::EventBridge(
+    std::string                                  agentName,
+    std::string                                  sessionId,
+    std::weak_ptr<agentxx::agent::AgentContext>  ctx,
+    std::shared_ptr<agentxx::agent::Session>     session,
+    std::shared_ptr<agentxx::agent::AgentIOBase> io,
+    neograph::graph::GraphStreamCallback         origCb
+) :
+    agentName_(std::move(agentName)),
+    sessionId_(std::move(sessionId)),
+    ctx_(std::move(ctx)),
+    session_(std::move(session)),
+    io_(std::move(io)),
+    origCb_(std::move(origCb)) {}
+
+void EventBridge::operator()(const neograph::graph::GraphEvent& event) {
+    // 先转发原始回调
+    if (origCb_) {
+        origCb_(event);
+    }
+
+    // 统一处理: 每个事件类型仅一个 handler, 同时负责对内 (总线发布) 与对外
+    // (会话增量 WireDelta/历史) 处理, 避免同一事件在多处维护
+    using T = neograph::graph::GraphEvent::Type;
+    switch (event.type) {
+        case T::LLM_TOKEN:
+            handleLLMToken(event);
+            break;
+        case T::CHANNEL_WRITE:
+            handleChannelWrite(event);
+            break;
+        case T::NODE_START:
+            handleNodeStart(event);
+            break;
+        case T::NODE_END:
+            handleNodeEnd(event);
+            break;
+        case T::ERROR:
+            handleError(event);
+            break;
+        default:
+            // 未知/未处理事件: 重置 chunk 类型, 使下一个 token 视为新流开始
+            // (tps 计时重置; THINKING 段由 thinkSegActive_ 跟踪, 不受影响)
+            lastChatChunkType_ = neograph::ChatStreamChunk::TYPE_UNKNOWN;
+            break;
+    }
+}
+
+void EventBridge::emitDelta(agentxx::agent::WireDelta delta) {
+    // WireDelta 流序号: 会话级单调递增 (服务端增量重放缓冲依赖 seq 单调性)
+    // 统一经 Session::nextDeltaSeq 分配 (与 SessionServerAgentIO 的新产出
+    // WireDelta 共用同一入口, 保证所有新 WireDelta 都携带有效 seq 入重放缓冲)
+    delta.seq = session_->nextDeltaSeq();
+    if (io_) {
+        io_->sendToPeer(std::move(delta));
+    }
+}
+
+neograph::graph::GraphStreamCallback EventBridge::makeCallback() {
+    auto self = shared_from_this();
+    return [self](const neograph::graph::GraphEvent& event) {
+        (*self)(event);
+    };
+}
+
+void EventBridge::handleLLMToken(const neograph::graph::GraphEvent& event) {
+    std::string token;
+    std::string kind = "content";
+    // 进入前的 chunk 类型: 用于检测 THINKING 流段的进入/离开
+    const bool prevWasThinking = (lastChatChunkType_ == neograph::ChatStreamChunk::TYPE_THINKING);
+
+    // tps 统计: 新 ModelCall 流开始 (节点开始/结束后的首个 token) 时重置计时与计数
+    if (lastChatChunkType_ == neograph::ChatStreamChunk::TYPE_UNKNOWN) {
+        tpsStartTime_     = std::chrono::steady_clock::now();
+        tpsTokenCount_    = 0.0;
+        tpsLastPushSec_   = 0.0;
+        tpsLastPushToken_ = 0.0;
+    }
+
+    if (event.data.is_string()) {
+        token              = event.data.get<std::string>();
+        lastChatChunkType_ = neograph::ChatStreamChunk::TYPE_CONTENT;
+    } else if (event.data.is_object()) {
+        neograph::ChatStreamChunk chunk;
+        neograph::from_json(event.data, chunk);
+        // 生成阶段标记 (见 protocol/provider_common.h): 不是模型输出文本,
+        // 只更新 UI 占位提示, 不参与正文/思考流段与 tps 统计
+        if (agentxx::protocol::chunk_type::isStatusChunk(chunk.type)) {
+            handleGenStatusChunk(chunk);
+            return;
+        }
+        token              = std::move(chunk.data);
+        lastChatChunkType_ = chunk.type;
+        if (chunk.type == neograph::ChatStreamChunk::TYPE_THINKING) {
+            kind = "thinking";
+        }
+    } else {
+        token = event.data.dump();
+    }
+
+    // THINKING 流段跟踪:
+    // - 进入 THINKING: 记录段起点 (think 耗时从此刻起算, 不随 token 携带时长,
+    //   避免"流式刚开始就显示耗时")
+    // - 离开 THINKING (切换到正文): 先结算 think 段耗时 —— 在正文首个 token 的
+    //   WireDelta 之前发送空文本 ThinkToken 结算包, client 收到后为已落盘的 Think
+    //   消息回填最终时长 ("输出完成时才计算并显示")
+    const bool curIsThinking = (lastChatChunkType_ == neograph::ChatStreamChunk::TYPE_THINKING);
+    if (!prevWasThinking && curIsThinking) {
+        thinkSegActive_  = true;
+        thinkSegStart_   = std::chrono::system_clock::now();
+        thinkSegStartMs_ = static_cast<int64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(thinkSegStart_.time_since_epoch())
+                .count()
+        );
+    } else if (prevWasThinking && !curIsThinking && thinkSegActive_) {
+        finalizeThinkSegment();
+    }
+
+    // 累计估算 token 数: 批量估算 (每16 token推送窗口再估, 减少 countTokens 遍历)
+    // 此处累加文本, 推送时统一经 countTokens 折算 token, 与 summarization 保持一致
+    tpsPendingText_ += token;
+    // 每 16 token (约 64 字节) 或窗口到期再做一次 countTokens 批量折算
+    constexpr size_t kBatchChars = 64;
+    if (tpsPendingText_.size() >= kBatchChars) {
+        tpsTokenCount_ += countTokens(tpsPendingText_);
+        tpsPendingText_.clear();
+    }
+    // 定时推送一次平均速度 (token/s) - push 时会把 pending 一并结算
+    pushTpsIfDue();
+
+    // 总线发布
+    publishModelToken(token, kind);
+
+    std::optional<agentxx::agent::ViewMessage::ThinkData> thinkData;
+    if (lastChatChunkType_ == neograph::ChatStreamChunk::TYPE_THINKING) {
+        if (token.empty()) {
+            thinkData = agentxx::agent::ViewMessage::ThinkData{
+                .reasoningTokens = 0,
+                .isEncrypted     = true,
+            };
+        }
+    }
+
+    emitDelta(agentxx::agent::WireDelta{
+        .text        = std::move(token),
+        .startTimeMs = nodeStartTimeMs_,
+        .think       = std::move(thinkData),
+        .type        = (lastChatChunkType_ == neograph::ChatStreamChunk::TYPE_THINKING)
+                           ? agentxx::agent::WireDelta::Type::ThinkToken
+                           : agentxx::agent::WireDelta::Type::TextToken,
+        // token WireDelta 不再携带 durationMs: think 耗时由 finalizeThinkSegment()
+        // 在段落完成时以独立结算包发送 (见 handleLLMToken 内 THINKING 流段跟踪)
+    });
+}
+
+void EventBridge::handleGenStatusChunk(const neograph::ChatStreamChunk& chunk) {
+    using Phase = agentxx::agent::WireDelta::GenPhase;
+    if (chunk.type == agentxx::protocol::chunk_type::kGenerationStart) {
+        // 模型节点开始执行 (请求已发出): 提示 UI "等待响应"
+        emitGenStatus(Phase::Waiting);
+        return;
+    }
+    // 工具调用开始 (参数未接收完, 内容无法展示): 提示 UI "正在调用工具"
+    // - 思考流此时已结束 (工具调用紧接思考/正文之后), 先结算思考段耗时,
+    //   保证 client 先回填 Think 消息耗时再展示占位提示
+    finalizeThinkSegment();
+    emitGenStatus(Phase::ToolCall, chunk.data);
+}
+
+void EventBridge::emitGenStatus(
+    agentxx::agent::WireDelta::GenPhase phase,
+    std::string_view                 toolName
+) {
+    // 生成结束: 占位提示清除 (client 侧对重复的 Done 无副作用)
+    genStatusActive_ = (phase != agentxx::agent::WireDelta::GenPhase::Done);
+    emitDelta(agentxx::agent::WireDelta{
+        .toolName = std::string{toolName},
+        .type     = agentxx::agent::WireDelta::Type::GenStatus,
+        .genPhase = phase,
+    });
+}
+
+void EventBridge::finalizeThinkSegment() {
+    if (!thinkSegActive_) {
+        return;
+    }
+    thinkSegActive_ = false;
+    // 结算包: 空文本 ThinkToken, 仅携带该思考段的开始时间与总耗时。
+    // client (TUI) 对空文本 ThinkToken 的处理 = 先落盘累积中的 Think 流文本,
+    // 再向前回溯最近一条 Think 消息回填 startTimeMs/durationMs —— 即"输出完成时
+    // 才计算这条消息的耗时并显示"
+    const int64_t durationMs
+        = static_cast<int64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   std::chrono::system_clock::now() - thinkSegStart_
+        )
+                                   .count());
+    if (lastThinkSegStartMs_ == 0) {
+        lastThinkSegStartMs_ = thinkSegStartMs_;
+    }
+    lastThinkSegDurationMs_ += durationMs;
+    emitDelta(agentxx::agent::WireDelta{
+        .text        = {},
+        .startTimeMs = thinkSegStartMs_,
+        .durationMs  = lastThinkSegDurationMs_,
+        .type        = agentxx::agent::WireDelta::Type::ThinkToken,
+    });
+}
+
+void EventBridge::handleChannelWrite(const neograph::graph::GraphEvent& event) {
+    using agentxx::agent::ViewMessage;
+    using agentxx::agent::WireDelta;
+
+    // 最终 assistant 消息写出即生成结束: 先结算未闭合的 THINKING 流段
+    // (典型场景: 思考后直接发起 tool_calls, 无正文 token 触发类型切换,
+    // 结算包必须先于 ToolStart WireDelta 到达, client 才能回填 Think 时长)
+    finalizeThinkSegment();
+
+    auto chan = event.data.value("channel", std::string{});
+    // event.data 为图边界类型 (neograph::json): value 整体转业务 Json
+    auto value = event.data.contains("value") ? agentxx::util::fromNeographJson(event.data["value"])
+                                              : utilxx_base::Json{};
+
+    // 通用提示消息: 转发为 WireDelta::MessageUITip, 由 client 端插入提示消息
+    if (chan == "message_tip" && value.is_object()) {
+        auto       tipType = WireDelta::TipType::Info;
+        const auto tip     = value.value("tipType", std::string{"info"});
+        if (tip == "warning") {
+            tipType = WireDelta::TipType::Warning;
+        } else if (tip == "error") {
+            tipType = WireDelta::TipType::Error;
+        }
+        emitDelta(WireDelta{
+            .text    = value.value("text", std::string{}),
+            .type    = WireDelta::Type::MessageUITip,
+            .tipType = tipType,
+        });
+        return;
+    }
+
+    if (chan != "messages" || !value.is_array()) {
+        return;
+    }
+    bool hasLLMOutput = false;
+    // 本批是否含已结算的工具结果 (工具结算属"事实", 立即落盘)
+    bool hasToolResult = false;
+    for (const auto& jm : value) {
+        auto role = jm.value("role", std::string{});
+        if (role == "assistant") {
+            hasLLMOutput = true;
+            // 展开: reasoning_content 非空 / 加密思考 → Think (折叠); content 非空 →
+            // Assistant 消息; 每条 tool_call → Tool 消息 (未完成, 历史默认折叠)。
+            // 顺序与渲染端解析一致: Think 在前, Assistant 在中, Tool 在后。
+            // 展开语义与渲染端 (TUI) 同步一致: 历史消息直接就是渲染消息,
+            // client 端无需再按 json 解析
+            auto reasoning       = jm.value("reasoning_content", std::string{});
+            int  reasoningTokens = 0;
+            bool isEncrypted     = false;
+            if (jm.contains("extra") && jm["extra"].is_object()) {
+                reasoningTokens = jm["extra"].value("reasoning_tokens", 0);
+                if (jm["extra"].contains("responses_reasoning_items")
+                    && jm["extra"]["responses_reasoning_items"].is_array()
+                    && !jm["extra"]["responses_reasoning_items"].empty()) {
+                    isEncrypted = true;
+                }
+            }
+            int64_t thinkStartTimeMs = jm.value("startTimeMs", int64_t{0});
+            int64_t thinkDurationMs  = jm.value("durationMs", int64_t{0});
+            if (thinkStartTimeMs == 0) {
+                thinkStartTimeMs
+                    = lastThinkSegStartMs_ > 0 ? lastThinkSegStartMs_ : nodeStartTimeMs_;
+            }
+            if (thinkDurationMs == 0) {
+                thinkDurationMs = lastThinkSegDurationMs_;
+            }
+            // 兜底: 若为非流式或无独立 THINKING chunk 的思考 (如仅返回 reasoning_tokens / encrypted
+            // reasoning), 但有节点计时, 则以节点运行耗时兜底
+            if (thinkDurationMs == 0
+                && (isEncrypted || reasoningTokens > 0 || !reasoning.empty())) {
+                if (nodeStartTimeMs_ > 0) {
+                    const int64_t nowMs = static_cast<int64_t>(
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch()
+                        )
+                            .count()
+                    );
+                    thinkDurationMs = std::max(int64_t{0}, nowMs - nodeStartTimeMs_);
+                }
+            }
+            if (!reasoning.empty() || isEncrypted || reasoningTokens > 0) {
+                auto m = ViewMessage::makeText(
+                    ViewMessage::Role::Think,
+                    reasoning,
+                    thinkStartTimeMs,
+                    thinkDurationMs
+                );
+                if (isEncrypted || reasoningTokens > 0) {
+                    m.think = ViewMessage::ThinkData{
+                        .reasoningTokens = reasoningTokens,
+                        .isEncrypted     = isEncrypted,
+                    };
+                }
+                m.collapsed = true;
+                session_->appendViewMessage(std::move(m));
+                if (isEncrypted || reasoningTokens > 0) {
+                    emitDelta(WireDelta{
+                        .text        = "",
+                        .startTimeMs = thinkStartTimeMs,
+                        .durationMs  = thinkDurationMs,
+                        .think       = ViewMessage::ThinkData{
+                            .reasoningTokens = reasoningTokens,
+                            .isEncrypted     = isEncrypted,
+                        },
+                        .type        = WireDelta::Type::ThinkToken,
+                    });
+                }
+                lastThinkSegStartMs_    = 0;
+                lastThinkSegDurationMs_ = 0;
+            }
+            auto content = jm.value("content", std::string{});
+            if (!content.empty()) {
+                int64_t assistantStartTimeMs = jm.value("startTimeMs", int64_t{0});
+                int64_t assistantDurationMs  = jm.value("durationMs", int64_t{0});
+                if (assistantStartTimeMs == 0) {
+                    assistantStartTimeMs
+                        = nodeStartTimeMs_ > 0 ? nodeStartTimeMs_ : thinkStartTimeMs;
+                }
+                if (assistantDurationMs == 0 && nodeStartTimeMs_ > 0) {
+                    const int64_t nowMs = static_cast<int64_t>(
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch()
+                        )
+                            .count()
+                    );
+                    assistantDurationMs = std::max(int64_t{0}, nowMs - nodeStartTimeMs_);
+                }
+                auto m = ViewMessage::makeText(
+                    ViewMessage::Role::Assistant,
+                    content,
+                    assistantStartTimeMs,
+                    assistantDurationMs
+                );
+                session_->appendViewMessage(std::move(m));
+            }
+            if (jm.contains("tool_calls") && jm["tool_calls"].is_array()) {
+                for (const auto& tc : jm["tool_calls"]) {
+                    const auto toolName   = tc.value("name", std::string{});
+                    const auto toolCallId = tc.value("id", std::string{});
+                    const auto arguments  = tc.value("arguments", std::string{});
+
+                    const int64_t startMs = static_cast<int64_t>(
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch()
+                        )
+                            .count()
+                    );
+                    ViewMessage m;
+                    m.role      = ViewMessage::Role::Tool;
+                    m.text      = arguments;
+                    m.collapsed = true; // 历史重连默认折叠 (与 onDelta 实时展开不同)
+                    m.tool      = ViewMessage::ToolData{};
+                    m.tool->toolName   = toolName;
+                    m.tool->toolCallId = toolCallId;
+                    m.startTimeMs      = startMs;
+                    const auto msgId   = session_->appendViewMessage(std::move(m));
+                    // 登记 toolCallId → viewMessages 索引, 供 tool 结果回填 O(1) 定位
+                    // (viewMessages append-only, 索引不失效)
+                    const size_t historyIndex = session_->viewMessages.size() - 1;
+                    if (!toolCallId.empty()) {
+                        toolCallHistoryIndex_[toolCallId] = historyIndex;
+                    }
+                    emitDelta(WireDelta{
+                        .msgId       = msgId,
+                        .toolName    = toolName,
+                        .toolCallId  = toolCallId,
+                        .arguments   = arguments,
+                        .startTimeMs = startMs,
+                        .type        = WireDelta::Type::ToolStart,
+                    });
+                }
+            }
+        } else if (role == "tool") {
+            hasToolResult = true;
+            auto content = jm.value("content", std::string{});
+            // 注意: 消息 JSON 由 neograph::ChatMessage::to_json 序列化, tool 结果
+            // 的字段名为 snake_case (tool_name/tool_call_id); 兼容读取 camelCase
+            // (手工构造 JSON 写入 channel 时可能使用), 避免 ToolEnd 关联失败
+            auto toolName   = jm.value("tool_name", jm.value("toolName", std::string{}));
+            auto toolCallId = jm.value("tool_call_id", jm.value("toolCallId", std::string{}));
+            if (toolCallId.empty()) {
+                continue;
+            }
+            int64_t toolStartTimeMs = 0;
+            int64_t toolDurationMs  = 0;
+            if (jm.contains("extra") && jm["extra"].is_object()) {
+                toolStartTimeMs = jm["extra"].value("startTimeMs", int64_t{0});
+                toolDurationMs  = jm["extra"].value("durationMs", int64_t{0});
+            }
+            if (toolStartTimeMs == 0) {
+                toolStartTimeMs = jm.value("startTimeMs", int64_t{0});
+            }
+            if (toolDurationMs == 0) {
+                toolDurationMs = jm.value("durationMs", int64_t{0});
+            }
+            // 回填对应的 Tool 消息 (assistant tool_calls 展开时已登记索引):
+            // - 优先 O(1) 索引定位 (本轮已登记)
+            // - 未命中时回扫兜底 (如历史来自更早轮次/恢复中断场景)
+            ViewMessage* target = nullptr;
+            if (auto idxIt = toolCallHistoryIndex_.find(toolCallId);
+                idxIt != toolCallHistoryIndex_.end()
+                && idxIt->second < session_->viewMessages.size()) {
+                target = &session_->viewMessages[idxIt->second];
+            }
+            if (!target) {
+                for (auto it = session_->viewMessages.rbegin(); it != session_->viewMessages.rend();
+                     ++it) {
+                    if (it->role == ViewMessage::Role::Tool && it->tool
+                        && it->tool->toolCallId == toolCallId && !it->tool->toolFinished) {
+                        target = &*it;
+                        break;
+                    }
+                }
+            }
+            if (target) {
+                if (!target->tool) {
+                    target->tool = ViewMessage::ToolData{}; // 防御: 类型保证下不应为空
+                }
+                target->tool->toolResult   = content;
+                target->tool->toolFinished = true;
+                target->collapsed          = true;
+                if (toolDurationMs > 0) {
+                    target->durationMs = toolDurationMs;
+                } else if (target->startTimeMs > 0) {
+                    const int64_t nowMs = static_cast<int64_t>(
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch()
+                        )
+                            .count()
+                    );
+                    target->durationMs = std::max(int64_t{0}, nowMs - target->startTimeMs);
+                    toolDurationMs     = target->durationMs;
+                }
+                if (toolStartTimeMs > 0) {
+                    target->startTimeMs = toolStartTimeMs;
+                }
+                // 回填后同步持久化: 库内该行仍是未完成的 Tool 消息 (tool_finished
+                // 缺失), 若不更新, 重启恢复/会话切换后再展示的 tool 结果会一直
+                // 显示未完成状态。经 Session::updateViewMessage 触发 onUpdateViewMessage
+                // 回调覆盖库内对应行 (按 msg.id 定位)。
+                if (!target->id.empty()) {
+                    session_->updateViewMessage(*target);
+                }
+                // (edit 工具参数 unified diff: 渲染端自行计算, 无处理者, 不再生成;
+                //  ToolData::diff 字段保留供未来)
+            }
+            emitDelta(WireDelta{
+                .toolName    = toolName,
+                .toolCallId  = toolCallId,
+                .result      = content,
+                .startTimeMs = target ? target->startTimeMs : toolStartTimeMs,
+                .durationMs  = target ? target->durationMs : toolDurationMs,
+                .type        = WireDelta::Type::ToolEnd,
+                .hasError    = false,
+            });
+        }
+    }
+    // ---- 请求落盘已结算的上下文 (增量持久化的核心挂点) ----
+    // 节点对该批消息 (assistant 回复 / tool 结果) 定稿时发出本事件, 此时消息
+    // 已写入会话上下文 (会话为唯一权威)。这里只需按节流窗口请求一次落盘,
+    // 使进程在轮次中途被杀/崩溃时已结算的上下文最多丢一个节流窗口
+    // (Session::kPersistThrottleMs), 而非整轮。
+    // - 上下文写入 (含系统提示词更新 / 压缩回写) 不产生本事件, 因此不会重复落盘
+    // - 分级: 工具结算立即落盘 (结果体积大且是后续推理的输入),
+    //   纯模型输出保持节流 (窗口内合并, 轮末权威保存兜底)
+    if (hasToolResult) {
+        session_->persistNow("tool-settle");
+    } else {
+        session_->persistThrottled("llm-output");
+    }
+
+    // llm node 执行完成，推送上下文统计更新 (占用 + 会话累计用量)
+    if (hasLLMOutput && io_ && session_->contextStats) {
+        io_->sendToPeer(agentxx::agent::io::toWireContextStats(*session_->contextStats));
+    }
+}
+
+void EventBridge::handleTurnStart() {
+    // 重置轮级 tps 统计 (上一轮残留: 流已结算, 计数归零)
+    turnTpsTokenCount_      = 0.0;
+    turnTpsDurationSec_     = 0.0;
+    lastThinkSegStartMs_    = 0;
+    lastThinkSegDurationMs_ = 0;
+    // 重置流级统计 (防御: 上轮异常结束可能未结算)
+    tpsStartTime_  = {};
+    tpsTokenCount_ = 0.0;
+    tpsPendingText_.clear();
+    tpsLastPushSec_   = 0.0;
+    tpsLastPushToken_ = 0.0;
+    // 新轮次开始: 上一轮的生成占位提示已随 client 侧 TurnEnd 清除, 此处只重置标记
+    // (不补发 Done: 补发会在新轮次的用户消息之后插入一条无意义的清除指令)
+    genStatusActive_ = false;
+}
+
+void EventBridge::settleCurrentStream() {
+    // 结算 pending 文本
+    if (!tpsPendingText_.empty()) {
+        tpsTokenCount_ += countTokens(tpsPendingText_);
+        tpsPendingText_.clear();
+    }
+    // 无进行中的流 (当前流无 token 输出) 时跳过
+    if (tpsTokenCount_ <= 0.0) {
+        return;
+    }
+    // 将当前流的累计估算 token 与流式耗时累加到轮级统计
+    // (耗时仅计 LLM 流式期间, 从首个 token 到节点结束)
+    const auto elapsedSec
+        = std::chrono::duration<double>(std::chrono::steady_clock::now() - tpsStartTime_).count();
+    turnTpsTokenCount_ += tpsTokenCount_;
+    if (elapsedSec > 0.0) {
+        turnTpsDurationSec_ += elapsedSec;
+    }
+    // 重置流级计数 (下一个流重新开始计时)
+    tpsStartTime_  = {};
+    tpsTokenCount_ = 0.0;
+    tpsPendingText_.clear();
+    tpsLastPushSec_   = 0.0;
+    tpsLastPushToken_ = 0.0;
+}
+
+double EventBridge::takeTurnTps() {
+    // 结算可能仍在进行中的流 (异常/取消路径可能未触发节点结束)
+    settleCurrentStream();
+    // 无 LLM 流式输出时返回 0 (如纯工具错误轮)
+    if (turnTpsDurationSec_ <= 0.0) {
+        turnTpsTokenCount_  = 0.0;
+        turnTpsDurationSec_ = 0.0;
+        return 0.0;
+    }
+    const double tps = turnTpsTokenCount_ / turnTpsDurationSec_;
+    // 取走后重置, 下一轮重新统计
+    turnTpsTokenCount_  = 0.0;
+    turnTpsDurationSec_ = 0.0;
+    return tps;
+}
+
+void EventBridge::handleNodeStart(const neograph::graph::GraphEvent& event) {
+    // 防御: 上一节点遗留未结算的 THINKING 段 (正常应已在节点结束/出错时结算)
+    finalizeThinkSegment();
+    lastThinkSegStartMs_    = 0;
+    lastThinkSegDurationMs_ = 0;
+    lastChatChunkType_      = neograph::ChatStreamChunk::TYPE_UNKNOWN;
+    nodeStartTime_          = std::chrono::system_clock::now();
+    nodeStartTimeMs_        = static_cast<int64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(nodeStartTime_.time_since_epoch())
+            .count()
+    );
+    emitDelta(agentxx::agent::WireDelta{
+        .nodeName    = event.node_name,
+        .startTimeMs = nodeStartTimeMs_,
+        .type        = agentxx::agent::WireDelta::Type::NodeStart,
+    });
+}
+
+void EventBridge::handleNodeEnd(const neograph::graph::GraphEvent& event) {
+    // 结算当前 LLM 流: 将流耗时累加到轮级 tps 统计 (ModelCall 节点结束即流结束)
+    settleCurrentStream();
+    // 结算未闭合的 THINKING 段 (思考后无正文直接结束的流, 如纯思考/仅 tool_calls):
+    // 结算包先于 NodeEnd WireDelta 发送, client 先回填 Think 时长再收节点结束事件
+    finalizeThinkSegment();
+    // 生成阶段提示收尾: 节点结束即生成结束, 清除 client 侧占位提示
+    // (正常路径下正文/工具消息已先到达并让 client 清除; 此处兜底无输出即结束的场景)
+    if (genStatusActive_) {
+        emitGenStatus(agentxx::agent::WireDelta::GenPhase::Done);
+    }
+    lastChatChunkType_ = neograph::ChatStreamChunk::TYPE_UNKNOWN;
+    // 计算持续时间
+    const int64_t duration_ms
+        = static_cast<int64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   std::chrono::system_clock::now() - nodeStartTime_
+        )
+                                   .count());
+    emitDelta(agentxx::agent::WireDelta{
+        .nodeName    = event.node_name,
+        .startTimeMs = nodeStartTimeMs_,
+        .durationMs  = duration_ms,
+        .type        = agentxx::agent::WireDelta::Type::NodeEnd,
+    });
+}
+
+void EventBridge::handleError(const neograph::graph::GraphEvent& event) {
+    // 错误不产出会话增量 WireDelta (由 WireTurnResult 统一报告), 仅发布总线事件
+    // 结算当前 LLM 流 (错误/取消可能跳过节点结束, 轮级统计需及时结算)
+    settleCurrentStream();
+    // 结算未闭合的 THINKING 段: 错误/取消中断思考流时同样回填已耗时长,
+    // 使 client 已落盘的 Think 消息携带中断前的真实耗时
+    finalizeThinkSegment();
+    // 生成阶段提示收尾: 出错/取消时清除 client 侧占位提示 (不再有后续输出)
+    if (genStatusActive_) {
+        emitGenStatus(agentxx::agent::WireDelta::GenPhase::Done);
+    }
+    lastChatChunkType_ = neograph::ChatStreamChunk::TYPE_UNKNOWN;
+    auto msg           = event.data.is_string() ? event.data.get<std::string>() : event.data.dump();
+    publishError(std::move(msg), event.node_name);
+}
+
+double EventBridge::countTokens(std::string_view text) {
+    // 优先使用 EventBus 上注册的 token 计算服务 (与上下文压缩/上下文统计一致)
+    if (auto ctxPtr = ctx_.lock(); ctxPtr && ctxPtr->bus) {
+        auto count
+            = ctxPtr->bus->callService<size_t(std::string_view)>(events::Topic::TokenCount, text);
+        if (count.has_value()) {
+            return static_cast<double>(*count);
+        }
+    }
+    if (session_ && session_->bus) {
+        auto count
+            = session_->bus->callService<size_t(std::string_view)>(events::Topic::TokenCount, text);
+        if (count.has_value()) {
+            return static_cast<double>(*count);
+        }
+    }
+
+    // 回退: 无 summarization (测试/裸 EventBridge) 时的内置估算
+    // 规则与 SummarizationMiddlewareHandle::countTokensForUtf8Str / utilxx_base::estimateTokenCount
+    // 完全一致:
+    // - 0xF8-0xFF (无效 UTF-8 前导, 5/6 字节编码已被 RFC 3629 废弃) 按 ascii
+    //   单字节处理, 避免吞掉后续字节少计
+    // - ascii ≈ 4 字符/token, 非 ascii ≈ 1.1 字符/token (分别折算后相加)
+    return utilxx_base::estimateTokenCount(text, 1.1, 4.0);
+}
+
+void EventBridge::pushTpsIfDue() {
+    // 无对端 (headless) 或无会话统计时不推送
+    if (!io_ || !session_->contextStats) {
+        return;
+    }
+    const auto nowSec
+        = std::chrono::duration<double>(std::chrono::steady_clock::now() - tpsStartTime_).count();
+    // 每 [tpsPushIntervalSec_] 秒更新一次平均速度; 流式期间 token 持续到达, 越界即推送
+    if (nowSec - tpsLastPushSec_ < tpsPushIntervalSec_) {
+        return;
+    }
+    // 结算 pending 文本再计算窗口 tps
+    if (!tpsPendingText_.empty()) {
+        tpsTokenCount_ += countTokens(tpsPendingText_);
+        tpsPendingText_.clear();
+    }
+    // 最近一个窗口 (推送周期) 内的平均生成速度:
+    // 窗口内 token 增量 / 窗口实际时长, 而非自流开始以来的累计平均
+    // (累计平均会被早期慢速段平滑, 无法反映当前实际速度)
+    const double windowSec = nowSec - tpsLastPushSec_;
+    const double tps       = (windowSec > 0.0 && tpsTokenCount_ > tpsLastPushToken_)
+                                 ? (tpsTokenCount_ - tpsLastPushToken_) / windowSec
+                                 : 0.0;
+    tpsLastPushSec_        = nowSec;
+    tpsLastPushToken_      = tpsTokenCount_;
+    io_->sendToPeer(
+        agentxx::agent::io::toWireContextStats(*session_->contextStats, tps)
+    );
+}
+
+void EventBridge::publishModelToken(const std::string& token, std::string_view kind) {
+    auto ctxPtr = ctx_.lock();
+    if (!ctxPtr || !ctxPtr->bus) {
+        return; // 无 bus, 跳过
+    }
+    auto  busPtr = ctxPtr->bus;
+    auto& bus    = *busPtr;
+    // 无订阅者时跳过: 避免每个 token 创建一次无处理者的协程
+    // (ModelToken topic 当前无生产订阅者, 该检查使热路径零开销)
+    if (false
+        == bus.hasListeners<agentxx::events::EventModelToken>(agentxx::events::Topic::ModelToken)) {
+        return;
+    }
+    auto task = [busPtr,
+                 agentName = agentName_,
+                 sessionId = sessionId_,
+                 token, // 捕获副本, 协程生命周期独立于本对象
+                 kind = std::string{kind}]() -> asio::awaitable<void> {
+        co_await busPtr->publish<agentxx::events::EventModelToken>(
+            agentxx::events::Topic::ModelToken,
+            agentxx::events::EventModelToken{
+                .agentName = agentName,
+                .sessionId = sessionId,
+                .token     = token,
+                .kind      = kind,
+            }
+        );
+    };
+    // 后台任务登记: 有登记表时由它统一在关闭阶段取消并等待收敛
+    if (ctxPtr->taskScope) {
+        ctxPtr->taskScope->spawn("event-publish", std::move(task));
+        return;
+    }
+    asio::co_spawn(bus.executor(), std::move(task), asio::detached);
+}
+
+void EventBridge::publishError(std::string message, std::string where) {
+    auto ctxPtr = ctx_.lock();
+    if (!ctxPtr || !ctxPtr->bus) {
+        return; // 无 bus, 跳过
+    }
+    auto  busPtr = ctxPtr->bus;
+    auto& bus    = *busPtr;
+    // 无订阅者时跳过 (与 ModelToken 一致, 避免无效协程创建)
+    if (false == bus.hasListeners<agentxx::events::EventError>(agentxx::events::Topic::Error)) {
+        return;
+    }
+    auto task = [busPtr,
+                 agentName = agentName_,
+                 sessionId = sessionId_,
+                 message   = std::move(message),
+                 where     = std::move(where)]() -> asio::awaitable<void> {
+        co_await busPtr->publish<agentxx::events::EventError>(
+            agentxx::events::Topic::Error,
+            agentxx::events::EventError{
+                .agentName = agentName,
+                .sessionId = sessionId,
+                .message   = message,
+                .where     = where,
+            }
+        );
+    };
+    if (ctxPtr->taskScope) {
+        ctxPtr->taskScope->spawn("event-publish", std::move(task));
+        return;
+    }
+    asio::co_spawn(bus.executor(), std::move(task), asio::detached);
+}
+
+} // namespace events
+} // namespace agentxx

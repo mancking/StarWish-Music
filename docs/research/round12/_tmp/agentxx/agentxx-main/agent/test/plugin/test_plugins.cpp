@@ -1,0 +1,3308 @@
+#include "agentxx-test/plugin/test_plugins.h"
+#include "agentxx-test/test_coro_util.h"
+
+#include "agentxx/agent/context.h"
+#include "agentxx/agent/resource_applier.h"
+#include "agentxx/event/event_stream.h"
+#include "agentxx/middlewares/memory_file.h"
+#include "agentxx/middlewares/middleware.h"
+#include "agentxx/middlewares/permission.h"
+#include "agentxx/middlewares/skill.h"
+#include "agentxx/nodes/agentcall.h"
+#include "agentxx/nodes/graph_conditions.h"
+#include "agentxx/nodes/modelcall.h"
+#include "agentxx/nodes/toolcall.h"
+#include "agentxx/plugin/api/plugin_kit.h"
+#include "agentxx/plugin/plugin_manager.h"
+#include "asio/co_spawn.hpp"
+#include "asio/detached.hpp"
+#include "asio/steady_timer.hpp"
+#include "asio/use_awaitable.hpp"
+#include "neograph/graph/compiler.h"
+#include "neograph/graph/validator.h"
+#include "utilxx/async_offload.h"
+#include "utilxx/http_server.h"
+#include "utilxx_base/log.h"
+#include "utilxx_base/system.h"
+#include <algorithm>
+#include <boost/beast/http.hpp>
+#include <chrono>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <string>
+#include <thread>
+
+namespace {
+// 本模块测试计数器 (仅本编译单元可见; 不经头文件 extern 导出)
+int g_plugin_passed = 0;
+int g_plugin_failed = 0;
+} // namespace
+
+// 断言计数宏覆盖: 将 test_framework.h 的 XX_TEST_EXPECT_* 映射到本模块计数器
+#define XX_TEST_PASSED g_plugin_passed
+#define XX_TEST_FAILED g_plugin_failed
+
+namespace agentxx {
+namespace plugin {
+const void* PLUGINXX_CALL xx_query_interface(const PluginxxHost*, const PluginxxStringView* iid);
+}
+
+namespace test {
+
+/// 定位插件库目录 (通用; exe 同目录优先, cwd 回退; 校验目录内存在动态库产物,
+/// 避免 cwd 在源码仓库下时误命中 agent/plugins/ 下的插件源码目录)
+static std::string findPluginDir(const char* pluginName) {
+    namespace fs = std::filesystem;
+    std::error_code       ec;
+    std::vector<fs::path> candidates;
+    if (auto exeDir = executableDir()) {
+        candidates.push_back(*exeDir / "plugins" / pluginName);
+    }
+    candidates.push_back(fs::current_path(ec) / "plugins" / pluginName);
+    auto hasLibFile = [](const fs::path& dir) {
+        std::error_code                     ec2;
+        std::filesystem::directory_iterator it(dir, ec2);
+        std::filesystem::directory_iterator end;
+        for (; it != end; it.increment(ec2)) {
+            auto ext = it->path().extension().string();
+            if (ext == ".so" || ext == ".dll" || ext == ".dylib") {
+                return true;
+            }
+        }
+        return false;
+    };
+    for (const auto& c : candidates) {
+        if (fs::is_directory(c, ec) && hasLibFile(c)) {
+            return c.string();
+        }
+    }
+    // 异常兜底: 返回相对目录路径, loadPluginAsync 解析失败时日志暴露原因
+    return std::string{"plugins/"} + pluginName;
+}
+
+static std::string findExamplePluginPath() {
+    return findPluginDir("example_plugin");
+}
+
+static asio::awaitable<void> sleepMs(int ms) {
+    auto timer
+        = asio::steady_timer(co_await asio::this_coro::executor, std::chrono::milliseconds{ms});
+    co_await timer.async_wait(asio::use_awaitable);
+}
+
+asio::awaitable<TestResult> run_plugin_tests() {
+    g_plugin_passed = 0;
+    g_plugin_failed = 0;
+
+    // ---- 1. 构造最小 AgentContext (io 线程环境, 与库内无锁模型一致) ----
+    auto ctx                     = std::make_shared<agentxx::agent::AgentContext>();
+    ctx->agentConfig             = std::make_shared<agentxx::agent::AgentConfig>();
+    ctx->middlewareHandleContext = std::make_shared<agentxx::middleware::MiddlewareContext>();
+    ctx->bus = std::make_shared<agentxx::events::EventBus>(co_await asio::this_coro::executor);
+    ctx->toolRegistry  = std::make_shared<agentxx::plugin::ToolRegistry>();
+    ctx->pluginManager = std::make_shared<agentxx::plugin::PluginManager>(ctx);
+    // 装配 io executor (与 BaseAgent::init 一致): 跨线程 (JS 线程/线程池) 的
+    // vtable 调用经真实 post 到 io 线程执行, 而非测试默认的"伪 io 线程"直连
+    ctx->pluginManager->setIoExecutor(co_await asio::this_coro::executor);
+
+    // ---- 2. 加载示例插件 (目录 + plugin.yaml 清单分派) ----
+    auto path = findExamplePluginPath();
+    XX_TEST_EXPECT_TRUE(path.find("example_plugin") != std::string::npos);
+    auto inst = co_await ctx->pluginManager->loadPluginAsync(path);
+    XX_TEST_EXPECT_TRUE(inst != nullptr);
+    if (!inst) {
+        XX_TEST_EXPECT_TRUE(false);
+        co_return TestResult{g_plugin_passed, g_plugin_failed};
+    }
+    XX_TEST_EXPECT_EQ(inst->name, "example_plugin");
+    XX_TEST_EXPECT_EQ(inst->version, "1.0.0");
+    XX_TEST_EXPECT_TRUE(ctx->toolRegistry->contains("example_echo"));
+    XX_TEST_EXPECT_TRUE(ctx->toolRegistry->contains("example_caller"));
+    XX_TEST_EXPECT_TRUE(ctx->pluginManager->capabilities()->has("example.demo"));
+    XX_TEST_EXPECT_TRUE(ctx->pluginManager->hasCapability("example.demo") == 1);
+
+    // ---- 2.5 接口表: agentxx.agent.config get_language / set_language ----
+    {
+        auto ifaceConfig = agentxx::plugin::queryInterface<PluginxxConfigIface>(
+            inst->hostView(),
+            PLUGINXX_IFACE_CONFIG
+        );
+        XX_TEST_EXPECT_TRUE(ifaceConfig != nullptr);
+        if (ifaceConfig) {
+            XX_TEST_EXPECT_EQ(ifaceConfig->version, PLUGINXX_IFACE_CONFIG_VERSION);
+            // 默认语言为 "en"
+            PluginxxString langOut{};
+            XX_TEST_EXPECT_EQ(ifaceConfig->get_language(inst->hostView(), &langOut), 0);
+            XX_TEST_EXPECT_TRUE(langOut.data != nullptr);
+            if (langOut.data) {
+                XX_TEST_EXPECT_EQ(std::string(langOut.data, langOut.size), std::string("en"));
+            }
+            agentxx::plugin::PluginString::free(inst->hostView(), &langOut);
+
+            // 切换语言为 "zh-cn"
+            PluginxxStringView zhSv{"zh-cn", 5};
+            XX_TEST_EXPECT_EQ(ifaceConfig->set_language(inst->hostView(), &zhSv), 0);
+
+            XX_TEST_EXPECT_EQ(ifaceConfig->get_language(inst->hostView(), &langOut), 0);
+            XX_TEST_EXPECT_TRUE(langOut.data != nullptr);
+            if (langOut.data) {
+                XX_TEST_EXPECT_EQ(std::string(langOut.data, langOut.size), std::string("zh-cn"));
+            }
+            agentxx::plugin::PluginString::free(inst->hostView(), &langOut);
+
+            // 不支持 auto, 传 auto 回退为 en
+            PluginxxStringView autoSv{"auto", 4};
+            XX_TEST_EXPECT_EQ(ifaceConfig->set_language(inst->hostView(), &autoSv), 0);
+
+            XX_TEST_EXPECT_EQ(ifaceConfig->get_language(inst->hostView(), &langOut), 0);
+            XX_TEST_EXPECT_TRUE(langOut.data != nullptr);
+            if (langOut.data) {
+                XX_TEST_EXPECT_EQ(std::string(langOut.data, langOut.size), std::string("en"));
+            }
+            agentxx::plugin::PluginString::free(inst->hostView(), &langOut);
+        }
+    }
+
+    // ---- 3. 工具执行 (同步 C 回调经线程池卸载) ----
+    {
+        auto tool = ctx->toolRegistry->find("example_echo");
+        XX_TEST_EXPECT_TRUE(tool != nullptr);
+        if (tool) {
+            auto out = co_await tool->execute_async(utilxx_base::Json{
+                {"sessionId", "t1"   },
+                {"hello",     "world"},
+            });
+            auto j   = utilxx_base::Json::parse(out);
+            XX_TEST_EXPECT_EQ(j["echo"]["hello"].get<std::string>(), "world");
+            XX_TEST_EXPECT_EQ(j["sessionId"].get<std::string>(), "t1");
+        }
+    }
+
+    // ---- 4. 插件互调 (call_tool) ----
+    {
+        auto tool = ctx->toolRegistry->find("example_caller");
+        XX_TEST_EXPECT_TRUE(tool != nullptr);
+        if (tool) {
+            auto out = co_await tool->execute_async(utilxx_base::Json{
+                {"sessionId", "t1"},
+                {"x",         42  },
+            });
+            auto j   = utilxx_base::Json::parse(out);
+            XX_TEST_EXPECT_EQ(j["via_call_tool"]["echo"]["x"].get<int>(), 42);
+        }
+    }
+
+    // ---- 4.5 真实插件端到端 (agentxx_execute_command 插件) ----
+    {
+        auto& prompt   = ctx->agentConfig->prompt;
+        auto  execPath = findPluginDir("agentxx_execute_command");
+#if XX_IS_WIN_D
+        const char* cmdToolName = "agentxx_execute_windows_command";
+#else
+        const char* cmdToolName = "agentxx_execute_bash_command";
+#endif
+        // 加载前: 提示词表无该工具条目 (工具提示词完全由插件贡献)
+        XX_TEST_EXPECT_FALSE(prompt.toolPrompt.contains(cmdToolName));
+
+        auto execInst = co_await ctx->pluginManager->loadPluginAsync(execPath);
+        XX_TEST_EXPECT_TRUE(execInst != nullptr);
+        if (execInst) {
+            XX_TEST_EXPECT_TRUE(ctx->toolRegistry->contains(cmdToolName));
+
+            // 插件 start 注入的工具提示词 (depict + 参数描述, 含启动时探测到的
+            // python/node 信息) 必须落到主程序提示词表与工具定义里
+            XX_TEST_EXPECT_TRUE(prompt.toolPrompt.contains(cmdToolName));
+            if (prompt.toolPrompt.contains(cmdToolName)) {
+                auto it = prompt.toolPrompt.find(cmdToolName);
+                XX_TEST_EXPECT_TRUE(it->second.args.contains("command"));
+                if (it->second.args.contains("command")) {
+                    XX_TEST_EXPECT_TRUE(
+                        it->second.args.at("command").find("Interpreters detected at startup")
+                        != std::string::npos
+                    );
+                }
+            }
+
+            auto tool = ctx->toolRegistry->find(cmdToolName);
+            if (tool) {
+                auto def = tool->get_definition();
+                XX_TEST_EXPECT_FALSE(def.description.empty());
+                // LLM 侧 schema 的 command 描述含环境段 (注册时固化, 与提示词同源)
+                auto props = def.parameters["properties"];
+                XX_TEST_EXPECT_TRUE(props.contains("command"));
+                if (props.contains("command")) {
+                    XX_TEST_EXPECT_TRUE(
+                        props["command"]["description"].get<std::string>().find(
+                            "Interpreters detected at startup"
+                        )
+                        != std::string::npos
+                    );
+                }
+
+                auto out = co_await tool->execute_async(utilxx_base::Json{
+                    {"command", "echo polled_e2e_ok"},
+                    {"timeout", 15                  },
+                });
+                XX_TEST_EXPECT_TRUE(out.find("polled_e2e_ok") != std::string::npos);
+                XX_TEST_EXPECT_TRUE(out.find("[ExitCode]") != std::string::npos);
+            }
+            co_await ctx->pluginManager->unloadAsync("agentxx_execute_command");
+            XX_TEST_EXPECT_TRUE(false == ctx->toolRegistry->contains(cmdToolName));
+            // 卸载后插件贡献撤销: 工具提示词条目回到加载前状态 (不存在)
+            XX_TEST_EXPECT_FALSE(prompt.toolPrompt.contains(cmdToolName));
+        }
+    }
+
+    // ---- 4.6 example_js_execute_command 插件端到端 (仿 execute_command 的 JS 实现) ----
+    {
+        auto jsEnginePath = findPluginDir("agentxx_javascript_engine");
+        if (!ctx->pluginManager->hasCapability("interpreter.js")) {
+            auto eInst = co_await ctx->pluginManager->loadPluginAsync(jsEnginePath);
+            XX_TEST_EXPECT_TRUE(eInst != nullptr);
+        }
+        auto jsExecPath = findPluginDir("example_js_execute_command");
+        auto jsExecInst = co_await ctx->pluginManager->loadPluginAsync(jsExecPath);
+        XX_TEST_EXPECT_TRUE(jsExecInst != nullptr);
+        if (jsExecInst) {
+            for (int i = 0; i < 30 && !ctx->toolRegistry->contains("example_js_execute_command");
+                 ++i) {
+                co_await sleepMs(50);
+            }
+            XX_TEST_EXPECT_TRUE(ctx->toolRegistry->contains("example_js_execute_command"));
+            // 别名工具 agentxx_execute_javascript 与 agentxx_execute_js
+            XX_TEST_EXPECT_TRUE(ctx->toolRegistry->contains("agentxx_execute_javascript"));
+            XX_TEST_EXPECT_TRUE(ctx->toolRegistry->contains("agentxx_execute_js"));
+
+            auto tool = ctx->toolRegistry->find("example_js_execute_command");
+            XX_TEST_EXPECT_TRUE(tool != nullptr);
+            if (tool) {
+                // 1. 同步计算与返回值
+                auto out1 = co_await tool->execute_async(utilxx_base::Json{
+                    {"code", "return 2+3"},
+                });
+                XX_TEST_EXPECT_TRUE(out1.find("5") != std::string::npos);
+                XX_TEST_EXPECT_TRUE(out1.find("[ExitCode]\n0") != std::string::npos);
+
+                // 2. 控制台输出与异常捕获
+                auto out2 = co_await tool->execute_async(utilxx_base::Json{
+                    {"code", "console.log('hi_js'); throw new Error('oops_js')"},
+                });
+                XX_TEST_EXPECT_TRUE(out2.find("hi_js") != std::string::npos);
+                XX_TEST_EXPECT_TRUE(out2.find("oops_js") != std::string::npos);
+                XX_TEST_EXPECT_TRUE(out2.find("[StdErr]") != std::string::npos);
+                XX_TEST_EXPECT_TRUE(out2.find("[ExitCode]\n1") != std::string::npos);
+
+                // 3. 异步 Promise 等待与对象 JSON 返回
+                auto out3 = co_await tool->execute_async(utilxx_base::Json{
+                    {"code",
+                     "await new Promise(r=>setTimeout(r,10)); return { status: 'async_ok', val: 42 };"
+                    },
+                });
+                XX_TEST_EXPECT_TRUE(out3.find("async_ok") != std::string::npos);
+                XX_TEST_EXPECT_TRUE(out3.find("42") != std::string::npos);
+
+                // 4. 超时场景处理 (1秒超时)
+                auto out4 = co_await tool->execute_async(utilxx_base::Json{
+                    {"code",    "await new Promise(r=>setTimeout(r,2000)); return 99"},
+                    {"timeout", 1                                                    },
+                });
+                XX_TEST_EXPECT_TRUE(out4.find("Command timed out") != std::string::npos);
+
+                // 5. all_output=false 策略 (成功不输出，失败输出)
+                auto out5 = co_await tool->execute_async(utilxx_base::Json{
+                    {"code",       "console.log('secret_log'); return 'hide_log';"},
+                    {"all_output", false                                          },
+                });
+                XX_TEST_EXPECT_TRUE(out5.find("secret_log") == std::string::npos);
+                XX_TEST_EXPECT_TRUE(out5.find("[ExitCode]\n0") != std::string::npos);
+
+                auto out5_err = co_await tool->execute_async(utilxx_base::Json{
+                    {"code",       "console.log('err_log'); throw new Error('visible_on_fail');"},
+                    {"all_output", false                                                        },
+                });
+                XX_TEST_EXPECT_TRUE(out5_err.find("visible_on_fail") != std::string::npos);
+
+                // 6. 大文本截断
+                auto out6 = co_await tool->execute_async(utilxx_base::Json{
+                    {"code", "let s = 'x'.repeat(35000); console.log(s); return s.length;"},
+                });
+                XX_TEST_EXPECT_TRUE(out6.find("[Content offloaded") != std::string::npos);
+            }
+
+            // 7. 别名工具调用验证
+            auto aliasTool = ctx->toolRegistry->find("agentxx_execute_js");
+            XX_TEST_EXPECT_TRUE(aliasTool != nullptr);
+            if (aliasTool) {
+                auto outAlias = co_await aliasTool->execute_async(utilxx_base::Json{
+                    {"code", "return 'alias_ok';"},
+                });
+                XX_TEST_EXPECT_TRUE(outAlias.find("alias_ok") != std::string::npos);
+            }
+            auto aliasTool2 = ctx->toolRegistry->find("agentxx_execute_javascript");
+            XX_TEST_EXPECT_TRUE(aliasTool2 != nullptr);
+            if (aliasTool2) {
+                auto outAlias2 = co_await aliasTool2->execute_async(utilxx_base::Json{
+                    {"code", "return 'alias2_ok';"},
+                });
+                XX_TEST_EXPECT_TRUE(outAlias2.find("alias2_ok") != std::string::npos);
+            }
+
+            // 8. 卸载与清理
+            co_await ctx->pluginManager->unloadAsync("example_js_execute_command");
+            XX_TEST_EXPECT_FALSE(ctx->toolRegistry->contains("example_js_execute_command"));
+            XX_TEST_EXPECT_FALSE(ctx->toolRegistry->contains("agentxx_execute_javascript"));
+            XX_TEST_EXPECT_FALSE(ctx->toolRegistry->contains("agentxx_execute_js"));
+        }
+        // 保持引擎加载，供后续 JS 用例复用
+    }
+
+    // ---- 5. 钩子登记: 主程序级派发器入链 + 处理器清单 ----
+    {
+        const auto& handles = ctx->middlewareHandleContext->handles;
+        bool        found   = std::any_of(handles.begin(), handles.end(), [](const auto& h) {
+            return h->name == "plugin_hooks";
+        });
+        XX_TEST_EXPECT_TRUE(found); ///< 中间件链上只有一个主程序级派发器
+        XX_TEST_EXPECT_EQ(inst->hookRegistrations.size(), size_t{1});
+        XX_TEST_EXPECT_GE(inst->hookRegistrations.front().handle, int64_t{1});
+        const auto handlers = ctx->pluginManager->handlersOf(AGENTXX_PLUGIN_HOOK_AGENT_START);
+        XX_TEST_EXPECT_EQ(handlers.size(), size_t{1});
+        if (!handlers.empty()) {
+            XX_TEST_EXPECT_EQ(handlers.front().owner, std::string{"plugin:example_plugin"});
+            XX_TEST_EXPECT_EQ(handlers.front().layer, std::string{"plugin"});
+            XX_TEST_EXPECT_TRUE(handlers.front().enabled);
+        }
+    }
+
+    // ---- 6. 事件订阅/发布回环 (plugin.demo.topic) ----
+    {
+        // 测试侧订阅同一 topic (JSON 字符串载荷)
+        bool received = false;
+        auto subId    = ctx->bus->get<std::string>("plugin.demo.topic")
+                         .subscribe([&](const std::string& data) -> asio::awaitable<void> {
+                             if (data.find("\"k\"") != std::string::npos) {
+                                 received = true;
+                             }
+                             co_return;
+                         });
+        int rc = ctx->pluginManager->publish("demo.topic", R"({"k":"v"})");
+        XX_TEST_EXPECT_EQ(rc, 0);
+        co_await sleepMs(150);
+        XX_TEST_EXPECT_TRUE(received);
+        ctx->bus->get<std::string>("plugin.demo.topic").unsubscribe(subId);
+    }
+
+    // ---- 7. 禁用 → 工具摘除/钩子处理器摘除; 启用 → 恢复 ----
+    {
+        ctx->pluginManager->disable("example_plugin");
+        XX_TEST_EXPECT_FALSE(ctx->toolRegistry->contains("example_echo"));
+        XX_TEST_EXPECT_FALSE(ctx->pluginManager->registry()->contains("example_caller"));
+        // 无轮次执行时 disable 立即摘除派发器; 处理器随实例一起摘除 (记录保留, 句柄置 0)
+        XX_TEST_EXPECT_TRUE(ctx->pluginManager->handlersOf(AGENTXX_PLUGIN_HOOK_AGENT_START).empty());
+        XX_TEST_EXPECT_EQ(inst->hookRegistrations.size(), size_t{1});
+        XX_TEST_EXPECT_EQ(inst->hookRegistrations.front().handle, int64_t{0});
+        XX_TEST_EXPECT_FALSE(inst->enabled);
+
+        ctx->pluginManager->enable("example_plugin");
+        // 启用是 start 事务 (投递到所属 IO 线程执行): 等待插件重新声明注册
+        for (int i = 0; i < 200 && !ctx->toolRegistry->contains("example_echo"); ++i) {
+            co_await sleepMs(5);
+        }
+        for (int i = 0; i < 200
+                        && ctx->pluginManager->handlersOf(AGENTXX_PLUGIN_HOOK_AGENT_START).empty();
+             ++i) {
+            co_await sleepMs(5);
+        }
+        XX_TEST_EXPECT_TRUE(ctx->toolRegistry->contains("example_echo"));
+        XX_TEST_EXPECT_TRUE(ctx->pluginManager->registry()->contains("example_caller"));
+        XX_TEST_EXPECT_EQ(ctx->pluginManager->handlersOf(AGENTXX_PLUGIN_HOOK_AGENT_START).size(), size_t{1});
+        {
+            const auto& handles = ctx->middlewareHandleContext->handles;
+            const bool  found   = std::any_of(handles.begin(), handles.end(), [](const auto& h) {
+                return h->name == "plugin_hooks" && !h->disabled;
+            });
+            XX_TEST_EXPECT_TRUE(found); ///< 重新登记后派发器回到链上并生效
+        }
+        XX_TEST_EXPECT_TRUE(inst->enabled);
+    }
+
+    // ---- 8. 卸载: 注册残留全部清理 + 插件移除 + 能力移除 ----
+    {
+        auto ok = co_await ctx->pluginManager->unloadAsync("example_plugin");
+        XX_TEST_EXPECT_TRUE(ok);
+        XX_TEST_EXPECT_FALSE(ctx->toolRegistry->contains("example_echo"));
+        XX_TEST_EXPECT_TRUE(ctx->pluginManager->find("example_plugin") == nullptr);
+        XX_TEST_EXPECT_FALSE(ctx->pluginManager->capabilities()->has("example.demo"));
+        // 没有处理器后派发器从 handles 摘除 (轮次执行中先置 disabled, 由 flush 摘除)
+        ctx->pluginManager->flushPendingCleanup();
+        const auto& handles = ctx->middlewareHandleContext->handles;
+        bool        found   = std::any_of(handles.begin(), handles.end(), [](const auto& h) {
+            return h->name == "plugin_hooks";
+        });
+        XX_TEST_EXPECT_FALSE(found);
+        XX_TEST_EXPECT_TRUE(ctx->pluginManager->handlersOf(AGENTXX_PLUGIN_HOOK_AGENT_START).empty());
+        // 工具对象应已释放 (inflight 归零后 dlclose)
+        XX_TEST_EXPECT_EQ(inst->tools.size(), size_t{0});
+    }
+
+    // ---- 9. 重复卸载拒绝 ----
+    {
+        auto ok = co_await ctx->pluginManager->unloadAsync("example_plugin");
+        XX_TEST_EXPECT_FALSE(ok);
+    }
+
+    // ---- 10. 名称冲突: 静态工具名集合 ----
+    {
+        // 最小非抽象工具 (仅测试注册表冲突检测用)
+        struct DummyTool : agentxx::tools::XXToolBase {
+            using XXToolBase::XXToolBase;
+
+            neograph::ChatTool get_definition() const override {
+                return neograph::ChatTool{};
+            }
+
+            asio::awaitable<std::string> execute_async(const utilxx_base::Json&) override {
+                co_return std::string{};
+            }
+        };
+
+        ctx->toolRegistry->setStaticToolNames({"builtin_tool_a"});
+        // 插件工具注册冲突在目录分派 (loadPluginAsync) 路径覆盖, 此处验证注册表拒绝同名静态工具
+        auto dummy = std::make_shared<DummyTool>("builtin_tool_a", ctx);
+        XX_TEST_EXPECT_FALSE(ctx->toolRegistry->registerTool("builtin_tool_a", dummy));
+        XX_TEST_EXPECT_TRUE(ctx->toolRegistry->registerTool("plugin_ok_tool", dummy));
+        ctx->toolRegistry->unregisterTool("plugin_ok_tool");
+    }
+
+    // ---- 11. 插件列表 ----
+    {
+        // 重新加载用于 list 验证
+        auto inst2 = co_await ctx->pluginManager->loadPluginAsync(path);
+        XX_TEST_EXPECT_TRUE(inst2 != nullptr);
+        if (inst2) {
+            auto list  = ctx->pluginManager->list();
+            bool found = std::any_of(list.begin(), list.end(), [](const auto& item) {
+                return item.name == "example_plugin" && item.enabled;
+            });
+            XX_TEST_EXPECT_TRUE(found);
+            co_await ctx->pluginManager->unloadAsync("example_plugin");
+        }
+    }
+
+    // JS 引擎库与JS 插件目录 (第 12~26 段共用; 函数级声明)
+    // findExamplePluginPath() 已含 plugins/ 前缀 (…/plugins/example_plugin),
+    // parent_path() 即 plugins/ 目录, 直接拼接插件子目录名即可
+    namespace fs       = std::filesystem;
+    auto        jsPath = findExamplePluginPath();
+    std::string jsLib  = (fs::path(jsPath).parent_path() / "agentxx_javascript_engine").string();
+    std::string jsDir  = (fs::path(jsPath).parent_path() / "example_js").string();
+
+    // ---- 12. JS JS 运行时插件加载 (二期) ----
+    {
+        auto engineInst = ctx->pluginManager->find("agentxx_javascript_engine");
+        if (!engineInst) {
+            engineInst = co_await ctx->pluginManager->loadPluginAsync(jsLib);
+        }
+        XX_TEST_EXPECT_TRUE(engineInst != nullptr);
+        if (!engineInst) {
+            XX_TEST_EXPECT_TRUE(false);
+            co_return TestResult{g_plugin_passed, g_plugin_failed};
+        }
+        XX_TEST_EXPECT_TRUE(ctx->pluginManager->hasCapability("interpreter.js") == 1);
+
+        // ---- 13. JS 插件 (plugin.yaml 目录分派) ----
+        // 需主程序 example_echo 供 js_call_host 互调
+        auto hostInst = co_await ctx->pluginManager->loadPluginAsync(path);
+        XX_TEST_EXPECT_TRUE(hostInst != nullptr);
+        auto jsInst = co_await ctx->pluginManager->loadPluginAsync(jsDir);
+        XX_TEST_EXPECT_TRUE(jsInst != nullptr);
+        // Wait for async offloaded load (when create was on io thread) to register js tools
+        for (int i = 0; i < 20 && jsInst && !ctx->toolRegistry->contains("js_hello"); ++i) {
+            co_await sleepMs(50);
+        }
+        if (!jsInst) {
+            XX_TEST_EXPECT_TRUE(false);
+            co_return TestResult{g_plugin_passed, g_plugin_failed};
+        }
+        XX_TEST_EXPECT_EQ(jsInst->name, "example_js");
+        // 统一模型: 所有插件都是 C++ 插件, 无 type 概念; 脚本能力由壳经
+        // 能力调用委派给引擎 (主程序不参与)。内置合并编译模式下, 插件是否无
+        // 动态库句柄 (dlHandle 为空) 取决于其是否在 AGENTXX_PLUGIN_BUILTIN_LIST:
+        // - 全量内置 ("all"): 无句柄; 名单外插件仍为动态库 (混合模式)
+        // - 全动态 (BUILTIN=OFF): 有句柄
+        // 两种形态均为正确行为, 此处仅记录不强制断言
+        TEST_INFO << "example_js dlHandle present = " << (jsInst->dlHandle != nullptr) << std::endl;
+        XX_TEST_EXPECT_TRUE(ctx->pluginManager->find("example_js") == jsInst);
+        // 依赖声明 (manifest depends: [agentxx_javascript_engine])
+        XX_TEST_EXPECT_EQ(jsInst->depends.size(), size_t{1});
+        XX_TEST_EXPECT_EQ(jsInst->depends[0], "agentxx_javascript_engine");
+        // 脚本内注册的工具挂到本插件实例 (引擎经壳 host 注册)
+        XX_TEST_EXPECT_TRUE(ctx->toolRegistry->contains("js_hello"));
+        XX_TEST_EXPECT_TRUE(ctx->toolRegistry->contains("js_async_wait"));
+        XX_TEST_EXPECT_TRUE(ctx->toolRegistry->contains("js_call_js"));
+        XX_TEST_EXPECT_TRUE(ctx->toolRegistry->contains("js_call_host"));
+
+        // ---- 14. JS 工具执行 (同步 + async Promise) ----
+        {
+            auto tool = ctx->toolRegistry->find("js_hello");
+            XX_TEST_EXPECT_TRUE(tool != nullptr);
+            if (tool) {
+                auto out = co_await tool->execute_async(utilxx_base::Json{
+                    {"sessionId", "t1"     },
+                    {"name",      "agentxx"},
+                });
+                auto j   = utilxx_base::Json::parse(out);
+                XX_TEST_EXPECT_EQ(j["greeting"].get<std::string>(), "Hello, agentxx!");
+                XX_TEST_EXPECT_EQ(j["from"].get<std::string>(), "js plugin");
+            }
+            auto asyncTool = ctx->toolRegistry->find("js_async_wait");
+            XX_TEST_EXPECT_TRUE(asyncTool != nullptr);
+            if (asyncTool) {
+                auto out = co_await asyncTool->execute_async(utilxx_base::Json{
+                    {"sessionId", "t2"}
+                });
+                auto j   = utilxx_base::Json::parse(out);
+                XX_TEST_EXPECT_EQ(j["waited"].get<bool>(), true);
+                XX_TEST_EXPECT_EQ(j["session"].get<std::string>(), "t2");
+            }
+        }
+
+        // ---- 15. JS 内互调 (本引擎工具内联执行) ----
+        {
+            auto tool = ctx->toolRegistry->find("js_call_js");
+            XX_TEST_EXPECT_TRUE(tool != nullptr);
+            if (tool) {
+                auto out = co_await tool->execute_async(utilxx_base::Json{
+                    {"name", "inner-x"}
+                });
+                auto j   = utilxx_base::Json::parse(out);
+                XX_TEST_EXPECT_EQ(j["inner"]["greeting"].get<std::string>(), "Hello, inner-x!");
+            }
+        }
+
+        // ---- 15b. JS Promise 拒绝映射为工具失败 (拒绝不再当成成功文本) ----
+        {
+            auto tool = ctx->toolRegistry->find("js_reject_demo");
+            XX_TEST_EXPECT_TRUE(tool != nullptr);
+            if (tool) {
+                bool        failed = false;
+                std::string message;
+                try {
+                    (void)co_await tool->execute_async(utilxx_base::Json{
+                        {"reason", "boom-demo"}
+                    });
+                } catch (const std::exception& e) {
+                    failed  = true;
+                    message = e.what();
+                }
+                XX_TEST_EXPECT_TRUE(failed);
+                XX_TEST_EXPECT_TRUE(message.find("boom-demo") != std::string::npos);
+            }
+        }
+
+        // ---- 16. JS → 主程序插件互调 (C 桥) ----
+        {
+            auto tool = ctx->toolRegistry->find("js_call_host");
+            XX_TEST_EXPECT_TRUE(tool != nullptr);
+            if (tool) {
+                auto out = co_await tool->execute_async(utilxx_base::Json{
+                    {"hello", "host"}
+                });
+                auto j   = utilxx_base::Json::parse(out);
+                XX_TEST_EXPECT_EQ(j["host"]["echo"]["hello"].get<std::string>(), "host");
+            }
+        }
+
+        // ---- 16a. callTool 始终返回 Promise (不再同步阻塞 JS 线程) ----
+        {
+            auto tool = ctx->toolRegistry->find("js_calltool_kind");
+            XX_TEST_EXPECT_TRUE(tool != nullptr);
+            if (tool) {
+                auto out = co_await tool->execute_async(utilxx_base::Json::object());
+                auto j   = utilxx_base::Json::parse(out);
+                XX_TEST_EXPECT_EQ(j["kind"].get<std::string>(), "object");
+            }
+        }
+
+        // ---- JS 脚本顶层异常的事务化回滚 ----
+        // 脚本先注册工具/事件/定时器再抛异常: load 必须失败, 且主程序注册表里
+        // 不留下任何该脚本的注册
+        {
+            namespace fs = std::filesystem;
+            std::error_code ec;
+            const auto      uniqueId = std::chrono::steady_clock::now().time_since_epoch().count();
+            auto            scriptPath
+                = fs::temp_directory_path(ec) / fmt::format("agentxx_js_rollback_{}.js", uniqueId);
+            {
+                std::ofstream f(scriptPath, std::ios::binary);
+                f << R"JS(
+agentxx.registerTool({
+  name: "rollback_probe_tool",
+  description: "registered before the top-level failure",
+  execute: () => "should never run",
+});
+agentxx.subscribe("rollback_probe.topic", () => {});
+setTimeout(() => agentxx.log(2, "rollback probe timer"), 60000);
+throw new Error("top-level rollback probe");
+)JS";
+            }
+            std::string args = fmt::format(
+                R"({{"name":"rollback_probe","path":{}}})",
+                utilxx_base::Json(std::string(scriptPath.string())).dump()
+            );
+
+            struct LoadState {
+                int         status = -1;
+                bool        done   = false;
+                std::string payload;
+            } st;
+
+            PluginxxString loadErr{nullptr, 0};
+            auto*          jsInst = ctx->pluginManager->find("example_js").get();
+            XX_TEST_EXPECT_TRUE(jsInst != nullptr);
+            auto* op = ctx->pluginManager->invokeCapabilityAsync(
+                jsInst,
+                "interpreter.js",
+                "load",
+                args,
+                [](void* ud, int32_t status, const PluginxxStringView* payload) {
+                    auto* s   = static_cast<LoadState*>(ud);
+                    s->status = status;
+                    s->done   = true;
+                    if (payload && payload->data) {
+                        s->payload.assign(payload->data, static_cast<size_t>(payload->size));
+                    }
+                },
+                &st,
+                &loadErr
+            );
+            XX_TEST_EXPECT_TRUE(op != nullptr);
+            if (loadErr.data) {
+                agentxx::plugin::PluginString::free(jsInst->hostView(), &loadErr);
+            }
+            for (int i = 0; i < 500 && !st.done; ++i) {
+                co_await sleepMs(2);
+            }
+            XX_TEST_EXPECT_TRUE(st.done);
+            XX_TEST_EXPECT_TRUE(st.status != PLUGINXX_OPERATOR_OK);
+            // 注册事务回滚: 失败脚本注册的工具必须已从主程序注册表撤销
+            XX_TEST_EXPECT_FALSE(ctx->toolRegistry->contains("rollback_probe_tool"));
+            // 引擎与既有脚本不受影响
+            XX_TEST_EXPECT_TRUE(ctx->toolRegistry->contains("js_hello"));
+            auto hello = ctx->toolRegistry->find("js_hello");
+            if (hello) {
+                auto out = co_await hello->execute_async(utilxx_base::Json{
+                    {"name", "after-rollback"}
+                });
+                XX_TEST_EXPECT_TRUE(out.find("after-rollback") != std::string::npos);
+            }
+            fs::remove(scriptPath, ec);
+        }
+
+        // ---- 17. 卸载 JS 插件: 工具摘除 + 引擎侧清理 ----
+        {
+            auto ok = co_await ctx->pluginManager->unloadAsync("example_js");
+            XX_TEST_EXPECT_TRUE(ok);
+            XX_TEST_EXPECT_FALSE(ctx->toolRegistry->contains("js_hello"));
+            XX_TEST_EXPECT_TRUE(ctx->pluginManager->find("example_js") == nullptr);
+            // 主程序 example_echo 不受影响
+            XX_TEST_EXPECT_TRUE(ctx->toolRegistry->contains("example_echo"));
+        }
+
+        // ---- 18. 卸载主程序示例插件 ----
+        {
+            co_await ctx->pluginManager->unloadAsync("example_plugin");
+            XX_TEST_EXPECT_FALSE(ctx->toolRegistry->contains("example_echo"));
+        }
+
+        // ---- 19. 卸载 JS JS 运行时插件: 能力消失 (JS 插件已在 17 卸载) ----
+        {
+            auto ok = co_await ctx->pluginManager->unloadAsync("agentxx_javascript_engine");
+            XX_TEST_EXPECT_TRUE(ok);
+            XX_TEST_EXPECT_FALSE(ctx->pluginManager->capabilities()->has("interpreter.js"));
+        }
+
+        // ---- 20. 依赖图级联卸载: 引擎卸载连带 depends 它的JS 插件 ----
+        {
+            // 重新加载引擎 + JS 插件
+            auto engine2 = co_await ctx->pluginManager->loadPluginAsync(jsLib);
+            XX_TEST_EXPECT_TRUE(engine2 != nullptr);
+            auto js2 = co_await ctx->pluginManager->loadPluginAsync(jsDir);
+            XX_TEST_EXPECT_TRUE(js2 != nullptr);
+            if (!js2) {
+                XX_TEST_EXPECT_TRUE(false);
+                co_return TestResult{g_plugin_passed, g_plugin_failed};
+            }
+            for (int i = 0; i < 20 && !ctx->toolRegistry->contains("js_hello"); ++i) {
+                co_await sleepMs(50);
+            }
+            XX_TEST_EXPECT_TRUE(ctx->toolRegistry->contains("js_hello"));
+            // 卸载引擎 → 级联卸载 example_js (依赖图: example_js depends 引擎)
+            auto ok = co_await ctx->pluginManager->unloadAsync("agentxx_javascript_engine");
+            XX_TEST_EXPECT_TRUE(ok);
+            XX_TEST_EXPECT_TRUE(ctx->pluginManager->find("example_js") == nullptr);
+            XX_TEST_EXPECT_FALSE(ctx->toolRegistry->contains("js_hello"));
+        }
+
+        // ---- 21. 依赖检查: 必选依赖缺失 → 加载失败 ----
+        {
+            // 引擎未加载, example_js depends agentxx_javascript_engine → 加载失败
+            auto js3 = co_await ctx->pluginManager->loadPluginAsync(jsDir);
+            XX_TEST_EXPECT_TRUE(js3 == nullptr);
+            XX_TEST_EXPECT_TRUE(ctx->pluginManager->find("example_js") == nullptr);
+        }
+
+        // ---- 22. 插件互查 API (vtable list_plugins/get_plugin) ----
+        {
+            // 重新加载引擎 (供JS 插件验证互查)
+            auto engine3 = co_await ctx->pluginManager->loadPluginAsync(jsLib);
+            XX_TEST_EXPECT_TRUE(engine3 != nullptr);
+            auto js4 = co_await ctx->pluginManager->loadPluginAsync(jsDir);
+            XX_TEST_EXPECT_TRUE(js4 != nullptr);
+            for (int i = 0; i < 20 && js4 && !ctx->toolRegistry->contains("js_hello"); ++i) {
+                co_await sleepMs(50);
+            }
+            if (js4) {
+                // 脚本内互查已由 plugin.js 顶层执行 (日志); 此处验证主程序侧 JSON
+                auto engineJson = ctx->pluginManager->getPluginJson("agentxx_javascript_engine");
+                XX_TEST_EXPECT_FALSE(engineJson.empty());
+                if (!engineJson.empty()) {
+                    auto j = utilxx_base::Json::parse(engineJson);
+                    XX_TEST_EXPECT_EQ(j["name"].get<std::string>(), "agentxx_javascript_engine");
+                    bool hasInterp = false;
+                    for (const auto& c : j["capabilities"]) {
+                        if (c.get<std::string>() == "interpreter.js") {
+                            hasInterp = true;
+                        }
+                    }
+                    XX_TEST_EXPECT_TRUE(hasInterp);
+                }
+                auto jsJson = ctx->pluginManager->getPluginJson("example_js");
+                XX_TEST_EXPECT_FALSE(jsJson.empty());
+                if (!jsJson.empty()) {
+                    auto j = utilxx_base::Json::parse(jsJson);
+                    XX_TEST_EXPECT_EQ(
+                        j["depends"][0].get<std::string>(),
+                        "agentxx_javascript_engine"
+                    );
+                    bool hasHello = false;
+                    for (const auto& t : j["tools"]) {
+                        if (t.get<std::string>() == "js_hello") {
+                            hasHello = true;
+                        }
+                    }
+                    XX_TEST_EXPECT_TRUE(hasHello);
+                }
+                auto allJson = ctx->pluginManager->listPluginsJson();
+                XX_TEST_EXPECT_FALSE(allJson.empty());
+                if (!allJson.empty()) {
+                    auto arr     = utilxx_base::Json::parse(allJson);
+                    bool foundJs = false;
+                    for (const auto& item : arr) {
+                        if (item["name"].get<std::string>() == "example_js"
+                            && item["depends"][0].get<std::string>()
+                                   == "agentxx_javascript_engine") {
+                            foundJs = true;
+                        }
+                    }
+                    XX_TEST_EXPECT_TRUE(foundJs);
+                }
+                // 未安装插件 → 空
+                XX_TEST_EXPECT_TRUE(ctx->pluginManager->getPluginJson("not_installed").empty());
+            }
+            co_await ctx->pluginManager->unloadAsync("example_js");
+            co_await ctx->pluginManager->unloadAsync("agentxx_javascript_engine");
+        }
+    }
+
+    // ---- 23. H1 回归: 工具超时后立即卸载不得执行已卸载代码段 ----
+    // - 统一异步操作模型: 超时 (asyncWithTimeout) 取消等待协程后, 主程序转入
+    //   后台收割协程继续驱动直至插件真正上报终态 —— inflight 保活随之转移,
+    //   unloadAsync 必须等到收割完成才 dlclose (卸载耗时 ≈ 操作剩余时间)
+    {
+        auto inst23 = co_await ctx->pluginManager->loadPluginAsync(path);
+        XX_TEST_EXPECT_TRUE(inst23 != nullptr);
+        if (inst23) {
+            // 注册带超时的慢工具: 超时 100ms, 阻塞操作 600ms 后才完成
+            // (阻塞委托型 offload线程池: execute 经 scheduler.offload 在主程序阻塞池线程执行)
+            struct SlowCtx : public agentxx::plugin::PluginBase {};
+
+            static SlowCtx slowCtx;
+            slowCtx.init(inst23->hostView());
+            agentxx::plugin::blocking_tool(
+                slowCtx,
+                "slow_timeout_tool",
+                "slow tool for unload race test",
+                "{}",
+                [](SlowCtx&, std::string_view) -> std::string {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(600));
+                    return "{}";
+                },
+                100
+            );
+
+            auto tool = ctx->toolRegistry->find("slow_timeout_tool");
+            XX_TEST_EXPECT_TRUE(tool != nullptr);
+            if (tool) {
+                // 该协程可能比本作用域活得更久: 共享状态用 shared_ptr 持有
+                auto       execDone = std::make_shared<std::atomic<bool>>(false);
+                auto              ex = co_await asio::this_coro::executor;
+                asio::co_spawn(
+                    ex,
+                    keepAliveRun([execDone, tool]() -> asio::awaitable<void> {
+                        auto out = co_await tool->execute_async(utilxx_base::Json{});
+                        (void)out; // 超时返回 "[Plugin tool timeout]"
+                        execDone->store(true);
+                        co_return;
+                    }),
+                    asio::detached
+                );
+                // 等待回调已开始 (inflight>0 说明线程池已进入 C 回调):
+                // - Windows 线程池调度延迟不定, 直接 sleep 后卸载可能遇到
+                //   inflight==0 (回调未开始), 卸载立即完成, 时序断言失真
+                // - 注意不能以 execDone 作为轮询出口: 它由超时返回 (100ms)
+                //   置位, 早于回调真正开始; 仅 inflight>0 能确认回调在跑
+                for (int i = 0;
+                     i < 200 && (inst23->lifetime ? inst23->lifetime->leaseCount() : 0) == 0;
+                     ++i) {
+                    co_await sleepMs(10);
+                }
+                // 等待超时返回 (100ms) + 回调仍在线程池执行 (600ms 未完成)
+                co_await sleepMs(250);
+                // 立即卸载: 必须等 inflight 归零 (回调完成) 才 dlclose
+                auto t0        = std::chrono::steady_clock::now();
+                auto ok        = co_await ctx->pluginManager->unloadAsync("example_plugin");
+                auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::steady_clock::now() - t0
+                )
+                                     .count();
+                XX_TEST_EXPECT_TRUE(ok);
+                // 卸载应等待回调完成 (600-250 ≈ 350ms; 放宽到 >= 250ms),
+                // 且回调必须完整执行完 (execDone)
+                // - execDone 由 detached 协程在 execute_async 返回后置位, 其
+                //   恢复依赖 io 线程调度 (Windows 上可能与卸载完成时刻竞态),
+                //   断言前限时等待其恢复, 消除调度时序抖动
+                for (int i = 0; i < 100 && !execDone->load(); ++i) {
+                    co_await sleepMs(10);
+                }
+                XX_TEST_EXPECT_TRUE(elapsedMs >= 250);
+                XX_TEST_EXPECT_TRUE(execDone->load());
+            }
+        }
+    }
+
+    // ---- 24. H4 回归: 轮次中 disable → 摘除留到轮末; enable 后钩子重新登记 ----
+    {
+        auto inst24 = co_await ctx->pluginManager->loadPluginAsync(path);
+        XX_TEST_EXPECT_TRUE(inst24 != nullptr);
+        if (inst24) {
+            XX_TEST_EXPECT_EQ(
+                ctx->pluginManager->handlersOf(AGENTXX_PLUGIN_HOOK_AGENT_START).size(),
+                size_t{1}
+            );
+            ctx->pluginManager->onTurnBegin(); // 轮次执行中
+            ctx->pluginManager->disable("example_plugin");
+            // 轮次执行中不修改中间件链: 处理器立即摘除, 派发器停用待摘除
+            XX_TEST_EXPECT_TRUE(
+                ctx->pluginManager->handlersOf(AGENTXX_PLUGIN_HOOK_AGENT_START).empty()
+            );
+            {
+                const auto& handles = ctx->middlewareHandleContext->handles;
+                const bool  disabledOnChain
+                    = std::any_of(handles.begin(), handles.end(), [](const auto& h) {
+                          return h->name == "plugin_hooks" && h->disabled;
+                      });
+                XX_TEST_EXPECT_TRUE(disabledOnChain);
+            }
+            ctx->pluginManager->flushPendingCleanup(); // 轮末摘除派发器
+            ctx->pluginManager->onTurnEnd();
+            {
+                const auto& handles = ctx->middlewareHandleContext->handles;
+                const bool  found   = std::any_of(handles.begin(), handles.end(), [](const auto& h) {
+                    return h->name == "plugin_hooks";
+                });
+                XX_TEST_EXPECT_FALSE(found); // 已物理摘除
+            }
+            XX_TEST_EXPECT_TRUE(inst24->hookRegistrations.size() == size_t{1});
+            XX_TEST_EXPECT_EQ(inst24->hookRegistrations.front().handle, int64_t{0});
+            // 启用: start 事务重新登记钩子 (派发器随首次登记回到链上)
+            ctx->pluginManager->enable("example_plugin");
+            for (int i = 0; i < 200
+                            && ctx->pluginManager
+                                   ->handlersOf(AGENTXX_PLUGIN_HOOK_AGENT_START)
+                                   .empty();
+                 ++i) {
+                co_await sleepMs(5);
+            }
+            XX_TEST_EXPECT_EQ(
+                ctx->pluginManager->handlersOf(AGENTXX_PLUGIN_HOOK_AGENT_START).size(),
+                size_t{1}
+            );
+            const auto& handles = ctx->middlewareHandleContext->handles;
+            bool        found   = std::any_of(handles.begin(), handles.end(), [](const auto& h) {
+                return h->name == "plugin_hooks" && !h->disabled;
+            });
+            XX_TEST_EXPECT_TRUE(found);
+            co_await ctx->pluginManager->unloadAsync("example_plugin");
+        }
+    }
+
+    // ---- 25. 回归: 用户手动禁用的插件不被 enable 级联恢复 ----
+    {
+        auto engine25 = co_await ctx->pluginManager->loadPluginAsync(jsLib);
+        XX_TEST_EXPECT_TRUE(engine25 != nullptr);
+        auto js25 = co_await ctx->pluginManager->loadPluginAsync(jsDir);
+        XX_TEST_EXPECT_TRUE(js25 != nullptr);
+        for (int i = 0; i < 20 && js25 && !ctx->toolRegistry->contains("js_hello"); ++i) {
+            co_await sleepMs(50);
+        }
+        if (engine25 && js25) {
+            ctx->pluginManager->disable("example_js"); // 用户手动禁用
+            XX_TEST_EXPECT_FALSE(ctx->pluginManager->find("example_js")->enabled);
+            // 启用引擎 → 不应级联恢复被用户手动禁用的JS 插件
+            ctx->pluginManager->enable("agentxx_javascript_engine");
+            XX_TEST_EXPECT_FALSE(ctx->pluginManager->find("example_js")->enabled);
+            // 用户显式启用 → 恢复
+            ctx->pluginManager->enable("example_js");
+            XX_TEST_EXPECT_TRUE(ctx->pluginManager->find("example_js")->enabled);
+            co_await ctx->pluginManager->unloadAsync("example_js");
+            co_await ctx->pluginManager->unloadAsync("agentxx_javascript_engine");
+        }
+    }
+
+    // ---- 25b. JS 引擎/JS 插件 disable→enable 往返: 引擎线程与脚本按事务重建 ----
+    // 引擎线程、JSRuntime 与脚本上下文都属于 start 事务 —— disable 停
+    // 线程 (stop), enable 重建线程并重放脚本 (start)。断言能力/工具的可观察状态
+    // 往返一致, 且 stop/destroy 顺序不会把实例提前销毁。
+    {
+        auto engine25b = co_await ctx->pluginManager->loadPluginAsync(jsLib);
+        XX_TEST_EXPECT_TRUE(engine25b != nullptr);
+        auto js25b = co_await ctx->pluginManager->loadPluginAsync(jsDir);
+        XX_TEST_EXPECT_TRUE(js25b != nullptr);
+        for (int i = 0; i < 40 && !ctx->toolRegistry->contains("js_hello"); ++i) {
+            co_await sleepMs(25);
+        }
+        XX_TEST_EXPECT_TRUE(ctx->toolRegistry->contains("js_hello"));
+        XX_TEST_EXPECT_TRUE(ctx->pluginManager->hasCapability("interpreter.js") == 1);
+
+        // 禁用引擎 → 级联禁用JS 插件 → 两者 stop (引擎退出 JS 线程并释放 runtime)
+        ctx->pluginManager->disable("agentxx_javascript_engine");
+        XX_TEST_EXPECT_FALSE(ctx->pluginManager->find("example_js")->enabled);
+        for (int i = 0; i < 300 && !engine25b->lifecycleStopped; ++i) {
+            co_await sleepMs(10);
+        }
+        XX_TEST_EXPECT_TRUE(engine25b->lifecycleStopped);
+        XX_TEST_EXPECT_TRUE(js25b->lifecycleStopped);
+        XX_TEST_EXPECT_TRUE(
+            engine25b->lifetime->state() == pluginxx::PluginInstanceState::Disabled
+        );
+        // 停用期间: 能力与脚本工具都不可见, 但实例/上下文保留 (未 destroy)
+        XX_TEST_EXPECT_FALSE(ctx->pluginManager->capabilities()->has("interpreter.js"));
+        XX_TEST_EXPECT_FALSE(ctx->toolRegistry->contains("js_hello"));
+        XX_TEST_EXPECT_TRUE(ctx->pluginManager->find("agentxx_javascript_engine") == engine25b);
+        XX_TEST_EXPECT_TRUE(ctx->pluginManager->find("example_js") == js25b);
+
+        // 重新启用引擎 → 级联恢复JS 插件: 引擎重建线程, 脚本重新 load
+        ctx->pluginManager->enable("agentxx_javascript_engine");
+        for (int i = 0; i < 400 && !ctx->toolRegistry->contains("js_hello"); ++i) {
+            co_await sleepMs(10);
+        }
+        XX_TEST_EXPECT_TRUE(ctx->pluginManager->hasCapability("interpreter.js") == 1);
+        XX_TEST_EXPECT_TRUE(ctx->toolRegistry->contains("js_hello"));
+        auto hello25b = ctx->toolRegistry->find("js_hello");
+        XX_TEST_EXPECT_TRUE(hello25b != nullptr);
+        if (hello25b) {
+            auto out = co_await hello25b->execute_async(utilxx_base::Json{
+                {"name", "reenabled"}
+            });
+            XX_TEST_EXPECT_TRUE(out.find("reenabled") != std::string::npos);
+        }
+
+        // disable/enable 紧邻 (stop 事务仍在飞行中): start 事务必须先补齐 stop
+        // 再重建, 能力名不得冲突、脚本工具不得重复或丢失。
+        ctx->pluginManager->disable("agentxx_javascript_engine");
+        ctx->pluginManager->enable("agentxx_javascript_engine");
+        for (int i = 0; i < 600 && !ctx->toolRegistry->contains("js_hello"); ++i) {
+            co_await sleepMs(10);
+        }
+        XX_TEST_EXPECT_TRUE(ctx->toolRegistry->contains("js_hello"));
+        XX_TEST_EXPECT_TRUE(ctx->pluginManager->find("example_js")->enabled);
+        XX_TEST_EXPECT_TRUE(ctx->pluginManager->hasCapability("interpreter.js") == 1);
+        auto hello25b2 = ctx->toolRegistry->find("js_hello");
+        XX_TEST_EXPECT_TRUE(hello25b2 != nullptr);
+        if (hello25b2) {
+            auto out = co_await hello25b2->execute_async(utilxx_base::Json{
+                {"name", "storm"}
+            });
+            XX_TEST_EXPECT_TRUE(out.find("storm") != std::string::npos);
+        }
+
+        // 清理: 卸载引擎级联卸载JS 插件
+        XX_TEST_EXPECT_TRUE(co_await ctx->pluginManager->unloadAsync(
+            "agentxx_javascript_engine",
+            std::chrono::seconds{30}
+        ));
+        XX_TEST_EXPECT_TRUE(ctx->pluginManager->find("agentxx_javascript_engine") == nullptr);
+        XX_TEST_EXPECT_TRUE(ctx->pluginManager->find("example_js") == nullptr);
+        XX_TEST_EXPECT_FALSE(ctx->toolRegistry->contains("js_hello"));
+        XX_TEST_EXPECT_FALSE(ctx->pluginManager->capabilities()->has("interpreter.js"));
+    }
+
+    // ---- 26. H2 回归: shutdownAsync (含 JS 引擎) 先子后父, stop/destroy 后 dlclose ----
+    // - JS 运行时插件 stop 停 JS 线程; JS 插件先卸载 (通知引擎释放 JSContext) →
+    //   引擎停线程时 JS 线程空闲 → 无挂死/无执行已卸载代码段
+    // - 同步 shutdownAll 不能等待 stop 事务: 导出 start/stop 的插件必须保留
+    //   实例/上下文 (CloseFailed), 由 shutdownAsync 收尾 (plugin.md 第 7.3 节)
+    {
+        auto engine26 = co_await ctx->pluginManager->loadPluginAsync(jsLib);
+        XX_TEST_EXPECT_TRUE(engine26 != nullptr);
+        auto js26 = co_await ctx->pluginManager->loadPluginAsync(jsDir);
+        XX_TEST_EXPECT_TRUE(js26 != nullptr);
+        for (int i = 0; i < 10 && js26 && !ctx->toolRegistry->contains("js_hello"); ++i) {
+            co_await sleepMs(50);
+        }
+        XX_TEST_EXPECT_TRUE(ctx->toolRegistry->contains("js_hello"));
+
+        // 同步关闭路径: stop 未执行前不得 destroy/dlclose
+        ctx->pluginManager->shutdownAll();
+        XX_TEST_EXPECT_TRUE(ctx->pluginManager->find("example_js") != nullptr);
+        XX_TEST_EXPECT_TRUE(ctx->pluginManager->find("agentxx_javascript_engine") != nullptr);
+        XX_TEST_EXPECT_TRUE(
+            engine26->lifetime->state() == pluginxx::PluginInstanceState::CloseFailed
+        );
+        // 对外注册已摘除 (工具/能力不可见), 但插件上下文与 DSO 仍保留
+        XX_TEST_EXPECT_FALSE(ctx->toolRegistry->contains("js_hello"));
+        XX_TEST_EXPECT_FALSE(ctx->pluginManager->capabilities()->has("interpreter.js"));
+
+        // 异步关闭: 先子后父完成 stop/destroy, 实例表清空
+        const bool closed26 = co_await ctx->pluginManager->shutdownAsync(std::chrono::seconds(30));
+        XX_TEST_EXPECT_TRUE(closed26);
+        XX_TEST_EXPECT_TRUE(ctx->pluginManager->find("example_js") == nullptr);
+        XX_TEST_EXPECT_TRUE(ctx->pluginManager->find("agentxx_javascript_engine") == nullptr);
+    }
+
+    // ---- 27. loadConfiguredPlugins 拓扑排序: 配置顺序无关 (JS 插件在前也能加载) ----
+    // - 库路径项按文件名推导插件名 (libagentxx_javascript_engine.so → agentxx_javascript_engine),
+    //   参与依赖排序: example_js (depends agentxx_javascript_engine) 排在引擎之后
+    {
+        std::vector<agentxx::agent::PluginConfig> cfgs;
+        // 故意把JS 插件目录写在引擎库之前 (配置顺序与依赖顺序相反)
+        agentxx::agent::PluginConfig jsCfg;
+        jsCfg.path    = jsDir;
+        jsCfg.enabled = true;
+        cfgs.push_back(jsCfg);
+        agentxx::agent::PluginConfig engCfg;
+        engCfg.path    = jsLib;
+        engCfg.enabled = true;
+        cfgs.push_back(engCfg);
+        co_await ctx->pluginManager->loadConfiguredPlugins(cfgs);
+        for (int i = 0; i < 20 && !ctx->toolRegistry->contains("js_hello"); ++i) {
+            co_await sleepMs(50);
+        }
+        // 两者都应加载成功 (拓扑排序保证引擎先加载)
+        XX_TEST_EXPECT_TRUE(ctx->pluginManager->find("agentxx_javascript_engine") != nullptr);
+        XX_TEST_EXPECT_TRUE(ctx->pluginManager->find("example_js") != nullptr);
+        XX_TEST_EXPECT_TRUE(ctx->toolRegistry->contains("js_hello"));
+        // 清理
+        co_await ctx->pluginManager->unloadAsync("agentxx_javascript_engine");
+        XX_TEST_EXPECT_TRUE(ctx->pluginManager->find("example_js") == nullptr); // 级联卸载
+        // 禁用项不加载
+        agentxx::agent::PluginConfig disCfg;
+        disCfg.path    = jsDir;
+        disCfg.enabled = false;
+        co_await ctx->pluginManager->loadConfiguredPlugins({disCfg});
+        XX_TEST_EXPECT_TRUE(ctx->pluginManager->find("example_js") == nullptr);
+    }
+
+    // ---- 28. 提示词读写 (get_prompt/set_prompt): 插件写入默认条目 + 卸载回滚 ----
+    // - 插件加载时经 set_prompt 写入主程序 toolPrompt (仅当无该条目);
+    //   卸载时自动回滚 (恢复加载前状态, 条目删除)
+    // - 用户 yaml 覆盖 (加载前已存在条目) 优先, 插件不覆盖
+    {
+        auto& prompt = ctx->agentConfig->prompt;
+        // 初始: 无 example_echo 条目
+        XX_TEST_EXPECT_FALSE(prompt.toolPrompt.contains("example_echo"));
+
+        // 加载插件 → 写入默认条目
+        auto inst28 = co_await ctx->pluginManager->loadPluginAsync(path);
+        XX_TEST_EXPECT_TRUE(inst28 != nullptr);
+        if (inst28) {
+            XX_TEST_EXPECT_TRUE(prompt.toolPrompt.contains("example_echo"));
+            if (prompt.toolPrompt.contains("example_echo")) {
+                XX_TEST_EXPECT_EQ(
+                    prompt.toolPrompt.at("example_echo").depict,
+                    "Echo the input arguments back as JSON (example plugin tool)."
+                );
+            }
+            // get_tool_prompt 可读取该条目
+            auto tpJson = ctx->pluginManager->getToolPromptJson("example_echo");
+            XX_TEST_EXPECT_FALSE(tpJson.empty());
+            if (!tpJson.empty()) {
+                auto j = utilxx_base::Json::parse(tpJson);
+                XX_TEST_EXPECT_TRUE(j["depict"].is_string());
+            }
+            // get_prompt 完整提示词含该条目
+            auto fullJson = ctx->pluginManager->getPromptJson();
+            XX_TEST_EXPECT_FALSE(fullJson.empty());
+            if (!fullJson.empty()) {
+                auto j = utilxx_base::Json::parse(fullJson);
+                XX_TEST_EXPECT_TRUE(
+                    j.contains("toolPrompt") && j["toolPrompt"].is_object()
+                    && j["toolPrompt"].contains("example_echo")
+                );
+            }
+
+            // system 提示词写入 + 回滚 (set_prompt 直接调用路径)
+            auto originalSystem = prompt.systemPrompt;
+            XX_TEST_EXPECT_EQ(
+                ctx->pluginManager
+                    ->setPromptJson(inst28.get(), R"({"systemPrompt":"modified by plugin"})"),
+                0
+            );
+            XX_TEST_EXPECT_EQ(prompt.systemPrompt, "modified by plugin");
+
+            // 卸载 → toolPrompt 条目删除 + system 提示词恢复
+            auto ok = co_await ctx->pluginManager->unloadAsync("example_plugin");
+            XX_TEST_EXPECT_TRUE(ok);
+            XX_TEST_EXPECT_FALSE(prompt.toolPrompt.contains("example_echo"));
+            XX_TEST_EXPECT_EQ(prompt.systemPrompt, originalSystem);
+        }
+
+        // 用户覆盖优先: 加载前已存在条目 (模拟 yaml 覆盖), 插件不覆盖
+        prompt.toolPrompt["example_echo"].depict = "user override";
+        auto inst28b = co_await ctx->pluginManager->loadPluginAsync(path);
+        XX_TEST_EXPECT_TRUE(inst28b != nullptr);
+        if (inst28b) {
+            XX_TEST_EXPECT_TRUE(prompt.toolPrompt.contains("example_echo"));
+            XX_TEST_EXPECT_EQ(prompt.toolPrompt.at("example_echo").depict, "user override");
+            co_await ctx->pluginManager->unloadAsync("example_plugin");
+            // 回滚后保留用户覆盖值 (插件未写入, 无回滚动作)
+            XX_TEST_EXPECT_TRUE(prompt.toolPrompt.contains("example_echo"));
+            XX_TEST_EXPECT_EQ(prompt.toolPrompt.at("example_echo").depict, "user override");
+            prompt.toolPrompt.erase("example_echo"); // 清理
+        }
+    }
+
+    // ---- 29. A7 + C2: sides 过滤 + args 随配置直接传递 ----
+    // - sides=client 的配置项不在 agent 侧加载 (原实现漏过滤, agent 侧会
+    //   误加载纯 client 插件)
+    // - args 经 loadConfiguredPlugins 直接传入实例 (原实现事后按路径推导名
+    //   回查, manifest name 与目录名不一致时静默丢失)
+    {
+        std::vector<agentxx::agent::PluginConfig> cfgs;
+        agentxx::agent::PluginConfig              pc;
+        pc.path    = path;
+        pc.enabled = true;
+        pc.args    = utilxx_base::Json{
+               {"custom_key", "custom_value"}
+        };
+
+        // sides=client: agent 侧跳过
+        pc.sides = agentxx::agent::PluginSide::Client;
+        cfgs.push_back(pc);
+        co_await ctx->pluginManager->loadConfiguredPlugins(cfgs);
+        XX_TEST_EXPECT_TRUE(ctx->pluginManager->find("example_plugin") == nullptr);
+
+        // sides=auto: 正常加载, args 随配置传入实例
+        pc.sides = agentxx::agent::PluginSide::Auto;
+        cfgs.clear();
+        cfgs.push_back(pc);
+        co_await ctx->pluginManager->loadConfiguredPlugins(cfgs);
+        auto inst29 = ctx->pluginManager->find("example_plugin");
+        XX_TEST_EXPECT_TRUE(inst29 != nullptr);
+        if (inst29) {
+            XX_TEST_EXPECT_EQ(inst29->args.value("custom_key", std::string{}), "custom_value");
+            auto json = ctx->pluginManager->getPluginArgsJson(inst29.get());
+            XX_TEST_EXPECT_FALSE(json.empty());
+            if (!json.empty()) {
+                auto j = utilxx_base::Json::parse(json);
+                XX_TEST_EXPECT_EQ(j["custom_key"].get<std::string>(), "custom_value");
+            }
+            co_await ctx->pluginManager->unloadAsync("example_plugin");
+        }
+    }
+
+    // ---- 30. B5 回归: 禁用插件 vtable publish 被拒绝 ----
+    {
+        auto inst30 = co_await ctx->pluginManager->loadPluginAsync(path);
+        XX_TEST_EXPECT_TRUE(inst30 != nullptr);
+        if (inst30) {
+            // 启用状态: publish 正常 (agentxx.agent.events 接口表)
+            const auto ev30 = agentxx::plugin::AgentIfaces::query(inst30->hostView()).events;
+            XX_TEST_EXPECT_TRUE(ev30 != nullptr && ev30->publish != nullptr);
+            auto topicSv = agentxx::plugin::PluginStringView::fromCstr("demo.topic");
+            auto paySv   = agentxx::plugin::PluginStringView::fromCstr(R"({"k":"v"})");
+            XX_TEST_EXPECT_EQ(ev30 ? ev30->publish(inst30->hostView(), &topicSv, &paySv) : -1, 0);
+            ctx->pluginManager->disable("example_plugin");
+            // 禁用状态: 接口表 publish 拒绝 (返回非 0)
+            int rc = ev30 ? ev30->publish(inst30->hostView(), &topicSv, &paySv) : -1;
+            XX_TEST_EXPECT_TRUE(rc != 0);
+            co_await ctx->pluginManager->unloadAsync("example_plugin");
+        }
+    }
+
+    // ---- 31. 统一异步操作模型: HostOp 句柄 / poll 推进 / 会话取消传递 ----
+    {
+        auto inst31 = co_await ctx->pluginManager->loadPluginAsync(path);
+        XX_TEST_EXPECT_TRUE(inst31 != nullptr);
+
+        // 31.1 call_tool_async 回调语义 (主程序在 io 线程派发 cb; 恰好一次)
+        {
+            PluginxxString e        = {nullptr, 0};
+            int            cbStatus = -1;
+            std::string    cbPayload;
+            bool           cbDone = false;
+            using StateTuple      = std::tuple<int*, std::string*, bool*>;
+            StateTuple state{&cbStatus, &cbPayload, &cbDone};
+
+            auto* op = ctx->pluginManager->callToolAsync(
+                inst31.get(),
+                "example_echo",
+                R"({"k":"v"})",
+                "t31",
+                [](void* ud, int32_t st, const PluginxxStringView* pl) {
+                    auto* s          = static_cast<StateTuple*>(ud);
+                    *std::get<0>(*s) = st;
+                    if (pl && pl->data && pl->size > 0) {
+                        std::get<1>(*s)->assign(pl->data, pl->size);
+                    }
+                    *std::get<2>(*s) = true;
+                },
+                &state,
+                &e
+            );
+            XX_TEST_EXPECT_TRUE(op != nullptr);
+            while (!cbDone) {
+                co_await sleepMs(2);
+            }
+            XX_TEST_EXPECT_EQ(cbStatus, PLUGINXX_OPERATOR_OK);
+            XX_TEST_EXPECT_TRUE(cbPayload.find("k") != std::string::npos);
+            if (e.data) {
+                agentxx::plugin::PluginString::free(inst31->hostView(), &e);
+            }
+
+            // 不存在的工具: 装配失败返回 NULL 并带错误
+            PluginxxString e2  = {nullptr, 0};
+            auto*          op2 = ctx->pluginManager->callToolAsync(
+                inst31.get(),
+                "not_registered_tool",
+                "{}",
+                "t31",
+                [](void*, int32_t, const PluginxxStringView*) {},
+                nullptr,
+                &e2
+            );
+            XX_TEST_EXPECT_TRUE(op2 == nullptr);
+            XX_TEST_EXPECT_TRUE(e2.data != nullptr);
+            if (e2.data) {
+                agentxx::plugin::PluginString::free(inst31->hostView(), &e2);
+            }
+        }
+
+        // 31.2 异步工具操作: 经 notify.done 上报完成
+        {
+            static AgentxxPluginToolSpec asyncSpec;
+            asyncSpec.name = agentxx::plugin::PluginStringView::fromCstr("async_notify_tool");
+            asyncSpec.description
+                = agentxx::plugin::PluginStringView::fromCstr("async tool for notify test");
+            asyncSpec.parameters_json = agentxx::plugin::PluginStringView::fromCstr("{}");
+            asyncSpec.execute_start   = +[](void*,
+                                          const PluginxxStringView*,
+                                          const PluginxxStringView*,
+                                          const PluginxxStringView*,
+                                          const PluginxxOperatorNotify* notify,
+                                          PluginxxString*) -> void* {
+                auto emptySv = agentxx::plugin::PluginStringView::fromCstr("{}");
+                notify->done(notify->host_ud, PLUGINXX_OPERATOR_OK, &emptySv);
+                return nullptr;
+            };
+            XX_TEST_EXPECT_EQ(ctx->pluginManager->registerTool(inst31.get(), &asyncSpec), 0);
+            auto asyncTool = ctx->toolRegistry->find("async_notify_tool");
+            XX_TEST_EXPECT_TRUE(asyncTool != nullptr);
+            if (asyncTool) {
+                auto out = co_await asyncTool->execute_async(utilxx_base::Json{
+                    {"sessionId", "t31"}
+                });
+                XX_TEST_EXPECT_EQ(out, "{}");
+            }
+            ctx->pluginManager->unregisterTool(inst31.get(), "async_notify_tool");
+        }
+
+        // 31.3 会话取消传递: CancelToken 取消 → execute_cancel 被调用 →
+        //      插件上报 CANCELLED → 工具协程收到 CancelledException
+        {
+            struct CancelOp {
+                PluginxxOperatorNotify notify;
+            };
+
+            static bool s_cancelCalled              = false;
+            s_cancelCalled                          = false;
+            static CancelOp*             s_activeOp = nullptr;
+            static AgentxxPluginToolSpec cSpec;
+            cSpec.name        = agentxx::plugin::PluginStringView::fromCstr("async_cancel_tool");
+            cSpec.description = agentxx::plugin::PluginStringView::fromCstr(
+                "cancellable async tool for cancel test"
+            );
+            cSpec.parameters_json = agentxx::plugin::PluginStringView::fromCstr("{}");
+            cSpec.execute_start   = +[](void*,
+                                      const PluginxxStringView*,
+                                      const PluginxxStringView*,
+                                      const PluginxxStringView*,
+                                      const PluginxxOperatorNotify* notify,
+                                      PluginxxString*) -> void* {
+                s_activeOp = new CancelOp{notify ? *notify : PluginxxOperatorNotify{}};
+                return s_activeOp;
+            };
+            cSpec.execute_cancel = +[](void*, void* op) {
+                s_cancelCalled = true;
+                auto* o        = static_cast<CancelOp*>(op);
+                if (o && o->notify.done) {
+                    auto nullSv = agentxx::plugin::PluginStringView::from(nullptr, 0);
+                    o->notify.done(o->notify.host_ud, PLUGINXX_OPERATOR_CANCELLED, &nullSv);
+                }
+                delete o;
+                s_activeOp = nullptr;
+            };
+            XX_TEST_EXPECT_EQ(ctx->pluginManager->registerTool(inst31.get(), &cSpec), 0);
+
+            // 会话装配取消令牌 (与 ToolCallNode 注入路径一致)
+            auto sess = ctx->sessions->getOrCreate("t_plugin_cancel");
+            XX_TEST_EXPECT_TRUE(sess != nullptr);
+            sess->setCancelToken(std::make_shared<neograph::graph::CancelToken>());
+
+            auto cancelTool = ctx->toolRegistry->find("async_cancel_tool");
+            XX_TEST_EXPECT_TRUE(cancelTool != nullptr);
+
+            // 30ms 后取消令牌 (io 线程定时器)
+            auto ex = co_await asio::this_coro::executor;
+            asio::co_spawn(
+                ex,
+                keepAliveRun([sess]() -> asio::awaitable<void> {
+                    asio::steady_timer t(co_await asio::this_coro::executor);
+                    t.expires_after(std::chrono::milliseconds(30));
+                    co_await t.async_wait(asio::use_awaitable);
+                    if (sess->getCancelToken()) {
+                        sess->getCancelToken()->cancel();
+                    }
+                }),
+                asio::detached
+            );
+
+            bool cancelledThrown = false;
+            try {
+                auto out = co_await cancelTool->execute_async(utilxx_base::Json{
+                    {"sessionId", "t_plugin_cancel"}
+                });
+                (void)out;
+            } catch (const neograph::graph::CancelledException&) {
+                cancelledThrown = true;
+            } catch (const std::exception& e) {
+                TEST_FAIL << "unexpected exception: " << e.what() << std::endl;
+            }
+            XX_TEST_EXPECT_TRUE(cancelledThrown);
+            XX_TEST_EXPECT_TRUE(s_cancelCalled); ///< 底层 cancel 回调被调用
+            ctx->pluginManager->unregisterTool(inst31.get(), "async_cancel_tool");
+            ctx->sessions->remove("t_plugin_cancel");
+        }
+
+        // 31.4 异常守卫: start() 违约抛 C++ 异常 → 主程序转失败终态 (不终止进程)
+        {
+            static AgentxxPluginToolSpec throwSpec;
+            throwSpec.name = agentxx::plugin::PluginStringView::fromCstr("throwing_start_tool");
+            throwSpec.description = agentxx::plugin::PluginStringView::fromCstr(
+                "tool whose start() throws (contract violation)"
+            );
+            throwSpec.parameters_json = agentxx::plugin::PluginStringView::fromCstr("{}");
+            throwSpec.execute_start   = +[](void*,
+                                          const PluginxxStringView*,
+                                          const PluginxxStringView*,
+                                          const PluginxxStringView*,
+                                          const PluginxxOperatorNotify*,
+                                          PluginxxString*) -> void* {
+                throw std::runtime_error("boom from plugin start");
+            };
+            XX_TEST_EXPECT_EQ(ctx->pluginManager->registerTool(inst31.get(), &throwSpec), 0);
+            auto throwTool = ctx->toolRegistry->find("throwing_start_tool");
+            XX_TEST_EXPECT_TRUE(throwTool != nullptr);
+            if (throwTool) {
+                bool failedAsExpected = false;
+                try {
+                    auto out = co_await throwTool->execute_async(utilxx_base::Json{
+                        {"sessionId", "t31"}
+                    });
+                    (void)out;
+                } catch (const std::exception& e) {
+                    failedAsExpected
+                        = std::string(e.what()).find("boom from plugin start") != std::string::npos
+                          || std::string(e.what()).find("threw") != std::string::npos;
+                }
+                XX_TEST_EXPECT_TRUE(failedAsExpected);
+            }
+            ctx->pluginManager->unregisterTool(inst31.get(), "throwing_start_tool");
+        }
+
+        // 31.5 违约检测: start() 返回 NULL 且未 done 且无 error → 主程序按协议违约合成失败
+        {
+            static AgentxxPluginToolSpec nullSpec;
+            nullSpec.name        = agentxx::plugin::PluginStringView::fromCstr("null_start_tool");
+            nullSpec.description = agentxx::plugin::PluginStringView::fromCstr(
+                "tool whose start() returns NULL without done"
+            );
+            nullSpec.parameters_json = agentxx::plugin::PluginStringView::fromCstr("{}");
+            nullSpec.execute_start   = +[](void*,
+                                         const PluginxxStringView*,
+                                         const PluginxxStringView*,
+                                         const PluginxxStringView*,
+                                         const PluginxxOperatorNotify*,
+                                         PluginxxString*) -> void* {
+                return nullptr; ///< 违约: 未 call notify->done 且未设 error_out
+            };
+            XX_TEST_EXPECT_EQ(ctx->pluginManager->registerTool(inst31.get(), &nullSpec), 0);
+            auto nullTool = ctx->toolRegistry->find("null_start_tool");
+            XX_TEST_EXPECT_TRUE(nullTool != nullptr);
+            if (nullTool) {
+                bool failedAsExpected = false;
+                try {
+                    auto out = co_await nullTool->execute_async(utilxx_base::Json{
+                        {"sessionId", "t31"}
+                    });
+                    (void)out;
+                } catch (const std::exception&) {
+                    failedAsExpected = true;
+                }
+                XX_TEST_EXPECT_TRUE(failedAsExpected);
+            }
+            ctx->pluginManager->unregisterTool(inst31.get(), "null_start_tool");
+        }
+
+        // 31.6 异常守卫: blocking_tool 异常守卫兜底 —— 用户 execute 抛异常时
+        //      适配层转 PLUGINXX_OPERATOR_FAILED, 异常不穿越 C ABI
+        {
+            struct BoomCtx : public agentxx::plugin::PluginBase {};
+
+            static BoomCtx boomCtx;
+            boomCtx.init(inst31->hostView());
+            agentxx::plugin::blocking_tool(
+                boomCtx,
+                "boom_tool",
+                "boom test",
+                "{}",
+                [](BoomCtx&, std::string_view) -> std::string {
+                    throw std::runtime_error("shim boom");
+                }
+            );
+            auto tool = ctx->toolRegistry->find("boom_tool");
+            XX_TEST_EXPECT_TRUE(tool != nullptr);
+            if (tool) {
+                try {
+                    auto out = co_await tool->execute_async(utilxx_base::Json{});
+                    XX_TEST_EXPECT_TRUE(false);
+                } catch (const std::exception& e) {
+                    XX_TEST_EXPECT_TRUE(
+                        std::string(e.what()).find("shim boom") != std::string::npos
+                    );
+                }
+            }
+            ctx->pluginManager->unregisterTool(inst31.get(), "boom_tool");
+        }
+
+        // 31.7 异常守卫: 事件 handler 违约抛异常 → 主程序派发兜底,
+        //      同 topic 其他订阅者仍正常收到
+        {
+            static bool s_goodHandlerRan = false;
+            s_goodHandlerRan             = false;
+            auto* subBad                 = ctx->pluginManager->subscribe(
+                inst31.get(),
+                "guard_throw.topic",
+                +[](const PluginxxStringView*, void*) {
+                    throw std::runtime_error("bad handler boom");
+                },
+                nullptr
+            );
+            auto* subGood = ctx->pluginManager->subscribe(
+                inst31.get(),
+                "guard_throw.topic",
+                +[](const PluginxxStringView*, void* ud) {
+                    *static_cast<bool*>(ud) = true;
+                },
+                &s_goodHandlerRan
+            );
+            XX_TEST_EXPECT_TRUE(subBad != nullptr);
+            XX_TEST_EXPECT_TRUE(subGood != nullptr);
+            XX_TEST_EXPECT_EQ(ctx->pluginManager->publish("guard_throw.topic", "{}"), 0);
+            co_await sleepMs(150);                 ///< 派发为 EventBus 协程异步执行
+            XX_TEST_EXPECT_TRUE(s_goodHandlerRan); ///< 违约不影响其他订阅者
+            ctx->pluginManager->unsubscribe(subBad);
+            ctx->pluginManager->unsubscribe(subGood);
+        }
+
+        auto ok31 = co_await ctx->pluginManager->unloadAsync("example_plugin");
+        XX_TEST_EXPECT_TRUE(ok31);
+    }
+
+    // ---- 32. exec_command 插件真实调用 (完成回调形驱动) ----
+    {
+        namespace fs2        = std::filesystem;
+        auto        basePath = findExamplePluginPath();
+        std::string execDir
+            = (fs2::path(basePath).parent_path() / "agentxx_execute_command").string();
+        auto instExec = co_await ctx->pluginManager->loadPluginAsync(execDir);
+        XX_TEST_EXPECT_TRUE(instExec != nullptr);
+        if (instExec) {
+#if XX_IS_WIN_D
+            const char* cmdToolName = "agentxx_execute_windows_command";
+#else
+            const char* cmdToolName = "agentxx_execute_bash_command";
+#endif
+            XX_TEST_EXPECT_TRUE(ctx->toolRegistry->contains(cmdToolName));
+            auto ex = co_await asio::this_coro::executor;
+
+            struct AsyncRes {
+                int               status = -1;
+                std::string       payload;
+                std::atomic<bool> done = false;
+            };
+
+            // ---- 32.1 命令真实调用 (无会话令牌): 快速完成且输出正确 ----
+            {
+                auto           t0 = std::chrono::steady_clock::now();
+                PluginxxString e  = {nullptr, 0};
+                AsyncRes       ares;
+                auto*          op = ctx->pluginManager->callToolAsync(
+                    instExec.get(),
+                    cmdToolName,
+                    R"({"command":"echo repro_check"})",
+                    "t_exec_no_token",
+                    [](void* ud, int32_t st, const PluginxxStringView* pl) {
+                        auto* r   = static_cast<AsyncRes*>(ud);
+                        r->status = st;
+                        if (pl && pl->data && pl->size > 0) {
+                            r->payload.assign(pl->data, pl->size);
+                        }
+                        r->done = true;
+                    },
+                    &ares,
+                    &e
+                );
+                XX_TEST_EXPECT_TRUE(op != nullptr);
+                while (!ares.done) {
+                    asio::steady_timer t(ex);
+                    t.expires_after(std::chrono::milliseconds(5));
+                    co_await t.async_wait(asio::use_awaitable);
+                }
+                auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now() - t0
+                )
+                              .count();
+                XX_TEST_EXPECT_EQ(ares.status, PLUGINXX_OPERATOR_OK);
+                XX_TEST_EXPECT_TRUE(ares.payload.find("repro_check") != std::string::npos);
+                XX_TEST_EXPECT_TRUE(ms < 10000);
+                if (e.data) {
+                    agentxx::plugin::PluginString::free(instExec->hostView(), &e);
+                }
+            }
+
+            // ---- 32.2 会话取消令牌存在 (真实 agent 运行态) 同样快速 ----
+            {
+                auto sess = ctx->sessions->getOrCreate("t_exec_with_token");
+                sess->setCancelToken(std::make_shared<neograph::graph::CancelToken>());
+                auto           t0 = std::chrono::steady_clock::now();
+                PluginxxString e  = {nullptr, 0};
+                AsyncRes       ares;
+                auto*          op = ctx->pluginManager->callToolAsync(
+                    instExec.get(),
+                    cmdToolName,
+                    R"({"command":"echo token_case"})",
+                    "t_exec_with_token",
+                    [](void* ud, int32_t st, const PluginxxStringView* pl) {
+                        auto* r   = static_cast<AsyncRes*>(ud);
+                        r->status = st;
+                        if (pl && pl->data && pl->size > 0) {
+                            r->payload.assign(pl->data, pl->size);
+                        }
+                        r->done = true;
+                    },
+                    &ares,
+                    &e
+                );
+                XX_TEST_EXPECT_TRUE(op != nullptr);
+                while (!ares.done) {
+                    asio::steady_timer t(ex);
+                    t.expires_after(std::chrono::milliseconds(5));
+                    co_await t.async_wait(asio::use_awaitable);
+                }
+                auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now() - t0
+                )
+                              .count();
+                XX_TEST_EXPECT_EQ(ares.status, PLUGINXX_OPERATOR_OK);
+                XX_TEST_EXPECT_TRUE(ares.payload.find("token_case") != std::string::npos);
+                XX_TEST_EXPECT_TRUE(ms < 10000);
+                if (e.data) {
+                    agentxx::plugin::PluginString::free(instExec->hostView(), &e);
+                }
+            }
+
+            // ---- 32.3 超时参数生效: sleep 超过 timeout → 返回超时结果文本 ----
+            {
+                PluginxxString e = {nullptr, 0};
+                AsyncRes       ares;
+#if XX_IS_WIN_D
+                const char* timeoutCmd = R"({"command":"timeout /t 5 >nul","timeout":1})";
+#else
+                const char* timeoutCmd = R"({"command":"sleep 5","timeout":1})";
+#endif
+                auto* op = ctx->pluginManager->callToolAsync(
+                    instExec.get(),
+                    cmdToolName,
+                    timeoutCmd,
+                    "t_exec_no_token",
+                    [](void* ud, int32_t st, const PluginxxStringView* pl) {
+                        auto* r   = static_cast<AsyncRes*>(ud);
+                        r->status = st;
+                        if (pl && pl->data && pl->size > 0) {
+                            r->payload.assign(pl->data, pl->size);
+                        }
+                        r->done = true;
+                    },
+                    &ares,
+                    &e
+                );
+                XX_TEST_EXPECT_TRUE(op != nullptr);
+                while (!ares.done) {
+                    asio::steady_timer t(ex);
+                    t.expires_after(std::chrono::milliseconds(10));
+                    co_await t.async_wait(asio::use_awaitable);
+                }
+                XX_TEST_EXPECT_EQ(ares.status, PLUGINXX_OPERATOR_OK);
+                XX_TEST_EXPECT_TRUE(
+                    ares.payload.find("timed out") != std::string::npos
+                    || ares.payload.find("ExitCode") != std::string::npos
+                );
+                if (e.data) {
+                    agentxx::plugin::PluginString::free(instExec->hostView(), &e);
+                }
+            }
+
+            co_await ctx->pluginManager->unloadAsync("agentxx_execute_command");
+        }
+    }
+
+    // ---- 33. 锚定协程唤醒精度测试 (sleep 50ms) ----
+    {
+        auto instEx = co_await ctx->pluginManager->loadPluginAsync(path);
+        XX_TEST_EXPECT_TRUE(instEx != nullptr);
+        if (instEx) {
+            auto tool = ctx->toolRegistry->find("example_sleep");
+            XX_TEST_EXPECT_TRUE(tool != nullptr);
+            if (tool) {
+                auto t0  = std::chrono::steady_clock::now();
+                auto out = co_await tool->execute_async(utilxx_base::Json{
+                    {"durationMs", 50}
+                });
+                auto ms  = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now() - t0
+                )
+                              .count();
+                XX_TEST_EXPECT_TRUE(ms >= 45 && ms <= 120);
+                XX_TEST_EXPECT_TRUE(out.find("50") != std::string::npos);
+            }
+            co_await ctx->pluginManager->unloadAsync("example_plugin");
+        }
+    }
+
+    // ---- 34. 卸载主动取消 (挂起中的 60s sleep 工具由 unload 立即取消) ----
+    {
+        auto instEx = co_await ctx->pluginManager->loadPluginAsync(path);
+        XX_TEST_EXPECT_TRUE(instEx != nullptr);
+        if (instEx) {
+            auto           ex = co_await asio::this_coro::executor;
+            PluginxxString e  = {nullptr, 0};
+
+            struct CancelRes {
+                int               status = -1;
+                std::string       payload;
+                std::atomic<bool> done = false;
+            } cres;
+
+            auto* op = ctx->pluginManager->callToolAsync(
+                instEx.get(),
+                "example_sleep",
+                R"({"durationMs":60000})",
+                "t_unload_cancel",
+                [](void* ud, int32_t st, const PluginxxStringView* pl) {
+                    auto* r   = static_cast<CancelRes*>(ud);
+                    r->status = st;
+                    if (pl && pl->data && pl->size > 0) {
+                        r->payload.assign(pl->data, pl->size);
+                    }
+                    r->done = true;
+                },
+                &cres,
+                &e
+            );
+            XX_TEST_EXPECT_TRUE(op != nullptr);
+
+            auto t0 = std::chrono::steady_clock::now();
+            bool ok = co_await ctx->pluginManager->unloadAsync("example_plugin");
+            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now() - t0
+            )
+                          .count();
+            XX_TEST_EXPECT_TRUE(ok);
+            XX_TEST_EXPECT_TRUE(ms < 1000); // 卸载立即返回，无需等 30s 超时
+            if (e.data) {
+                agentxx::plugin::PluginString::free(instEx->hostView(), &e);
+            }
+        }
+    }
+
+    // ---- 35. example_graph_node 插件: 节点注册 + 执行图修改 ----
+    {
+        auto graphPath = findPluginDir("example_graph_node");
+        XX_TEST_EXPECT_TRUE(graphPath.find("example_graph_node") != std::string::npos);
+
+        // 35.1 构造带 graphRegistry 的上下文 (插件注册节点类型需要)
+        auto gctx                     = std::make_shared<agentxx::agent::AgentContext>();
+        gctx->agentConfig             = std::make_shared<agentxx::agent::AgentConfig>();
+        gctx->middlewareHandleContext = std::make_shared<agentxx::middleware::MiddlewareContext>();
+        gctx->bus = std::make_shared<agentxx::events::EventBus>(co_await asio::this_coro::executor);
+        gctx->toolRegistry  = std::make_shared<agentxx::plugin::ToolRegistry>();
+        gctx->pluginManager = std::make_shared<agentxx::plugin::PluginManager>(gctx);
+        gctx->pluginManager->setIoExecutor(co_await asio::this_coro::executor);
+        gctx->graphRegistry = std::make_shared<neograph::graph::GraphRegistry>();
+        // agentxx 图条件 (与 BaseAgent::initRegisterNodes 一致; 自建 registry 需显式注册,
+        // 否则图定义引用的 xx_has_tool_calls 编译报"Unknown condition")
+        agentxx::nodes::registerAgentGraphConditions(*gctx->graphRegistry);
+
+        // 默认图 (与 BaseAgent::initGraphDefinition 同构): 名称 agentxx.default
+        gctx->graphDefinitionJson = neograph::json{
+            {"name", "agentxx.default"},
+            {
+             "channels", {
+                    {"messages", {{"reducer", "append"}}},
+                }, },
+            {
+             "nodes", {
+                    {"agent_start", {{"type", "xx_MiddlewareWrapAgentStartCall"}}},
+                    {"agent_end", {{"type", "xx_MiddlewareWrapAgentEndCall"}}},
+                    {"tools", {{"type", "xx_Toolcall"}}},
+                    {"llm", {{"type", "xx_ModelCallWrap"}}},
+                }, },
+            {
+             "edges", neograph::json::array({
+                    {{"from", "__start__"}, {"to", "agent_start"}},
+                    {{"from", "agent_start"}, {"to", "llm"}},
+                    {
+                        {"from", "llm"},
+                        {"type", "conditional"},
+                        // agentxx 条件 (会话持有上下文; 内置 has_tool_calls 读图状态
+                        // 的 messages 通道, 在新架构下恒为 false)
+                        {"condition", "xx_has_tool_calls"},
+                        {"routes", {{"true", "tools"}, {"false", "agent_end"}}},
+                    },
+                    {{"from", "tools"}, {"to", "llm"}},
+                    {{"from", "agent_end"}, {"to", "__end__"}},
+                }),
+             },
+        };
+
+        auto ginst = co_await gctx->pluginManager->loadPluginAsync(graphPath);
+        XX_TEST_EXPECT_TRUE(ginst != nullptr);
+        if (ginst) {
+            XX_TEST_EXPECT_EQ(ginst->name, "example_graph_node");
+            // 节点类型已注册到 per-agent GraphRegistry
+            XX_TEST_EXPECT_TRUE(gctx->graphRegistry->contains_type("example_intent_router"));
+            XX_TEST_EXPECT_TRUE(gctx->graphRegistry->contains_type("example_datetime"));
+            // 执行图已被插件修改
+            XX_TEST_EXPECT_TRUE(gctx->graphDefinitionJson.contains("name"));
+            if (gctx->graphDefinitionJson.contains("name")) {
+                XX_TEST_EXPECT_EQ(
+                    gctx->graphDefinitionJson["name"].get<std::string>(),
+                    "example_graph_node.intent"
+                );
+            }
+            XX_TEST_EXPECT_TRUE(gctx->graphDefinitionJson.contains("nodes"));
+            if (gctx->graphDefinitionJson.contains("nodes")) {
+                XX_TEST_EXPECT_TRUE(gctx->graphDefinitionJson["nodes"].contains("intent_router"));
+                XX_TEST_EXPECT_TRUE(gctx->graphDefinitionJson["nodes"].contains("datetime_node"));
+                XX_TEST_EXPECT_EQ(
+                    gctx->graphDefinitionJson["nodes"]["intent_router"]["type"].get<std::string>(),
+                    "example_intent_router"
+                );
+            }
+
+            // 35.2 用修改后的图构建 engine 并执行: 走 datetime 流程 (需要
+            // mock provider 供 llm 节点输出意图)
+            {
+                // 注册 4 个基础节点类型 (对齐 BaseAgent::initRegisterNodes)
+                std::weak_ptr<agentxx::agent::AgentContext> agCtx = gctx;
+                gctx->graphRegistry->register_type(
+                    std::string{"xx_MiddlewareWrapAgentStartCall"},
+                    [agCtx](const std::string&, const neograph::json&, const neograph::graph::NodeContext&) {
+                        return std::make_unique<agentxx::nodes::AgentStartCallWrapNode>(
+                            "agent_start",
+                            agCtx.lock()
+                        );
+                    }
+                );
+                gctx->graphRegistry->register_type(
+                    std::string{"xx_MiddlewareWrapAgentEndCall"},
+                    [agCtx](const std::string&, const neograph::json&, const neograph::graph::NodeContext&) {
+                        return std::make_unique<agentxx::nodes::AgentEndCallWrapNode>(
+                            "agent_end",
+                            agCtx.lock()
+                        );
+                    }
+                );
+                gctx->graphRegistry->register_type(
+                    std::string{"xx_ModelCallWrap"},
+                    [agCtx](
+                        const std::string&                  name,
+                        const neograph::json&               nodeConfig,
+                        const neograph::graph::NodeContext& nc
+                    ) {
+                        // 与 BaseAgent::initRegisterNodes 一致: 节点级配置合并进
+                        // NodeContext.extra_config (插件图用 xx_autoRoute=false
+                        // 关闭主程序的自动路由)
+                        auto merged = nc;
+                        if (nodeConfig.is_object()) {
+                            if (!merged.extra_config.is_object()) {
+                                merged.extra_config = neograph::json::object();
+                            }
+                            for (const auto& [key, value] : nodeConfig.items()) {
+                                if (key == "type") {
+                                    continue;
+                                }
+                                merged.extra_config[key] = value;
+                            }
+                        }
+                        return std::make_unique<agentxx::nodes::ModelCallWrapNode>(
+                            name,
+                            merged,
+                            agCtx.lock()
+                        );
+                    }
+                );
+                gctx->graphRegistry->register_type(
+                    std::string{"xx_Toolcall"},
+                    [agCtx](
+                        const std::string& name,
+                        const neograph::json&,
+                        const neograph::graph::NodeContext& nc
+                    ) {
+                        return std::make_unique<agentxx::nodes::ToolcallWrapNode>(
+                            name,
+                            nc,
+                            agCtx.lock()
+                        );
+                    }
+                );
+
+                // 构造完整 AgentConfig (llm 节点需要)
+                auto cfg                 = gctx->agentConfig;
+                cfg->model.modelName     = "test-model";
+                cfg->agentName           = "test-agent";
+                cfg->prompt.systemPrompt = "You are a test agent.";
+
+                // ModelProviderRegistry 创建 provider: 使用 mock
+                // (OpenAIProvider 需网络; 用一个固定返回 provider)
+                // 注意: BaseAgent 构造要求 config->model.isValid(), 测试直接
+                // 构造 engine 而非 BaseAgent, 用 mock provider
+                class MockProvider : public neograph::Provider {
+                public:
+
+                    std::string get_name() const override {
+                        return "mock";
+                    }
+
+                    // 覆写 invoke_format_data: ModelCallWrapNode 经此调用;
+                    // 默认实现会经 chunk 回调转发, stream_cb 为空时触发
+                    // bad_function_call, 故直接在此返回
+                    asio::awaitable<neograph::ChatCompletion> invoke_format_data(
+                        const neograph::CompletionParams&  params,
+                        neograph::FormatDataStreamCallback on_chunk = nullptr
+                    ) override {
+                        (void)on_chunk;
+                        neograph::ChatCompletion completion;
+                        completion.message.role = "assistant";
+                        // 意图识别: 检查最后一条 user 消息是否含 "时间"
+                        std::string lastUser;
+                        for (auto it = params.messages.rbegin(); it != params.messages.rend();
+                             ++it) {
+                            if (it->role == "user") {
+                                lastUser = it->content;
+                                break;
+                            }
+                        }
+                        if (lastUser.find("时间") != std::string::npos
+                            || lastUser.find("现在几点") != std::string::npos) {
+                            completion.message.content = "datetime";
+                        } else {
+                            completion.message.content = "normal";
+                        }
+                        co_return completion;
+                    }
+                };
+
+                auto provider = std::make_shared<MockProvider>();
+
+                neograph::graph::NodeContext nodeCtx;
+                nodeCtx.provider     = provider;
+                nodeCtx.instructions = cfg->prompt.systemPrompt;
+                nodeCtx.extra_config = neograph::json{
+                    {agentxx::nodes::ModelCallWrapNode::defUseModelRegistryKey, true},
+                };
+
+                // 编译插件修改后的图
+                auto topology = neograph::graph::GraphCompiler::parse(
+                    gctx->graphDefinitionJson,
+                    *gctx->graphRegistry
+                );
+                auto validated = neograph::graph::GraphValidator::require_valid(
+                    std::move(topology),
+                    *gctx->graphRegistry
+                );
+                neograph::graph::EngineConfig engineConfig;
+                engineConfig.node_context = nodeCtx;
+                neograph::graph::EngineResources resources;
+                resources.registry = gctx->graphRegistry;
+                auto engine        = neograph::graph::GraphEngine::link(
+                    std::move(validated),
+                    std::move(engineConfig),
+                    std::move(resources)
+                );
+                XX_TEST_EXPECT_TRUE(engine != nullptr);
+                if (engine) {
+                    // 运行 datetime 意图: 应走到 datetime_node 输出时间并结束
+                    // - 上下文以会话为唯一权威 (图状态不再有 messages 通道),
+                    //   因此初始上下文写入会话而非 RunConfig.input
+                    {
+                        auto sess = gctx->getSession("graph-test-datetime");
+                        sess->replaceMessages(
+                            {neograph::ChatMessage{.role = "user", .content = "现在几点"}}
+                        );
+                    }
+                    neograph::graph::RunConfig runCfg;
+                    runCfg.thread_id = "graph-test-datetime";
+                    /// 插件完成包必须经当前 IO executor 提交；同步 run 会创建嵌套
+                    /// io_context 并阻塞当前循环，不能在主程序协程内使用。
+                    auto result = co_await engine->run_async(runCfg);
+                    XX_TEST_EXPECT_TRUE(false == result.interrupted);
+                    // 会话上下文含时间 (datetime_node 写 messages 通道由主程序
+                    // 转成会话上下文写入)
+                    bool hasTime = false;
+                    try {
+                        auto sess = gctx->getSession("graph-test-datetime");
+                        for (const auto& m : sess->messages()) {
+                            if (m.role == "assistant"
+                                && m.content.find("当前系统日期时间") != std::string::npos) {
+                                hasTime = true;
+                            }
+                        }
+                    } catch (...) {
+                    }
+                    XX_TEST_EXPECT_TRUE(hasTime);
+
+                    // 运行 normal 意图: 应进入 agent loop (llm 输出 normal 后
+                    // intent_router 移除意图消息 → llm 重答 → 无 tool_calls → end)
+                    {
+                        auto sess = gctx->getSession("graph-test-normal");
+                        sess->replaceMessages(
+                            {neograph::ChatMessage{.role = "user", .content = "你好"}}
+                        );
+                    }
+                    neograph::graph::RunConfig runCfg2;
+                    runCfg2.thread_id = "graph-test-normal";
+                    auto result2      = co_await engine->run_async(runCfg2);
+                    XX_TEST_EXPECT_TRUE(false == result2.interrupted);
+                    try {
+                        auto sess      = gctx->getSession("graph-test-normal");
+                        bool hasUser   = false;
+                        bool hasAssistant = false;
+                        for (const auto& m : sess->messages()) {
+                            if (m.role == "user") {
+                                hasUser = true;
+                            }
+                            if (m.role == "assistant") {
+                                hasAssistant = true;
+                            }
+                        }
+                        // 应包含用户消息与 llm 最终回答
+                        XX_TEST_EXPECT_TRUE(hasUser);
+                        XX_TEST_EXPECT_TRUE(hasAssistant);
+                    } catch (...) {
+                        XX_TEST_EXPECT_TRUE(false);
+                    }
+                }
+            }
+
+            co_await gctx->pluginManager->unloadAsync("example_graph_node");
+            gctx->graphRegistry.reset();
+            gctx->pluginManager->shutdownAll();
+        }
+    }
+
+    // ---- 36. 插件 SDK 框架级 CancelRegistry 与防 UAF / 并发测试 ----
+    {
+        // 36.1 基础功能与幂等性
+        agentxx::plugin::CancelRegistry reg;
+        XX_TEST_EXPECT_EQ(reg.activeCount(), size_t(0));
+        XX_TEST_EXPECT_FALSE(reg.isCancelled("sess_1"));
+
+        int  cb1_count = 0, cb2_count = 0, cb3_count = 0;
+        auto id1 = reg.registerCallback("sess_1", [&cb1_count]() {
+            cb1_count++;
+        });
+        auto id2 = reg.registerCallback("sess_1", [&cb2_count]() {
+            cb2_count++;
+        });
+        auto id3 = reg.registerCallback("sess_2", [&cb3_count]() {
+            cb3_count++;
+        });
+        XX_TEST_EXPECT_TRUE(id1 != 0);
+        XX_TEST_EXPECT_TRUE(id2 != 0);
+        XX_TEST_EXPECT_TRUE(id3 != 0);
+        XX_TEST_EXPECT_EQ(reg.activeCount(), size_t(3));
+
+        // 仅取消 sess_1
+        reg.cancel("sess_1");
+        XX_TEST_EXPECT_EQ(cb1_count, 1);
+        XX_TEST_EXPECT_EQ(cb2_count, 1);
+        XX_TEST_EXPECT_EQ(cb3_count, 0);
+        XX_TEST_EXPECT_TRUE(reg.isCancelled("sess_1"));
+        XX_TEST_EXPECT_FALSE(reg.isCancelled("sess_2"));
+        XX_TEST_EXPECT_EQ(reg.activeCount(), size_t(1));
+
+        // 重复 cancel 幂等
+        reg.cancel("sess_1");
+        XX_TEST_EXPECT_EQ(cb1_count, 1);
+
+        // 预取消状态下新注册: 同步触发并返回 0
+        int  cb4_count = 0;
+        auto id4       = reg.registerCallback("sess_1", [&cb4_count]() {
+            cb4_count++;
+        });
+        XX_TEST_EXPECT_EQ(cb4_count, 1);
+        XX_TEST_EXPECT_EQ(id4, 0ULL);
+
+        // cancelAll: 批量清理与触发剩余回调
+        reg.cancelAll();
+        XX_TEST_EXPECT_EQ(cb3_count, 1);
+        XX_TEST_EXPECT_EQ(reg.activeCount(), size_t(0));
+
+        // ScopedRegistration RAII 守卫移动与作用域注销
+        {
+            int scoped_count = 0;
+            {
+                auto guard = reg.bind("sess_scoped", [&scoped_count]() {
+                    scoped_count++;
+                });
+                XX_TEST_EXPECT_EQ(reg.activeCount(), size_t(1));
+                // 测试 move 语义
+                auto guard2 = std::move(guard);
+                XX_TEST_EXPECT_EQ(reg.activeCount(), size_t(1));
+            }
+            XX_TEST_EXPECT_EQ(reg.activeCount(), size_t(0));
+            reg.cancel("sess_scoped");
+            XX_TEST_EXPECT_EQ(scoped_count, 0);
+        }
+
+        // clearCancelled 重置标记
+        XX_TEST_EXPECT_TRUE(reg.isCancelled("sess_1"));
+        reg.clearCancelled("sess_1");
+        XX_TEST_EXPECT_FALSE(reg.isCancelled("sess_1"));
+
+        // 36.2 防 UAF 排空验证 (Anti-UAF Protocol):
+        // 验证 unregisterCallback 必须阻塞等待正在并发执行的回调完成，杜绝回调访问被析构对象
+        {
+            struct ResourceOnStack {
+                std::atomic<bool> destroyed{false};
+                std::atomic<bool> accessedDuringCb{false};
+
+                ~ResourceOnStack() {
+                    destroyed.store(true, std::memory_order_release);
+                }
+            };
+
+            auto              res = std::make_unique<ResourceOnStack>();
+            std::atomic<bool> cbStarted{false};
+            std::atomic<bool> unregisterDone{false};
+
+            auto regId = reg.registerCallback("sess_uaf", [&, r = res.get()]() {
+                cbStarted.store(true, std::memory_order_release);
+                // 模拟耗时外部系统调用/中断流程
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                if (!r->destroyed.load(std::memory_order_acquire)) {
+                    r->accessedDuringCb.store(true, std::memory_order_release);
+                }
+            });
+
+            // 线程 1 触发 cancel
+            std::thread tCancel([&reg]() {
+                reg.cancel("sess_uaf");
+            });
+
+            // 等待回调开始执行
+            while (!cbStarted.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+
+            // 此时回调正在执行中，我们在主线程调用 unregisterCallback
+            // 由于内部 entry->mu 保护，unregisterCallback 必须等待回调执行完毕
+            reg.unregisterCallback(regId);
+            unregisterDone.store(true, std::memory_order_release);
+
+            // 销毁资源
+            res.reset();
+
+            tCancel.join();
+            XX_TEST_EXPECT_TRUE(unregisterDone.load());
+        }
+
+        // 36.3 多线程高频并发压力测试 (8 线程并发注册/注销/取消)
+        {
+            agentxx::plugin::CancelRegistry benchReg;
+            std::atomic<int>                triggered{0};
+            std::atomic<bool>               stop{false};
+            constexpr int                   kThreads = 8;
+            std::vector<std::thread>        workers;
+
+            for (int t = 0; t < kThreads; ++t) {
+                workers.emplace_back([&benchReg, &triggered, &stop, t]() {
+                    std::string key = fmt::format("sess_bench_{}", t % 4);
+                    while (!stop.load(std::memory_order_relaxed)) {
+                        auto id = benchReg.registerCallback(key, [&triggered]() {
+                            triggered.fetch_add(1, std::memory_order_relaxed);
+                        });
+                        if (id != 0) {
+                            std::this_thread::yield();
+                            benchReg.unregisterCallback(id);
+                        }
+                    }
+                });
+            }
+
+            for (int i = 0; i < 50; ++i) {
+                benchReg.cancel("sess_bench_0");
+                benchReg.clearCancelled("sess_bench_0");
+                benchReg.cancel("sess_bench_1");
+                benchReg.clearCancelled("sess_bench_1");
+                benchReg.cancel("sess_bench_2");
+                benchReg.clearCancelled("sess_bench_2");
+                benchReg.cancel("sess_bench_3");
+                benchReg.clearCancelled("sess_bench_3");
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+
+            stop.store(true, std::memory_order_relaxed);
+            for (auto& w : workers) {
+                w.join();
+            }
+            benchReg.cancelAll();
+            XX_TEST_EXPECT_EQ(benchReg.activeCount(), size_t(0));
+        }
+
+        // 36.4 PluginBase 集成与 sessionCancelled 本地优先读取
+        {
+            struct DummyPlugin : public agentxx::plugin::PluginBase {};
+
+            DummyPlugin plug;
+            XX_TEST_EXPECT_FALSE(plug.sessionCancelled("test_sess"));
+
+            // 主程序 execute_cancel 或本地登记取消
+            plug.cancelRegistry.cancel("test_sess");
+            // 本地直接命中, 零跨线程 host 交互
+            XX_TEST_EXPECT_TRUE(plug.sessionCancelled("test_sess"));
+        }
+    }
+
+    // ---- 37. 插件加载失败的事务性回滚 (RAII 回滚验证) ----
+    {
+        auto rollbackCtx         = std::make_shared<agentxx::agent::AgentContext>();
+        rollbackCtx->agentConfig = std::make_shared<agentxx::agent::AgentConfig>();
+        rollbackCtx->middlewareHandleContext
+            = std::make_shared<agentxx::middleware::MiddlewareContext>();
+        rollbackCtx->bus
+            = std::make_shared<agentxx::events::EventBus>(co_await asio::this_coro::executor);
+        rollbackCtx->toolRegistry  = std::make_shared<agentxx::plugin::ToolRegistry>();
+        rollbackCtx->pluginManager = std::make_shared<agentxx::plugin::PluginManager>(rollbackCtx);
+        rollbackCtx->pluginManager->setIoExecutor(co_await asio::this_coro::executor);
+
+        auto fakeInst = std::make_shared<agentxx::plugin::PluginInstance>("fake_rollback_plugin");
+        fakeInst->manager     = rollbackCtx->pluginManager;
+        fakeInst->self        = fakeInst;
+        fakeInst->ownerSelf   = fakeInst;
+        auto vtableSv         = agentxx::plugin::PluginStringView::fromCstr("__vtable");
+        fakeInst->hostControl = agentxx::plugin::PluginHostControl::create(
+            fakeInst,
+            (const PluginxxHostVtable*)agentxx::plugin::xx_query_interface(nullptr, &vtableSv)
+        );
+
+        struct FakeCtx : public agentxx::plugin::PluginBase {};
+
+        FakeCtx fctx;
+        fctx.init(fakeInst->hostView());
+        agentxx::plugin::fast_tool(fctx, "fake_rollback_tool", "desc", "{}", [](std::string_view) {
+            return "ok";
+        });
+        XX_TEST_EXPECT_TRUE(rollbackCtx->toolRegistry->contains("fake_rollback_tool"));
+
+        // 验证 detachAll 完全拔除工具与订阅
+        rollbackCtx->pluginManager->detachAll(fakeInst.get());
+        XX_TEST_EXPECT_FALSE(rollbackCtx->toolRegistry->contains("fake_rollback_tool"));
+        XX_TEST_EXPECT_EQ(fakeInst->subscriptions.size(), size_t(0));
+        rollbackCtx->pluginManager->shutdownAll();
+    }
+
+    // ---- 38. 并发调用 call_tool 零死锁三态机压力测试 ----
+    {
+        auto instCall = co_await ctx->pluginManager->loadPluginAsync(path);
+        XX_TEST_EXPECT_TRUE(instCall != nullptr);
+        auto tool = ctx->toolRegistry->find("example_caller");
+        XX_TEST_EXPECT_TRUE(tool != nullptr);
+        if (tool) {
+            constexpr int    kTotalCalls = 1000;
+            // 该协程可能比本作用域活得更久: 共享状态用 shared_ptr 持有
+            auto completed = std::make_shared<std::atomic<int>>(0);
+            auto             ex = co_await asio::this_coro::executor;
+            for (int i = 0; i < kTotalCalls; ++i) {
+                asio::co_spawn(
+                    ex,
+                    keepAliveRun([tool, completed, i]() -> asio::awaitable<void> {
+                        auto out = co_await tool->execute_async(utilxx_base::Json{
+                            {"sessionId", fmt::format("conc_{}", i)},
+                            {"x", i},
+                        });
+                        auto j   = utilxx_base::Json::parse(out);
+                        if (j["via_call_tool"]["echo"]["x"].get<int>() == i) {
+                            completed->fetch_add(1, std::memory_order_relaxed);
+                        }
+                    }),
+                    asio::detached
+                );
+            }
+            for (int waitCount = 0;
+                 waitCount < 500 && completed->load(std::memory_order_relaxed) < kTotalCalls;
+                 ++waitCount) {
+                co_await sleepMs(10);
+            }
+            XX_TEST_EXPECT_EQ(completed->load(), kTotalCalls);
+            // 仍有未结束的并发调用时不得卸载 (卸载会与它们交错, 造成 use-after-free)
+            if (completed->load() != kTotalCalls) {
+                XX_TEST_EXPECT_TRUE(false);
+                co_return TestResult{g_plugin_passed, g_plugin_failed};
+            }
+        }
+        co_await ctx->pluginManager->unloadAsync("example_plugin");
+    }
+
+    // ---- 38b. 协程驱动桥端到端: 真实主程序下 driver/wake 交错执行 (plugin.md 6/10) ----
+    //
+    // `example_bridge` 每步都经"主程序 timer 回调 -> 投递 continuation + wake -> 下一次
+    // driver"推进, 因此:
+    // - 插件执行期间主程序 IO 线程必须仍能推进其它任务 (hostTicks 递增 = 没有被插件独占);
+    // - 结果里 driverAvailable/onHostIoThread 必须为真 (真主程序提供 coroutine_runtime);
+    // - 只有真实唤醒源 (timer/callback) 才产生请求, 因此 ticks=3 时不应有自旋。
+    {
+        auto instBridge = co_await ctx->pluginManager->loadPluginAsync(path);
+        XX_TEST_EXPECT_TRUE(instBridge != nullptr);
+        auto bridgeTool = ctx->toolRegistry->find("example_bridge");
+        XX_TEST_EXPECT_TRUE(bridgeTool != nullptr);
+        if (bridgeTool) {
+            // 该协程可能比本作用域活得更久: 共享状态用 shared_ptr 持有
+            auto hostTicks  = std::make_shared<std::atomic<int>>(0);
+            auto pluginDone = std::make_shared<std::atomic<bool>>(false);
+            auto              ex = co_await asio::this_coro::executor;
+            asio::co_spawn(
+                ex,
+                keepAliveRun([hostTicks, pluginDone]() -> asio::awaitable<void> {
+                    for (int i = 0; i < 200 && !pluginDone->load(std::memory_order_acquire); ++i) {
+                        hostTicks->fetch_add(1, std::memory_order_relaxed);
+                        co_await sleepMs(1);
+                    }
+                }),
+                asio::detached
+            );
+
+            auto out = co_await bridgeTool->execute_async(utilxx_base::Json{
+                {"sessionId", "bridge_e2e"},
+                {"ticks",     3           }
+            });
+            pluginDone->store(true, std::memory_order_release);
+            auto j = utilxx_base::Json::parse(out);
+            XX_TEST_EXPECT_EQ(j["driverAvailable"].get<bool>(), true);
+            XX_TEST_EXPECT_EQ(j["onHostIoThread"].get<bool>(), true);
+            XX_TEST_EXPECT_EQ(j["ticks"].get<int>(), 3);
+            XX_TEST_EXPECT_EQ(
+                j["calls"]["echo"]["from"].get<std::string>(),
+                std::string{"example_bridge"}
+            );
+            // 插件挂起期间主程序任务推进过 => 两者在同一 IO 序列中交错执行
+            XX_TEST_EXPECT_GE(hostTicks->load(), 2);
+        }
+        co_await ctx->pluginManager->unloadAsync("example_plugin");
+    }
+
+    // ---- 38c. 受控轮询端到端: 插件本地 reactor 上的 asio 等待由 pump 推进 ----
+    //
+    // `example_polled_timer` 的等待是插件本地 reactor 上的 asio::steady_timer
+    // (没有主程序可见唤醒源), 只能由声明式受控轮询推进。因此:
+    // - 计时器必须真正到期 (elapsedMs ≈ ticks*intervalMs), 说明本地 reactor 被
+    //   持续驱动, 而不是"挂死在那里等主程序回调";
+    // - 插件执行期间主程序 IO 线程必须仍能推进其它任务 (hostTicks 递增 = 未被独占);
+    // - pumpOnStart/driverAvailable/onHostIoThread 为真 (真实主程序提供 coroutine_runtime)。
+    {
+        auto instPolled = co_await ctx->pluginManager->loadPluginAsync(path);
+        XX_TEST_EXPECT_TRUE(instPolled != nullptr);
+        auto polledTool = ctx->toolRegistry->find("example_polled_timer");
+        XX_TEST_EXPECT_TRUE(polledTool != nullptr);
+        if (polledTool) {
+            // 该协程可能比本作用域活得更久: 共享状态用 shared_ptr 持有
+            auto hostTicks  = std::make_shared<std::atomic<int>>(0);
+            auto polledDone = std::make_shared<std::atomic<bool>>(false);
+            auto              ex = co_await asio::this_coro::executor;
+            asio::co_spawn(
+                ex,
+                keepAliveRun([hostTicks, polledDone]() -> asio::awaitable<void> {
+                    for (int i = 0; i < 600 && !polledDone->load(std::memory_order_acquire); ++i) {
+                        hostTicks->fetch_add(1, std::memory_order_relaxed);
+                        co_await sleepMs(1);
+                    }
+                }),
+                asio::detached
+            );
+
+            auto t0  = std::chrono::steady_clock::now();
+            auto out = co_await polledTool->execute_async(utilxx_base::Json{
+                {"sessionId",  "polled_e2e"},
+                {"ticks",      3           },
+                {"intervalMs", 15          },
+            });
+            polledDone->store(true, std::memory_order_release);
+            auto wallMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now() - t0
+            )
+                              .count();
+
+            auto j = utilxx_base::Json::parse(out);
+            XX_TEST_EXPECT_EQ(j["driverAvailable"].get<bool>(), true);
+            XX_TEST_EXPECT_EQ(j["onHostIoThread"].get<bool>(), true);
+            XX_TEST_EXPECT_EQ(j["pumpOnStart"].get<bool>(), true);
+            XX_TEST_EXPECT_EQ(j["ticks"].get<int>(), 3);
+            // asio 原生 timer 在 pump 下真正到期 (退避间隔 10ms, 因此放宽下界)
+            XX_TEST_EXPECT_GE(j["elapsedMs"].get<int64_t>(), int64_t{40});
+            XX_TEST_EXPECT_TRUE(wallMs < 3000);
+            // 插件等待期间主程序任务持续推进 => 两者在同一 IO 序列中交错
+            XX_TEST_EXPECT_GE(hostTicks->load(), 2);
+        }
+        XX_TEST_EXPECT_TRUE(co_await ctx->pluginManager->unloadAsync("example_plugin"));
+        XX_TEST_EXPECT_FALSE(ctx->toolRegistry->contains("example_polled_timer"));
+    }
+
+    // ---- 38d. agentxx_filesystem 端到端: read/write/edit 走受控轮询 (asio::stream_file),
+    //          list 仍走 offload 阻塞池 —— 两类工具在同一实例内共存 ----
+    {
+        auto fsPath = findPluginDir("agentxx_filesystem");
+        auto fsInst = co_await ctx->pluginManager->loadPluginAsync(fsPath);
+        XX_TEST_EXPECT_TRUE(fsInst != nullptr);
+        if (fsInst) {
+            namespace fsx = std::filesystem;
+            std::error_code ec;
+            const auto      uniqueId = std::chrono::steady_clock::now().time_since_epoch().count();
+            const auto      dir
+                = fsx::temp_directory_path(ec) / fmt::format("agentxx_polled_fs_{}", uniqueId);
+            fsx::create_directories(dir, ec);
+            const std::string file = (dir / "polled.txt").string();
+
+            auto writeTool = ctx->toolRegistry->find("agentxx_filesystem_write");
+            auto readTool  = ctx->toolRegistry->find("agentxx_filesystem_read");
+            auto editTool  = ctx->toolRegistry->find("agentxx_filesystem_edit");
+            auto listTool  = ctx->toolRegistry->find("agentxx_filesystem_list");
+            XX_TEST_EXPECT_TRUE(writeTool != nullptr);
+            XX_TEST_EXPECT_TRUE(readTool != nullptr);
+            XX_TEST_EXPECT_TRUE(editTool != nullptr);
+            XX_TEST_EXPECT_TRUE(listTool != nullptr);
+
+            if (writeTool && readTool && editTool && listTool) {
+                // 1. write (受控轮询 + stream_file)
+                auto w = co_await writeTool->execute_async(utilxx_base::Json{
+                    {"path",      file                         },
+                    {"content",   "hello polled\nsecond line\n"},
+                    {"overwrite", true                         },
+                });
+                XX_TEST_EXPECT_TRUE(w.find("success") != std::string::npos);
+
+                // 2. read (受控轮询, 带行区间)
+                auto r = co_await readTool->execute_async(utilxx_base::Json{
+                    {"path",        file},
+                    {"line_offset", 0   },
+                    {"line_limit",  2   },
+                });
+                XX_TEST_EXPECT_TRUE(r.find("hello polled") != std::string::npos);
+
+                // 3. edit (受控轮询: 异步读 + 原子写)
+                auto e = co_await editTool->execute_async(utilxx_base::Json{
+                    {"path",    file         },
+                    {"old_str", "second line"},
+                    {"new_str", "SECOND"     },
+                });
+                XX_TEST_EXPECT_TRUE(e.find("success") != std::string::npos);
+                auto r2 = co_await readTool->execute_async(utilxx_base::Json{
+                    {"path", file}
+                });
+                XX_TEST_EXPECT_TRUE(r2.find("SECOND") != std::string::npos);
+
+                // 4. list (仍走 offload 阻塞池): 两类工具在同一实例内共存
+                auto l = co_await listTool->execute_async(utilxx_base::Json{
+                    {"path", dir.string()}
+                });
+                XX_TEST_EXPECT_TRUE(l.find("polled.txt") != std::string::npos);
+            }
+            fsx::remove_all(dir, ec);
+            XX_TEST_EXPECT_TRUE(co_await ctx->pluginManager->unloadAsync("agentxx_filesystem"));
+        }
+    }
+
+    // ---- 38d-2. agentxx_filesystem 兜底注册: 关闭文件异步 I/O 后重新加载插件,
+    //          read/write/edit 应改注册 blocking_tool (offload 阻塞池) 且功能不变
+    //          (对应容器/虚拟化下 io_uring 被 seccomp 拦截的部署环境) ----
+    {
+        /// 作用域结束恢复自动探测 (含异常路径)
+        struct ScopedDisableAsyncFileIo {
+            ScopedDisableAsyncFileIo() {
+                utilxx_base::setAsyncFileIoSupported(false);
+            }
+
+            ~ScopedDisableAsyncFileIo() {
+                utilxx_base::resetAsyncFileIoSupported();
+            }
+        } scopedDisable;
+
+        auto fsPath = findPluginDir("agentxx_filesystem");
+        auto fsInst = co_await ctx->pluginManager->loadPluginAsync(fsPath);
+        XX_TEST_EXPECT_TRUE(fsInst != nullptr);
+        if (fsInst) {
+            namespace fsx = std::filesystem;
+            std::error_code ec;
+            const auto      uniqueId = std::chrono::steady_clock::now().time_since_epoch().count();
+            const auto      dir
+                = fsx::temp_directory_path(ec) / fmt::format("agentxx_fallback_fs_{}", uniqueId);
+            fsx::create_directories(dir, ec);
+            const std::string file = (dir / "fallback.txt").string();
+
+            auto writeTool = ctx->toolRegistry->find("agentxx_filesystem_write");
+            auto readTool  = ctx->toolRegistry->find("agentxx_filesystem_read");
+            auto editTool  = ctx->toolRegistry->find("agentxx_filesystem_edit");
+            XX_TEST_EXPECT_TRUE(writeTool != nullptr);
+            XX_TEST_EXPECT_TRUE(readTool != nullptr);
+            XX_TEST_EXPECT_TRUE(editTool != nullptr);
+
+            if (writeTool && readTool && editTool) {
+                // write / read / edit 全程走同步兜底实现 (blocking_tool)
+                auto w = co_await writeTool->execute_async(utilxx_base::Json{
+                    {"path",      file                           },
+                    {"content",   "hello fallback\nsecond line\n"},
+                    {"overwrite", true                           },
+                });
+                XX_TEST_EXPECT_TRUE(w.find("success") != std::string::npos);
+
+                auto r = co_await readTool->execute_async(utilxx_base::Json{
+                    {"path",        file},
+                    {"line_offset", 0   },
+                    {"line_limit",  2   },
+                });
+                XX_TEST_EXPECT_TRUE(r.find("hello fallback") != std::string::npos);
+
+                auto e = co_await editTool->execute_async(utilxx_base::Json{
+                    {"path",    file         },
+                    {"old_str", "second line"},
+                    {"new_str", "SECOND"     },
+                });
+                XX_TEST_EXPECT_TRUE(e.find("success") != std::string::npos);
+
+                auto r2 = co_await readTool->execute_async(utilxx_base::Json{
+                    {"path", file}
+                });
+                XX_TEST_EXPECT_TRUE(r2.find("SECOND") != std::string::npos);
+            }
+            fsx::remove_all(dir, ec);
+            XX_TEST_EXPECT_TRUE(co_await ctx->pluginManager->unloadAsync("agentxx_filesystem"));
+        }
+    }
+
+    // ---- 38d-3. 工具权限声明: 插件在注册工具后声明自身工具的权限限制
+    //             (agentxx.agent.permission 接口表), 声明交给权限中间件并由
+    //             主程序统一判定; 插件禁用/卸载时声明随工具一并撤销 ----
+    {
+        // 装配权限中间件 (真实运行中由 BaseAgent::initMiddleware 装配)
+        auto permission = std::make_shared<agentxx::middleware::PermissionMiddlewareHandle>(ctx);
+        ctx->middlewareHandleContext->handles.push_back(permission);
+        using Mw = agentxx::middleware::PermissionMiddlewareHandle;
+
+        auto fsPath = findPluginDir("agentxx_filesystem");
+        auto fsInst = co_await ctx->pluginManager->loadPluginAsync(fsPath);
+        XX_TEST_EXPECT_TRUE(fsInst != nullptr);
+        if (fsInst) {
+            // 1. 读/写工具声明了路径目标 (目标参数 `path`), 作用域各自独立
+            const auto* writeSpec = permission->toolPermission("agentxx_filesystem_write");
+            XX_TEST_EXPECT_TRUE(writeSpec != nullptr);
+            if (writeSpec) {
+                XX_TEST_EXPECT_EQ(writeSpec->scope, Mw::FilesystemPermissionWRITE);
+                XX_TEST_EXPECT_TRUE(
+                    writeSpec->targetKind == agentxx::middleware::ToolPermissionTargetKind::Path
+                );
+                XX_TEST_EXPECT_EQ(writeSpec->targetArgs.size(), size_t{1});
+                if (!writeSpec->targetArgs.empty()) {
+                    XX_TEST_EXPECT_EQ(writeSpec->targetArgs[0], std::string{"path"});
+                }
+            }
+            const auto* readSpec = permission->toolPermission("agentxx_filesystem_read");
+            XX_TEST_EXPECT_TRUE(readSpec != nullptr);
+            if (readSpec) {
+                XX_TEST_EXPECT_EQ(readSpec->scope, Mw::FilesystemPermissionREAD);
+            }
+            // 2. 模式类工具 (glob/grep) 声明的是 `file_patterns` (数组) 的读权限:
+            //    声明的目标只描述扫描起点 (决定是否询问), 展开出的实际路径由工具
+            //    内批量查询逐项复核 (见 38d-4)
+            const auto* globSpec = permission->toolPermission("agentxx_filesystem_glob");
+            const auto* grepSpec = permission->toolPermission("agentxx_filesystem_grep");
+            XX_TEST_EXPECT_TRUE(globSpec != nullptr);
+            XX_TEST_EXPECT_TRUE(grepSpec != nullptr);
+            if (globSpec) {
+                XX_TEST_EXPECT_EQ(globSpec->scope, Mw::FilesystemPermissionREAD);
+                XX_TEST_EXPECT_EQ(globSpec->targetArgs.size(), size_t{1});
+                if (!globSpec->targetArgs.empty()) {
+                    XX_TEST_EXPECT_EQ(globSpec->targetArgs[0], std::string{"file_patterns"});
+                }
+            }
+            if (grepSpec) {
+                XX_TEST_EXPECT_EQ(grepSpec->scope, Mw::FilesystemPermissionREAD);
+            }
+
+            // 3. 判定: 已声明工具按规则表兜底 (无规则 = noRuleOperator); 未声明工具直接放行
+            permission->noRuleOperator = agentxx::middleware::PermissionOperator::DENY;
+            auto writeArgs             = utilxx_base::Json{
+                            {"path", "/tmp/agentxx_permission_decl/x.txt"}
+            };
+            XX_TEST_EXPECT_FALSE(
+                co_await permission->checkToolPermission("agentxx_filesystem_write", writeArgs)
+            );
+            // 模式类工具: `file_patterns` 数组逐项判定 (此处两项都未命中规则 → DENY)
+            auto globArgs = utilxx_base::Json{
+                {"file_patterns", utilxx_base::Json::array({"/tmp/a/*.cpp", "/tmp/b/*.h"})}
+            };
+            XX_TEST_EXPECT_FALSE(
+                co_await permission->checkToolPermission("agentxx_filesystem_glob", globArgs)
+            );
+            // 未声明权限的工具: 直接放行 (权限限制随工具来源走)
+            XX_TEST_EXPECT_TRUE(
+                co_await permission->checkToolPermission("plugin_undeclared_tool", globArgs)
+            );
+
+            // 4. 禁用: 工具与权限声明一并摘除 (未声明 => 直接放行)
+            ctx->pluginManager->disable("agentxx_filesystem");
+            XX_TEST_EXPECT_TRUE(permission->toolPermission("agentxx_filesystem_write") == nullptr);
+            XX_TEST_EXPECT_TRUE(
+                co_await permission->checkToolPermission("agentxx_filesystem_write", writeArgs)
+            );
+
+            // 5. 重新启用: start 事务重新注册工具并重新声明权限 (异步收尾, 等它就绪)
+            ctx->pluginManager->enable("agentxx_filesystem");
+            for (int i = 0;
+                 i < 200 && permission->toolPermission("agentxx_filesystem_write") == nullptr;
+                 ++i) {
+                co_await sleepMs(10);
+            }
+            XX_TEST_EXPECT_TRUE(permission->toolPermission("agentxx_filesystem_write") != nullptr);
+            XX_TEST_EXPECT_FALSE(
+                co_await permission->checkToolPermission("agentxx_filesystem_write", writeArgs)
+            );
+
+            // 6. 非法声明被拒绝: 非本实例所有的工具 / 未知作用域取值
+            auto ifacePermission = agentxx::plugin::queryInterface<AgentxxPluginPermissionIface>(
+                fsInst->hostView(),
+                AGENTXX_PLUGIN_IFACE_AGENT_PERMISSION
+            );
+            XX_TEST_EXPECT_TRUE(ifacePermission != nullptr);
+            if (ifacePermission) {
+                XX_TEST_EXPECT_EQ(
+                    ifacePermission->version,
+                    AGENTXX_PLUGIN_IFACE_AGENT_PERMISSION_VERSION
+                );
+                auto argSv = agentxx::plugin::PluginStringView::fromCstr("path");
+                AgentxxPluginToolPermissionSpec spec{};
+                spec.scope       = AGENTXX_PLUGIN_PERMISSION_SCOPE_WRITE;
+                spec.target_kind = AGENTXX_PLUGIN_PERMISSION_TARGET_PATH;
+                spec.target_arg  = argSv;
+
+                // 非本插件工具 (内置工具名)
+                spec.tool_name = agentxx::plugin::PluginStringView::fromCstr("agentxx_share_store");
+                XX_TEST_EXPECT_TRUE(
+                    ifacePermission->register_tool_permission(fsInst->hostView(), &spec) != 0
+                );
+
+                // 本插件工具 + 未知作用域取值
+                spec.tool_name
+                    = agentxx::plugin::PluginStringView::fromCstr("agentxx_filesystem_write");
+                spec.scope = 999;
+                XX_TEST_EXPECT_TRUE(
+                    ifacePermission->register_tool_permission(fsInst->hostView(), &spec) != 0
+                );
+                // 非法声明不得改变已生效的声明 (作用域仍为写)
+                const auto* specAfterBad = permission->toolPermission("agentxx_filesystem_write");
+                XX_TEST_EXPECT_TRUE(specAfterBad != nullptr);
+                if (specAfterBad) {
+                    XX_TEST_EXPECT_EQ(specAfterBad->scope, Mw::FilesystemPermissionWRITE);
+                }
+            }
+
+            // 7. 卸载: 声明撤销
+            XX_TEST_EXPECT_TRUE(co_await ctx->pluginManager->unloadAsync("agentxx_filesystem"));
+            XX_TEST_EXPECT_TRUE(permission->toolPermission("agentxx_filesystem_write") == nullptr);
+            XX_TEST_EXPECT_TRUE(permission->toolPermission("agentxx_filesystem_read") == nullptr);
+        }
+        // 摘除本用例装配的权限中间件 (避免影响后续用例)
+        ctx->middlewareHandleContext->handles.pop_back();
+    }
+
+    // ---- 38d-4. 模式类工具 (glob / grep) 的路径权限: 声明的目标只决定"是否询问",
+    //             模式展开出的实际路径在工具内逐项查询过滤 (check_paths, 三态不询问) ----
+    {
+        namespace fsx = std::filesystem;
+        std::error_code ec;
+        const auto      uniqueId = std::chrono::steady_clock::now().time_since_epoch().count();
+        const auto      root
+            = fsx::temp_directory_path(ec) / fmt::format("agentxx_perm_glob_{}", uniqueId);
+        fsx::create_directories(root / "keep", ec);
+        fsx::create_directories(root / "secret" / "deep", ec);
+        {
+            std::ofstream(root / "keep" / "ok.txt") << "needle_keep\n";
+            std::ofstream(root / "secret" / "hidden.txt") << "needle_secret\n";
+            std::ofstream(root / "secret" / "deep" / "hidden2.txt") << "needle_secret_deep\n";
+        }
+
+        auto permission = std::make_shared<agentxx::middleware::PermissionMiddlewareHandle>(ctx);
+        ctx->middlewareHandleContext->handles.push_back(permission);
+        // 无规则即放行 (对照用例先验证"未拒绝时全部可见")
+        permission->noRuleOperator = agentxx::middleware::PermissionOperator::ALLOW;
+
+        auto fsPath = findPluginDir("agentxx_filesystem");
+        auto fsInst = co_await ctx->pluginManager->loadPluginAsync(fsPath);
+        XX_TEST_EXPECT_TRUE(fsInst != nullptr);
+        if (fsInst) {
+            // glob/grep 现在声明了 `file_patterns` (数组) 的读权限: 目标为模式扫描起点
+            const auto* globSpec = permission->toolPermission("agentxx_filesystem_glob");
+            const auto* grepSpec = permission->toolPermission("agentxx_filesystem_grep");
+            XX_TEST_EXPECT_TRUE(globSpec != nullptr);
+            XX_TEST_EXPECT_TRUE(grepSpec != nullptr);
+            if (globSpec) {
+                XX_TEST_EXPECT_EQ(
+                    globSpec->scope,
+                    agentxx::middleware::PermissionMiddlewareHandle::FilesystemPermissionREAD
+                );
+                XX_TEST_EXPECT_EQ(globSpec->targetArgs.size(), size_t{1});
+                if (!globSpec->targetArgs.empty()) {
+                    XX_TEST_EXPECT_EQ(globSpec->targetArgs[0], std::string{"file_patterns"});
+                }
+            }
+
+            auto globTool = ctx->toolRegistry->find("agentxx_filesystem_glob");
+            auto grepTool = ctx->toolRegistry->find("agentxx_filesystem_grep");
+            XX_TEST_EXPECT_TRUE(globTool != nullptr);
+            XX_TEST_EXPECT_TRUE(grepTool != nullptr);
+            const std::string patternAll = (root / "**" / "*.txt").generic_string();
+
+            // (1) 对照: 未配置拒绝规则 → 被扫目录的文件全部出现在结果中
+            if (globTool && grepTool) {
+                auto globOut = co_await globTool->execute_async(utilxx_base::Json{
+                    {"file_patterns", utilxx_base::Json::array({patternAll})},
+                });
+                XX_TEST_EXPECT_TRUE(globOut.find("ok.txt") != std::string::npos);
+                XX_TEST_EXPECT_TRUE(globOut.find("hidden.txt") != std::string::npos);
+                XX_TEST_EXPECT_TRUE(globOut.find("hidden2.txt") != std::string::npos);
+
+                // 默认输出模式 (files_with_matches): 列出命中的文件路径与计数
+                auto grepOut = co_await grepTool->execute_async(utilxx_base::Json{
+                    {"file_patterns", utilxx_base::Json::array({patternAll})},
+                    {"text_patterns", utilxx_base::Json::array({"needle_"}) },
+                });
+                XX_TEST_EXPECT_TRUE(grepOut.find("hidden.txt") != std::string::npos);
+                // content 模式: 命中行内容 (含被拒目录内的内容, 此时尚未配置拒绝规则)
+                auto grepContentOut = co_await grepTool->execute_async(utilxx_base::Json{
+                    {"file_patterns", utilxx_base::Json::array({patternAll})},
+                    {"text_patterns", utilxx_base::Json::array({"needle_"}) },
+                    {"output_mode",   "content"                             },
+                });
+                XX_TEST_EXPECT_TRUE(grepContentOut.find("needle_secret") != std::string::npos);
+            }
+
+            // (2) 配置拒绝 secret 子目录 (权限黑名单; 见用户场景: 允许 /a/* 但拒绝 /a/b/c)
+            permission->addConfigDenyPath((root / "secret").generic_string());
+
+            // (3) glob: 模式仍可匹配到 secret 下文件, 但逐路径过滤后不出现在结果里
+            if (globTool) {
+                auto globOut = co_await globTool->execute_async(utilxx_base::Json{
+                    {"file_patterns", utilxx_base::Json::array({patternAll})},
+                });
+                XX_TEST_EXPECT_TRUE(globOut.find("ok.txt") != std::string::npos);
+                XX_TEST_EXPECT_TRUE(globOut.find("hidden.txt") == std::string::npos);
+                XX_TEST_EXPECT_TRUE(globOut.find("hidden2.txt") == std::string::npos);
+            }
+
+            // (4) grep: 被拒目录的文件不读取, 命中行不出现在结果里 (keep 目录仍可搜索)
+            if (grepTool) {
+                auto grepOut = co_await grepTool->execute_async(utilxx_base::Json{
+                    {"file_patterns", utilxx_base::Json::array({patternAll})},
+                    {"text_patterns", utilxx_base::Json::array({"needle_"}) },
+                    {"output_mode",   "content"                             },
+                });
+                XX_TEST_EXPECT_TRUE(grepOut.find("needle_keep") != std::string::npos);
+                XX_TEST_EXPECT_TRUE(grepOut.find("needle_secret") == std::string::npos);
+            }
+
+            // (4b) list: 条目实时过滤 (recursive 下钻 + limit 只统计真正输出的条目)
+            {
+                const auto listRoot = root / "listed";
+                fsx::create_directories(listRoot / "deny_dir", ec);
+                fsx::create_directories(listRoot / "keep_dir", ec);
+                for (int i = 0; i < 10; ++i) {
+                    std::ofstream(listRoot / "deny_dir" / fmt::format("d{}.txt", i)) << "x";
+                    std::ofstream(listRoot / "keep_dir" / fmt::format("k{}.txt", i)) << "x";
+                }
+                permission->addConfigDenyPath((listRoot / "deny_dir").generic_string());
+                auto listTool = ctx->toolRegistry->find("agentxx_filesystem_list");
+                XX_TEST_EXPECT_TRUE(listTool != nullptr);
+                if (listTool) {
+                    auto listOut = co_await listTool->execute_async(utilxx_base::Json{
+                        {"path",      listRoot.generic_string()},
+                        {"recursive", true                     },
+                        {"limit",     5                        },
+                    });
+                    // 被拒目录自身与其下条目都不输出
+                    XX_TEST_EXPECT_TRUE(listOut.find("deny_dir") == std::string::npos);
+                    XX_TEST_EXPECT_TRUE(listOut.find("d0.txt") == std::string::npos);
+                    // limit 只统计真正输出的条目: 过滤后仍给出 5 条允许条目
+                    const auto lineCount
+                        = static_cast<size_t>(std::count(listOut.begin(), listOut.end(), '\n'))
+                          + (listOut.empty() ? 0 : 1);
+                    XX_TEST_EXPECT_EQ(lineCount, size_t{5});
+                    XX_TEST_EXPECT_TRUE(listOut.find("k0.txt") != std::string::npos);
+                }
+            }
+
+            // (5) C ABI: 批量路径查询 (三态; 不发起询问)
+            {
+                auto ifacePermission
+                    = agentxx::plugin::queryInterface<AgentxxPluginPermissionIface>(
+                        fsInst->hostView(),
+                        AGENTXX_PLUGIN_IFACE_AGENT_PERMISSION
+                    );
+                XX_TEST_EXPECT_TRUE(ifacePermission != nullptr);
+                if (ifacePermission) {
+                    XX_TEST_EXPECT_TRUE(ifacePermission->check_paths != nullptr);
+                    const std::vector<std::string> paths{
+                        (root / "keep" / "ok.txt").generic_string(),
+                        (root / "secret" / "hidden.txt").generic_string(),
+                        "/data/outside_query.txt",
+                    };
+                    std::vector<PluginxxStringView> views;
+                    views.reserve(paths.size());
+                    for (const auto& p : paths) {
+                        views.push_back(agentxx::plugin::PluginStringView::from(p));
+                    }
+                    AgentxxPluginPermissionPathQuery query{};
+                    query.struct_size = sizeof(AgentxxPluginPermissionPathQuery);
+                    query.scope       = AGENTXX_PLUGIN_PERMISSION_SCOPE_READ;
+                    query.path_count  = static_cast<int32_t>(views.size());
+                    query.paths       = views.data();
+                    std::vector<int32_t> decisions(views.size(), -1);
+                    XX_TEST_EXPECT_EQ(
+                        ifacePermission->check_paths(fsInst->hostView(), &query, decisions.data()),
+                        0
+                    );
+                    XX_TEST_EXPECT_EQ(decisions[0], AGENTXX_PLUGIN_PERMISSION_DECISION_ALLOW);
+                    XX_TEST_EXPECT_EQ(decisions[1], AGENTXX_PLUGIN_PERMISSION_DECISION_DENY);
+                    // 未命中任何规则 + noRuleOperator=ALLOW → 已明确允许
+                    XX_TEST_EXPECT_EQ(decisions[2], AGENTXX_PLUGIN_PERMISSION_DECISION_ALLOW);
+
+                    // 非法入参: 空数组 / 空指针 → 失败 (调用方跳过过滤)
+                    query.path_count = 0;
+                    XX_TEST_EXPECT_TRUE(
+                        ifacePermission->check_paths(fsInst->hostView(), &query, decisions.data())
+                        != 0
+                    );
+                }
+            }
+
+            // (6) 主程序未装配权限中间件: 查询返回失败 → 工具跳过过滤 (保持原行为)
+            ctx->middlewareHandleContext->handles.pop_back();
+            if (globTool) {
+                auto globOut = co_await globTool->execute_async(utilxx_base::Json{
+                    {"file_patterns", utilxx_base::Json::array({patternAll})},
+                });
+                XX_TEST_EXPECT_TRUE(globOut.find("ok.txt") != std::string::npos);
+                XX_TEST_EXPECT_TRUE(globOut.find("hidden.txt") != std::string::npos);
+            }
+            {
+                // list 同样按"不过滤"处理 (查询不可用时不把条目当成拒绝)
+                auto listTool = ctx->toolRegistry->find("agentxx_filesystem_list");
+                if (listTool) {
+                    auto listOut = co_await listTool->execute_async(utilxx_base::Json{
+                        {"path",      root.generic_string()},
+                        {"recursive", true                 },
+                    });
+                    XX_TEST_EXPECT_TRUE(listOut.find("keep") != std::string::npos);
+                    XX_TEST_EXPECT_TRUE(listOut.find("hidden.txt") != std::string::npos);
+                }
+            }
+            {
+                auto ifacePermission
+                    = agentxx::plugin::queryInterface<AgentxxPluginPermissionIface>(
+                        fsInst->hostView(),
+                        AGENTXX_PLUGIN_IFACE_AGENT_PERMISSION
+                    );
+                if (ifacePermission) {
+                    const std::vector<std::string>  paths{(root / "keep" / "ok.txt").string()};
+                    std::vector<PluginxxStringView> views;
+                    for (const auto& p : paths) {
+                        views.push_back(agentxx::plugin::PluginStringView::from(p));
+                    }
+                    AgentxxPluginPermissionPathQuery query{};
+                    query.struct_size = sizeof(AgentxxPluginPermissionPathQuery);
+                    query.scope       = AGENTXX_PLUGIN_PERMISSION_SCOPE_READ;
+                    query.path_count  = 1;
+                    query.paths       = views.data();
+                    int32_t decision  = -1;
+                    XX_TEST_EXPECT_TRUE(
+                        ifacePermission->check_paths(fsInst->hostView(), &query, &decision) != 0
+                    );
+                }
+            }
+
+            XX_TEST_EXPECT_TRUE(co_await ctx->pluginManager->unloadAsync("agentxx_filesystem"));
+        }
+        fsx::remove_all(root, ec);
+    }
+
+    // ---- 38e. agentxx_websearch 端到端: 网络等待走受控轮询 (本地回环 HTTP 服务) ----
+    //
+    // 覆盖: 单请求完成、并发多请求 (共享同一 polled 驱动序列与 HTTP keep-alive 池,
+    // 互不阻塞)、插件等待期间主程序 IO 线程仍在推进。
+    {
+        using Server = utilxx::HttpServer;
+        Server server({.address = "127.0.0.1", .port = 0, .ioThreads = 1});
+        server.router().add(
+            "/hello",
+            0,
+            std::make_shared<Server::Handler>(
+                [](Server::Request&, Server::Response& resp, std::string_view
+                ) -> asio::awaitable<void> {
+                    resp.result(boost::beast::http::status::ok);
+                    resp.set(boost::beast::http::field::content_type, "text/plain");
+                    resp.body() = "polled_web_ok";
+                    resp.prepare_payload();
+                    co_return;
+                }
+            )
+        );
+        std::thread serverThread([&server]() {
+            server.start();
+        });
+        uint16_t    port = 0;
+        for (int i = 0; i < 200; ++i) {
+            port = server.port();
+            if (port != 0) {
+                break;
+            }
+            co_await sleepMs(10);
+        }
+        XX_TEST_EXPECT_TRUE(port != 0);
+
+        auto webPath = findPluginDir("agentxx_websearch");
+        auto webInst = co_await ctx->pluginManager->loadPluginAsync(webPath);
+        XX_TEST_EXPECT_TRUE(webInst != nullptr);
+        /// 并发 fetch 是否已全部收束 (仍有挂起协程时不得卸载插件, 否则与其交错)
+        bool webFetchesSettled = false;
+        if (webInst && port != 0) {
+            const std::string baseUrl     = "http://127.0.0.1:" + std::to_string(port);
+            auto              fetchTool   = ctx->toolRegistry->find("agentxx_web_fetch");
+            auto              fetchMdTool = ctx->toolRegistry->find("agentxx_web_fetch_markdown");
+            XX_TEST_EXPECT_TRUE(fetchTool != nullptr);
+            XX_TEST_EXPECT_TRUE(fetchMdTool != nullptr);
+
+            if (fetchTool && fetchMdTool) {
+                // 注: 下面所有 co_spawn(..., detached) 协程都可能比本作用域活得更久,
+                // 共享状态一律用 shared_ptr 持有 (捕获引用会在作用域结束后写坏内存;
+                // Release 实测为堆对象被写坏后释放野指针崩溃), 且卸载插件前必须等它们全部结束
+                auto              hostTicks  = std::make_shared<std::atomic<int>>(0);
+                auto              netDone    = std::make_shared<std::atomic<bool>>(false);
+                auto              ex         = co_await asio::this_coro::executor;
+                asio::co_spawn(
+                    ex,
+                    keepAliveRun([hostTicks, netDone]() -> asio::awaitable<void> {
+                        for (int i = 0; i < 2000 && !netDone->load(std::memory_order_acquire); ++i) {
+                            hostTicks->fetch_add(1, std::memory_order_relaxed);
+                            co_await sleepMs(1);
+                        }
+                    }),
+                    asio::detached
+                );
+
+                // 1. 单请求 (受控轮询驱动 socket 收发)
+                auto out1 = co_await fetchTool->execute_async(utilxx_base::Json{
+                    {"url",     baseUrl + "/hello"},
+                    {"timeout", 10                },
+                });
+                XX_TEST_EXPECT_TRUE(out1.find("polled_web_ok") != std::string::npos);
+
+                // 2. markdown 路径
+                auto out2 = co_await fetchMdTool->execute_async(utilxx_base::Json{
+                    {"url",     baseUrl + "/hello"},
+                    {"timeout", 10                },
+                });
+                XX_TEST_EXPECT_TRUE(out2.find("polled_web_ok") != std::string::npos);
+
+                // 3. 并发 6 路请求: 共享同一实例的 polled 驱动序列, 互不阻塞
+                constexpr int    kConcurrent = 6;
+                auto             okCount     = std::make_shared<std::atomic<int>>(0);
+                auto             doneCount   = std::make_shared<std::atomic<int>>(0);
+                for (int i = 0; i < kConcurrent; ++i) {
+                    asio::co_spawn(
+                        ex,
+                        keepAliveRun(
+                            [fetchTool, okCount, doneCount, baseUrl]() -> asio::awaitable<void> {
+                                auto out = co_await fetchTool->execute_async(utilxx_base::Json{
+                                    {"url",     baseUrl + "/hello"},
+                                    {"timeout", 10                },
+                                });
+                                if (out.find("polled_web_ok") != std::string::npos) {
+                                    okCount->fetch_add(1, std::memory_order_relaxed);
+                                }
+                                doneCount->fetch_add(1, std::memory_order_release);
+                            }
+                        ),
+                        asio::detached
+                    );
+                }
+                // 必须等到 6 路**全部**结束, 而不是"计数达标或超时即继续": 否则后面
+                // (可能)执行的插件卸载会与仍在运行的 fetch 协程交错, 造成 use-after-free
+                for (int i = 0; i < 4000 && doneCount->load(std::memory_order_acquire) < kConcurrent;
+                     ++i) {
+                    co_await sleepMs(5);
+                }
+                netDone->store(true, std::memory_order_release);
+                const bool allFetchesDone
+                    = doneCount->load(std::memory_order_acquire) == kConcurrent;
+                webFetchesSettled = allFetchesDone;
+                XX_TEST_EXPECT_EQ(doneCount->load(), kConcurrent);
+                XX_TEST_EXPECT_EQ(okCount->load(), kConcurrent);
+                // 插件等待网络期间主程序任务仍在推进
+                XX_TEST_EXPECT_GE(hostTicks->load(), 2);
+                if (!allFetchesDone) {
+                    XX_TEST_EXPECT_TRUE(false); // 已有断言失败; 此时卸载会踩到未结束的协程
+                }
+            }
+            // 卸载: 无未完成操作 -> pump 已停止, 无残留
+            // (仅在上面的并发 fetch 已全部收束时执行; 仍有挂起协程时卸载会与其交错)
+            if (webFetchesSettled) {
+                XX_TEST_EXPECT_TRUE(co_await ctx->pluginManager->unloadAsync("agentxx_websearch"));
+                XX_TEST_EXPECT_FALSE(ctx->toolRegistry->contains("agentxx_web_fetch"));
+            }
+        }
+        server.stop();
+        serverThread.join();
+    }
+
+    // ---- 38f. 受控轮询未完成时卸载: 命令挂起时卸载, pump 停止且不泄漏 ----
+    {
+        auto instExec2
+            = co_await ctx->pluginManager->loadPluginAsync(findPluginDir("agentxx_execute_command")
+            );
+        XX_TEST_EXPECT_TRUE(instExec2 != nullptr);
+        if (instExec2) {
+#if XX_IS_WIN_D
+            const char* cmdToolName2 = "agentxx_execute_windows_command";
+            const char* slowCommand  = "ping -n 6 127.0.0.1 > nul";
+#else
+            const char* cmdToolName2 = "agentxx_execute_bash_command";
+            const char* slowCommand  = "sleep 5";
+#endif
+            XX_TEST_EXPECT_TRUE(ctx->toolRegistry->contains(cmdToolName2));
+            auto           ex = co_await asio::this_coro::executor;
+            PluginxxString e2{nullptr, 0};
+
+            struct UnloadRes {
+                int               status = -1;
+                std::atomic<bool> done{false};
+            } ures;
+
+            auto* op2 = ctx->pluginManager->callToolAsync(
+                instExec2.get(),
+                cmdToolName2,
+                utilxx_base::Json{
+                    {"command", slowCommand},
+                    {"timeout", 20         }
+            }.dump(),
+                "t_polled_unload",
+                [](void* ud, int32_t st, const PluginxxStringView*) {
+                    auto* r   = static_cast<UnloadRes*>(ud);
+                    r->status = st;
+                    r->done.store(true, std::memory_order_release);
+                },
+                &ures,
+                &e2
+            );
+            XX_TEST_EXPECT_TRUE(op2 != nullptr);
+            // 让子进程真正跑起来 (pump 已进入轮询等待)
+            co_await sleepMs(150);
+            XX_TEST_EXPECT_FALSE(ures.done.load());
+            auto t0 = std::chrono::steady_clock::now();
+            // 卸载: 主程序取消操作 -> 插件结束 (kill 进程组) -> pump 停止 -> inflight 归零
+            XX_TEST_EXPECT_TRUE(co_await ctx->pluginManager->unloadAsync("agentxx_execute_command")
+            );
+            auto unloadMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - t0
+            )
+                                .count();
+            XX_TEST_EXPECT_TRUE(unloadMs < 5000);
+            for (int i = 0; i < 200 && !ures.done.load(std::memory_order_acquire); ++i) {
+                co_await sleepMs(5);
+            }
+            XX_TEST_EXPECT_TRUE(ures.done.load());
+            XX_TEST_EXPECT_TRUE(ures.status != PLUGINXX_OPERATOR_OK);
+            XX_TEST_EXPECT_FALSE(ctx->toolRegistry->contains(cmdToolName2));
+            if (e2.data) {
+                agentxx::plugin::PluginString::free(instExec2->hostView(), &e2);
+            }
+        }
+    }
+
+    // ---- 39. 多实例并发隔离 (10 个独立 AgentContext 并行加载 agentxx_system_monitor) ----
+    {
+        auto sysMonPath = findPluginDir("agentxx_system_monitor");
+        if (std::filesystem::exists(sysMonPath)) {
+            constexpr int kInstances = 10;
+            auto          ex         = co_await asio::this_coro::executor;
+            std::vector<std::shared_ptr<agent::AgentContext>>    contexts;
+            std::vector<std::shared_ptr<plugin::PluginInstance>> instances;
+            contexts.reserve(kInstances);
+            instances.reserve(kInstances);
+
+            for (int i = 0; i < kInstances; ++i) {
+                auto c                     = std::make_shared<agent::AgentContext>();
+                c->agentConfig             = std::make_shared<agent::AgentConfig>();
+                c->middlewareHandleContext = std::make_shared<middleware::MiddlewareContext>();
+                c->bus                     = std::make_shared<event::EventBus>(ex);
+                c->toolRegistry            = std::make_shared<plugin::ToolRegistry>();
+                c->pluginManager           = std::make_shared<plugin::PluginManager>(c);
+                c->pluginManager->setIoExecutor(ex);
+
+                auto inst = co_await c->pluginManager->loadPluginAsync(sysMonPath);
+                XX_TEST_EXPECT_TRUE(inst != nullptr);
+                XX_TEST_EXPECT_TRUE(c->toolRegistry->contains("agentxx_get_system_core_info"));
+                contexts.push_back(c);
+                instances.push_back(inst);
+            }
+
+            // 每个实例独立调用其工具
+            for (int i = 0; i < kInstances; ++i) {
+                auto tool = contexts[i]->toolRegistry->find("agentxx_get_system_core_info");
+                XX_TEST_EXPECT_TRUE(tool != nullptr);
+                if (tool) {
+                    auto out = co_await tool->execute_async(utilxx_base::Json{});
+                    XX_TEST_EXPECT_TRUE(out.find("CPU Usage:") != std::string::npos);
+                }
+            }
+
+            // 全部卸载
+            for (int i = 0; i < kInstances; ++i) {
+                co_await contexts[i]->pluginManager->unloadAsync("agentxx_system_monitor");
+                XX_TEST_EXPECT_FALSE(
+                    contexts[i]->toolRegistry->contains("agentxx_get_system_core_info")
+                );
+                contexts[i]->pluginManager->shutdownAll();
+            }
+        }
+    }
+
+    // ---- 40. 加载期 start 失败的真实 DSO 回滚 ----
+    // 测试插件 start 依次注册 工具/图类型/订阅/prompt/hook/能力/资源 后主动失败:
+    // - 主程序必须回滚全部已生效注册 (工具/图类型/订阅/prompt/hook 中间件/能力/资源);
+    // - 再次加载同一 DSO, 同名注册必须全部重新成功 (插件经 probe 事件
+    //   `{"step":"all","ok":true}` 证明走到了最后一步)。
+    {
+#ifdef AGENTXX_TEST_START_FAIL_PLUGIN_PATH
+        std::vector<std::string> reports; ///< 先声明: 保证晚于 bus 析构 (回调安全)
+        auto                     sctx = std::make_shared<agent::AgentContext>();
+        sctx->agentConfig             = std::make_shared<agent::AgentConfig>();
+        sctx->middlewareHandleContext = std::make_shared<middleware::MiddlewareContext>();
+        sctx->bus           = std::make_shared<event::EventBus>(co_await asio::this_coro::executor);
+        sctx->toolRegistry  = std::make_shared<plugin::ToolRegistry>();
+        sctx->pluginManager = std::make_shared<plugin::PluginManager>(sctx);
+        sctx->pluginManager->setIoExecutor(co_await asio::this_coro::executor);
+        sctx->graphRegistry = std::make_shared<neograph::graph::GraphRegistry>();
+        // 资源应用器 (skill/memory 中间件): 插件 start 经 vtable 注册 skill 目录,
+        // 回滚后所有权记录必须为空。
+        auto skillMw = std::make_shared<agentxx::middleware::SkillMiddlewareHandle>(
+            std::vector<std::string>{},
+            sctx
+        );
+        auto memMw = std::make_shared<agentxx::middleware::MemoryFileMiddlewareHandle>(
+            std::vector<std::string>{},
+            sctx
+        );
+        auto applier = std::make_shared<agentxx::agent::AgentResourceApplier>(
+            sctx,
+            co_await asio::this_coro::executor,
+            skillMw,
+            memMw
+        );
+        sctx->resourceApplier = applier;
+
+        sctx->bus->get<std::string>("plugin.dso_rollback.probe")
+            .subscribe([&](const std::string& data) -> asio::awaitable<void> {
+                reports.push_back(data);
+                co_return;
+            });
+        const std::string promptBefore = sctx->pluginManager->getPromptJson();
+        auto              waitReports  = [&](size_t count) -> asio::awaitable<void> {
+            for (int i = 0; i < 500 && reports.size() < count; ++i) {
+                co_await sleepMs(2);
+            }
+        };
+
+        // 第一次加载: 全注册后失败, 主程序回滚
+        auto fail1
+            = co_await sctx->pluginManager->loadPluginAsync(AGENTXX_TEST_START_FAIL_PLUGIN_PATH);
+        XX_TEST_EXPECT_TRUE(fail1 == nullptr);
+        co_await waitReports(1);
+        XX_TEST_EXPECT_EQ(reports.size(), size_t{1});
+        XX_TEST_EXPECT_TRUE(
+            !reports.empty() && reports[0].find("\"step\":\"all\"") != std::string::npos
+        );
+        XX_TEST_EXPECT_TRUE(
+            !reports.empty() && reports[0].find("\"ok\":true") != std::string::npos
+        );
+        XX_TEST_EXPECT_FALSE(sctx->toolRegistry->contains("dso_rollback_tool"));
+        // 注: GraphRegistry 无删除类型接口 (设计如此), 类型名保留在注册表中;
+        // 回滚语义由 GraphTypeSlot 失效 + 第二次加载能重新注册同名类型共同证明。
+        XX_TEST_EXPECT_EQ(sctx->pluginManager->getPromptJson(), promptBefore);
+        // 订阅已撤销: 发布 watch 主题不得调用已卸载 DSO 的 handler (ASan 下泄漏即崩溃)
+        XX_TEST_EXPECT_EQ(sctx->pluginManager->publish("dso_rollback.watch", "{}"), 0);
+        // 能力已注销: 失败加载不得留下能力注册
+        XX_TEST_EXPECT_FALSE(sctx->pluginManager->hasCapability("dso.rollback.cap") != 0);
+        // hook 处理器已摘除: 失败实例的处理器不得留在注册表里 (派发器也随之摘除)
+        {
+            sctx->pluginManager->flushPendingCleanup();
+            const auto& handles = sctx->middlewareHandleContext->handles;
+            const bool  found   = std::any_of(handles.begin(), handles.end(), [](const auto& h) {
+                return h->name == "plugin_hooks";
+            });
+            XX_TEST_EXPECT_FALSE(found);
+            XX_TEST_EXPECT_TRUE(
+                sctx->pluginManager->handlersOf(AGENTXX_PLUGIN_HOOK_AGENT_START).empty()
+            );
+        }
+        // 资源已摘除: 失败实例不得留下 skill 目录所有权记录
+        XX_TEST_EXPECT_TRUE(applier->ownedBy("test_start_fail_plugin").skillDirs.empty());
+        co_await sleepMs(5);
+        XX_TEST_EXPECT_EQ(reports.size(), size_t{1});
+
+        // 第二次加载: 同名注册必须全部重新成功 (无残留冲突)
+        auto fail2
+            = co_await sctx->pluginManager->loadPluginAsync(AGENTXX_TEST_START_FAIL_PLUGIN_PATH);
+        XX_TEST_EXPECT_TRUE(fail2 == nullptr);
+        co_await waitReports(2);
+        XX_TEST_EXPECT_EQ(reports.size(), size_t{2});
+        XX_TEST_EXPECT_TRUE(
+            reports.size() >= 2 && reports[1].find("\"step\":\"all\"") != std::string::npos
+        );
+        XX_TEST_EXPECT_FALSE(sctx->toolRegistry->contains("dso_rollback_tool"));
+        // 第二次 start 仍走到 "all": 同名工具/图类型注册均未因残留而冲突
+        XX_TEST_EXPECT_TRUE(
+            reports.size() >= 2 && reports[1].find("\"ok\":true") != std::string::npos
+        );
+        XX_TEST_EXPECT_EQ(sctx->pluginManager->getPromptJson(), promptBefore);
+        XX_TEST_EXPECT_FALSE(sctx->pluginManager->hasCapability("dso.rollback.cap") != 0);
+        XX_TEST_EXPECT_TRUE(applier->ownedBy("test_start_fail_plugin").skillDirs.empty());
+        sctx->pluginManager->shutdownAll();
+#else
+        // 独立构建未接线测试插件: 跳过
+#endif
+    }
+
+    // ---- 41. agentxx_planning 插件: 提示词迁移与 todos 无 summary 验证 ----
+    {
+        // 41.1 验证主程序初始状态下无 planning 提示词 (已从 prompt.h 剥离)
+        auto planCtx                     = std::make_shared<agent::AgentContext>();
+        planCtx->agentConfig             = std::make_shared<agent::AgentConfig>();
+        planCtx->middlewareHandleContext = std::make_shared<middleware::MiddlewareContext>();
+        planCtx->bus = std::make_shared<event::EventBus>(co_await asio::this_coro::executor);
+        planCtx->toolRegistry  = std::make_shared<plugin::ToolRegistry>();
+        planCtx->pluginManager = std::make_shared<plugin::PluginManager>(planCtx);
+        planCtx->pluginManager->setIoExecutor(co_await asio::this_coro::executor);
+
+        XX_TEST_EXPECT_TRUE(
+            planCtx->agentConfig->prompt.appendSystemPrompts.find("planning")
+            == planCtx->agentConfig->prompt.appendSystemPrompts.end()
+        );
+        XX_TEST_EXPECT_TRUE(
+            planCtx->agentConfig->prompt.toolPrompt.find("agentxx_planning")
+            == planCtx->agentConfig->prompt.toolPrompt.end()
+        );
+
+        // 41.2 加载 agentxx_planning 插件: 验证 appendSystemPrompts 与 toolPrompt 注入
+        auto planPath = findPluginDir("agentxx_planning");
+        auto instPlan = co_await planCtx->pluginManager->loadPluginAsync(planPath);
+        XX_TEST_EXPECT_TRUE(instPlan != nullptr);
+        if (instPlan) {
+            // appendSystemPrompts 中有 planning
+            auto itApp = planCtx->agentConfig->prompt.appendSystemPrompts.find("planning");
+            XX_TEST_EXPECT_TRUE(itApp != planCtx->agentConfig->prompt.appendSystemPrompts.end());
+            if (itApp != planCtx->agentConfig->prompt.appendSystemPrompts.end()) {
+                XX_TEST_EXPECT_TRUE(itApp->second.find("## Planning") != std::string::npos);
+            }
+
+            // toolPrompt 中有 agentxx_planning
+            auto itTool = planCtx->agentConfig->prompt.toolPrompt.find("agentxx_planning");
+            XX_TEST_EXPECT_TRUE(itTool != planCtx->agentConfig->prompt.toolPrompt.end());
+            if (itTool != planCtx->agentConfig->prompt.toolPrompt.end()) {
+                // depict 包含两层规划描述
+                XX_TEST_EXPECT_TRUE(
+                    itTool->second.depict.find("Two-level task planning tool") != std::string::npos
+                );
+                // todos 参数描述与 depict 示例均不包含 summary
+                XX_TEST_EXPECT_TRUE(itTool->second.args.find("todos") != itTool->second.args.end());
+                auto todosDesc = itTool->second.getArg("todos");
+                XX_TEST_EXPECT_TRUE(todosDesc.find("\"summary\"") == std::string::npos);
+                XX_TEST_EXPECT_TRUE(itTool->second.depict.find("\"summary\"") == std::string::npos);
+            }
+
+            // 工具注册成功
+            XX_TEST_EXPECT_TRUE(planCtx->toolRegistry->contains("agentxx_planning"));
+
+            // 41.3 卸载插件: prompt 贡献被自动撤销
+            XX_TEST_EXPECT_TRUE(co_await planCtx->pluginManager->unloadAsync("agentxx_planning"));
+            XX_TEST_EXPECT_TRUE(
+                planCtx->agentConfig->prompt.appendSystemPrompts.find("planning")
+                == planCtx->agentConfig->prompt.appendSystemPrompts.end()
+            );
+            XX_TEST_EXPECT_TRUE(
+                planCtx->agentConfig->prompt.toolPrompt.find("agentxx_planning")
+                == planCtx->agentConfig->prompt.toolPrompt.end()
+            );
+            XX_TEST_EXPECT_FALSE(planCtx->toolRegistry->contains("agentxx_planning"));
+        }
+        planCtx->pluginManager->shutdownAll();
+    }
+
+    ctx->pluginManager->shutdownAll();
+
+    co_return TestResult{g_plugin_passed, g_plugin_failed};
+}
+
+} // namespace test
+} // namespace agentxx

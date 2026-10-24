@@ -1,0 +1,312 @@
+#pragma once
+
+#include "agentxx-client/io/tui/model/history_window.h"
+#include "agentxx-client/io/tui/model/queue_mirror.h"
+#include "agentxx/agent/context.h"
+#include "agentxx/agent/io/agent_io_transport.h"
+#include "agentxx/plugin/client_plugin_manager.h"
+#include "asio/experimental/concurrent_channel.hpp"
+#include "neograph/api.h"
+#include "neograph/define.h"
+#include "utilxx_base/json.h"
+#include <deque>
+#include <functional>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace agentxx::client {
+
+/// 中断表单提交结果 (UI 线程 → client 线程; 一次提交/取消整份表单)
+///
+/// - `cancelled == false`: `values` 为 **控件 id → 值** 的对象
+///   (`{"decision": "true", "remember": false}`; 值类型随控件形态:
+///   checkbox=布尔 / number=数值 / buttons|select=候选项原始值 / text=字符串),
+///   语义由 agent 侧消费 (客户端只回传表单值, 不解释业务含义)
+/// - `cancelled == true`: 用户取消整份表单, values 无意义 (空对象)
+///
+/// 一次中断请求 (一份表单 = 一条消息) 对应一个 channel: client 线程
+/// handleInterrupt 挂起接收, UI 线程 (消息列表中断视图) 提交/取消后发送。
+struct InterruptFormSubmit {
+    /// true = 用户取消整份表单 (表单值全部丢弃)
+    bool cancelled = false;
+    /// 控件 id → 值 (对象; 空对象 = 未提交/取消)
+    utilxx_base::Json values = utilxx_base::Json::object();
+};
+
+using InterruptResultChannel
+    = asio::experimental::concurrent_channel<void(utilxx_base::AsioErrorCode, InterruptFormSubmit)>;
+
+/// TUI 消息模型: 统一使用 agentxx::agent::ViewMessage
+/// (与 server Session::viewMessages / wire Sync 同型, 见
+/// [conversation_types.h](/agent/lib/include/agentxx/agent/conversation_types.h))
+///
+/// 设计说明:
+/// - 通用字段 (role/text/startTimeMs/durationMs/collapsed) 平铺,
+///   角色专属字段按 role 放入 optional 子结构 (tool/system/interrupt)
+/// - 纯 UI 交互状态 (中断输入框编辑文本/选中项/校验提示/结果回传通道)
+///   不属于消息内容, 由 MessageListComponent 独立维护 (InterruptUIState 表)
+using TUIMessage = agentxx::agent::ViewMessage;
+
+/// 排队等待发送的用户输入 (服务端消息队列在客户端的镜像)
+struct TUIPendingInput {
+    std::string                                  id;
+    std::string                                  text;
+    std::string                                  model;
+    std::vector<agentxx::agent::MediaAttachment> attachments;
+    int64_t                                      createdAtMs = 0;
+    bool                                         expanded    = false;
+};
+
+/// agent-io 连接状态 (消息列表 banner 显示 + 输入发送限制)
+/// - Connecting: 服务尚未就绪 (本地模式 init 中 / 远程模式连接握手前),
+///   禁止发送消息, banner 显示"启动中"
+/// - Connected:  服务就绪, 输入直接发送
+/// - Failed:     连接失败, banner 显示失败提示 + 可点击的"重试"按钮
+enum class ConnState : uint8_t {
+    Connecting,
+    Connected,
+    Failed,
+};
+
+/// 跨线程共享的渲染状态 (COW 语义)
+///
+/// 所有被 client 线程 (onDelta/onSync) 和 UI 线程 (渲染/事件) 并发访问的数据
+/// 收敛于此结构, 经 shared_ptr + mutex 保护:
+/// - 写方: 短锁 + COW (mutableState) 后修改
+/// - 读方: 短锁拷贝 shared_ptr 快照, 之后无锁渲染
+///
+/// 性能设计 (流式输出的热路径):
+/// - currentToken 为 shared_ptr<string>: 流式追加 token 时按需 COW 字符串本体,
+///   避免每 token 深拷贝整个已累积文本 (O(n²) -> O(n))
+/// - contextMessages 为 shared_ptr<json>: utilxx_base::Json 拷贝是深拷贝
+///   (yyjson_mut_val_mut_copy 全树复制), 若放在 COW 全量拷贝内,
+///   每 token 都会复制整个上下文 JSON; 指针化后 COW 拷贝仅 O(1)
+struct TUIRenderState {
+    // 成员按对齐/尺寸从大到小排列, 减少结构体内填充字节
+
+    /// 待发送队列的展示列表 (由 [queue] 镜像 + 界面展开态派生)
+    std::deque<TUIPendingInput> pendingInputs;
+
+    /// 启动更新检查发现的新版本标签 (空 = 未发现更新/未开启检查/检查失败)
+    /// - 由 TUIClientAgentIO::applyUpdateCheckResult 写入 (client io 线程 → UI 快照)
+    /// - Info 侧边栏底部据此显示"发现新版本"提示行 (见 kUpdateNoticeHitId)
+    std::string availableUpdateTag;
+    /// 新版本发布页 URL (availableUpdateTag 非空时有效; 点击提示行复制该链接)
+    std::string availableUpdateUrl;
+
+    /// 当前进行中的 agent 启动步骤 (如 "加载 MCP server: xxx"); 由
+    /// onServerProgress (agent 线程 → sharedState) 更新, Connecting 期间
+    /// banner 逐步展示; 启动完成 (onServerReady) 后清空
+    std::string startupProgress;
+
+    std::string currentNodeName;
+
+    /// 是否还有未加载的更早历史 (窗口上方非空; 判定在 [HistoryWindow] 内)
+    bool hasMoreHistory() const noexcept {
+        return history.hasMore();
+    }
+    std::string              cachedModelName;
+
+    /// 待应用模型选择:
+    /// 模型选择弹窗确认后写入, 随下一次发送的用户消息 (WireUserInput.model)
+    /// 携带; BaseAgent 执行新一轮会话时自动切换。发送时取走并清空,
+    /// 仅对"选择之后发送的下一条消息"生效 (重复选择以最后一次为准)
+    std::string pendingModel;
+
+    std::vector<std::shared_ptr<TUIMessage>> messages;
+
+    std::vector<std::string> modelNames;
+
+    /// 持久化会话列表 (会话选择弹窗数据源, WireSessionList 响应填充)
+    /// - 分页加载: 打开弹窗时先请求最新一页 (keyset 游标), 用户浏览到末尾时
+    ///   以上一条为游标续取; sessionList 始终保持按最近活动时间降序的已加载区间
+    /// - sessionListLoaded: false = 列表请求已发出但首页响应未到达 (弹窗显示
+    ///   loading); true = 已收到响应 (列表为空则确实无持久化会话)
+    std::vector<agentxx::agent::SessionInfo> sessionList;
+
+    std::vector<agentxx::agent::AppendComponentNotification> appendComponents;
+    /// client 插件 UI 注册表快照 (工具消息装饰等; 每帧开头由主渲染器从
+    /// ClientPluginManager 拉取, 渲染/事件期间无锁读取; 无插件管理器时为空)
+    /// - 测试可直接经 mutate 注入假注册表, 驱动装饰渲染路径
+    std::shared_ptr<const agentxx::plugin::ClientUiRegistry> pluginRegistry;
+
+    std::shared_ptr<std::string> currentToken;
+
+    /// 上下文消息快照 (弹窗展示用); 为 null 表示尚未获取
+    std::shared_ptr<utilxx_base::Json> contextMessages;
+
+    /// 各模型多模态能力 (WireModelInfo 填充)
+    std::map<std::string, agentxx::agent::ModelCapabilityInfo> modelCapabilities;
+
+    // ---- 历史分页窗口状态 (服务端 viewMessages 尾窗同步 + 分页拉取) ----
+    /// 已加载窗口首条消息在服务端完整 viewMessages 中的绝对下标
+    /// 历史分页窗口 (上下边界/未完成的请求/序号连续性都在模型内,
+    /// 见 [HistoryWindow]); 全量同步后 windowStart()==0, 尾窗同步后 > 0
+    HistoryWindow history;
+    /// 流式代次 (client 线程在**新建** currentToken 时递增; COW 复制不递增):
+    /// - 语义 = 流身份: 同一流内 currentToken 只会被原地 append (或 COW 复制,
+    ///   内容仍是同一流的延续), epoch 不变
+    /// - UI 线程 (MessageListComponent::syncStream) 据此 O(1) 判断"新流/延续流",
+    ///   替代每帧对整段累积文本做前缀比较 (O(n²) -> O(n))
+    uint64_t currentTokenEpoch = 0;
+
+    /// 判断当前是否有待提交的流式 token 内容 (文本或加密思考/token统计)
+    bool hasPendingToken() const noexcept {
+        if (currentToken && !currentToken->empty()) {
+            return true;
+        }
+        return (currentTokenRole == TUIMessage::Role::Think) && pendingTokenThink.has_value()
+               && (pendingTokenThink->isEncrypted || pendingTokenThink->reasoningTokens > 0);
+    }
+
+    int64_t                              pendingTokenDurationMs  = 0;
+    int64_t                              pendingTokenStartTimeMs = 0;
+    /// 持久化会话总数 (WireSessionList.totalCount; 0 = 未知, 供弹窗展示 x/y)
+    uint64_t sessionListTotalCount = 0;
+
+    /// 上下文统计 (WireContextStats 响应填充; 状态栏/Info 侧边栏显示用)
+    /// - TUI 不持有 server-io 的 Session, 统计经 Wire 消息获取后存于此
+    /// - 0/0 表示尚未收到服务端推送
+    size_t contextTokens    = 0;
+    size_t maxContextTokens = 0;
+    double tps              = 0.0;
+
+    /// 本会话已消耗的 token 累计量 (WireContextStats 同一条消息下发)
+    /// - 与 contextTokens 的区别: 后者是"当前装了多少" (随压缩回落), 这里是
+    ///   "累计花掉多少", 只增不减; Info 侧边栏的 Context 段据此显示
+    /// - sessionUsageKnown 为 false 表示服务端尚未推送过 (老服务端或无数据),
+    ///   此时 Context 段显示无数据而不是一堆 0
+    uint64_t sessionPromptTokens       = 0;
+    uint64_t sessionCompletionTokens   = 0;
+    uint64_t sessionTotalTokens        = 0;
+    uint64_t sessionCachedPromptTokens = 0;
+    bool     sessionUsageKnown         = false;
+    std::optional<TUIMessage::ThinkData> pendingTokenThink;
+
+    /// 流式末尾 Think 折叠态的用户点击覆盖 (tri-state; UI 线程写, client 线程读):
+    /// - -1 = 用户未点击 (跟随 TUISettings::tailThinkingMode 设置)
+    /// - 0  = 用户点击折叠
+    /// - 1  = 用户点击展开
+    ///
+    /// 作用范围 = 当前流 (currentTokenEpoch 标识): 用户点击展开后, 流提交落盘
+    /// (pushCurrentTokenLocked) 时据此把 Think 消息落盘为展开 (collapsed=false),
+    /// 思考结束不会自动折回; 提交与新流开始时重置为 -1, 使下一次思考回到
+    /// 设置模式的默认展示。
+    ///
+    /// 放在共享状态而非 UI 组件内: 提交落盘发生在 client 线程, 需要读到用户
+    /// 在 UI 线程点击的结果 (双方经 sharedState 的 mutex + COW 访问)。
+    int streamThinkOverride = -1;
+    /// 消息队列镜像 (队列快照/状态/投递回执记账见 [MessageQueueMirror])
+    MessageQueueMirror queue;
+
+    /// 当前是否已"完全授权所有权限" (服务端 WirePermissionState 下发/广播):
+    /// - 由 agent 侧权限中间件持有 (权限切换按钮或权限询问卡片勾选 fullAuth 由客户端切换)
+    /// - Info 侧边栏底部的授权按钮显示与点击切换依据此值
+    bool fullAuthorized = false;
+    TUIMessage::Role             currentTokenRole = TUIMessage::Role::Assistant;
+    bool                         isStreaming      = false;
+
+    // ---- 生成占位提示 (服务端 GenStatus 增量) ----
+    /// 模型生成阶段: 模型节点开始执行后, 首个正文/思考 token 或工具消息到达前,
+    /// 消息列表末尾展示占位提示 ("等待响应..."/"正在调用工具..."), 到达后清除
+    /// - GenPhase::Done 表示无占位提示 (其余取值见 WireDelta::GenPhase)
+    /// - genToolName: 正在接收的工具调用对应的工具名 (可能为空: 工具名尚未到达)
+    agentxx::agent::WireDelta::GenPhase genPhase = agentxx::agent::WireDelta::GenPhase::Done;
+    std::string                         genToolName;
+
+    /// agent-io 连接状态 (默认 Connecting: TUI 启动后、服务就绪前输入受限,
+    /// banner 显示"启动中"; 连接建立后由 mode_runners 置 Connected)
+    ConnState connState = ConnState::Connecting;
+    /// 是否已收到服务端模型信息响应 (WireModelInfo):
+    /// - false: 模型列表数据尚未加载 (弹窗应显示 loading)
+    /// - true:  已收到响应 (若列表仍为空则说明确实无可用模型)
+    bool modelInfoLoaded = false;
+
+    bool showContextOverlay = false;
+    bool                                     sessionListLoaded = false;
+    /// 是否还有未加载的更早会话 (WireSessionList.hasMore; 旧版服务端全量响应
+    /// 时恒为 false); 末尾空页防御: 收到空页即置 false 终止续取
+    bool sessionListHasMore = false;
+    /// 是否有未返回的会话列表分页请求 (预取去重, 防止滚动事件高频重复请求)
+    bool sessionListLoadingMore = false;
+
+    /// 获取当前活动模型的能力描述
+    agentxx::agent::ModelCapabilityInfo currentModelCapability() const {
+        std::string active = !pendingModel.empty() ? pendingModel : cachedModelName;
+        auto        it     = modelCapabilities.find(active);
+        if (it != modelCapabilities.end()) {
+            return it->second;
+        }
+        return agentxx::agent::ModelCapabilityInfo{.name = active};
+    }
+};
+
+/// COW 共享状态容器 (封装 mutex + shared_ptr + COW 辅助)
+///
+/// 线程模型:
+/// - client 线程: 经 mutableState() 短锁 COW 写入
+/// - UI 线程渲染: 经 snapshot() 短锁拷贝 shared_ptr, 之后无锁读取
+/// - UI 线程事件: 经 mutableState() 短锁 COW 写入
+class TUISharedState {
+public:
+
+    TUISharedState() :
+        state_(std::make_shared<TUIRenderState>()) {}
+
+    /// COW 写入: 获取可写引用; 若被快照共享 (use_count > 1) 则深拷贝结构
+    /// 调用方须持有 lock()
+    TUIRenderState& mutableState() {
+        if (state_.use_count() > 1) {
+            state_ = std::make_shared<TUIRenderState>(*state_);
+        }
+        return *state_;
+    }
+
+    /// COW 写入单条消息: 总是复制消息对象
+    /// 调用方须持有 lock()
+    ///
+    /// 为什么总是复制 (而非 use_count > 1 时才复制):
+    /// 1. 消除 use_count 读取与修改之间的数据竞争 —— UI 线程渲染结束释放快照时
+    ///    (shared_ptr 析构) 与 client 线程读 use_count 无锁并发, 是未定义行为
+    /// 2. 保证 "消息内容变化 -> 消息对象指针变化" 恒成立: 消息列表渲染缓存
+    ///    以消息指针为失效 key, 指针不变即内容未变, 可直接复用缓存的 Element,
+    ///    免去每帧对全部消息文本重新哈希的开销
+    /// 复制成本: 低频事件 (Tool 结束 / 节点结束 / 折叠点击) 才触发, 可接受
+    TUIMessage& mutableMessage(TUIRenderState& st, size_t idx) {
+        st.messages[idx] = std::make_shared<TUIMessage>(*st.messages[idx]);
+        return *st.messages[idx];
+    }
+
+    /// 快照: 拷贝 shared_ptr (纳秒级), 供 UI 线程本帧无锁渲染
+    /// 调用方须持有 lock()
+    std::shared_ptr<TUIRenderState> snapshot() {
+        return state_;
+    }
+
+    std::mutex& mutex() {
+        return mutex_;
+    }
+
+    /// 便捷: 加锁 + COW 写入 + 解锁
+    void mutate(std::function<void(TUIRenderState&)> fn) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        fn(mutableState());
+    }
+
+    /// 便捷: 加锁 + 读取快照 + 解锁
+    std::shared_ptr<TUIRenderState> readSnapshot() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return snapshot();
+    }
+
+private:
+
+    std::mutex                      mutex_;
+    std::shared_ptr<TUIRenderState> state_;
+};
+
+} // namespace agentxx::client

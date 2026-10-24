@@ -2,7 +2,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import type { ScanProgress, Song } from '../../shared/types'
 import { createLogger } from './log'
-import { saveSongs, localCount } from './db'
+import { saveSongs, localCount, run, get, all } from './db'
 import { saveEmbeddedCover } from './cover'
 
 const logger = createLogger('library')
@@ -184,6 +184,26 @@ export async function scanLibrary(dirs: string[], onProgress: (p: ScanProgress) 
     }
   }
   if (batch.length) saveSongs(batch.splice(0, batch.length))
+
+  // Bug 103：扫描后按现存文件集清理 DB 死链（已消失的本地文件记录删除）
+  try {
+    const alive = new Set(files)
+    const rows = all<{ id: string; local_path: string }>(
+      "SELECT id, local_path FROM songs WHERE source = 'local' AND local_path != ''",
+      []
+    )
+    let removed = 0
+    for (const r of rows) {
+      if (r.local_path && !alive.has(r.local_path)) {
+        run('DELETE FROM songs WHERE id = ?', [r.id])
+        run('DELETE FROM favorites WHERE song_id = ?', [r.id])
+        removed++
+      }
+    }
+    if (removed) logger.info('本地曲库死链清理', `${removed} 条`)
+  } catch {
+    /* 清理失败不影响扫描结果 */
+  }
 
   progress.phase = cancelFlag ? 'done' : 'done'
   progress.current = ''

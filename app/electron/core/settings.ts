@@ -64,6 +64,14 @@ export const DEFAULT_SETTINGS: AppSettings = {
   danmakuArea: 'half',
   danmakuAntiSubtitle: true,
   danmakuBlockWords: '',
+  /** F-17：音源调试日志开关（logs/sources/<源名>.log） */
+  sourceDebug: false,
+  /** F-21：首次启动引导标记 */
+  onboarded: false,
+  /** N29：自定义源市场 URL（空 = 官方分支 manifest） */
+  marketUrl: '',
+  /** N31：git 私有仓库下载令牌 */
+  gitToken: '',
 
   webdavEnabled: false,
   webdavUrl: '',

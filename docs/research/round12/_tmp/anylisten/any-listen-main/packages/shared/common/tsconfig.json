@@ -1,0 +1,12 @@
+{
+  "extends": "@any-listen/eslint/tsconfig.json",
+  "compilerOptions": {
+    // "typeRoots": [
+    //   "./types"
+    // ],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "rootDir": "./",
+    "types": ["@any-listen/types"]
+  }
+}

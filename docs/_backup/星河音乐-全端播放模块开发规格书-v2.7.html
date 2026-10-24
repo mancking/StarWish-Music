@@ -1,0 +1,1096 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>星河音乐 · 全端播放模块开发规格书 v2.8</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><circle cx='50' cy='50' r='40' fill='%23A78BFA'/><circle cx='50' cy='50' r='15' fill='%23F472B6'/></svg>">
+<style>
+  :root{
+    --bg:#0B0B10; --bg-2:#13131B; --bg-3:#1C1C27; --line:#262633;
+    --text:#ECECF1; --text-2:#9B9BA8; --text-3:#63636F;
+    --accent:#A78BFA; --accent-2:#F472B6;
+    --green:#34D399; --amber:#FBBF24; --red:#F87171; --blue:#60A5FA;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;line-height:1.7;-webkit-font-smoothing:antialiased;overflow-x:hidden}
+  code{font-family:"SF Mono",Menlo,Consolas,monospace;font-size:.88em;background:var(--bg-3);padding:2px 6px;border-radius:4px;color:var(--accent)}
+  .wrap{max-width:1200px;margin:0 auto;padding:0 32px}
+
+  /* 顶部 */
+  .topbar{padding:60px 0 40px;border-bottom:1px solid var(--line)}
+  .topbar .ver{font-family:"SF Mono",Menlo,monospace;font-size:12px;color:var(--accent);letter-spacing:2px;margin-bottom:16px}
+  .topbar h1{font-size:36px;letter-spacing:-1px;margin-bottom:16px;line-height:1.2}
+  .topbar .meta{color:var(--text-2);font-size:14px;max-width:820px}
+  .topbar .meta b{color:var(--text)}
+
+  /* Tab切换 */
+  .tabs{position:sticky;top:0;background:var(--bg);z-index:100;border-bottom:1px solid var(--line);padding:12px 0}
+  .tabs .inner{display:flex;gap:8px;flex-wrap:wrap}
+  .tabs button{background:var(--bg-2);border:1px solid var(--line);color:var(--text-2);padding:8px 18px;border-radius:8px;cursor:pointer;font-size:14px;font-family:inherit}
+  .tabs button.active{background:var(--bg-3);color:var(--text);border-color:var(--accent)}
+
+  section{padding:50px 0;border-bottom:1px solid var(--line)}
+  .mod-head{display:flex;align-items:baseline;gap:16px;margin-bottom:8px;flex-wrap:wrap}
+  .mod-num{font-family:"SF Mono",Menlo,monospace;color:var(--accent);font-size:14px}
+  .mod-head h2{font-size:24px}
+  .mod-tag{font-size:11px;font-family:"SF Mono",Menlo,monospace;padding:3px 10px;border-radius:100px}
+  .mod-tag.music{background:rgba(167,139,250,.15);color:var(--accent)}
+  .mod-tag.video{background:rgba(244,114,182,.15);color:var(--accent-2)}
+  .mod-tag.shared{background:rgba(255,255,255,.08);color:var(--text-2)}
+  .mod-desc{color:var(--text-2);font-size:14px;margin-bottom:24px;max-width:820px}
+
+  /* 规格表 */
+  table.spec{width:100%;border-collapse:collapse;font-size:13px;margin:16px 0;background:var(--bg-2);border:1px solid var(--line);border-radius:8px;overflow:hidden;table-layout:fixed}
+  table.spec th, table.spec td{padding:10px 14px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top;word-wrap:break-word}
+  table.spec th{background:var(--bg-3);font-weight:500;color:var(--text-3);font-size:12px;width:170px;font-family:"SF Mono",Menlo,monospace}
+  table.spec td{width:calc(100% - 170px)}
+  table.spec tr:last-child th, table.spec tr:last-child td{border-bottom:none}
+
+  /* 子模块折叠 */
+  details.sub{margin:20px 0;background:var(--bg-2);border:1px solid var(--line);border-radius:10px;overflow:hidden}
+  details.sub summary{padding:16px 20px;cursor:pointer;font-weight:600;font-size:15px;list-style:none;display:flex;align-items:center;gap:10px}
+  details.sub summary::-webkit-details-marker{display:none}
+  details.sub summary::before{content:"▸";color:var(--accent);transition:transform .2s}
+  details.sub[open] summary::before{transform:rotate(90deg)}
+  details.sub .body{padding:0 20px 20px}
+
+  /* 端标签 */
+  .end{display:inline-block;font-size:11px;font-family:"SF Mono",Menlo,monospace;padding:2px 8px;border-radius:4px;margin-right:4px;margin-bottom:2px}
+  .end.phone{background:rgba(96,165,250,.15);color:var(--blue)}
+  .end.pad{background:rgba(52,211,153,.15);color:var(--green)}
+  .end.desktop{background:rgba(167,139,250,.15);color:var(--accent)}
+  .end.car{background:rgba(251,191,36,.15);color:var(--amber)}
+  .end.all{background:rgba(255,255,255,.08);color:var(--text-2)}
+
+  /* 提示框 */
+  .warn{background:rgba(248,113,113,.08);border:1px solid rgba(248,113,113,.3);border-radius:8px;padding:14px 18px;margin:16px 0;font-size:13px;color:#fecdd3}
+  .ok{background:rgba(52,211,153,.08);border:1px solid rgba(52,211,153,.3);border-radius:8px;padding:14px 18px;margin:16px 0;font-size:13px;color:#bbf7d0}
+  .info{background:rgba(96,165,250,.08);border:1px solid rgba(96,165,250,.3);border-radius:8px;padding:14px 18px;margin:16px 0;font-size:13px;color:#bfdbfe}
+
+  /* 功能分级标签 */
+  .lvl{display:inline-block;font-size:11px;font-family:"SF Mono",Menlo,monospace;padding:2px 8px;border-radius:4px;margin-right:4px}
+  .lvl.core{background:rgba(52,211,153,.15);color:var(--green)}
+  .lvl.ext{background:rgba(96,165,250,.15);color:var(--blue)}
+  .lvl.car{background:rgba(251,191,36,.15);color:var(--amber)}
+
+  /* Mockup 框 */
+  .mock-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px;margin:20px 0}
+  .mock{background:var(--bg-2);border:1px solid var(--line);border-radius:10px;overflow:hidden}
+  .mock .label{padding:8px 12px;font-size:11px;color:var(--text-3);font-family:"SF Mono",Menlo,monospace;border-bottom:1px solid var(--line)}
+  .mock .screen{background:#000;position:relative;overflow:hidden}
+
+  /* 音乐mockup */
+  .m-phone{height:300px;background:linear-gradient(180deg,#2a1f4d,#0f0d1f);padding:16px;display:flex;flex-direction:column;color:#fff}
+  .m-phone .nav{display:flex;justify-content:space-between;font-size:11px;color:rgba(255,255,255,.5);margin-bottom:12px}
+  .m-phone .cover{width:120px;height:120px;border-radius:10px;margin:0 auto;background:radial-gradient(circle at 30% 30%,#F472B6,#8B5CF6 60%)}
+  .m-phone .info{text-align:center;margin-top:12px;font-size:12px}
+  .m-phone .info small{display:block;color:rgba(255,255,255,.5);font-size:10px}
+  .m-phone .ctrl{margin-top:auto;display:flex;justify-content:center;gap:16px;align-items:center}
+
+  .m-pad{height:300px;background:linear-gradient(135deg,#2a1f4d,#0f0d1f);display:grid;grid-template-columns:1fr 1fr;color:#fff}
+  .m-pad .left{padding:20px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px}
+  .m-pad .vinyl{width:110px;height:110px;border-radius:50%;background:radial-gradient(circle,#3a2d6e,#1a1530);border:6px solid #000;position:relative}
+  .m-pad .vinyl::after{content:"";position:absolute;inset:22px;border-radius:50%;background:radial-gradient(circle,#F472B6,#8B5CF6)}
+  .m-pad .right{padding:20px;border-left:1px solid rgba(255,255,255,.1);font-size:11px;color:rgba(255,255,255,.5)}
+  .m-pad .right .cur{color:#fff;font-size:12px}
+
+  .m-desktop{height:300px;background:linear-gradient(135deg,#2a1f4d 0%,#0f0d1f 100%);display:grid;grid-template-columns:280px 1fr;color:#fff}
+  .m-desktop .left{padding:20px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;border-right:1px solid rgba(255,255,255,.08)}
+  .m-desktop .vinyl{width:130px;height:130px;border-radius:50%;background:radial-gradient(circle,#3a2d6e,#1a1530);border:7px solid #000;position:relative}
+  .m-desktop .vinyl::after{content:"";position:absolute;inset:26px;border-radius:50%;background:radial-gradient(circle,#F472B6,#8B5CF6)}
+  .m-desktop .right{padding:20px;font-size:11px;color:rgba(255,255,255,.5);overflow:hidden}
+  .m-desktop .right .cur{color:#fff;font-size:12px}
+
+  .m-car{height:300px;background:#0a0a0a;color:#fff;padding:24px;display:flex;align-items:center;gap:24px}
+  .m-car .big{font-size:28px;font-weight:600}
+  .m-car .sub{font-size:16px;color:#9B9BA8;margin-top:4px}
+  .m-car .ctrl{margin-left:auto;display:flex;gap:20px;align-items:center}
+  .m-car .btn{width:64px;height:64px;border-radius:50%;background:rgba(255,255,255,.1);display:flex;align-items:center;justify-content:center;font-size:24px}
+  .m-car .btn.play{background:#fff;color:#000;width:80px;height:80px;font-size:32px}
+
+  /* 视频mockup */
+  .v-phone{height:300px;background:#000;position:relative;color:#fff}
+  .v-phone .screen{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#1a1a2e,#16213e)}
+  .v-phone .ctrl{position:absolute;bottom:0;left:0;right:0;padding:10px;background:linear-gradient(transparent,rgba(0,0,0,.8));font-size:11px}
+
+  .v-car{height:300px;background:#000;position:relative;color:#fff}
+  .v-car .screen{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#1a1a2e,#16213e);font-size:48px}
+  .v-car .ctrl{position:absolute;bottom:0;left:0;right:0;padding:16px;background:linear-gradient(transparent,rgba(0,0,0,.9));display:flex;gap:24px;align-items:center;font-size:18px}
+
+  footer{padding:40px 0;text-align:center;color:var(--text-3);font-size:12px}
+
+  @media (max-width:768px){
+    .wrap{padding:0 20px}
+    .topbar h1{font-size:26px}
+    section{padding:36px 0}
+    .mod-head h2{font-size:19px}
+    table.spec{display:block}
+    table.spec tr{display:block;padding:8px 0;border-bottom:1px solid var(--line)}
+    table.spec th, table.spec td{display:block;width:100% !important;padding:4px 0;border:none}
+    table.spec th{margin-bottom:4px}
+  }
+</style>
+</head>
+<body>
+
+<!-- 顶部 -->
+<div class="wrap topbar">
+  <div class="ver">FULL-SPEC · ALL PLATFORMS · v2.8</div>
+  <h1>星河音乐 · 全端播放模块开发规格书</h1>
+  <div class="meta">
+    <b>覆盖端：</b>Android 手机 / Android 平板 / 车机（Android Automotive）/ Windows / Linux / macOS / iOS 手机 / iOS 平板。<br>
+    <b>本版本要求：</b>所有列出功能一次性全部做完，不分优先级、不砍不减。<b>无广告</b>，任何位置不插入广告。配色允许按需扩展同色系辅助色。<br>
+    <b>本文档是唯一执行依据。</b>开发时严格按文档实现，不允许自行增减功能、不允许调整像素参数。文档未覆盖的边界情况，<b>停下来问，不要自己决定</b>。
+  </div>
+</div>
+
+<!-- Tab -->
+<div class="tabs">
+  <div class="wrap inner">
+    <button class="active" onclick="showTab('global',this)">全局规范</button>
+    <button onclick="showTab('music',this)">音乐播放器</button>
+    <button onclick="showTab('video',this)">视频播放器</button>
+    <button onclick="showTab('pages',this)">页面结构</button>
+    <button onclick="showTab('bugfix',this)">Bug修复</button>
+    <button onclick="showTab('diff',this)">多端差异</button>
+    <button onclick="showTab('accept',this)">验收清单</button>
+  </div>
+</div>
+
+<!-- ==================== 全局规范 Tab ==================== -->
+<div id="tab-global">
+
+<!-- 0.1 断点矩阵 -->
+<section>
+  <div class="wrap">
+    <div class="mod-head"><span class="mod-num">0.1</span><h2>多端断点矩阵</h2></div>
+    <div class="mod-desc">同一套代码，按宽度和设备类型自动切换布局。车机单独走车机专用布局，不按宽度判断。</div>
+
+    <table class="spec">
+      <tr><th>设备分类</th><td>
+        <span class="end phone">手机 Phone</span> 竖屏宽度 &lt; 600px<br>
+        <span class="end pad">平板 Tablet</span> 600px ~ 1024px（横/竖屏自适应）<br>
+        <span class="end desktop">桌面 Desktop</span> ≥ 1024px（Windows / Linux / macOS 窗口化）<br>
+        <span class="end car">车机 Car</span> 通过 UA 或配置项识别为车机，强制走车机布局（横屏、大字、少交互）
+      </td></tr>
+      <tr><th>布局切换规则</th><td>
+        ① 先判断是否车机 → 是则走车机布局，无视宽度。<br>
+        ② 否则按 CSS 宽度断点：&lt;600 手机 / 600~1024 平板 / ≥1024 桌面。<br>
+        ③ 平板横屏（≥900 宽）走接近桌面的两栏布局；竖屏（&lt;900）走手机布局。
+      </td></tr>
+      <tr><th>禁止</th><td>不允许新增其他断点。不允许按操作系统（Win/Mac/Linux）做差异化 UI——三个桌面端 UI 完全一致，仅打包脚本不同。</td></tr>
+    </table>
+  </div>
+</section>
+
+<!-- 0.2 配色 -->
+<section>
+  <div class="wrap">
+    <div class="mod-head"><span class="mod-num">0.2</span><h2>配色 Token（全端统一）</h2></div>
+    <table class="spec">
+      <tr><th>页面背景</th><td><code>#0B0B10</code></td></tr>
+      <tr><th>卡片背景</th><td><code>#13131B</code></td></tr>
+      <tr><th>分割线</th><td><code>#262633</code></td></tr>
+      <tr><th>主文字</th><td><code>#ECECF1</code></td></tr>
+      <tr><th>次文字</th><td><code>#9B9BA8</code></td></tr>
+      <tr><th>音乐强调色</th><td><code>#A78BFA</code>（紫）</td></tr>
+      <tr><th>视频强调色</th><td><code>#F472B6</code>（粉）</td></tr>
+      <tr><th>车机强调色</th><td><code>#FBBF24</code>（琥珀黄，驾驶场景辨识度高）</td></tr>
+      <tr><th>渐变</th><td><code>linear-gradient(135deg, #A78BFA, #F472B6)</code></td></tr>
+    </table>
+    <div class="warn"><b>硬约束：</b>车机端文字最小字号 20px，按钮最小高度 56px（戴手套可点）。配色以本文档 token 为基础，<b>允许按需扩展同色系辅助色</b>，但整体保持深色音乐氛围，不允许出现刺眼高饱和大色块。</div>
+  </div>
+</section>
+
+<!-- 0.3 性能分级 -->
+<section>
+  <div class="wrap">
+    <div class="mod-head"><span class="mod-num">0.3</span><h2>性能分级降级规则</h2></div>
+    <table class="spec">
+      <tr><th>判定条件</th><td>满足任一即视为"低性能设备"：① <code>hardwareConcurrency &lt; 4</code>；② 手机/平板/车机 UA；③ 用户在设置中手动开启省电模式。</td></tr>
+      <tr><th>降级动作</th><td>
+        ① 粒子数量：桌面 200 → 手机/平板 50 → 车机 0（不显示粒子）；<br>
+        ② 封面模糊：桌面 blur(30px) → 手机/平板 blur(12px) → 车机不模糊；<br>
+        ③ 舞台频谱：桌面全屏 64 柱 → 平板 32 柱 → 手机 16 柱窄条 → 车机不显示；<br>
+        ④ 唱片旋转：桌面/平板旋转 → 手机静态封面 → 车机静态封面。
+      </td></tr>
+      <tr><th>车机特殊规则</th><td>车机端<b>强制关闭所有动效</b>（粒子、频谱、模糊、旋转），只保留静态封面和歌词。驾驶安全优先。</td></tr>
+    </table>
+  </div>
+</section>
+
+<!-- 0.4 功能分级 -->
+<section>
+  <div class="wrap">
+    <div class="mod-head"><span class="mod-num">0.4</span><h2>功能分级（哪些必做、哪些不做）</h2></div>
+    <table class="spec">
+      <tr><th><span class="lvl core">CORE 全部必做</span></th><td>
+        本规格书列出的所有功能<b>一次性全部做完</b>，不分优先级、不分版本。包括：<br>
+        <b>音乐播放：</b>播放/暂停/切歌/进度/循环/封面唱片（全端统一圆形旋转）/歌词/粒子/舞台频谱/桌面歌词悬浮窗/快捷键/手势/EQ 均衡器（6预设+5段滑块）/下载（多线程+断点续传）/本地文件扫描/播放缓存（50首/500MB）。<br>
+        <b>视频播放：</b>循环（含AB段）/画面适应/画质档位/全屏/倍速/手势/画中画/记忆位置/字幕音轨切换/视频转音频模式（含音频提取保存MP3、视频仅音频下载）。<br>
+        <b>页面：</b>推荐首页（时间+问候语+搜索框+星河Logo底部卡片）/我喜欢的音乐/最近播放/本地音乐/下载管理。
+      </td></tr>
+      <tr><th><span class="lvl car">CAR 车机专用</span></th><td>
+        仅车机端启用：大字模式（文字最小 20px、按钮最小 56px）、简化控制栏（只保留播放/暂停/上下首/全屏）、琥珀黄强调色、驾驶勿扰模式（控件持续显示不自动隐藏）。<br>
+        车机端不做：粒子、频谱、模糊背景、手势、快捷键、下载、本地扫描、画中画。
+      </td></tr>
+      <tr><th><span class="lvl" style="background:rgba(248,113,113,.15);color:var(--red)">不做</span></th><td>
+        本版本仅明确不做：<b>① 任何形式广告（开屏/横幅/信息流/推广）；② 需要自建服务器的功能（登录注册、社交评论关注、云端同步、用户系统）</b>。<br>
+        除此之外，规格书内列出的所有功能全部实现，不设其他限制。皮肤商店、主题自定义后续版本可加。
+      </td></tr>
+    </table>
+    <div class="info"><b>无广告承诺：</b>本应用任何位置<b>不插入广告、不显示推广 banner、不做开屏广告、不做信息流广告</b>。这是硬约束，永久有效。</div>
+  </div>
+</section>
+
+<!-- 0.5 存储Key -->
+<section>
+  <div class="wrap">
+    <div class="mod-head"><span class="mod-num">0.5</span><h2>本地存储 Key 命名规范</h2></div>
+    <table class="spec">
+      <tr><th>统一前缀</th><td><code>xinyuan_</code></td></tr>
+      <tr><th>视觉模式</th><td><code>xinyuan_visual_mode</code>（0~3）</td></tr>
+      <tr><th>循环模式</th><td><code>xinyuan_loop_mode</code>（0~3）</td></tr>
+      <tr><th>歌词面板</th><td><code>xinyuan_lyrics_panel</code>（0/1）</td></tr>
+      <tr><th>桌面歌词位置</th><td><code>xinyuan_desktop_lrc_pos</code></td></tr>
+      <tr><th>播放位置</th><td><code>xinyuan_resume_&lt;hash&gt;</code>（秒数）</td></tr>
+      <tr><th>低性能模式</th><td><code>xinyuan_low_perf</code>（auto/on/off）</td></tr>
+      <tr><th>端类型</th><td><code>xinyuan_platform</code>（phone/pad/desktop/car，启动时写入）</td></tr>
+    </table>
+  </div>
+</section>
+
+<!-- 0.6 模块化重构 -->
+<section>
+  <div class="wrap">
+    <div class="mod-head"><span class="mod-num">0.6</span><h2>代码架构要求：模块化重构</h2></div>
+    <div class="warn"><b>硬性要求：</b>必须按模块化结构开发，<b>禁止在旧代码上打补丁修补</b>。如果现有代码结构混乱，必须先重构再开发新功能。</div>
+    <table class="spec">
+      <tr><th>模块拆分</th><td>
+        ① <code>player-core/</code>：播放内核（AudioContext、播放状态机、进度调度），音乐和视频共用；<br>
+        ② <code>player-music/</code>：音乐播放器 UI（唱片、歌词、粒子、频谱、EQ）；<br>
+        ③ <code>player-video/</code>：视频播放器 UI（画面、控制栏、适应、画质、画中画）；<br>
+        ④ <code>pages/</code>：推荐首页、我喜欢的音乐、最近播放、本地音乐、下载管理；<br>
+        ⑤ <code>platform/</code>：端侧适配（手机手势、桌面快捷键、车机布局、原生存储权限）；<br>
+        ⑥ <code>storage/</code>：本地数据库、下载管理、缓存管理。
+      </td></tr>
+      <tr><th>模块边界</th><td>音乐播放器和视频播放器 UI 完全隔离，不互相 import 业务组件。共用逻辑只放在 player-core 和 storage 里。</td></tr>
+      <tr><th>禁止补丁式开发</th><td>
+        ① 不允许在已有函数里加 if-else 硬塞新逻辑；<br>
+        ② 不允许复制粘贴代码改改变量名；<br>
+        ③ 不允许在全局事件监听里塞业务逻辑；<br>
+        ④ 新功能必须新建独立模块/组件，通过接口调用。
+      </td></tr>
+      <tr><th>状态管理</th><td>全局播放状态用单一 store（当前歌曲/视频、播放状态、进度、音量、循环模式）。各模块订阅 store，不直接互相操作 DOM。</td></tr>
+    </table>
+  </div>
+</section>
+
+<!-- 多端 Mockup 预览 -->
+<section>
+  <div class="wrap">
+    <div class="mod-head"><span class="mod-num">0.6</span><h2>音乐播放器四端形态预览</h2></div>
+    <div class="mock-grid">
+      <div class="mock">
+        <div class="label">PHONE · 手机竖屏</div>
+        <div class="screen"><div class="m-phone">
+          <div class="nav"><span>‹ 返回</span><span>正在播放</span></div>
+          <div class="cover"></div>
+          <div class="info">星愿<small>星河音乐</small></div>
+          <div class="ctrl"><span>⏮</span><span>▶</span><span>⏭</span></div>
+        </div></div>
+      </div>
+      <div class="mock">
+        <div class="label">PAD · 平板横屏</div>
+        <div class="screen"><div class="m-pad">
+          <div class="left">
+            <div class="vinyl"></div>
+            <div style="font-size:12px">星愿</div>
+          </div>
+          <div class="right">
+            <div>当星光照亮远方</div>
+            <div>我在梦里飞翔</div>
+            <div class="cur">愿所有愿望都能实现</div>
+            <div>愿你我都在身旁</div>
+          </div>
+        </div></div>
+      </div>
+      <div class="mock">
+        <div class="label">DESKTOP · Windows/macOS/Linux</div>
+        <div class="screen"><div class="m-desktop">
+          <div class="left">
+            <div class="vinyl"></div>
+            <div style="font-size:12px">星愿 · 同名专辑</div>
+          </div>
+          <div class="right">
+            <div style="color:#63636F;font-size:10px;margin-bottom:8px">LYRICS</div>
+            <div>当星光照亮远方</div>
+            <div>我在梦里飞翔</div>
+            <div class="cur">愿所有愿望都能实现</div>
+            <div>愿你我都在身旁</div>
+            <div>风吹过脸庞</div>
+          </div>
+        </div></div>
+      </div>
+      <div class="mock">
+        <div class="label">CAR · 车机横屏大字</div>
+        <div class="screen"><div class="m-car">
+          <div>
+            <div class="big">星愿</div>
+            <div class="sub">星河音乐</div>
+          </div>
+          <div class="ctrl">
+            <div class="btn">⏮</div>
+            <div class="btn play">▶</div>
+            <div class="btn">⏭</div>
+          </div>
+        </div></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+</div><!-- /tab-global -->
+
+<!-- ==================== 音乐播放器 Tab ==================== -->
+<div id="tab-music" style="display:none">
+
+<section>
+  <div class="wrap">
+    <div class="mod-head"><span class="mod-num">1.0</span><h2>音乐播放器模块</h2><span class="mod-tag music">MUSIC</span></div>
+    <div class="mod-desc">原有功能全部保留：封面、歌词、粒子、舞台、循环。按四端形态分别规定尺寸和交互。</div>
+
+    <!-- 1.1 布局 -->
+    <details class="sub" open>
+      <summary>1.1 播放页布局（四端分别规定）</summary>
+      <div class="body">
+        <table class="spec">
+          <tr><th><span class="end phone">手机</span></th><td>
+            单列垂直布局。顶部导航栏高 48px（左返回、中标题、右更多）。下方居中圆形唱片 200×200px，边框 6px 黑。唱片中心 60px 封面图。唱片下歌名 16px + 歌手 12px。进度条。控制按钮组（上一首/播放/下一首）。左右 padding 20px。
+          </td></tr>
+          <tr><th><span class="end pad">平板</span></th><td>
+            横屏：两栏 Grid，左栏 320px 放唱片+控制，右栏 1fr 放歌词。竖屏：走手机单列布局。
+          </td></tr>
+          <tr><th><span class="end desktop">桌面</span></th><td>
+            两栏 Grid：左栏 1fr 垂直居中（唱片 200px + 歌名 + 进度条 + 控制按钮），右栏固定 280px 歌词面板。右栏可隐藏，隐藏后左栏占满。
+          </td></tr>
+          <tr><th><span class="end car">车机</span></th><td>
+            横屏单栏。左侧 1/3 显示歌曲信息（歌名 28px、歌手 18px），右侧 2/3 显示三个大控制按钮（上一首/播放/下一首，按钮直径 64px，播放按钮 80px）。不显示封面、不显示歌词、不显示粒子。文字琥珀黄 <code>#FBBF24</code>。
+          </td></tr>
+        </table>
+      </div>
+    </details>
+
+    <!-- 1.2 封面唱片 -->
+    <details class="sub">
+      <summary>1.2 封面 / 唱片</summary>
+      <div class="body">
+        <table class="spec">
+          <tr><th><span class="end phone">手机</span></th><td>圆形唱片 200×200px，边框 6px 黑，中心 60px 封面图。<b>播放时旋转 12s 一圈，暂停停转</b>。背景纯渐变 <code>linear-gradient(180deg,#2a1f4d,#0f0d1f)</code>，不做模糊。</td></tr>
+          <tr><th><span class="end pad">平板</span></th><td>圆形唱片 180px，边框 6px 黑，播放时旋转 12s 一圈。横屏竖屏都用圆形，不做方形。</td></tr>
+          <tr><th><span class="end desktop">桌面</span></th><td>圆形唱片 200px，边框 8px 黑。中心 70px 封面图。播放旋转 12s，暂停停转。背景：封面模糊 <code>blur(30px) brightness(0.4)</code> + 黑色遮罩 50%。</td></tr>
+          <tr><th><span class="end car">车机</span></th><td><b>不显示封面图</b>，只显示歌曲名文字。驾驶场景不做视觉装饰。</td></tr>
+          <tr><th>统一规则</th><td><b>所有端（手机/平板/桌面）封面形态统一为圆形唱片，播放时旋转、暂停停转</b>，仅尺寸不同。不允许手机端用方形、平板竖屏用方形。</td></tr>
+          <tr><th>封面缺失</th><td>统一显示径向渐变占位（粉 #F472B6 → 紫 #8B5CF6）。不显示破图图标。</td></tr>
+          <tr><th>切歌转场</th><td>所有端统一：<code>opacity 300ms</code> 淡入淡出。不做滑动、翻页、缩放动画。</td></tr>
+        </table>
+      </div>
+    </details>
+
+    <!-- 1.3 歌词 -->
+    <details class="sub">
+      <summary>1.3 歌词</summary>
+      <div class="body">
+        <table class="spec">
+          <tr><th>数据源</th><td>LRC 格式，<code>[mm:ss.xx]</code> 时间戳。</td></tr>
+          <tr><th><span class="end phone">手机</span></th><td>点击封面切换封面视图 ↔ 歌词视图。歌词 16px，行高 2.4，当前行紫色 #A78BFA，其他 #63636F，居中。</td></tr>
+          <tr><th><span class="end pad">平板</span></th><td>横屏右侧歌词面板，14px，行高 2.2，左对齐。当前行白色 600 字重。</td></tr>
+          <tr><th><span class="end desktop">桌面</span></th><td>右栏 280px 歌词面板，14px，行高 2.2。顶部 11px 小标题"LYRICS"。当前行白色 600 字重。</td></tr>
+          <tr><th><span class="end car">车机</span></th><td><b>不显示歌词</b>。驾驶场景禁止阅读长文本。</td></tr>
+          <tr><th>滚动规则</th><td>当前行垂直居中，<code>scrollIntoView({behavior:'smooth',block:'center'})</code>。不做逐字卡拉OK效果。</td></tr>
+          <tr><th>点击歌词</th><td>点击任意行跳转到该行时间点播放。手机/平板/桌面必须实现。</td></tr>
+          <tr><th>翻译行</th><td>LRC 有翻译则显示在原文下方，字号小 2px，色 #63636F。无翻译不显示空行。</td></tr>
+          <tr><th>无歌词</th><td>居中显示"暂无歌词"，14px，#63636F。不做搜索动画。</td></tr>
+        </table>
+      </div>
+    </details>
+
+    <!-- 1.4 视觉模式 -->
+    <details class="sub">
+      <summary>1.4 视觉模式切换（封面/歌词/粒子/舞台）</summary>
+      <div class="body">
+        <div class="info">控制栏一个"视觉"按钮，点击循环切换 4 种模式。<b>不做弹窗菜单</b>。</div>
+        <table class="spec">
+          <tr><th>模式 0 封面</th><td>默认。显示唱片/封面 + 模糊背景（桌面）或渐变背景（手机）。</td></tr>
+          <tr><th>模式 1 歌词</th><td>桌面：歌词面板扩大占满，唱片缩小到左上 60px。手机：封面区被歌词全屏替换。</td></tr>
+          <tr><th>模式 2 粒子</th><td>背景叠加 Canvas 粒子层（见 1.5）。封面/唱片仍在。</td></tr>
+          <tr><th>模式 3 舞台</th><td>背景叠加频谱层（见 1.6）。封面/唱片仍在。</td></tr>
+          <tr><th>车机端</th><td><b>不显示视觉模式按钮</b>。车机永远固定在"封面"模式（但车机封面区就是歌名文字）。</td></tr>
+          <tr><th>持久化</th><td>当前模式写入 localStorage，下次启动记住。</td></tr>
+        </table>
+      </div>
+    </details>
+
+    <!-- 1.5 粒子 -->
+    <details class="sub">
+      <summary>1.5 粒子背景</summary>
+      <div class="body">
+        <table class="spec">
+          <tr><th>渲染</th><td>Canvas 2D，position fixed，z-index 0（在模糊背景之上、内容之下）。</td></tr>
+          <tr><th><span class="end desktop">桌面</span></th><td>默认开启，200 粒子，1~2.5px 圆点，色 #A78BFA / #F472B6 随机，透明度 0.3~0.7，每帧位移 0.2~0.5px，边缘反弹。</td></tr>
+          <tr><th><span class="end pad">平板</span></th><td>默认开启，80 粒子，其他规则同桌面。</td></tr>
+          <tr><th><span class="end phone">手机</span></th><td><b>默认关闭</b>，设置里手动开启后限 50 粒子 30 帧。</td></tr>
+          <tr><th><span class="end car">车机</span></th><td><b>强制关闭，不渲染粒子层</b>。</td></tr>
+          <tr><th>禁止</th><td>不做粒子连线、不做鼠标交互、不做碰撞检测、不做 WebGL。性能优先。</td></tr>
+        </table>
+      </div>
+    </details>
+
+    <!-- 1.6 舞台频谱 -->
+    <details class="sub">
+      <summary>1.6 舞台（频谱可视化）</summary>
+      <div class="body">
+        <table class="spec">
+          <tr><th>数据源</th><td>Web Audio API AnalyserNode，fftSize=256，取前 N 个频段。</td></tr>
+          <tr><th><span class="end desktop">桌面</span></th><td>底部铺满 64 根柱子，高度映射 0~200px，色 #A78BFA 透明度 0.6，圆角 2px。</td></tr>
+          <tr><th><span class="end pad">平板</span></th><td>底部 32 根柱子，高度映射 0~120px。</td></tr>
+          <tr><th><span class="end phone">手机</span></th><td>顶部 24px 高窄条，16 根柱子。不做全屏。</td></tr>
+          <tr><th><span class="end car">车机</span></th><td><b>不显示频谱</b>。</td></tr>
+          <tr><th>禁止</th><td>不做 3D 环形、不做光波涟漪、不做玻璃拟态、不做 VJ 特效。就是简单柱状图。</td></tr>
+        </table>
+      </div>
+    </details>
+
+    <!-- 1.7 循环 -->
+    <details class="sub">
+      <summary>1.7 循环模式</summary>
+      <div class="body">
+        <table class="spec">
+          <tr><th>四态循环</th><td>按钮循环切换：列表循环 → 单曲循环 → 随机播放 → 关闭顺序播放。</td></tr>
+          <tr><th>图标</th><td>列表循环：环形箭头 SVG；单曲循环：环形箭头中间数字"1"；随机：交叉箭头；关闭：环形箭头灰显。</td></tr>
+          <tr><th>默认</th><td>首次启动默认"列表循环"。状态写入 localStorage。</td></tr>
+          <tr><th>车机</th><td>只保留"列表循环"和"单曲循环"两态，隐藏随机。驾驶场景不随机切歌。</td></tr>
+        </table>
+      </div>
+    </details>
+
+    <!-- 1.8 桌面歌词悬浮窗 -->
+    <details class="sub">
+      <summary>1.8 桌面歌词悬浮窗 <span class="end desktop">仅桌面</span></summary>
+      <div class="body">
+        <table class="spec">
+          <tr><th>形态</th><td>独立无边框小窗口，初始 400×60px，屏幕底部居中。</td></tr>
+          <tr><th>内容</th><td>当前行歌词白色 16px 居中；下一行预览在下方 #63636F 12px。</td></tr>
+          <tr><th>行为</th><td>始终置顶。按住歌词文字可拖动。位置写入 localStorage。</td></tr>
+          <tr><th>开关</th><td>播放页控制栏"桌面歌词"按钮开关。快捷键 Ctrl+D。</td></tr>
+          <tr><th>不做</th><td>不做字体自定义、不做大小调节、不做双行滚动。本版本就是单行当前歌词 + 下一行预览。</td></tr>
+        </table>
+      </div>
+    </details>
+
+    <!-- 1.9 快捷键 -->
+    <details class="sub">
+      <summary>1.9 全局快捷键 <span class="end desktop">仅桌面</span></summary>
+      <div class="body">
+        <table class="spec">
+          <tr><th>空格</th><td>播放 / 暂停</td></tr>
+          <tr><th>← / →</th><td>快退 5 秒 / 快进 5 秒</td></tr>
+          <tr><th>↑ / ↓</th><td>音量 +5% / -5%</td></tr>
+          <tr><th>Ctrl+← / Ctrl+→</th><td>上一首 / 下一首</td></tr>
+          <tr><th>Ctrl+L</th><td>循环模式切换</td></tr>
+          <tr><th>Ctrl+D</th><td>桌面歌词开关</td></tr>
+          <tr><th>注意</th><td>输入框聚焦时不响应快捷键。手机/平板/车机不做快捷键。</td></tr>
+        </table>
+      </div>
+    </details>
+
+    <!-- 1.10 手势 -->
+    <details class="sub">
+      <summary>1.10 触摸手势 <span class="end phone">手机</span> <span class="end pad">平板</span></summary>
+      <div class="body">
+        <table class="spec">
+          <tr><th>左半屏上下滑</th><td>调节系统亮度（范围 0.1~1.0）。</td></tr>
+          <tr><th>右半屏上下滑</th><td>调节音量（0~100）。</td></tr>
+          <tr><th>封面区左右滑</th><td>左滑下一首，右滑上一首。200ms 淡入淡出。</td></tr>
+          <tr><th>点击封面</th><td>切换封面视图 ↔ 歌词视图。</td></tr>
+          <tr><th>双击屏幕</th><td>播放 / 暂停。</td></tr>
+          <tr><th>车机</th><td>车机为触摸屏但驾驶场景<b>不做手势</b>，所有功能必须有物理大按钮可点。</td></tr>
+        </table>
+      </div>
+    </details>
+
+    <!-- 1.11 EQ 均衡器 -->
+    <details class="sub">
+      <summary>1.11 EQ 均衡器 / 音效预设</summary>
+      <div class="body">
+        <table class="spec">
+          <tr><th>入口</th><td>播放页控制栏"更多"菜单里"音效"项。点开弹出底部面板（手机）或右侧抽屉（桌面）。</td></tr>
+          <tr><th>预设模式</th><td>提供 6 个预设：<b>关闭（默认）/ 流行 / 摇滚 / 古典 / 人声 / 低音增强</b>。点击即切换。</td></tr>
+          <tr><th>手动 EQ</th><td>5 段均衡器滑块：60Hz / 230Hz / 910Hz / 3.6kHz / 14kHz，每段范围 -12dB ~ +12dB，步进 1dB。</td></tr>
+          <tr><th>实现方式</th><td>Web Audio API：<code>BiquadFilterNode</code> 链。预设=滑块自动设值；手动=用户拖滑块实时改 filter.gain。</td></tr>
+          <tr><th>状态持久化</th><td>当前预设和手动滑块值写入 localStorage：<code>xinyuan_eq_preset</code> / <code>xinyuan_eq_bands</code>。</td></tr>
+          <tr><th><span class="end car">车机</span></th><td>只保留"关闭 / 人声 / 低音增强"三个预设，隐藏手动滑块。驾驶场景不做复杂调节。</td></tr>
+          <tr><th>不做</th><td>不做环绕声、不做空间音频、不做 3D 环绕、不做耳机关配。就 5 段 EQ + 6 预设。</td></tr>
+        </table>
+      </div>
+    </details>
+
+    <!-- 1.12 下载缓存 -->
+    <details class="sub">
+      <summary>1.12 下载 / 离线缓存</summary>
+      <div class="body">
+        <table class="spec">
+          <tr><th>入口</th><td>歌曲详情页 / 列表项"更多"菜单里"下载"按钮。仅在线歌曲显示，本地文件不显示。</td></tr>
+          <tr><th>下载位置</th><td>桌面端：用户选择目录（默认下载目录）。手机/平板：应用私有目录。</td></tr>
+          <tr><th>下载格式</th><td>原格式保存（MP3 / FLAC 等），不转码。文件名 = "歌手 - 歌名.mp3"。</td></tr>
+          <tr><th>封面嵌入</th><td>下载时同时下载封面图，写入文件 ID3 标签。</td></tr>
+          <tr><th>下载管理</th><td>设置页"下载管理"列表：显示已下载/下载中/失败。支持删除已下载文件。</td></tr>
+          <tr><th>离线播放</th><td>已下载歌曲自动识别为本地文件，无网可播。列表里用下载图标标记。</td></tr>
+          <tr><th>状态持久化</th><td>下载记录写入 localStorage：<code>xinyuan_downloads</code>，value 为 {歌曲hash, 本地路径, 状态}。</td></tr>
+          <tr><th>播放缓存</th><td>在线歌曲播放时自动缓存最近播放的 50 首音频到本地临时目录，再次播放直接读缓存不重新请求。缓存上限 500MB，超出自动清理最旧缓存。</td></tr>
+          <tr><th>视频缓存</th><td>在线视频播放时边播边缓存当前视频到临时目录，拖动进度条不重复下载。缓存上限 1GB，超出自动清理。</td></tr>
+          <tr><th>缓存清理</th><td>设置页提供"清除缓存"按钮，一键清空播放缓存（不删除已下载文件）。</td></tr>
+          <tr><th><span class="end car">车机</span></th><td>车机端<b>不做下载</b>。车机存储小，且驾驶场景不需要离线缓存。</td></tr>
+          <tr><th>下载增强</th><td>支持多线程下载、断点续传、下载进度条显示、暂停/继续/取消。失败可重试。</td></tr>
+        </table>
+      </div>
+    </details>
+
+  </div>
+</section>
+
+</div><!-- /tab-music -->
+
+<!-- ==================== 视频播放器 Tab ==================== -->
+<div id="tab-video" style="display:none">
+
+<section>
+  <div class="wrap">
+    <div class="mod-head"><span class="mod-num">2.0</span><h2>视频播放器模块</h2><span class="mod-tag video">VIDEO</span></div>
+    <div class="mod-desc">原有循环、适应、画质全部保留。视频以画面为绝对主角，不加装饰性背景特效。</div>
+
+    <!-- 视频四端mockup -->
+    <div class="mock-grid">
+      <div class="mock">
+        <div class="label">PHONE · 手机竖屏</div>
+        <div class="screen"><div class="v-phone">
+          <div class="screen">▶</div>
+          <div class="ctrl">
+            <div style="height:3px;background:#ffffff33;margin-bottom:8px"><div style="height:100%;width:42%;background:#F472B6"></div></div>
+            <div style="display:flex;justify-content:space-between"><span>⏸ 02:41</span><span>循环 适应 画质</span></div>
+          </div>
+        </div></div>
+      </div>
+      <div class="mock">
+        <div class="label">CAR · 车机横屏大字</div>
+        <div class="screen"><div class="v-car">
+          <div class="screen">▶</div>
+          <div class="ctrl">
+            <span>⏮</span><span>⏸</span><span>⏭</span>
+            <span style="margin-left:auto">全屏</span>
+          </div>
+        </div></div>
+      </div>
+    </div>
+
+    <!-- 2.1 布局 -->
+    <details class="sub" open>
+      <summary>2.1 播放页布局</summary>
+      <div class="body">
+        <table class="spec">
+          <tr><th>背景</th><td>纯黑 #000000。视频居中黑边填充。<b>不加模糊、不加渐变、不加粒子</b>。</td></tr>
+          <tr><th><span class="end phone">手机</span></th><td>竖屏：视频居中 16:9，上下黑边。横屏：全屏视频。控件叠加在视频上。</td></tr>
+          <tr><th><span class="end pad">平板</span></th><td>同手机横屏逻辑，控件更大。</td></tr>
+          <tr><th><span class="end desktop">桌面</span></th><td>视频占满窗口，底部控制栏高 48px，半透明黑底渐变叠加。</td></tr>
+          <tr><th><span class="end car">车机</span></th><td>横屏全屏视频。控制栏在底部，按钮大（高 56px），只保留播放/暂停/上下首/全屏四个按钮。隐藏循环、适应、画质菜单。</td></tr>
+          <tr><th>控件自动隐藏</th><td>播放 3 秒后自动隐藏控件，鼠标移动/触摸时显示，3 秒无操作再隐藏。车机端不自动隐藏（驾驶场景需要持续可见）。</td></tr>
+        </table>
+      </div>
+    </details>
+
+    <!-- 2.2 循环 -->
+    <details class="sub">
+      <summary>2.2 循环播放</summary>
+      <div class="body">
+        <table class="spec">
+          <tr><th>三态循环</th><td>列表循环 → 单片循环 → 关闭（播完停止）。</td></tr>
+          <tr><th>A-B 段循环</th><td>设置菜单"AB循环"按钮。第一次点击设 A 点，第二次设 B 点，之后 A→B 循环。第三次点击关闭。进度条上 A 点绿色标记、B 点粉色标记。</td></tr>
+          <tr><th>车机</th><td>只保留"单片循环"开关，隐藏列表循环和 AB。</td></tr>
+        </table>
+      </div>
+    </details>
+
+    <!-- 2.3 适应 -->
+    <details class="sub">
+      <summary>2.3 画面适应</summary>
+      <div class="body">
+        <table class="spec">
+          <tr><th>四种模式</th><td>按钮循环切换：适应窗口 → 填充 → 拉伸 → 100% 原始大小。</td></tr>
+          <tr><th>适应窗口</th><td>默认。视频完整显示，保持比例，黑边填充。</td></tr>
+          <tr><th>填充</th><td>视频铺满容器，保持比例，超出裁剪。</td></tr>
+          <tr><th>拉伸</th><td>强制铺满，不保持比例（画面变形）。</td></tr>
+          <tr><th>100%</th><td>视频原始像素，居中，超出裁剪。</td></tr>
+          <tr><th>车机</th><td>固定"适应窗口"，隐藏适应按钮。</td></tr>
+        </table>
+      </div>
+    </details>
+
+    <!-- 2.4 画质 -->
+    <details class="sub">
+      <summary>2.4 画质调节</summary>
+      <div class="body">
+        <table class="spec">
+          <tr><th>显示条件</th><td><b>仅在线视频显示</b>。本地视频（file:// / blob）自动隐藏此按钮。</td></tr>
+          <tr><th>档位</th><td>菜单：自动 / 360P / 480P / 720P / 1080P / 4K。按数据源返回的档位显示，有几个显示几个。</td></tr>
+          <tr><th>切换</th><td>从当前时间点继续播放，不从头开始。按钮文字显示当前档位。</td></tr>
+          <tr><th>车机</th><td>固定"自动"，隐藏画质按钮。车机网络环境差，不允许手动切高画质。</td></tr>
+          <tr><th>禁止</th><td>不做本地视频滤镜、不做画质增强开关、不做 HDR 切换。</td></tr>
+        </table>
+      </div>
+    </details>
+
+    <!-- 2.5 全屏 -->
+    <details class="sub">
+      <summary>2.5 全屏播放</summary>
+      <div class="body">
+        <table class="spec">
+          <tr><th><span class="end desktop">桌面</span></th><td>调用 requestFullscreen()。Esc 退出。双击画面切换全屏。</td></tr>
+          <tr><th><span class="end phone">手机</span></th><td>横屏自动全屏（监听方向）。竖屏不强制。</td></tr>
+          <tr><th><span class="end car">车机</span></th><td>车机本身就是全屏横屏，不做全屏切换按钮。</td></tr>
+        </table>
+      </div>
+    </details>
+
+    <!-- 2.6 进度条 -->
+    <details class="sub">
+      <summary>2.6 进度条</summary>
+      <div class="body">
+        <table class="spec">
+          <tr><th>样式</th><td>高 3px，默认 #FFFFFF33，已播 #F472B6，拖拽把手 12px 白色圆点。</td></tr>
+          <tr><th>桌面端</th><td>鼠标悬停显示时间文字。本版本不做缩略图预览，只显示时间。</td></tr>
+          <tr><th>拖拽</th><td>按住拖动时暂停预览，松手从该点播放。</td></tr>
+          <tr><th>时间显示</th><td>左侧"当前时间 / 总时长"，mm:ss 格式，12px，#FFFFFFCC。</td></tr>
+        </table>
+      </div>
+    </details>
+
+    <!-- 2.7 倍速 -->
+    <details class="sub">
+      <summary>2.7 倍速播放</summary>
+      <div class="body">
+        <table class="spec">
+          <tr><th>档位</th><td>菜单：0.5x / 0.75x / 1.0x / 1.25x / 1.5x / 2.0x。默认 1.0x。</td></tr>
+          <tr><th>车机</th><td>固定 1.0x，隐藏倍速按钮。</td></tr>
+        </table>
+      </div>
+    </details>
+
+    <!-- 2.8 手势 -->
+    <details class="sub">
+      <summary>2.8 触摸手势 <span class="end phone">手机</span> <span class="end pad">平板</span></summary>
+      <div class="body">
+        <table class="spec">
+          <tr><th>左半屏上下滑</th><td>调节亮度。</td></tr>
+          <tr><th>右半屏上下滑</th><td>调节音量。</td></tr>
+          <tr><th>左右滑</th><td>拖动时显示时间偏移预览（如"快进 10s"），松手跳转。</td></tr>
+          <tr><th>双击</th><td>双击左半屏快退 10s，双击右半屏快进 10s，双击中间暂停/播放。</td></tr>
+          <tr><th>车机</th><td>不做手势。</td></tr>
+        </table>
+      </div>
+    </details>
+
+    <!-- 2.9 画中画 -->
+    <details class="sub">
+      <summary>2.9 画中画</summary>
+      <div class="body">
+        <table class="spec">
+          <tr><th>触发</th><td>控制栏"画中画"按钮，调用 requestPictureInPicture() API。</td></tr>
+          <tr><th>行为</th><td>视频缩为 240×135 悬浮窗，可拖动，切其他 App 继续播放。</td></tr>
+          <tr><th>支持端</th><td>桌面浏览器、Android 8.0+、iOS 14+。车机不支持（系统限制）。</td></tr>
+        </table>
+      </div>
+    </details>
+
+    <!-- 2.10 记忆位置 -->
+    <details class="sub">
+      <summary>2.10 记忆播放位置</summary>
+      <div class="body">
+        <table class="spec">
+          <tr><th>存储</th><td>每 5 秒自动记录当前秒数，key 为视频 URL 或文件路径 hash。</td></tr>
+          <tr><th>续播</th><td>下次打开同一视频时弹出 toast"已从 mm:ss 继续播放"，3 秒消失。</td></tr>
+          <tr><th>清除</th><td>进度 >95% 后自动清除记录。</td></tr>
+        </table>
+      </div>
+    </details>
+
+    <!-- 2.11 字幕音轨 -->
+    <details class="sub">
+      <summary>2.11 字幕与音轨</summary>
+      <div class="body">
+        <table class="spec">
+          <tr><th>字幕延迟</th><td>设置菜单：+0.5s / -0.5s / 重置。每次步进 0.5 秒。</td></tr>
+          <tr><th>音轨切换</th><td>多音轨视频：菜单列出所有音轨，点击切换。</td></tr>
+          <tr><th>外挂字幕</th><td>支持加载本地 .srt / .ass 字幕文件。</td></tr>
+        </table>
+      </div>
+    </details>
+
+    <!-- 2.12 视频转音频模式 -->
+    <details class="sub">
+      <summary>2.12 视频转音频模式（听视频声音）</summary>
+      <div class="body">
+        <table class="spec">
+          <tr><th>入口</th><td>视频播放控制栏"音频模式"按钮。点击后视频画面隐藏，界面切换为音乐播放器布局，音频继续播放。</td></tr>
+          <tr><th>切换行为</th><td>
+            ① 视频画面暂停渲染，但音频流继续播放；<br>
+            ② 界面从视频播放器切换为音乐播放器布局（封面区+歌词区+控制栏）；<br>
+            ③ 封面位置显示视频首帧截图作为静态封面；<br>
+            ④ 进度条、播放/暂停、切歌、循环、EQ 全部走音乐播放器逻辑。
+          </td></tr>
+          <tr><th>切回视频</th><td>音乐播放器界面点"视频模式"按钮，切回视频画面，进度位置保持不变。</td></tr>
+          <tr><th>移动端</th><td>手机锁屏后音频继续播放（后台音频），通知栏显示控制。这就是"听视频"场景。</td></tr>
+          <tr><th>车机</th><td>车机端视频播放器直接默认音频模式（驾驶场景不看画面）。</td></tr>
+          <tr><th>音频提取保存</th><td>音频模式下可点"提取音频"按钮，将当前视频音轨提取保存为 MP3 文件，自动加入本地音乐库。文件名 = 视频标题 + ".mp3"。提取完成后在下载管理页可查看。</td></tr>
+          <tr><th>视频音频分离下载</th><td>视频下载时可选"仅下载音频"，不下载视频画面，节省存储。下载后同样加入本地音乐库。</td></tr>
+        </table>
+      </div>
+    </details>
+
+  </div>
+</section>
+
+</div><!-- /tab-video -->
+
+<!-- ==================== 多端差异 Tab ==================== -->
+<div id="tab-diff" style="display:none">
+
+<section>
+  <div class="wrap">
+    <div class="mod-head"><span class="mod-num">3.0</span><h2>多端差异总表</h2></div>
+    <div class="mod-desc">同一功能在四个端的行为差异，开发时按此表逐项实现。</div>
+
+    <table class="spec">
+      <tr><th>功能</th><td>
+        <b>手机（&lt;600px）</b>：竖屏单列、圆形唱片旋转、歌词点击切换、手势控制、粒子默认关、画中画支持。<br>
+        <b>平板（600~1024px）</b>：横屏两栏、圆形唱片旋转、歌词侧栏、粒子 80 个、手势支持。<br>
+        <b>桌面（≥1024px）</b>：两栏布局、唱片旋转、歌词面板可隐藏、粒子 200 个、频谱全屏、桌面歌词悬浮窗、快捷键、画中画。<br>
+        <b>车机（Android Automotive）</b>：横屏大字、琥珀黄主题、只显示歌名+三个大按钮、无封面/歌词/粒子/频谱/手势/快捷键、控件不自动隐藏。
+      </td></tr>
+    </table>
+
+    <details class="sub" open>
+      <summary>音乐播放器 · 四端行为对比</summary>
+      <div class="body">
+        <table class="spec">
+          <tr><th>封面形态</th><td>所有端统一圆形唱片旋转（手机 200px / 平板 180px / 桌面 200px+模糊背景）；车机不显示封面</td></tr>
+          <tr><th>歌词位置</th><td>手机：点击封面切换全屏歌词 / 平板横屏：右侧面板 / 桌面：右侧 280px 面板 / 车机：不显示</td></tr>
+          <tr><th>粒子数量</th><td>手机：0 默认（开后 50）/ 平板：80 / 桌面：200 / 车机：0</td></tr>
+          <tr><th>频谱</th><td>手机：顶部窄条 16 柱 / 平板：底部 32 柱 / 桌面：底部 64 柱 / 车机：无</td></tr>
+          <tr><th>循环模式</th><td>手机/平板/桌面：四态（列表/单曲/随机/关闭）/ 车机：两态（列表/单曲）</td></tr>
+          <tr><th>手势</th><td>手机/平板：有 / 桌面：无（鼠标键盘）/ 车机：无</td></tr>
+          <tr><th>快捷键</th><td>仅桌面有</td></tr>
+          <tr><th>桌面歌词悬浮窗</th><td>仅桌面有</td></tr>
+        </table>
+      </div>
+    </details>
+
+    <details class="sub">
+      <summary>视频播放器 · 四端行为对比</summary>
+      <div class="body">
+        <table class="spec">
+          <tr><th>默认全屏</th><td>手机横屏自动全屏 / 平板同手机 / 桌面手动全屏 / 车机本身全屏</td></tr>
+          <tr><th>循环</th><td>手机/平板/桌面：三态+AB / 车机：仅单片循环开关</td></tr>
+          <tr><th>适应按钮</th><td>手机/平板/桌面：四模式循环 / 车机：隐藏（固定适应窗口）</td></tr>
+          <tr><th>画质按钮</th><td>手机/平板/桌面：在线视频显示 / 车机：隐藏（固定自动）</td></tr>
+          <tr><th>倍速</th><td>手机/平板/桌面：六档 / 车机：隐藏（固定 1.0x）</td></tr>
+          <tr><th>手势</th><td>手机/平板：亮度/音量/进度手势 / 桌面：无 / 车机：无</td></tr>
+          <tr><th>画中画</th><td>手机/平板/桌面：支持 / 车机：系统不支持</td></tr>
+          <tr><th>控件自动隐藏</th><td>手机/平板/桌面：3 秒无操作隐藏 / 车机：持续可见</td></tr>
+          <tr><th>按钮尺寸</th><td>手机：44px / 平板：48px / 桌面：36px（鼠标 hover 放大）/ 车机：56px 最小高度</td></tr>
+        </table>
+      </div>
+    </details>
+
+    <details class="sub">
+      <summary>三桌面端（Windows / Linux / macOS）差异说明</summary>
+      <div class="body">
+        <div class="info"><b>UI 完全一致</b>，三个系统共用一套代码（Electron 或 Web）。差异仅在打包和系统集成层：</div>
+        <table class="spec">
+          <tr><th>窗口控制按钮</th><td>macOS 左上角红黄绿三按钮；Windows/Linux 右上角最小化/最大化/关闭。这是系统原生窗口装饰，应用内不自己画。</td></tr>
+          <tr><th>媒体键</th><td>三端都支持硬件媒体键（耳机播放键、键盘媒体键）。</td></tr>
+          <tr><th>系统托盘</th><td>三端都最小化到托盘，点击托盘图标显示/隐藏窗口。</td></tr>
+          <tr><th>文件关联</th><td>三端都注册音频/视频文件双击打开。</td></tr>
+          <tr><th>不做差异化</th><td>不允许 macOS 用毛玻璃、Windows 用 Mica、Linux 用其他主题。UI 完全一致。</td></tr>
+        </table>
+      </div>
+    </details>
+
+    <details class="sub">
+      <summary>iOS / Android 差异说明</summary>
+      <div class="body">
+        <table class="spec">
+          <tr><th>UI 一致性</th><td>iOS 和 Android 用同一套 Web 代码（Capacitor/Cordova 或 WebView），UI 完全一致。</td></tr>
+          <tr><th>系统差异</th><td>仅平台 API 层不同：iOS 画中画用 Safari 原生，Android 用 Android 原生 PiP；iOS 后台音频需要 UIBackgroundModes 配置，Android 用 Foreground Service。这些是原生层，不影响 UI。</td></tr>
+          <tr><th>安全区域</th><td>iOS 刘海屏需要 safe-area-inset 适配；Android 沉浸式状态栏。两端都用 CSS env() 处理。</td></tr>
+        </table>
+      </div>
+    </details>
+
+  </div>
+</section>
+
+</div><!-- /tab-diff -->
+
+<!-- ==================== 页面结构 Tab ==================== -->
+<div id="tab-pages" style="display:none">
+
+<section>
+  <div class="wrap">
+    <div class="mod-head"><span class="mod-num">3.0</span><h2>App 页面结构规范</h2></div>
+    <div class="mod-desc">底部 Tab 导航固定：推荐 / 发现 / 视频 / 我的。所有页面按以下规格实现。</div>
+
+    <!-- 3.1 推荐首页 -->
+    <details class="sub" open>
+      <summary>3.1 推荐首页</summary>
+      <div class="body">
+        <table class="spec">
+          <tr><th>顶部时间</th><td>页面内容区最上方显示日期和星期（如"10月23日 · 星期五"），字号 13px，次文字色，左对齐。</td></tr>
+          <tr><th>问候语</th><td>时间下方。根据时段显示"早上好/下午好/晚上好，欢迎回来"。字号 24~28px，字重 600，白色主标题，左对齐。</td></tr>
+          <tr><th>搜索框</th><td>问候语下方。圆角胶囊形，高度 40~48px，深色半透明背景+浅色描边，提示文字"搜索歌曲、歌手、歌单"。桌面端宽度 320~480px，移动端宽度 100% 减左右 padding。</td></tr>
+          <tr><th>内容模块</th><td>搜索框下方：每日推荐、推荐歌单、新歌速递。每个模块右侧有"播放全部"和"更多"按钮。</td></tr>
+          <tr><th>星河 Logo 背景卡片</th><td><b>页面底部、底部 Tab 上方</b>，作为背景卡片装饰。Logo 右对齐、半透明、融合渐变背景。<b>禁止放到顶部、问候语左侧、搜索框左侧</b>。</td></tr>
+          <tr><th>底部 Tab</th><td>固定屏幕底部：推荐（激活）/ 发现 / 视频 / 我的。</td></tr>
+        </table>
+      </div>
+    </details>
+
+    <!-- 3.2 我喜欢的音乐 -->
+    <details class="sub">
+      <summary>3.2 我喜欢的音乐（收藏夹页面）</summary>
+      <div class="body">
+        <table class="spec">
+          <tr><th>顶部布局</th><td>标题"我喜欢的音乐"居中或左对齐，下方小字"收藏夹 · N 首 · 保存在本地"。<b>不显示星河 App 图标</b>，页面顶部不放任何 Logo/图标。</td></tr>
+          <tr><th>操作按钮</th><td>播放全部、加入队列。两个按钮并排。</td></tr>
+          <tr><th>空状态</th><td>音符图标 + "还没有喜欢的音乐" + "去发现音乐"按钮。</td></tr>
+          <tr><th>收藏同步</th><td>歌曲列表爱心、播放页红心按钮双向同步收藏状态。点击爱心即加入/移出收藏夹。</td></tr>
+        </table>
+      </div>
+    </details>
+
+    <!-- 3.3 最近播放 -->
+    <details class="sub">
+      <summary>3.3 最近播放</summary>
+      <div class="body">
+        <table class="spec">
+          <tr><th>操作按钮</th><td>播放全部、清空历史。</td></tr>
+          <tr><th>记录规则</th><td>歌曲开始播放时立刻写入记录，切歌后列表即时刷新（见 Bug 修复 4.3）。</td></tr>
+          <tr><th>去重</th><td>同一首歌短时间重复播放不新增多条，更新时间戳置顶。</td></tr>
+          <tr><th>空状态</th><td>"还没有播放记录"提示。</td></tr>
+        </table>
+      </div>
+    </details>
+
+    <!-- 3.4 本地音乐 -->
+    <details class="sub">
+      <summary>3.4 本地音乐</summary>
+      <div class="body">
+        <table class="spec">
+          <tr><th>操作按钮</th><td>添加文件夹并扫描、重新扫描、搜索筛选框、播放全部。</td></tr>
+          <tr><th>支持格式</th><td>MP3 / FLAC / M4A / OGG / WAV。</td></tr>
+          <tr><th>扫描行为</th><td>读取文件标签（歌名/歌手/专辑）和内嵌封面。过滤损坏文件。</td></tr>
+          <tr><th>移动端权限</th><td>安卓适配分区存储、Android 13+ 媒体权限；iOS 适配文件访问权限。权限拒绝时友好提示，不崩溃。<b>车机不支持本地扫描</b>。</td></tr>
+        </table>
+      </div>
+    </details>
+
+    <!-- 3.5 下载管理 -->
+    <details class="sub">
+      <summary>3.5 下载管理</summary>
+      <div class="body">
+        <table class="spec">
+          <tr><th>分区</th><td>进行中任务列表、已完成下载记录。</td></tr>
+          <tr><th>操作</th><td>进度条展示、暂停/取消、删除已下载文件。</td></tr>
+          <tr><th>移动端</th><td><b>安卓/iOS 完整开放下载功能</b>，移除"移动端暂不支持下载"提示。使用原生存储权限。</td></tr>
+          <tr><th>车机</th><td><b>隐藏下载管理页面</b>。</td></tr>
+        </table>
+      </div>
+    </details>
+
+  </div>
+</section>
+
+</div><!-- /tab-pages -->
+
+<!-- ==================== Bug修复 Tab ==================== -->
+<div id="tab-bugfix" style="display:none">
+
+<section>
+  <div class="wrap">
+    <div class="mod-head"><span class="mod-num">4.0</span><h2>专项 Bug 修复（必做，验收卡点）</h2></div>
+    <div class="mod-desc">以下 4 项是现有版本存在的缺陷，纳入开发验收标准，必须一次性解决，不允许遗留。</div>
+
+    <details class="sub" open>
+      <summary>Bug 1：冷启动加载缓慢，约 10 秒</summary>
+      <div class="body">
+        <table class="spec">
+          <tr><th>现象</th><td>长时间后台休眠或完全关闭后，再次启动 App 加载耗时约 10 秒。</td></tr>
+          <tr><th>修复要求</th><td>
+            ① 资源拆分：首屏 UI、播放器内核、特效资源、歌词解析引擎分优先级异步加载，首屏优先渲染；<br>
+            ② 数据库分页懒加载，本地曲库/收藏/历史不全量一次性读取；<br>
+            ③ UI 静态资源和封面缩略图持久缓存，启动先渲染缓存再后台刷新；<br>
+            ④ <b>指标：冷启动首屏渲染 ≤ 2 秒</b>。
+          </td></tr>
+          <tr><th>禁止</th><td>不允许只加 loading 遮罩掩盖阻塞问题，必须优化加载链路。</td></tr>
+        </table>
+      </div>
+    </details>
+
+    <details class="sub">
+      <summary>Bug 2：移动端返回手势直接回首页，不逐级返回</summary>
+      <div class="body">
+        <table class="spec">
+          <tr><th>现象</th><td>侧滑返回或系统返回键，不管在哪个子页面，直接跳回推荐首页，不遵循页面栈。</td></tr>
+          <tr><th>修复要求</th><td>
+            ① 实现标准路由栈：每打开一个子页面压入栈，返回弹出栈顶；<br>
+            ② 侧滑返回、系统返回键统一读取同一栈；栈空才回首页；<br>
+            ③ 示例：推荐 → 歌单详情 → 播放页，返回顺序：播放页 → 歌单详情 → 推荐。
+          </td></tr>
+          <tr><th>覆盖页面</th><td>收藏、本地音乐、下载管理、最近播放、视频子页面全部纳入路由栈。</td></tr>
+        </table>
+      </div>
+    </details>
+
+    <details class="sub">
+      <summary>Bug 3：最近播放记录写入延迟</summary>
+      <div class="body">
+        <table class="spec">
+          <tr><th>现象</th><td>切歌后最近播放列表不立刻更新，刷新后才出现记录。</td></tr>
+          <tr><th>修复要求</th><td>
+            ① 歌曲 play 事件触发时立刻写入内存列表，UI 同步刷新；<br>
+            ② 数据库异步持久化，不阻塞 UI；<br>
+            ③ 同一首歌短时间重复播放不新增多条，更新时间戳置顶；<br>
+            ④ <b>验收：切歌后最近播放页面即时看到新记录，无肉眼可见延迟</b>。
+          </td></tr>
+        </table>
+      </div>
+    </details>
+
+    <details class="sub">
+      <summary>Bug 4：移动端不支持下载和本地扫描（沙盒限制）</summary>
+      <div class="body">
+        <table class="spec">
+          <tr><th>现象</th><td>移动端提示"暂不支持下载"、无法扫描本地歌曲，仅桌面可用。</td></tr>
+          <tr><th>修复要求</th><td>
+            ① 安卓/iOS 接入原生存储权限，移除"移动端暂不支持"提示；<br>
+            ② 本地音乐页面完整开放添加文件夹扫描、重新扫描；<br>
+            ③ 下载管理页面移动端完整可用；<br>
+            ④ 权限拒绝时友好提示，不崩溃。
+          </td></tr>
+          <tr><th>车机</th><td>保持不开放下载和本地扫描。</td></tr>
+        </table>
+      </div>
+    </details>
+
+  </div>
+</section>
+
+</div><!-- /tab-bugfix -->
+
+<!-- ==================== 验收清单 Tab ==================== -->
+<div id="tab-accept" style="display:none">
+
+<section>
+  <div class="wrap">
+    <div class="mod-head"><span class="mod-num">4.0</span><h2>交付验收清单</h2></div>
+    <div class="mod-desc">开发完成后逐项核对，全部打勾才算完成。</div>
+
+    <details class="sub" open>
+      <summary>音乐播放器验收项</summary>
+      <div class="body">
+        <ul style="list-style:none">
+          <li style="padding:6px 0">☐ 手机端：圆形唱片 200px 播放旋转暂停停转，点击切歌词视图，左右滑切歌</li>
+          <li style="padding:6px 0">☐ 平板横屏：两栏布局，圆形唱片旋转，右侧歌词面板</li>
+          <li style="padding:6px 0">☐ 桌面端：唱片 200px 旋转，右栏歌词可隐藏，模糊背景生效</li>
+          <li style="padding:6px 0">☐ 车机端：横屏大字琥珀黄，只显示歌名+三个大按钮，无封面/歌词/粒子</li>
+          <li style="padding:6px 0">☐ 视觉模式按钮循环切换 4 种模式，刷新后记住</li>
+          <li style="padding:6px 0">☐ 粒子：桌面 200 / 平板 80 / 手机默认关 / 车机 0</li>
+          <li style="padding:6px 0">☐ 频谱：桌面 64 柱 / 平板 32 柱 / 手机窄条 / 车机无</li>
+          <li style="padding:6px 0">☐ 桌面歌词悬浮窗可拖动、置顶、Ctrl+D 开关</li>
+          <li style="padding:6px 0">☐ 快捷键：空格/方向键/Ctrl+L/Ctrl+D，输入框聚焦时不触发</li>
+          <li style="padding:6px 0">☐ 循环四态切换正常，车机只有两态</li>
+          <li style="padding:6px 0">☐ EQ：6 个预设可切换，5 段滑块 -12~+12dB，Web Audio BiquadFilter 生效</li>
+          <li style="padding:6px 0">☐ 下载：在线歌曲可下载，本地文件不显示下载按钮，已下载歌曲离线可播</li>
+          <li style="padding:6px 0">☐ 我喜欢的音乐页面：<b>无星河 App 图标</b>，只有标题+收藏夹信息+播放全部按钮</li>
+          <li style="padding:6px 0">☐ 推荐首页顶部：左侧星河 App 图标 + 问候语，右侧搜索框</li>
+          <li style="padding:6px 0">☐ 本地音乐页面：支持添加文件夹扫描、重新扫描，移动端权限正常</li>
+          <li style="padding:6px 0">☐ 最近播放：切歌后即时刷新，无延迟</li>
+        </ul>
+      </div>
+    </details>
+
+    <details class="sub">
+      <summary>视频播放器验收项</summary>
+      <div class="body">
+        <ul style="list-style:none">
+          <li style="padding:6px 0">☐ 控件 3 秒无操作自动隐藏（车机不隐藏）</li>
+          <li style="padding:6px 0">☐ 适应四模式循环切换，"拉伸"模式画面确实变形</li>
+          <li style="padding:6px 0">☐ 画质按钮本地视频隐藏，在线视频显示档位</li>
+          <li style="padding:6px 0">☐ AB 循环：A 绿 B 粉标记在进度条上</li>
+          <li style="padding:6px 0">☐ 手机双击左右半屏快退/快进 10s</li>
+          <li style="padding:6px 0">☐ 画中画能进入和退出</li>
+          <li style="padding:6px 0">☐ 播到 95% 自动清除播放位置记录</li>
+          <li style="padding:6px 0">☐ 视频转音频模式：切到音乐播放器界面音频继续播，切回视频进度不变</li>
+          <li style="padding:6px 0">☐ 车机端只有播放/暂停/上下首/全屏四个按钮</li>
+        </ul>
+      </div>
+    </details>
+
+    <details class="sub">
+      <summary>全局验收项</summary>
+      <div class="body">
+        <ul style="list-style:none">
+          <li style="padding:6px 0">☐ 断点正确：&lt;600 手机 / 600~1024 平板 / ≥1024 桌面 / 车机走车机布局</li>
+          <li style="padding:6px 0">☐ 配色只用文档指定 token，无杂色</li>
+          <li style="padding:6px 0">☐ 车机端所有动效关闭，文字最小 20px，按钮最小 56px</li>
+          <li style="padding:6px 0">☐ Win/Linux/macOS UI 完全一致，无平台差异化装饰</li>
+          <li style="padding:6px 0">☐ iOS/Android UI 完全一致，仅原生 API 层不同</li>
+          <li style="padding:6px 0">☐ 所有交互有反馈，无僵尸按钮</li>
+          <li style="padding:6px 0">☐ 文档外未新增任何功能</li>
+        </ul>
+      </div>
+    </details>
+
+    <details class="sub">
+      <summary>Bug 修复验收项（必过）</summary>
+      <div class="body">
+        <ul style="list-style:none">
+          <li style="padding:6px 0">☐ 冷启动首屏渲染 ≤ 2 秒，资源懒加载，数据库分页不阻塞主线程</li>
+          <li style="padding:6px 0">☐ 移动端返回手势遵循路由栈逐级回退，栈空才回首页</li>
+          <li style="padding:6px 0">☐ 切歌后最近播放列表即时刷新，无延迟</li>
+          <li style="padding:6px 0">☐ 安卓/iOS 支持下载缓存和本地文件夹扫描，无"暂不支持"提示</li>
+          <li style="padding:6px 0">☐ 我喜欢的音乐页面无星河 App 图标</li>
+        </ul>
+      </div>
+    </details>
+
+  </div>
+</section>
+
+</div><!-- /tab-accept -->
+
+<footer>星河音乐 · 全端播放模块开发规格书 v2.8 · 无广告 · 含EQ+下载+本地扫描 · Bug修复必过 · 本文档是唯一执行依据</footer>
+
+<script>
+function showTab(name, btn){
+  document.querySelectorAll('.tabs button').forEach(b=>b.classList.remove('active'));
+  btn.classList.add('active');
+  ['global','music','video','pages','bugfix','diff','accept'].forEach(t=>{
+    document.getElementById('tab-'+t).style.display = t===name ? 'block' : 'none';
+  });
+  window.scrollTo({top:0, behavior:'smooth'});
+}
+</script>
+
+</body>
+</html>

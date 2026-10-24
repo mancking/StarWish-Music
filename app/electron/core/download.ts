@@ -33,6 +33,8 @@ export interface DownloadTask {
   received: number
   total: number
   file?: string
+  /** 断点续传：半成品文件（规格书 1.12 .part + Range/206） */
+  partPath?: string
   error?: string
   createdAt: number
   finishedAt?: number
@@ -144,31 +146,93 @@ async function fetchCover(url?: string): Promise<{ mime: string; data: Uint8Arra
   }
 }
 
-async function streamTo(url: string, dest: string, signal: AbortSignal, onProgress: (r: number, got: number, total: number) => void): Promise<void> {  const headers: Record<string, string> = { 'User-Agent': UA, Accept: '*/*' }
+/** 单流空闲超时（Bug 81）：30s 无数据即失败，释放并发槽 */
+const STREAM_IDLE_TIMEOUT_MS = 30_000
+
+/**
+ * 流式下载到 dest。
+ * startAt > 0 时携带 Range 头从断点续传（追加写）；服务端不支持 Range（返回 200 非 206）则退回全量重下。
+ */
+async function streamTo(
+  url: string,
+  dest: string,
+  signal: AbortSignal,
+  onProgress: (r: number, got: number, total: number) => void,
+  startAt = 0,
+): Promise<void> {
+  const headers: Record<string, string> = { 'User-Agent': UA, Accept: '*/*' }
   if (/bilibili|bilivideo|hdslb/i.test(url)) headers.Referer = 'https://www.bilibili.com/'
+  if (startAt > 0) headers.Range = `bytes=${startAt}-`
+
   let res: Response
   try {
     res = await fetch(url, { headers, redirect: 'follow', signal })
   } catch {
     res = await net.fetch(url, { headers, redirect: 'follow', signal })
   }
+  if (startAt > 0 && res.status === 416) {
+    // 断点越界（远端内容已变化）→ 从头重下
+    res = await fetch(url, { headers: { ...headers, Range: undefined } as any, redirect: 'follow', signal })
+    startAt = 0
+  }
   if (!res.ok || !res.body) throw new Error(`下载失败（HTTP ${res.status}）`)
+  let append = false
+  if (startAt > 0 && res.status === 206) {
+    append = true
+  } else if (startAt > 0) {
+    startAt = 0
+  }
 
-  const total = Number(res.headers.get('content-length') || 0)
-  const fh = await fsp.open(dest, 'w')
-  let got = 0
+  const total = startAt + (Number(res.headers.get('content-length') || 0) || 0)
+  const fh = await fsp.open(dest, append ? 'a' : 'w')
+  let got = startAt
+  let reader: any = null
+  let idleTimer: NodeJS.Timeout | null = null
+  const armIdle = () => {
+    if (idleTimer) clearTimeout(idleTimer)
+    idleTimer = setTimeout(() => {
+      try {
+        reader?.cancel('idle-timeout')
+      } catch {
+        /* ignore */
+      }
+    }, STREAM_IDLE_TIMEOUT_MS)
+  }
   try {
-    const reader = (res.body as any).getReader()
+    reader = (res.body as any).getReader()
+    armIdle()
     for (;;) {
       const { done, value } = await reader.read()
       if (done) break
       if (signal.aborted) throw new Error('已取消')
       await fh.write(value)
       got += value?.byteLength || 0
+      armIdle()
       onProgress(total ? got / total : 0, got, total)
     }
   } finally {
+    if (idleTimer) clearTimeout(idleTimer)
     await fh.close()
+  }
+}
+
+/** 启动清理（N15）：下载目录里没有任务认领的 .part 残留直接删除 */
+export function sweepOrphanParts(): void {
+  try {
+    const dir = downloadDir()
+    for (const f of fs.readdirSync(dir)) {
+      if (!f.endsWith('.part')) continue
+      const full = path.join(dir, f)
+      const claimed = [...tasks.values()].some(t => t.partPath === full)
+      if (claimed) continue
+      try {
+        fs.rmSync(full, { force: true })
+      } catch {
+        /* ignore */
+      }
+    }
+  } catch {
+    /* 目录不存在 */
   }
 }
 
@@ -193,20 +257,39 @@ async function runOne(id: string): Promise<void> {
     const base = safeName(`${task.song.singer || '未知'} - ${task.song.name || '未命名'}`)
     const dir = downloadDir()
     let file = path.join(dir, `${base}.${ext}`)
-    // 同名不覆盖，加 (1)(2)
-    let n = 1
-    while (fs.existsSync(file)) {
-      file = path.join(dir, `${base} (${n}).${ext}`)
-      n++
-      if (n > 99) break
+    if (!task.partPath) {
+      // 同名不覆盖，加 (1)(2)；断点续传时沿用首次选定的文件名
+      let n = 1
+      while (fs.existsSync(file) || fs.existsSync(`${file}.part`)) {
+        file = path.join(dir, `${base} (${n}).${ext}`)
+        n++
+        if (n > 99) break
+      }
+      task.file = file
+      task.partPath = `${file}.part`
+    } else {
+      file = task.file || file
     }
 
-    await streamTo(url, file, ac.signal, (r, got, total) => {
-      task.progress = r
+    // 断点续传（Bug 7 / N14）：.part 已有字节数作为 Range 起点，追加写入
+    let startAt = 0
+    try {
+      startAt = fs.existsSync(task.partPath) ? fs.statSync(task.partPath).size : 0
+    } catch {
+      startAt = 0
+    }
+    if (task.total > 0 && startAt >= task.total && task.total > 0) startAt = 0
+
+    await streamTo(url, task.partPath!, ac.signal, (r, got, total) => {
+      task.progress = total ? got / total : r
       task.received = got
       task.total = total
       throttleEmit(task)
-    })
+    }, startAt)
+
+    // 完成：.part 改名正式文件（规格书 1.12）
+    await fsp.rename(task.partPath!, file)
+    task.partPath = undefined
 
     // 歌词同名 .lrc（失败不影响下载结果）
     if (s.downloadLrc) {
@@ -246,9 +329,18 @@ async function runOne(id: string): Promise<void> {
     if (ac.signal.aborted && pausedIds.has(id)) {
       task.status = 'paused'
       task.error = '已暂停'
+      // 暂停保留 .part（断点续传依据）
     } else if (ac.signal.aborted) {
       task.status = 'canceled'
       task.error = '已取消'
+      if (task.partPath) {
+        try {
+          fs.rmSync(task.partPath, { force: true })
+        } catch {
+          /* ignore */
+        }
+        task.partPath = undefined
+      }
     } else {
       task.status = 'error'
       task.error = e?.message || '下载失败'
@@ -340,23 +432,22 @@ export function pauseDownload(id: string): boolean {
   return true
 }
 
-/** 继续下载：不做断点续传（规格书 1.12 明确不做），从头重下。 */
+/** 继续下载（Bug 7）：不清零进度，按 .part 已收字节断点续传。 */
 export function resumeDownload(id: string): boolean {
   const t = tasks.get(id)
   if (!t || t.status !== 'paused') return false
   pausedIds.delete(id)
   t.status = 'queued'
-  t.progress = 0
-  t.received = 0
-  t.total = 0
   t.error = undefined
+  // progress/received/total 保留：runOne 会读 .part 大小作为 Range 起点
   queue.push(id)
   emit(t)
   pump()
   return true
 }
 
-export function removeDownload(id: string, deleteFile = false): boolean {  const t = tasks.get(id)
+export function removeDownload(id: string, deleteFile = false): boolean {
+  const t = tasks.get(id)
   if (!t) return false
   if (t.status === 'running') cancelDownload(id)
   if (deleteFile && t.file) {
@@ -366,6 +457,13 @@ export function removeDownload(id: string, deleteFile = false): boolean {  const
       if (fs.existsSync(lrc)) fs.unlinkSync(lrc)
     } catch (e: any) {
       logger.warn('删除文件失败', e?.message)
+    }
+  }
+  if (t.partPath) {
+    try {
+      fs.rmSync(t.partPath, { force: true })
+    } catch {
+      /* ignore */
     }
   }
   tasks.delete(id)

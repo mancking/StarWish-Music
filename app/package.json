@@ -41,6 +41,7 @@
     "crypto-js": "^4.1.1",
     "dayjs": "^1.11.23",
     "he": "^2.0.0",
+    "lamejs": "^1.2.1",
     "music-metadata": "^10.9.1",
     "qrcode": "^1.5.4",
     "qs": "^6.16.1",
@@ -77,14 +78,21 @@
       "node_modules/sql.js/dist/sql-wasm.js",
       "package.json",
       "!**/*.map",
-      "!**/node_modules/@capacitor/**"
+      "!**/node_modules/@capacitor/**",
+      "!**/node_modules/@capacitor-community/**",
+      "!**/node_modules/sql.js/dist/sql-asm*",
+      "!**/node_modules/sql.js/dist/sql-shell.js",
+      "!**/node_modules/sql.js/dist/sqljs-all.zip",
+      "!**/node_modules/sql.js/dist/*.map"
     ],
     "extraResources": [
       {
         "from": "sources",
         "to": "sources",
         "filter": [
-          "**/*.js"
+          "starwish-unified.js",
+          "星愿内置音源.js",
+          "starwish-bilibili.js"
         ]
       },
       {

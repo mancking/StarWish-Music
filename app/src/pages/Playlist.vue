@@ -9,6 +9,7 @@ import { call } from '@/api'
 import { usePlayerStore } from '@/stores/player'
 import { useLibraryStore } from '@/stores/library'
 import { useUiStore } from '@/stores/ui'
+import { isFavPlaylist, toggleFavPlaylist } from '@/platform/playlist-favorites'
 import type { Song } from '@shared/types'
 import { platformLabel } from '@/utils/labels'
 
@@ -36,8 +37,34 @@ const renameValue = ref('')
 const confirmDelete = ref(false)
 const importing = ref(false)
 
+/* 歌单收藏（规格书 3.8 / Bug 13）：xinyuan_fav_playlists 本地收藏 */
+const plFav = ref(false)
+const favId = computed(() => {
+  if (isLocal.value) return ''
+  // 路由契约：/playlist/:id?src=wy —— id 为平台原始歌单 id
+  const src = String(route.query.src || route.params.source || route.params.platform || 'wy')
+  return `${src}:${route.params.id}`
+})
+function syncFav(): void {
+  plFav.value = favId.value ? isFavPlaylist(favId.value) : false
+}
+function toggleFav(): void {
+  if (!favId.value) return
+  const on = toggleFavPlaylist({
+    id: favId.value,
+    name: name.value || '未命名歌单',
+    pic: pic.value || undefined,
+    author: author.value || undefined,
+    source: String(route.query.src || route.params.source || route.params.platform || 'wy'),
+    count: count.value,
+  })
+  plFav.value = on
+  ui.toast(on ? '已收藏歌单' : '已取消收藏', on ? 'success' : 'info', 1400)
+}
+
 const localMeta = computed(() => library.playlists.find(p => p.id === String(route.params.id)))
 const count = computed(() => songs.value.length)
+watch(favId, syncFav, { immediate: true })
 
 async function load(): Promise<void> {
   loading.value = true
@@ -201,6 +228,9 @@ onMounted(() => void load())
         <div class="m-acts">
           <button class="btn primary m-play" :disabled="!count" @click="playAll"><Icon name="play" :size="15" />播放全部</button>
           <button class="btn" :disabled="!count" @click="addAllToQueue"><Icon name="queue" :size="15" />加入队列</button>
+          <button v-if="!isLocal && count" class="btn" @click="toggleFav">
+            <Icon :name="plFav ? 'heart-filled' : 'heart'" :size="15" />{{ plFav ? '已收藏' : '收藏歌单' }}
+          </button>
           <button v-if="!isLocal && count" class="btn" :disabled="importing" @click="importToMine">
             <Icon name="plus" :size="15" />{{ importing ? '收藏中…' : '收藏' }}
           </button>
@@ -231,6 +261,9 @@ onMounted(() => void load())
           <div class="actions">
             <button class="btn primary" :disabled="!count" @click="playAll"><Icon name="play" :size="15" />播放全部</button>
             <button class="btn" :disabled="!count" @click="addAllToQueue"><Icon name="queue" :size="15" />加入队列</button>
+            <button v-if="!isLocal && count" class="btn" :class="{ 'fav-on': plFav }" @click="toggleFav">
+              <Icon :name="plFav ? 'heart-filled' : 'heart'" :size="15" />{{ plFav ? '已收藏' : '收藏歌单' }}
+            </button>
             <button v-if="!isLocal && count" class="btn" :disabled="importing" @click="importToMine">
               <Icon name="plus" :size="15" />{{ importing ? '收藏中…' : '收藏到我的歌单' }}
             </button>

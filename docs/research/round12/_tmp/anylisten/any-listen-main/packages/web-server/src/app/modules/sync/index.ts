@@ -1,0 +1,52 @@
+import {
+  getSyncWebDAVState,
+  runSyncWebDAV as runSyncWebDAVOriginal,
+  cancelWebDAVSyncTask,
+  runWebDAVSyncTask,
+  type SyncWebDAVOptions,
+  syncWebDAVEvent,
+} from '@any-listen/app/modules/sync'
+
+import { appEvent, appState } from '@/app/app'
+
+const init = (immediately?: boolean) => {
+  if (appState.appSetting['sync.webdav.enable']) {
+    runWebDAVSyncTask(immediately)
+  } else {
+    cancelWebDAVSyncTask()
+  }
+}
+export const initSync = async () => {
+  appEvent.on('updated_config', (keys, settings) => {
+    if (keys.includes('sync.webdav.enable')) {
+      init()
+    }
+  })
+  appEvent.on('inited', () => {
+    init(true)
+  })
+}
+
+export const runSyncWebDAV = async (
+  getListMergeMode: SyncWebDAVOptions['getListMergeMode'],
+  getDislikeMergeMode: SyncWebDAVOptions['getDislikeMergeMode']
+) => {
+  return runSyncWebDAVOriginal(
+    {
+      url: appState.appSetting['sync.webdav.url'],
+      username: appState.appSetting['sync.webdav.username'],
+      password: appState.appSetting['sync.webdav.password'],
+      path: appState.appSetting['sync.webdav.path'],
+    },
+    {
+      getListMergeMode,
+      getDislikeMergeMode,
+    }
+  )
+}
+
+export const onWebDAVSyncStatusChanged = (callback: (state: AnyListen.IPCSync.SyncState['webdav']) => void | Promise<void>) => {
+  syncWebDAVEvent.on('statusChanged', callback)
+}
+
+export { getSyncWebDAVState }

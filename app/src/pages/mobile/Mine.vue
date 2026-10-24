@@ -5,6 +5,7 @@ import Icon from '@/components/Icon.vue'
 import { useLibraryStore } from '@/stores/library'
 import { useDownloadStore } from '@/stores/download'
 import { usePlayerStore } from '@/stores/player'
+import { favPlaylists } from '@/platform/playlist-favorites'
 
 /**
  * 移动端「我的」—— 分模块设计（v2.3.2 重写）。
@@ -26,6 +27,13 @@ const player = usePlayerStore()
 
 const creating = ref(false)
 const newName = ref('')
+const favPls = favPlaylists()
+
+/** 收藏歌单条目（wy:123）→ 歌单详情路由（/playlist/:id?src=wy） */
+function favPlPath(pl: { id: string }): string {
+  const [src, ...rest] = pl.id.split(':')
+  return `/playlist/${rest.join(':')}?src=${src}`
+}
 
 const quickEntries = computed(() => [
   { path: '/favorites', icon: 'heart', label: '我喜欢的', meta: library.favoriteCount ? `${library.favoriteCount}` : '' },
@@ -101,6 +109,25 @@ async function createPlaylist(): Promise<void> {
       </div>
     </section>
 
+    <!-- ④ 收藏的歌单（规格书 3.8 / Bug 13） -->
+    <section class="mod">
+      <header class="mod-head">
+        <h2>收藏的歌单</h2>
+        <span class="mod-act">{{ favPls.length || '' }}</span>
+      </header>
+      <div class="mod-card">
+        <button v-for="pl in favPls" :key="pl.id" class="row" @click="go(favPlPath(pl))">
+          <span class="row-icon tint-list"><Icon name="heart" :size="16" /></span>
+          <span class="row-label ellipsis">{{ pl.name }}</span>
+          <span class="row-meta">{{ pl.count ?? 0 }} 首</span>
+          <Icon name="chevron-right" :size="14" class="row-arrow" />
+        </button>
+        <div v-if="!favPls.length" class="none">
+          还没有收藏歌单。在歌单详情页点「收藏歌单」即可保存在本地。
+        </div>
+      </div>
+    </section>
+
   </div>
 </template>
 
@@ -169,7 +196,7 @@ async function createPlaylist(): Promise<void> {
 /* ② 四宫格 */
 .grid-mod {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(5, 1fr);
   gap: 8px;
 }
 .g-item {

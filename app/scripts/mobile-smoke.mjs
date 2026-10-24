@@ -4,7 +4,7 @@
  * 验证目标是「window.sw 桥在浏览器环境里真的把 core 跑起来了」：
  *  1. #app 有真实 DOM 子元素（Vue 挂载成功）
  *  2. sw.platform === 'android'、sw.invoke 可用
- *  3. sw.invoke('sources:list') 返回内置 11 个音源（vfs 种子 + lx-host 生效）
+ *  3. sw.invoke('sources:list') 返回随包白名单音源（规格书 0.8：仅自研 3 源 + B 站，≥4）
  *  4. sw.invoke('db:playlists') / 'songs:library' 走真 sqlite（虚拟 fs）
  *  5. 控制台无 error 级输出、无未捕获异常
  *  6. 首页渲染出内容（首页 feed 至少一个模块有数据或已渲染）
@@ -188,7 +188,8 @@ async function main() {
   // 2. 音源：vfs 种子 + lx-host
   const sources = await js(`(window).sw.invoke('sources:list')`).catch((e) => ({ ok: false, error: String(e && e.message) }))
   const srcCount = sources && sources.data ? sources.data.length : 0
-  check('sources:list 返回内置音源', srcCount >= 10, { count: srcCount, first: sources && sources.data ? sources.data[0] : sources })
+  // 规格书 0.8 随包白名单：sources/ 仅自研源随包（第三方改由源市场/订阅获取）
+  check('sources:list 返回随包白名单音源', srcCount >= 4, { count: srcCount, first: sources && sources.data ? sources.data[0] : sources })
 
   // 3. sqlite（虚拟 fs + sql.js wasm）
   const pls = await js(`(window).sw.invoke('db:playlists')`).catch((e) => ({ ok: false, error: String(e && e.message) }))

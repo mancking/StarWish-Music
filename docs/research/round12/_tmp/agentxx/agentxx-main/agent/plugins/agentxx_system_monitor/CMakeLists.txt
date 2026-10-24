@@ -1,0 +1,165 @@
+# agentxx_system_monitor —— 系统资源监控插件 (CPU/内存/GPU)
+# - 平台: Windows (PDH/DXGI) / Linux 与 Android (/proc + sysfs) / macOS
+#   (mach host_statistics + IOKit IOAccelerator); 其余平台跳过编译
+# - 默认: 独立动态库 (MODULE), 仅依赖纯 C ABI 头 + cxx_utilxx_base_static (Json/JsonView) + asio (boost 头文件)
+# - 内置模式: 源文件编译为 OBJECT 库合并进
+#   libagentxx; cxx_utilxx_base_static/asio 为既有依赖, 仅补链接平台库
+#   (Windows: pdh/dxgi; macOS: IOKit/CoreFoundation framework)
+# - 从 libagentxx src/expand/get_cpu_gpu_use 拆分独立:
+#   - 工具 agentxx_get_system_core_info (原内置工具迁移, 同名同行为)
+#   - 能力 agentxx.system_usage (方法 query): 主程序 TUI 系统资源展示路径
+#     (WireGetSystemUsage) 经能力调用获取使用率 JSON
+set(PLUGIN_NAME agentxx_system_monitor)
+
+# ===== 平台支持判定 =====
+# Windows (PDH 性能计数器 + DXGI GPU 枚举)、Linux (/proc + sysfs 解析) 与
+# macOS (mach host_statistics + IOKit IOAccelerator) 有真实实现;
+# Android 复用 Linux 分支 (/proc/stat、/proc/meminfo 在 Android 可读, GPU 经
+# sysfs/drm 枚举缺失时 readFileContent 返回空串优雅降级); iOS 为空桩, 跳过编译
+# (平台支持情况说明见 docs/zh-cn/design/plugins.md §14)
+include("${CMAKE_CURRENT_LIST_DIR}/../cmake/plugin_platform_support.cmake")
+agentxx_plugin_platform_gate(${PLUGIN_NAME} _AGENTXX_PLATFORM_OK windows linux macos android)
+if (NOT _AGENTXX_PLATFORM_OK)
+  return() # 跳过本插件全部目标 (内置合并/独立动态库两模式均在此拦截)
+endif ()
+
+if (_AGENTXX_ADD_AS_BUILTIN)
+  # ===== 内置合并编译分支 =====
+  set(_target abp_${PLUGIN_NAME})
+  add_library(${_target} OBJECT
+    ${CMAKE_CURRENT_SOURCE_DIR}/agentxx_system_monitor.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/cpu_gpu_monitor.cpp
+  )
+  target_compile_definitions(${_target} PRIVATE
+    "AGENTXX_PLUGIN_BUILTIN=1"
+    "agentxx_plugin_agent_create=agentxx_plugin_agent_builtin_create_${PLUGIN_NAME}"
+    "agentxx_plugin_agent_get_info=agentxx_plugin_agent_builtin_get_info_${PLUGIN_NAME}"
+    "agentxx_plugin_agent_destroy=agentxx_plugin_agent_builtin_destroy_${PLUGIN_NAME}"
+    "agentxx_plugin_agent_start=agentxx_plugin_agent_builtin_start_${PLUGIN_NAME}"
+    "agentxx_plugin_agent_stop=agentxx_plugin_agent_builtin_stop_${PLUGIN_NAME}"
+    "agentxx_plugin_client_create=agentxx_plugin_client_builtin_create_${PLUGIN_NAME}"
+    "agentxx_plugin_client_get_info=agentxx_plugin_client_builtin_get_info_${PLUGIN_NAME}"
+    "agentxx_plugin_client_destroy=agentxx_plugin_client_builtin_destroy_${PLUGIN_NAME}"
+    "agentxx_plugin_client_start=agentxx_plugin_client_builtin_start_${PLUGIN_NAME}"
+    "agentxx_plugin_client_stop=agentxx_plugin_client_builtin_stop_${PLUGIN_NAME}"
+  )
+  target_include_directories(${_target} PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"          # cpu_gpu_monitor.h / system_monitor_plugin.h
+    "${AGENTXX_LIB_INCLUDE_DIR}"           # agentxx/plugin/plugin_api.h
+    "${AGENTXX_INSTALL_DIR}/include"       # cxx_utilxx_base_static (Json/JsonView)
+    "${BOOST_ROOT}/include/"
+    "${BOOST_ROOT}/include/boost/"
+  )
+  # 复用 cxx_utilxx_base_static 工具库 (libagentxx 已链接本库; 此处经 PRIVATE 链接仅
+  # 传递编译宏/头路径: util 头文件依赖 XX_IS_* 宏与 include 路径)
+  target_link_libraries(${_target} PRIVATE cxx_utilxx_base_static)
+set_target_properties(${_target} PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+    CXX_STANDARD 26
+    CXX_STANDARD_REQUIRED OFF
+  )
+  if (XX_IS_WIN_D)
+    # cpu_gpu_monitor Windows 分支: PDH (性能计数器) + DXGI (GPU 适配器枚举)
+    # - 独立模式经下方独立分支 PRIVATE 链接; 内置模式经本收集通道并入 libagentxx
+    set(AGENTXX_BUILTIN_PLUGIN_LINK_LIBS
+      "${AGENTXX_BUILTIN_PLUGIN_LINK_LIBS}" pdh dxgi PARENT_SCOPE)
+  elseif (XX_IS_MACOS_D)
+    # cpu_gpu_monitor macOS 分支: IOKit (IOAccelerator 枚举 + PerformanceStatistics
+    # 属性读取) + CoreFoundation (CFString/CFDictionary/CFNumber 解析)
+    set(AGENTXX_BUILTIN_PLUGIN_LINK_LIBS
+      "${AGENTXX_BUILTIN_PLUGIN_LINK_LIBS}"
+      "-framework IOKit" "-framework CoreFoundation" PARENT_SCOPE)
+  endif()
+  set(AGENTXX_BUILTIN_PLUGIN_OBJECT_TARGETS "${AGENTXX_BUILTIN_PLUGIN_OBJECT_TARGETS}" "${_target}" PARENT_SCOPE)
+  # 登记进内置插件清单 (子目录自登记: 平台不支持时本文件开头已提前 return,
+  # 不会误登记; 原由父目录 plugins/CMakeLists.txt 无条件追加, 现统一走此通道)
+  list(APPEND AGENTXX_BUILTIN_PLUGIN_NAMES ${PLUGIN_NAME})
+  set(AGENTXX_BUILTIN_PLUGIN_NAMES "${AGENTXX_BUILTIN_PLUGIN_NAMES}" PARENT_SCOPE)
+  # 资源: plugin.yaml (运行期目录配置推导 depends/入口)
+  set(_res "${AGENTXX_EXEC_INSTALL_PREFIX}/plugins/${PLUGIN_NAME}/plugin.yaml")
+  # 资源拷贝 (自包含 ALL 目标: 跨目录 OUTPUT 不进构建图, 见 plugins.md;
+  # ALL 保证随 libagentxx 构建执行; 仅内置合并分支存在本目标)
+  add_custom_target(${PLUGIN_NAME}_builtin_resources ALL
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      "${CMAKE_CURRENT_SOURCE_DIR}/plugin.yaml" "${_res}"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/plugin.yaml"
+    COMMENT "Copy ${PLUGIN_NAME} plugin resource (builtin mode)")
+  return()
+endif()
+
+# ===== 独立动态库编译 (默认) =====
+add_library(${PLUGIN_NAME} SHARED
+  agentxx_system_monitor.cpp
+  cpu_gpu_monitor.cpp
+)
+target_include_directories(${PLUGIN_NAME} PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}"          # cpu_gpu_monitor.h / system_monitor_plugin.h
+  "${AGENTXX_LIB_INCLUDE_DIR}"           # agentxx/plugin/plugin_api.h
+  "${AGENTXX_INSTALL_DIR}/include"       # cxx_utilxx_base_static (Json/JsonView)
+)
+# ===== 依赖查找与链接 (顺序: 先依赖库的依赖, 再依赖库本体) =====
+# 工具库条件依赖 (io_uring / hyperscan) 由 plugins/CMakeLists.txt 统一查找;
+# 本处只导入依赖库本体, 随后按 imported target / 裸库名链接
+if (NOT TARGET cxx_utilxx_base_static)
+  # 内置合并编译时 util 目标随 libagentxx 已存在 (且 install 目录尚未生成
+  # config), 仅独立构建本插件时经安装 config 导入
+  find_package(cxx_utilxx_base REQUIRED)
+endif()
+target_link_libraries(${PLUGIN_NAME} PRIVATE
+  cxx_utilxx_base_static
+)
+# 裸库名依赖 (如 hs_runtime) 的解析目录: 与 cxx_utilxx* 导出接口的 link 目录一致
+target_link_directories(${PLUGIN_NAME} PRIVATE
+  "${AGENTXX_INSTALL_DIR}/lib/"
+)
+
+# asio 头文件 (cpu_gpu_monitor 使用 asio 协程; 头文件-only, 仅需 include 路径)
+# boost 分发布局: ${BOOST_ROOT}/include/boost/asio/...; 源码用 asio/... 前缀
+# (映射 include/boost/), 而 asio 头内部用 <boost/asio/...> 形式 (映射 include/),
+# 两者缺一会导致内部头回退到系统安装的 boost, 与主程序 asio 混用崩溃
+target_include_directories(${PLUGIN_NAME} PRIVATE
+  "${BOOST_ROOT}/include/"
+  "${BOOST_ROOT}/include/boost/"
+)
+
+if (XX_IS_WIN_D)
+  # cpu_gpu_monitor Windows 分支: PDH (性能计数器) + DXGI (GPU 适配器枚举)
+  target_link_libraries(${PLUGIN_NAME} PRIVATE
+    pdh
+    dxgi
+  )
+elseif (XX_IS_MACOS_D)
+  # cpu_gpu_monitor macOS 分支: IOKit + CoreFoundation
+  # (asio 在 macOS 无文件异步 I/O, 该分支的数据来源为 mach 系统调用与 IOKit
+  #  属性读取, 无其他额外依赖)
+  target_link_libraries(${PLUGIN_NAME} PRIVATE
+    "-framework IOKit"
+    "-framework CoreFoundation"
+  )
+endif()
+# 注: Linux 下 asio 文件 I/O (-DASIO_HAS_IO_URING) 需要的 io_uring 符号,
+# 由 cxx_utilxx_base_static 的导出接口携带 (库文件绝对路径, 无需本插件补链;
+# 见 agent/third_party/cxx_utilxx_base/CMakeLists.txt 的
+# CXX_UTILXX_BASE_LINUX_IO_URING_SUPPORTED)
+
+set_target_properties(${PLUGIN_NAME} PROPERTIES
+  PREFIX "lib"
+  CXX_STANDARD 26
+  CXX_STANDARD_REQUIRED OFF
+  RUNTIME_OUTPUT_DIRECTORY "${AGENTXX_EXEC_INSTALL_PREFIX}/plugins/${PLUGIN_NAME}/"
+  LIBRARY_OUTPUT_DIRECTORY "${AGENTXX_EXEC_INSTALL_PREFIX}/plugins/${PLUGIN_NAME}/"
+)
+foreach(config DEBUG RELEASE MINSIZEREL RELWITHDEBINFO)
+  # 统一复制到 exec 目录时直接将 动态库文件 放到 插件目录下，否则可能会放到 `exec/plugins/agentxx_xxx_plugin/Debug/libxxx.dll`
+  # 修正后统一放到 `exec/plugins/plugin_xxx/libxxx.dll`
+  set_target_properties(${PLUGIN_NAME} PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY_${config} "${AGENTXX_EXEC_INSTALL_PREFIX}/plugins/${PLUGIN_NAME}/"
+    LIBRARY_OUTPUT_DIRECTORY_${config} "${AGENTXX_EXEC_INSTALL_PREFIX}/plugins/${PLUGIN_NAME}/"
+  )
+endforeach()
+add_custom_command(TARGET ${PLUGIN_NAME} POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "${CMAKE_CURRENT_SOURCE_DIR}/plugin.yaml"
+    "${AGENTXX_EXEC_INSTALL_PREFIX}/plugins/${PLUGIN_NAME}/plugin.yaml"
+  COMMENT "Copy ${PLUGIN_NAME} plugin resources to ${AGENTXX_EXEC_INSTALL_PREFIX}/plugins/${PLUGIN_NAME}"
+)

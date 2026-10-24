@@ -1,0 +1,36 @@
+#!/bin/bash
+
+script_dir=$(cd "$(dirname "$0")" && pwd)
+src_dir="$script_dir/../"
+build_dir="$script_dir/../build/temp/linux-debug"
+
+BOOST_ROOT=$(cd "$src_dir/third_party/boost-build-debug/$abi" && pwd)
+OPENSSL_ROOT_DIR=$(cd "$src_dir/third_party/OpenSSL/$abi" && pwd)
+
+cmake -B "$build_dir" -S "$src_dir" \
+    -DAGENTXX_BUILD_CLIENT=ON \
+    -DAGENTXX_BUILD_TEST=ON \
+    -DXX_IS_RELEASE_D=0 -DCMAKE_BUILD_TYPE=Debug
+
+if [[ $? -ne 0 ]]; then
+    echo "cmake config failed!"
+    exit 1
+fi
+
+cmake --build "$build_dir" --config debug
+
+if [[ $? -ne 0 ]]; then
+    echo "cmake build failed!"
+    exit 1
+fi
+
+cmake --install "$build_dir" --config Debug
+
+if [[ $? -ne 0 ]]; then
+    echo "cmake install failed!"
+    exit 1
+fi
+
+# 测试依赖 cwd 下的 plugins/ 等资源: 切到可执行文件目录再运行
+cd "$build_dir/exec" || exit 1
+LD_LIBRARY_PATH=. ./test_temp

@@ -6,6 +6,11 @@ import Cover from '@/components/Cover.vue'
 import { call } from '@/api'
 import type { MvItem } from '@shared/types'
 
+/**
+ * 视频 / MV 聚合页（规格书 3.10 · 特色模块）：
+ * B 站（默认兜底）+ 网易云/QQ/酷狗/酷我 MV 混合信息流，源 Tab 切换；
+ * 酷狗/酷我本期只展示元数据，播放置灰「签名源二期」。
+ */
 const router = useRouter()
 
 const keyword = ref('音乐')
@@ -15,6 +20,34 @@ const loadingMore = ref(false)
 const error = ref('')
 const page = ref(1)
 const hasMore = ref(true)
+/** 源 Tab（F-14）：bili 默认兜底 */
+const source = ref('bili')
+
+/** 源能力：签名源（kg/kw）元数据可看、播放置灰（2.17） */
+const isSignedSource = (v: MvItem): boolean => v.source === 'kg' || v.source === 'kw'
+
+const SOURCE_TABS = [
+  { key: 'bili', label: 'B站' },
+  { key: 'wy', label: '网易云' },
+  { key: 'qq', label: 'QQ' },
+  { key: 'kg', label: '酷狗' },
+  { key: 'kw', label: '酷我' },
+]
+
+function sourceLabel(v: MvItem): string {
+  const map: Record<string, string> = { bili: 'B站', wy: '网易', qq: 'QQ', kg: '酷狗', kw: '酷我' }
+  return map[v.source || 'bili'] || v.source || 'B站'
+}
+
+function mvId(v: MvItem): string {
+  return v.sourceId || v.bvid || ''
+}
+
+function open(v: MvItem): void {
+  if (isSignedSource(v)) return
+  const src = v.source || 'bili'
+  router.push(`/mv/${src}/${mvId(v)}`)
+}
 
 async function search(): Promise<void> {
   loading.value = true
@@ -22,7 +55,11 @@ async function search(): Promise<void> {
   page.value = 1
   hasMore.value = true
   try {
-    const res = await call<MvItem[]>('music:mv', { keyword: keyword.value.trim() || '音乐', page: 1 })
+    const res = await call<MvItem[]>('music:mv', {
+      keyword: keyword.value.trim() || '音乐',
+      page: 1,
+      source: source.value,
+    })
     list.value = res
     hasMore.value = res.length > 0
     if (!res.length) error.value = '没有找到相关视频，换个关键词试试'
@@ -33,14 +70,24 @@ async function search(): Promise<void> {
   }
 }
 
+function switchSource(k: string): void {
+  if (source.value === k) return
+  source.value = k
+  void search()
+}
+
 async function loadMore(): Promise<void> {
   if (loadingMore.value || !hasMore.value) return
   loadingMore.value = true
   try {
     const next = page.value + 1
-    const res = await call<MvItem[]>('music:mv', { keyword: keyword.value.trim() || '音乐', page: next })
-    const seen = new Set(list.value.map(v => v.bvid))
-    const fresh = res.filter(v => !seen.has(v.bvid))
+    const res = await call<MvItem[]>('music:mv', {
+      keyword: keyword.value.trim() || '音乐',
+      page: next,
+      source: source.value,
+    })
+    const seen = new Set(list.value.map(v => `${v.source || 'bili'}:${mvId(v)}`))
+    const fresh = res.filter(v => !seen.has(`${v.source || 'bili'}:${mvId(v)}`))
     if (!fresh.length && !res.length) {
       hasMore.value = false
     } else {
@@ -53,10 +100,6 @@ async function loadMore(): Promise<void> {
   } finally {
     loadingMore.value = false
   }
-}
-
-function open(v: MvItem): void {
-  router.push(`/mv/${v.bvid}`)
 }
 
 function fmt(n: number): string {
@@ -81,6 +124,18 @@ onMounted(() => void search())
       </div>
     </header>
 
+    <!-- 源 Tab（F-14 / 3.10） -->
+    <nav class="src-tabs">
+      <button
+        v-for="t in SOURCE_TABS"
+        :key="t.key"
+        :class="{ on: source === t.key }"
+        @click="switchSource(t.key)"
+      >
+        {{ t.label }}
+      </button>
+    </nav>
+
     <div v-if="loading" class="grid">
       <div v-for="i in 8" :key="i" class="sk" style="aspect-ratio: 16 / 10; border-radius: 12px" />
     </div>
@@ -92,12 +147,14 @@ onMounted(() => void search())
     </div>
 
     <div v-else class="grid">
-      <div v-for="v in list" :key="v.bvid" class="mv-card" @click="open(v)">
+      <div v-for="v in list" :key="`${v.source || 'bili'}:${mvId(v)}`" class="mv-card" @click="open(v)">
         <div class="thumb">
           <Cover :src="v.pic" :alt="v.title" size="100%" :radius="12" />
-          <span class="dur">{{ v.duration }}</span>
-          <span class="play-count"><Icon name="play" :size="10" />{{ fmt(v.play) }}</span>
+          <span class="src-tag">{{ sourceLabel(v) }}</span>
+          <span v-if="v.durationSec || v.duration" class="dur">{{ v.duration || fmt(Number(v.durationSec) || 0) }}</span>
+          <span v-if="v.play" class="play-count"><Icon name="play" :size="10" />{{ fmt(v.play) }}</span>
           <span class="overlay"><Icon name="play-circle" :size="38" /></span>
+          <span v-if="isSignedSource(v)" class="signed">签名源二期</span>
         </div>
         <div class="mv-title clamp-2">{{ v.title }}</div>
         <div class="mv-author ellipsis">{{ v.author }}</div>
@@ -219,6 +276,46 @@ h1 {
   margin-top: 2px;
   font-size: 11px;
   color: var(--text-3);
+}
+.src-tabs {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 16px;
+}
+.src-tabs button {
+  height: 30px;
+  padding: 0 14px;
+  border-radius: 15px;
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--text-2);
+  font-size: 12.5px;
+  cursor: pointer;
+}
+.src-tabs button.on {
+  background: var(--accent-soft, rgba(167, 139, 250, 0.16));
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.src-tag {
+  position: absolute;
+  left: 8px;
+  top: 8px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  font-size: 10px;
+}
+.signed {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  font-size: 12px;
+  border-radius: 12px;
 }
 .load-more {
   display: flex;

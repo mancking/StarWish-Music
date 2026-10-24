@@ -23,12 +23,13 @@ import { registerBufferGlobal, patchFetch, patchNativeFetch, isNativeWebView } f
 import { initDb, setSqlJsLoader } from '../../../electron/core/db'
 import { lxHost } from '../../../electron/core/lx-host'
 import * as mfHost from '../../../electron/core/mf-host'
+import * as marketHost from '../../../electron/core/market-host'
 import { loadSettings, saveSettings, getSettings } from '../../../electron/core/settings'
 import { userDataDir } from '../../../electron/core/paths'
-import { dbStats, playStats, favoriteIds, favoriteSongs, toggleFavorite, historySongs, addHistory, clearHistory, listPlaylists, createPlaylist, updatePlaylist, deletePlaylist, playlistSongs, addSongsToPlaylist, removeSongFromPlaylist, reorderPlaylist, getSongs, saveSongs, localSongs, localCount, removeLocalSongs, dbGetSetting, dbSetSetting, isFavorite } from '../../../electron/core/db'
+import { dbStats, playStats, favoriteIds, favoriteSongs, toggleFavorite, historySongs, addHistory, clearHistory, listPlaylists, createPlaylist, updatePlaylist, deletePlaylist, playlistSongs, addSongsToPlaylist, removeSongFromPlaylist, reorderPlaylist, getSongs, saveSongs, localSongs, localCount, removeLocalSongs, dbGetSetting, dbSetSetting, isFavorite, recentHistory } from '../../../electron/core/db'
 import {
   searchAll, getLyric, getCover, getPlaylists, getPlaylistTags, getPlaylistDetail, getToplist, getToplistTree,
-  getNewSongs, importPlaylist, searchMv, getMvInfo, getMvParts, getMvUrl, getPodcastEpisodes,
+  getNewSongs, importPlaylist, searchMv, getMvInfo, getMvParts, getMvUrl, getPodcastEpisodes, mvBySong,
 } from '../../../electron/core/music-service'
 import { buildHomeFeed } from '../../../electron/core/recommend'
 import { buildRadio } from '../../../electron/core/radio'
@@ -347,6 +348,7 @@ const handlers: Record<string, Handler> = {
   'sources:list': () => {
     const disabled = dbGetSetting<string[]>('sources.disabled') || []
     const deleted = dbGetSetting<string[]>('sources.deleted') || []
+    lxHost.setUserEnabledList(dbGetSetting<string[]>('sources.enabled') || [])
     lxHost.setDisabledList(disabled)
     lxHost.setDeletedList(deleted)
     return lxHost.list()
@@ -355,6 +357,7 @@ const handlers: Record<string, Handler> = {
   'sources:toggle': ({ file, enabled }: any) => {
     lxHost.setEnabled(file, enabled)
     dbSetSetting('sources.disabled', lxHost.getDisabledList())
+    dbSetSetting('sources.enabled', lxHost.getUserEnabledList())
     emit('sources:changed', lxHost.list())
     return lxHost.list()
   },
@@ -408,13 +411,28 @@ const handlers: Record<string, Handler> = {
     return { ...r, list: mfHost.list(), subs: mfHost.listSubscriptions() }
   },
   'plugins:subs:list': () => mfHost.listSubscriptions(),
-  'plugins:subs:remove': async ({ url }: any) => {
-    await mfHost.removeSubscription(url)
+  'plugins:subs:remove': async ({ url, uninstall }: any) => {
+    await mfHost.removeSubscription(url, !!uninstall)
+    emit('plugins:changed', mfHost.list())
     return mfHost.listSubscriptions()
   },
+  /* C-25：订阅立即刷新 */
+  'plugins:subs:refresh': async ({ url, name }: any) => await mfHost.importSubscription(url, name),
+  /* Bug 127：回滚到上一版 */
+  'plugins:rollback': ({ file }: any) => mfHost.rollbackPlugin(file),
+  /* 统一源市场（0.10）：移动端与桌面对等（F-27/F-28） */
+  'market:list': async ({ url }: any) => await marketHost.listMarket(String(url || '')),
+  'market:channels': () => marketHost.channels(),
+  'market:install': async ({ item }: any) => await marketHost.installItem(item),
+  'market:update': async ({ item }: any) => await marketHost.updateItem(item),
+  'market:uninstall': async ({ item }: any) => await marketHost.uninstallItem(item),
   'plugins:search': ({ file, query, page, type }: any) => mfHost.search(file, query, page, type),
   'plugins:lyric': ({ file, musicItem }: any) => mfHost.getLyric(file, musicItem),
   'plugins:url': ({ file, musicItem, quality }: any) => mfHost.getMediaSource(file, musicItem, quality),
+
+  /* ---- 局域网同步（规格书 4.8）：移动端为客户端，桌面为宿主 ---- */
+  'lan:info': () => ({ active: false, role: 'client' }),
+  'lan:sync': async ({ ip, pin }: any) => await lanSyncRun(String(ip || ''), String(pin || '')),
 
   /* ---- 音乐数据 ---- */
   'music:search': async ({ keyword, page, platform }: any) => searchAll(keyword, page || 1, { platform }),
@@ -431,10 +449,12 @@ const handlers: Record<string, Handler> = {
   'music:toplist': ({ platform, id }: any) => getToplist(platform, id),
   'music:new': () => getNewSongs(),
   'music:importPlaylist': ({ input, platform }: any) => importPlaylist(input, platform),
-  'music:mv': ({ keyword, page }: any) => searchMv(keyword || '音乐', page || 1),
-  'music:mvinfo': ({ bvid }: any) => getMvInfo(bvid),
-  'music:mvurl': ({ bvid, cid, qn }: any) => getMvUrl(bvid, cid, qn),
-  'music:mvparts': ({ bvid }: any) => getMvParts(bvid),
+  /* MV 多音源（规格书 2.17 / 3.10）：与桌面同契约 */
+  'music:mv': ({ keyword, page, source }: any) => searchMv(keyword || '音乐', page || 1, source || 'bili'),
+  'music:mvinfo': ({ bvid, source }: any) => getMvInfo(source || 'bili', bvid),
+  'music:mvurl': ({ bvid, cid, qn, source }: any) => getMvUrl(source || 'bili', bvid, cid, qn),
+  'music:mvparts': ({ bvid, source }: any) => getMvParts(source || 'bili', bvid),
+  'music:mvBySong': ({ song }: any) => mvBySong(song),
   'home:feed': async ({ force }: any) => buildHomeFeed(!!force),
   /** 私人电台：按口味生成可连续播放的新歌队列（换一批时 force=true） */
   'radio:build': async ({ force, size }: any) => {
@@ -650,7 +670,69 @@ const dlUris = new Map<string, string>()
 const dlPaused = new Set<string>()
 let dlChain: Promise<void> = Promise.resolve()
 
-function nativeCall(plugin: string, method: string, opts: any): Promise<any> {
+/** 原生桥直调（截图/提取音频等页面级原生能力也走这里） */
+export /* 4.8 局域网同步客户端：配对 → 双向 LWW 一次往返 */
+async function lanSyncRun(ip: string, pinCode: string): Promise<{ applied: any; pulled: any }> {
+  const host = ip.includes(':') ? ip : `${ip}:42717`
+  const base = `http://${host}`
+  // 1) 探测
+  const ping = await fetch(`${base}/lan/ping`).then(r => r.json()).catch(() => null)
+  if (!ping?.ok) throw new Error('未发现桌面宿主，请确认同一局域网且已开启主机')
+  // 2) 配对
+  const pair = await fetch(`${base}/lan/pair`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ pin: pinCode }),
+  }).then(r => r.json())
+  if (!pair?.ok) throw new Error(pair?.error || '配对失败')
+  // 3) 组装本机数据（收藏/最近播放/设置子集）
+  const favIds = favoriteIds()
+  const favorites = favIds.map(id => ({
+    songId: id,
+    at: Date.now(),
+    song: getSongs([id])[0] || null,
+  }))
+  const history = recentHistory(200).map((r: any) => ({ songId: r.id, at: r.at, song: getSongs([r.id])[0] || null }))
+  const s = getSettings()
+  // 4) 一次往返双向合并
+  const resp = await fetch(`${base}/lan/sync`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      token: pair.token,
+      favorites,
+      history,
+      settings: { theme: s.theme, accent: s.accent, quality: s.quality, playMode: s.playMode },
+    }),
+  }).then(r => r.json())
+  if (!resp?.ok) throw new Error(resp?.error || '同步失败')
+  // 5) 应用宿主侧数据到本机（LWW：宿主记录更旧则跳过由宿主完成，这里按 at 简单拉取）
+  let pulledFav = 0
+  for (const rec of resp.favorites || []) {
+    if (!rec?.songId) continue
+    const local = getSongs([rec.songId])[0] || null
+    if (!local) {
+      if (rec.song) {
+        saveSongs([rec.song])
+        if (!favoriteIds().includes(rec.songId)) {
+          toggleFavorite(rec.song)
+          pulledFav++
+        }
+      }
+    }
+  }
+  let pulledHist = 0
+  for (const rec of resp.history || []) {
+    if (!rec?.songId || !rec.song) continue
+    saveSongs([rec.song])
+    addHistory(rec.song, 0)
+    pulledHist++
+  }
+  return { applied: resp.applied, pulled: { favorites: pulledFav, history: pulledHist } }
+}
+
+/** 原生桥直调（截图/提取音频等页面级原生能力也走这里） */
+export function nativeCall(plugin: string, method: string, opts: any): Promise<any> {
   const cap: any = (globalThis as any).Capacitor
   if (!cap || typeof cap.nativePromise !== 'function') throw new Error('原生通道不可用')
   return cap.nativePromise(plugin, method, opts)

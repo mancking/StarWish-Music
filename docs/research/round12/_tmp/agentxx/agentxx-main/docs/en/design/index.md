@@ -1,0 +1,1711 @@
+# Agentxx Comprehensive Architecture Design Document
+
+> Related docs: [design](index.md) (Architecture) · [plugins.md](plugins.md) (Pure C ABI Plugin Paradigm) · [ffi.md](ffi.md) (FFI Interface Design)
+> (TUI and benchmark design docs are currently maintained in Chinese only: `docs/zh-cn/design/tui.md`, `docs/zh-cn/design/benchmark.md`.)
+> Translation status: the Chinese pages under `docs/zh-cn/design/` are the reference; this page
+> may lag behind them (for example the memory / allocator section in `docs/zh-cn/design/index.md`).
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Features & Capabilities](#features--capabilities)
+    - [Core Conversational Capabilities](#core-conversational-capabilities)
+    - [Tool Invocations (ToolCall)](#tool-invocations-toolcall)
+    - [Middleware System](#middleware-system)
+    - [Event System](#event-system)
+    - [Multi-Session & Concurrency](#multi-session--concurrency)
+    - [Remote Communication](#remote-communication)
+    - [Protocol Support](#protocol-support)
+    - [Client UI](#client-ui)
+    - [Training System](#training-system)
+    - [Extension Capabilities](#extension-capabilities)
+    - [Dependency Injection](#dependency-injection)
+- [Usage Guide](#usage-guide)
+    - [Compilation](#compilation)
+    - [Running Tests](#running-tests)
+    - [Configuration File](#configuration-file)
+    - [Command-Line Usage](#command-line-usage)
+    - [Using as a Library](#using-as-a-library)
+- [Architectural Design](#architectural-design)
+    - [Overall Architecture](#overall-architecture)
+    - [Data Flow](#data-flow)
+    - [Core Design Patterns](#core-design-patterns)
+    - [Connection & Reconnection Mechanism](#connection--reconnection-mechanism)
+    - [Dependency Injection Container](#dependency-injection-container)
+- [Code Structure](#code-structure)
+    - [Key Dependencies](#key-dependencies)
+- [Appendix A: Core Data Models (conversation_types.h)](#appendix-a-core-data-models-conversation_typesh)
+- [Appendix B: Plugin System v1 Key Concepts (See plugins.md)](#appendix-b-plugin-system-v1-key-concepts-see-pluginsmd)
+- [Appendix C: Session Working Directory Multi-Source Fallback (AgentContext::getSessionWorkDir)](#appendix-c-session-working-directory-multi-source-fallback-agentcontextgetsessionworkdir)
+
+---
+
+## Overview
+
+Agentxx is an AI Agent framework implemented in C++23, compiled with C++26/C17 standard options enabled. Core design objectives:
+
+- **Cross-Platform**: Supports Linux x86_64 (including WSL extensions), Windows 10+ x86_64, and Android 5.0+.
+- **Multi-Form Compilation**: Can be compiled as a standalone executable, dynamic shared library, or static library, depending only on basic system libraries.
+- **High Concurrency**: Single-threaded / multi-coroutine interleaved execution across multiple sessions, requiring no thread locks.
+- **Layered Decoupling**: Client handles UI rendering and user interaction; Agent (BaseAgent / CodeAgent) manages session execution, LLM API calls, and ToolCall execution.
+- **Multi-Connection Modes**: Supports single-process client+agent (in-process Channel direct connection) and remote client connecting to an agent server over WebSocket.
+
+---
+
+## Features & Capabilities
+
+### Core Conversational Capabilities
+
+- **Multi-Turn Conversations**: Comprehensive multi-turn conversation management, maintaining dual message sets: `viewMessages` (append-only complete historical log) and `llmMessages` (compressible LLM context).
+- **Streaming Output**: LLM responses are streamed as incremental Delta events (TextToken / ThinkToken / ToolStart / ToolEnd / TurnStart / TurnEnd / NodeStart / NodeEnd / MessageUITip / InsertMessage / UpdateMessage), with each Delta bearing a monotonically increasing `seq` for replay and synchronization. Turn statistics, errors, cancellation notifications, and interrupt headers are constructed by the agent thread as complete ViewMessages and inserted into session history via InsertMessage (carrying `msgId`), guaranteeing that `viewMessages` stay perfectly synchronized with the UI.
+- **Multi-Model Support**: Dynamic per-session (`sessionId`) model switching at runtime, supporting OpenAI Chat Completions, Anthropic Messages, and OpenAI Responses (Codex) provider protocols.
+- **Context Compaction**: `SummarizationMiddleware` automatically compresses historical messages when context approaches the model token limit, supporting tool call deduplication and truncation. The compaction result is written back to the session `llmMessages` immediately (and persisted during the next throttled flush), so a killed process does not lose it and does not re-compact in a loop after restart; compaction is mutually exclusive per session (manual vs. in-turn); the "Summarizing…" tip message is reused by its pending id, so an interrupt/resume does not append duplicates. Failure and cooldown handling: consecutive LLM failures are counted per turn (`graphDataKey_summarizationFailCount`) and fall back to a **hard truncation** (dropping the oldest messages by token budget) after 2 failures or at >= 95% token usage; "less than 2 new messages since the last compaction" is treated as a cooldown (`graphDataKey_summarizationLastMsgCount`) that skips redundant LLM compaction (avoiding a useless compaction subagent every turn); a manual compaction waits at most 2 minutes (so a stuck subagent cannot occupy the io thread forever — the timeout falls back to hard truncation).
+- **Chain-of-Thought (CoT) Display**: Streams and renders LLM reasoning/thinking content in real time.
+- **Node-Level Events**: `NodeStart`/`NodeEnd` events delineate execution lifecycles of Graph nodes, making progress tracking intuitive on the UI.
+
+### Tool Invocations (ToolCall)
+
+Rich suite of tools organized by functional categories. Core programming utilities (filesystem, command execution, web search, RAG retrieval, strings, system time, planning writes) have been refactored from library internals into **standalone plugins** (identical names and behaviors; see `agent/plugins/agentxx_*`), loaded dynamically via the YAML `plugins` section or compiled directly into `libagentxx` via `AGENTXX_PLUGIN_BUILTIN_LIST` (not embedded by default). The core library retains only `share_store`, `subagent`, `git_worktree`, and lazy-loading wiring (`ToolSkillSearchSubAgentTask` template, currently not registered as a standalone tool):
+
+| Category | Tool | Description |
+|---|---|---|
+| **Filesystem** | `agentxx_filesystem_list` | Lists file and directory metadata (size, type, modification time), supporting recursive traversal and shell wildcards (`*`, `?`, `[...]`, `**`) in `path`: matched entries themselves are listed, and `recursive` expands matched directories as well. |
+| | `agentxx_filesystem_read` | Reads text files line by line, supporting offset and limit parameters. |
+| | `agentxx_filesystem_write` | Creates or overwrites text files. |
+| | `agentxx_filesystem_edit` | Performs exact string replacement edits on text files. |
+| | `agentxx_filesystem_glob` | Searches files matching glob patterns. |
+| | `agentxx_filesystem_grep` | Searches file contents via literal text (`text_patterns`) or regular expressions (`regex_patterns`) (can search both simultaneously). |
+| **Command Execution** | `agentxx_execute_bash_command` | Executes Linux shell commands with timeout enforcement (Linux / macOS); the plugin probes python/node availability + version at start and writes them into the tool prompt. |
+| | `agentxx_execute_windows_command` | Executes Windows commands, defaulting to PowerShell (the plugin auto-probes pwsh/powershell at start and injects the executable name + version into the tool prompt), falling back to cmd.exe (Windows / callable under WSL). |
+| | `example_js_execute_command` | Executes JavaScript code via the QuickJS interpreter (the JS equivalent of execute_bash_command; depends on `agentxx_javascript_engine` plugin). |
+| **Mathematics** | `agentxx_math_calculate` | Mathematical expression parsing and evaluation (arithmetic, exponentiation, factorials, bitwise, logic, constants, trigonometric/hyperbolic/logarithmic/combinatorial functions, implicit multiplication). |
+| **Network** | `agentxx_web_search` | Web search (DuckDuckGo / Model Search). |
+| | `agentxx_web_fetch` | HTTP GET retrieving raw webpage content. |
+| | `agentxx_web_fetch_markdown` | Fetches webpage content and converts it to Markdown. |
+| **Knowledge Retrieval** | `agentxx_rag_search` | Vector semantic similarity search across knowledge bases. |
+| **Code Analysis** | `agentxx_codegraph_search` | Searches code symbols by name. |
+| | `agentxx_codegraph_context` | Retrieves symbol definitions, callers, and callees. |
+| | `agentxx_codegraph_callers` / `agentxx_codegraph_callees` | Forward and reverse call-graph tracing. |
+| | `agentxx_codegraph_path` | Finds call-chain paths connecting two symbols. |
+| | | 5 tools actually registered (search/context/callers/callees/path; the 6th count in the `loaded (6 tools)` log covers the client-side Info section, not an agent tool); registered only when configured in the YAML `plugins` section and compiled with `AGENTXX_ENABLE_PLUGIN_CODEGRAPH`. |
+| **Planning** | `agentxx_planning` | Two-layer task planning (Mermaid state diagrams + Todo lists + Memo notes; dual-sided plugin: plans persisted to `{dataDir}/plans/{thread}.json`, publishes `agentxx_planning.planning` events, renders on the client via a type-level tool renderer (live + replayed history) plus runtime decor and an Info section, resubscribes to `agentxx_host.client_attached` for re-attach self-healing). |
+| **Sub-Agent** | `agentxx_subagent` | Spawns and manages subagents for delegated task execution (single-task fields subagent/message, or parallel `tasks` batch; injected as a singleton by the SubagentManager middleware, default `subagent_task` registered). |
+| | `tool_skill_search` logic | Lazy tool/skill search: `ToolSkillSearchSubAgentTask` is only a system-prompt template (currently not registered as a standalone tool; retrieval logic is inlined by subagents on demand). |
+| **Data** | `agentxx_share_store` | Session-level text storage for context economy. |
+| | `agentxx_string_html_to_markdown` | Converts HTML to Markdown. |
+| | `agentxx_string_regexp` | Regular expression matching, replacement, and extraction. |
+| **System** | `agentxx_get_current_datetime` | Obtains current system date and time. |
+| | `agentxx_get_system_core_info` | Retrieves CPU (utilization and logical core count), memory, and GPU utilization metrics (Windows / Linux / Android / macOS). |
+| **UI Control** | `agentxx_ui_control_keyboard_mouse` | Mouse and keyboard automation on Windows (Windows only; provided by the `agentxx_computer_use` plugin, depends: screen_capture). |
+| **Screen Capture** | `agentxx_screen_capture` | Screen capture and streaming (Windows only). |
+| **Audio Stream** | `agentxx_audio_stream` | System/application/microphone audio capture (**skipped on all platforms**: WASAPI implementation not enabled, stub only; see platform matrix in plugins.md). |
+| **Text Selection Monitor** | `agentxx_text_selection_monitor` | System-wide text selection event stream (Windows UIAutomation only). |
+| **JS Execution** | `example_js_execute_command` | Executes JS code via QuickJS (depends: `interpreter.js` capability of `agentxx_javascript_engine`). |
+
+Tool Characteristics:
+- **Automatic Compaction**: Compresses summaries when tool outputs exceed `toolcallSummaryLimitOutputLength` (default 2K) and the tool enables `autoSummaryOutput` (original text offloaded via share_store); tools that come with their own pagination parameters do not enable it (e.g. `agentxx_filesystem_read` with `line_offset`/`line_limit`: the caller decides how many lines to read, the result is returned as-is); tools that crop their own output do not enable it either (the command tools crop stdout/stderr separately to 30k characters so the `[ExitCode]`/`[StdOut]`/`[StdErr]` structure stays intact).
+- **Lazy Loading**: Plugin tools register on demand; `XXToolBase::canDelayLoad` flags deferrable tools (default true), injecting only names into the system prompt initially.
+- **Argument Self-Healing**: `ToolcallWrapNode::autoFixArgsType` auto-corrects argument types against JSON Schema (string↔array/number/boolean coercion), improving model compatibility.
+- **Repeat-Call Guard**: Tools enabling the check prompt the user via the interrupt channel when identical calls repeat consecutively within one LLM↔tool chain up to `toolcallRepeatCheckThreshold` (default 5, 0=disabled) to prevent infinite loops; the chain resets on a new user turn. Built-in tools opt in via the `XXToolBase::repeatCallCheck` constructor argument; plugin tools opt in via the registration flag `AGENTXX_PLUGIN_TOOL_FLAG_REPEAT_CALL_CHECK` (off by default; currently enabled for `agentxx_filesystem` read/list/glob/grep/write, `agentxx_planning`, `agentxx_string_html_to_markdown`, and `agentxx_get_current_datetime`).
+- **Deduplication**: Filesystem tools integrate with `SummarizationToolHandle`, pruning older duplicate call results.
+- **Context Repair Optimization**: `ModelCallWrapNode::repairMessages` automatically validates and fixes message structure (coalescing consecutive same-role messages, normalizing tool_call/tool_result pairing) with minimal copying overhead.
+- **Event-Driven Cancellation**: Subprocess tools (e.g. `agentxx_execute_command`) integrate with the framework's centralized `CancelRegistry`, delivering millisecond-level instant termination of process groups and IO pipes rather than relying solely on polling loops.
+- **MCP Extensibility & Resilience**: Connects to external MCP Servers via MCP Client, dynamically registering remote tools over HTTP SSE and stdio transports (namespace-prefix isolation; whole tool-call timeout defaults to 120s and can be set through yaml `mcp.list[].timeout`, while internal fixed timeouts are 60s per request and 10s for initialization); failed components are uniformly recorded in `appendComponentInfo.failedComponents` for client UI diagnostics.
+
+### Git Worktree Mode (YAML `worktree.enable`, Disabled by Default)
+
+Enabling registers the `agentxx_git_worktree` tool (`agentxx::tools::GitWorktreeTool`). Design goal: Multiple agent sessions started within the same repository directory develop in isolated worktrees simultaneously without mutual interference (inspired by Claude Code `--worktree` / `EnterWorktree` layered isolation design).
+
+- **Tool Operations**: `create` (create + bind) / `info` (list + current binding) / `status` (uncommitted changes & unmerged commits summary) / `remove` (delete; the sole deletion entry under the default retention policy).
+- **Bind on Creation**: A successful `create` writes directly to `Session::WorktreeBinding` (`{repoRoot}/.agentxx/agent/worktrees/{name}`, branch `agentxx/wt-{name}`, based on `base_ref` defaulting to current HEAD). All subsequent relative path resolutions and child process working directories for the session automatically switch to the worktree—ensuring correct behavior is platform-enforced rather than model-dependent. Simultaneously appends `.agentxx/` to `.git/info/exclude` (effective locally without polluting tracked files).
+- **Permission Boundary Enforcement** (Code-level constraint): Binds per-session isolation (`SessionFsIsolation`) into `PermissionMiddleware`: write operations in the main checkout tree are DENIED (reads remain unrestricted), with isolation taking precedence over whitelists and mode defaults. Filesystem tool relative paths resolve against the worktree via `normalizePermissionPath(path, sessionId)`, ensuring stable path-permission synchronization.
+- **Plugin Chain Propagation**: The `agentxx.agent.config` interface table's `get_session_work_dir(host, session_id)` prioritizes worktree bindings (empty falls back to the default session workdir). Filesystem and execute_command plugins resolve paths dynamically per invocation using injected session IDs rather than static initialization caches.
+- **Subagent Inheritance**: When `AgentHost` derives subagents, they inherit parent session worktree bindings (subagent `config.workDir` is preset to the worktree path with `inheritedWorktreePath` flag set). Permission Ask default rules and all toolchains automatically target the inherited worktree.
+- **Lifecycle Management**: Worktrees are preserved under a keep policy and do not auto-delete on session termination. Deletion via `remove` runs dual-layer safety checks (uncommitted changes, untracked files, unmerged commits); if work artifacts exist, deletion is rejected with instructions to commit first, requiring `force=true` to override.
+- Git underlying encapsulation: See `agent/third_party/cxx_utilxx/include/utilxx/worktree.h` (direct argv execution bypassing shells, terminating entire process group on timeout; tested in `worktree`).
+
+### Middleware System
+
+Stacked middleware architecture intercepting execution before and after Graph node runs:
+
+| Middleware | Function |
+|---|---|
+| **PermissionMiddleware** | Tool execution authorization via EventBus requesting user decisions (HITL). Filesystem rules use longest-prefix matching with `*` wildcard support: rules on `/data/projects` apply to all nested children with fallback to parent chain rules (see `XXRouter::get`'s `prefix_fallback`). Default behavior governed by YAML `permission.mode` (Ask = ALLOW in workDir + INTERRUPT elsewhere / AllAsk = all INTERRUPT / Pass = all ALLOW / Deny = all DENY). Whitelists always allow; blacklists always deny (blacklists take priority on collision); `noRuleOperator` provides final fallback. Clients can select "remember this choice": the permission card is rendered from a declarative UI descriptor (see [interrupt_ui.h](/agent/lib/include/agentxx/middlewares/interrupt_ui.h) and the preset template `preset::permissionCard`); the checkbox value is returned as `values.remember` in the interrupt result and the permission handler registers the path rule on the agent side (the client holds no permission semantics). |
+| **SkillMiddleware** | Progressive discovery and loading of skill definitions (`SKILL.md`). |
+| **MemoryFileMiddleware** | Reads and caches context memory files; content is appended to the end of the system message (stable prefix, so upstream KV/prefix caching can hit it). |
+| **SummarizationMiddleware** | Token tracking and automatic context compaction, preventing model window overflow. |
+| **SubagentManagerMiddleware** | Subagent delegation management: owns the `SubAgentManagerTool` singleton (`agentxx_subagent`), injecting it for models per YAML `subagent.enable`; the `service.subagent.execute` bus service stays registered (for internal paths like context compaction). |
+| **AgentHost** | Process-level agent host: Registers root agent and subagents as equal peers (`AgentNode`), spawning independent agents for subagent execution, serving `service.subagent` on both root and child global buses (flattening nested and root delegations into identical paths), enforcing depth and concurrency budgets, routing inter-agent messages via `HostBus`, and handling lifecycle cleanup. |
+| **EventBridge** | Translates internal GraphEngine events into strongly-typed EventBus events. |
+| **LogPrint** | Debug logging middleware (conditionally compiled, log levels controlled by configuration). |
+
+### Event System
+
+- **EventBus**: Strongly-typed event bus supporting unidirectional event streams (`EventStream<T>`) and request-response streams (`RequestResponseStream<Req, Resp>`).
+- **Event Topics**: Organized under `Topic` namespace constants covering `agent.*`, `service.*`, and `io.*`.
+- **Subscription Model**: Supports permanent subscriptions and self-expiring subscriptions with hit limits (`execHit`).
+- **HITL (Human-in-the-Loop)**: Interrupt and permission requests are dispatched to client UI via `RequestResponseStream`, supporting configurable timeouts.
+- **Timers**: EventBus provides built-in timer streams supporting both one-shot (`once`) and periodic (`repeat`) modes.
+
+### Multi-Session & Concurrency
+
+- **Session Isolation**: Each `sessionId` maintains an isolated `Session` (mapped to `thread_id` in Graph context), encapsulating IO, EventBus, ContextStats, CancelToken, model selection, and message history.
+- **SessionsManager**: Manages sessions by `sessionId` (accessed exclusively by the agent `io_context` thread, lock-free); `SessionStore` specifically refers to the attached SQLite persistence backend.
+- **Single Checkpoint Storage**: Engine utilizes `InMemorySingleCheckpointStore` (inheriting from `SingleCheckpointStore` strategy base class, with template method `save = saveImpl` persisting latest and `evictImpl` pruning history). Agentxx relies only on `load_latest` checkpoints and attached pending writes for resume/interrupt recovery, eschewing forks or historical travel (`get_state_history`). Retaining only the latest checkpoint per thread drops storage overhead from O(super-steps) to O(threads) with zero turn-end pruning needed.
+- **Activity States**: `Idle`, `Streaming`, `ExecutingTool`, `WaitingInput` (currently `ExecutingTool` and `Idle` are logged by `LogPrint`, while `Streaming` and `WaitingInput` are reserved; client activity awareness is driven via Delta event streams).
+- **Chained Hashing**: `viewMessages` consistency is verified using FNV-1a chained hashes.
+- **Thread Binding (Single-Thread Read/Write)**: Sessions bind to the IO thread via `bindIoThread()`; `assertIoThread()` enforces that mutable state (`viewMessages`, `llmMessages`, `chainHash`) is accessed solely on the IO thread. Clients and UI never read this memory directly, receiving wire-transferred copies (Sync / Delta) instead, obviating snapshot locks.
+- **Cancellation & Model Switching**: Client-initiated cancellations and model switches are dispatched to the agent thread via Wire messages (`WireCancel`, `WireSelectModel`), preventing cross-thread race conditions.
+- **Asynchronous Mutex**: `AsyncMutex` provides coroutine-aware mutual exclusion using asio `concurrent_channel`, suspending without thread blocking across `co_await` boundaries.
+
+#### Session SQLite Persistence (Messages Context / viewMessages / share_store)
+
+- Toggle: `AgentConfig::enableSessionStore` (disabled by default; enabled by `agentxx_cli` in `buildDefaultConfig`). When enabled, `BaseAgent` instantiates `SessionStore` and injects it into `AgentContext` (`AgentContext::sessions->sessionStore`; requires non-empty `dataDir` or explicit `sessionStoreDirectory`, otherwise falls back to memory-only with startup warning):
+  - Recovers and persists session message state (attached via `SessionsManager` when creating a Session).
+  - Supplies `MiddlewareContext` construction parameters (write-through share store).
+- Data Directory: `{dataDir}/sqlite/sessions/{sessionId}/` (`sessionId` is sanitized via `sanitizeSessionId` to replace illegal characters, truncate length, and avoid Windows reserved names, appending an FNV hash suffix on collision; `dataDir` configured by YAML `data_dir`; **if neither dataDir nor sessionStoreDirectory is set, persistence is disabled** and settings, sessions, and codegraph indices remain in-memory only).
+- Single-Database Design (single `session.db`, four tables, WAL + `busy_timeout`):
+  - `view_message` table: `viewMessages` (append-only, one JSON line per message).
+  - `llm_context` table: `llmMessages` (single-row whole-table replacement).
+  - `meta` table: `msgIdCounter` / `title` / `lastActiveMs`.
+  - `store` table: `agentxx_share_store` KV entries (auto-incrementing ID = current max ID + 1, continuing across restarts; memory caches only the few most recently used entries, the rest are read by ID) — sharing the session lifecycle (created/removed with the session), written on the same IO thread and serialized by mutex.
+- Integration Points:
+  - `SessionsManager::getOrCreate`: Recovers `viewMessages`/`llmMessages`, rebuilds chained hashes, restores `msgIdCounter`, and binds `SessionStoreHooks` (`std::function` callbacks decoupled from SQLite headers).
+  - `Session::appendViewMessage` / `updateViewMessage`: Appends and backfills are persisted via a throttler (messages + counter committed transactionally; updates modify matching rows by `msg.id`, such as `toolFinished`/`toolResult`/`collapsed`, keeping on-disk history aligned with memory).
+  - **Persistence Throttling** (`Session::kPersistThrottleMs` = 3s): First trigger flushes immediately; subsequent triggers within the window are coalesced (view operations are queued in order, while LLM context updates memory only), converging on the next trigger or turn end. If a process is terminated mid-turn (e.g. killed via taskkill), at most one throttling window (<3s) of settled messages is lost, avoiding empty LLM context anomalies.
+  - `EventBridge::handleChannelWrite`: Channel writes signify settled LLM context batches (completed assistant turns / tool outputs, rather than streaming tokens), appended via `Session::appendSettledLlmMessages` and triggering throttled persistence.
+  - `BaseAgent::runTurnAsync`: Persists authoritative final `llmMessages` at turn end and flushes unwritten `viewMessages`.
+  - `MiddlewareContext` Share Store Methods (get/set/add): The session database `store` table is the single source of truth; memory keeps only a small LRU cache (`SessionShareStore::kCacheCapacity` = 3) of the most recently used entries per session. The first access to a session reads back only the auto-increment id counter `max(id)` instead of the whole content (memory usage is independent of the number of stored items); a cache miss reads the entry from the database and fills the cache, and writes go through to the database synchronously and update the cache. An id greater than the auto-increment id (never allocated) is rejected with an invalid-argument error, and entries can no longer be deleted. Without injected persistence (`persistence_` empty) there is no database to read back from, so every entry stays in memory (no eviction), matching the behavior before the split.
+- Fault Tolerance: Database write failures log errors without interrupting conversational flow (best-effort persistence). Reads against non-existent directories return empty results without creating empty directories or files.
+- Thread Safety: Internal mutexes protect `SessionStore`; under standard usage, invocations occur on the agent IO thread.
+
+#### Session Switching (TUI Session Selector Modal)
+
+```
+TUI [F3] opens Session Selector Modal → WireListSessions (blocking I/O offloaded to blockingPool)
+  → Server returns WireSessionList (persisted sessions sorted descending by lastActiveMs)
+  → User confirms → WireSwitchSession(newSessionId)
+  → SessionServerAgentIO::switchSession:
+      Rebinds config_.sessionId → Clears delta replay buffer (new session uses independent seq numbering)
+      → Resets firstTurn_ (first input takes resume_if_exists=true restoration path)
+      → Pushes new session Sync (tail-window paginated by initialSyncTailCount; 0=full)
+        + WireModelInfo + WireContextStats
+  → Client (TUI) updates local sessionId binding; in WS mode, concurrently calls
+    transport->updateReconnectSessionId() (resets reconnect handshake sessionId/lastSeq/tailHash)
+```
+
+- Allowed only when no active turn is executing (guarded on client and server).
+- New session history is restored from `SessionStore` (or initialized empty if non-existent).
+- Data source: Directory scan of `{dataDir}/sqlite/sessions/` + `meta` table (`sessionId`, `title`, `lastActiveMs`).
+
+#### Subagent Execution Pipeline (NodeInterrupt → Bus Dispatch → Host Spawns Independent Agent)
+
+```
+Parent Agent LLM calls agentxx_subagent (single task = tasks array with 1 item, batch = multiple tasks)
+  → SubagentManagerMiddlewareHandle (independent middleware owning SubAgentManagerTool singleton;
+    injects agentxx_subagent into tools based on AgentConfig::enableSubagent; bus service always registered)
+      → SubAgentManagerTool::execute_async
+          → Validates parameters (valid subagent name + message/messages provided)
+          → MiddlewareContext::requestInterrupt: saves interrupt args ({tasks: [...]})
+            into graphData, throws NodeInterrupt → engine checkpoint pauses parent graph
+  → AgentRunner (unified interrupt loop shared by root agent and subagents):
+      → Parses interrupt args in graphData, dispatching by handle name:
+        - "subagent" interrupt (unified batch semantics): parses ReqSubagentBatch
+          (shared parseSubagentBatchFromInterrupt), requests delegation via local bus service.subagent
+        - Other interrupts (permission prompts, etc.): requested via session bus service.interrupt,
+          timing out per IO endpoint interruptTimeout; root agent inserts MessageTip header
+  → AgentHost::spawnBatch → spawnOneTask:
+      → Spawns an "independent agent" per task (isolated AgentContext / engine / SessionStore /
+        middleware stack), registered as equal peer (AgentNode). Configured as lightweight subagent:
+        no MCP connections / no plugins / no RAG / no CodeGraph, no parent Skill/Memory injected,
+        no persistence, defaulting to configured subagent model
+      → Host enforces nesting depth (maxDepth) and concurrency limits (maxConcurrentSubagents)
+      → After subagent construction, host serves service.subagent on its global bus:
+        subagent-scoped "subagent" interrupts (nested delegations) route via this bus,
+        sharing identical paths with root delegations (flat delegation, no nested direct host calls)
+      → HITL bubbling: subagent sessions inherit parent session IO and bus (permission/prompts reach user);
+        parent session looked up from parent agent (parentAgentCtx) SessionStore (resolves to immediate parent)
+      → Driven by same AgentRunner interrupt loop (no checkpoint persistence / no MessageTip)
+      → Cancellation propagation: parent cancellation cascades to subagent (engine run cancelled)
+      → Progress reported via hostBus agent.progress; completion notified via agent.done
+      → On completion (success/error/cancel), host immediately reclaims AgentNode: session and middleware
+        states are freed alongside AgentContext destruction, preventing thread-accumulated leaks
+  → Results written back to graphData via interruptResult channel
+  → AgentRunner resume_async resumes parent graph; execute_async extracts results keyed by
+    (tool_call_id + "_") + (result_id | task_index) (plain text for single task, JSON array for batch)
+```
+
+- Subagents are fully independent agents: Isomorphic to root agent (`AgentNode`), message contexts are completely isolated.
+- Single unified interrupt implementation (`AgentRunner`): Shared between root and subagents, with behavioral differences parameterized via hooks (checkpoint persistence / interrupt headers / event callbacks / pre-and-post resume logic). Delegation timeout is unlimited, preventing premature 30s timeouts on long tasks.
+- Shared resume key generation: `(tool_call_id + "_") + (result_id | task_index)` is centralized in `makeSubagentResumeKey` / `buildSubagentResumeValues`, eliminating collisions during concurrent multi-task runs.
+- Subagent tool injection and bus registration are decoupled from context compaction (which invokes `service.subagent.execute` directly).
+- Cleans up interrupt args in `graphData` once resolved, preventing redundant processing.
+- Cross-agent messaging (`agent.message`): Routed via local mailboxes or forwarded to remote agents via A2A bridge (`registerRemoteAgent`).
+
+### Remote Communication
+
+- **WebSocket Service**: `AgentServer` provides WebSocket services with token authentication.
+- **Wire Protocol**: Bidirectional JSON message protocol (Hello, HelloAck, UserInput, Cancel, SelectModel, GetModel, Delta, Sync, InterruptRequest, InterruptResponse, InterruptExpired, TurnResult, ContextStats, Error, Log, ModelInfo, GetAppendComponentInfo, AppendComponentInfo, GetContext, ContextMessages, Ping, Pong, CompactContext, ListSessions, SessionList, SwitchSession, GetViewMessages, ViewMessagesPage, ClearMessageQueue, RemoveQueueItem, InterruptAndRunNext, MessageQueueUpdate, PluginData, PluginDataUp, ListDir, ListDirResult, GetPermissionState, SetFullAuth, PermissionState).
+  - Queued message management: Active turn queues are maintained per session by the server and synchronized via `MessageQueueUpdate`. Clients can remove individual items (`RemoveQueueItem`), clear the queue (`ClearMessageQueue`), or interrupt the active turn to immediately run the front queue item (`InterruptAndRunNext`).
+  - Plugin events are forwarded transparently via `PluginData` (agent→client downlink) and `PluginDataUp` (client→agent uplink).
+  - Two server-state query groups: `ListDir` / `ListDirResult` list a server-side directory (data source for cross-device attachment selection; the scan runs on the server thread pool and paths are UTF-8 on both sides) and `GetPermissionState` / `SetFullAuth` / `PermissionState` query and toggle "fully authorize all permissions" (the permission middleware on the server owns the state, clients only mirror it; after a toggle the server broadcasts the new state to every attached endpoint).
+- **Uplink Multimodal Attachments**: `UserInput.attachments` carries the attachment list (fields in [wire-protocol-fields.md](wire-protocol-fields.md)); the server validates size (image 10MB / audio 25MB / video 50MB) and count (<=5 per message) before accepting, and rejects oversize input with `InputAck{status:"rejected", reason:"attachment_too_large"|"too_many_attachments"}` plus an `Error{code:4}`. An attachment's `dataUrl` is used as-is; when only `pathOrUrl` is given (a server-side file picked on another device) the server reads and encodes it itself.
+- **Automatic Reconnection**: Clients reconnect automatically with `lastSeq` for incremental Delta replay; reverts to full `Sync` if `seq` continuity is broken.
+- **History Pagination (viewMessages Tail-Window Sync)**: On long session recovery, the server initially syncs only a trailing window (`SessionServerAgentIO::Config::initialSyncTailCount`, local TUI mode = 100, remote configured via `AgentServer::Config`, 0 = full). `SyncPayload.fromIndex` specifies the window's starting absolute index, and `totalMessages` reports total session message count. When the client (TUI) scrolls near the top of the loaded window, it sends `GetViewMessages(beforeIndex, count)` to paginate older history, which the server returns via `ViewMessagesPage(startIndex, totalCount, messages)`. Since `viewMessages` is append-only, absolute indices are immutable and race-free. On the TUI side, prepended items invoke `LazyScrollable::notifyPrepended` for scroll anchoring (existing item layout caches/heights shift seamlessly, compensating view offsets by the prepended height so the visible viewport remains completely stable).
+- **Grace Period**: Keeps sessions executing during disconnections, preventing accidental cancellations of active turns.
+- **In-Process Direct Connection**: `ChannelAgentIOTransport` provides zero-serialization Channel transmission, directly linking client and agent in single-process mode.
+- **Transport Layer Abstraction**: `AgentIOTransportBase` offers a unified `connect/recv/send/close/alive` interface, hiding network transmission details.
+
+### Protocol Support
+
+| Protocol | Role | Description |
+|---|---|---|
+| **OpenAI API** | Client | Compatible with OpenAI Chat Completions API (streaming / non-streaming), supporting thinking / reasoning_content. |
+| **Anthropic API** | Client | Anthropic Messages API, supporting extended thinking and tool_use. |
+| **MCP** | Client + Server | Model Context Protocol, supporting multi-version negotiation (2024-11-05 to 2026-07-28) over HTTP SSE + stdio transports. |
+| **A2A** | Client + Server | Agent-to-Agent protocol v1.0, managing tasks (SendMessage, GetTask, CancelTask, ListTasks). |
+| **ACP** | Server | Agent Communication Protocol in stdio service mode. |
+
+### Client UI
+
+- **TUI Mode**: FTXUI-based terminal interface featuring:
+  - Message list supporting User, Assistant, Thinking, Tool, System, and Interrupt roles.
+  - Automatic folding/expansion of Thinking and Tool blocks (expanded while executing, folded upon completion; a Thinking stream the user manually expanded stays expanded when committed).
+  - Interactive click-to-fold/expand: Clicking finalized messages toggles `msg.collapsed`; clicking the tail Thinking block during active streaming toggles the shared override state (`TUIRenderState::streamThinkOverride`, cycling: unset follows TailThinkingMode / folded / expanded). The override is scoped to the current stream: a manually expanded thinking stream stays expanded once committed (`pushCurrentTokenLocked` derives `msg.collapsed` from it, so the end of thinking no longer folds it back), and it resets to -1 on commit / new stream start so the next thinking round follows the configured default (it lives in the shared state because the commit happens on the client thread and has to read the UI thread's click). Hit areas are mapped from the previous frame's `visibleBoxes` (`collapsibleBoxes_` + `collapsibleIsStream_`).
+  - Real-time streaming token rendering with Copy-on-Write (COW) semantics, preventing O(n²) string accumulation.
+  - Declarative interrupt-prompt rendering (generic mechanism; the TUI holds no specialization for any prompt type, including permission): the agent side declares the header segments and an **ordered block list** in `InterruptHandleArg.ui` (schema: [interrupt_ui.h](/agent/lib/include/agentxx/middlewares/interrupt_ui.h)); the client `InterruptView` implements rendering, height estimation, hit areas, interaction and result assembly:
+    - **One interrupt request = one message = one form**: the descriptor may contain multiple control blocks and the user submits all values at once; the descriptor is **self-contained** (no other message fields are read by the client).
+    - **Content blocks compose freely** (custom rendering): `text` (style/indent/hard-wrap) / `markdown` (rich text rendered with the client markdown renderer; line-based front-ends print the source) / `diff` / `separator` / `gap`; the reserved `custom` block (component + props) renders its `fallback` text until client-side component renderers exist.
+    - **Control blocks declare their interaction form** (`control`): `buttons` (option buttons; `commitOnPick` submits on click) / `select` (vertical single-choice list) / `checkbox` / `text` / `number` (`integer`/`min`/`max`/`step`). Validation failures show a tip under that control and block submission; the keyboard acts on the most recently clicked control. **There is no "parameter type" (bool/int/enum…) concept in the protocol** — producers that want a "typed inputs + confirm" form generate the descriptor with the preset templates ([interrupt_presets.h](/agent/lib/include/agentxx/middlewares/interrupt_presets.h): `preset::inputForm` / `permissionCard` / `confirmCard`).
+    - The result is **always an object** `{"values": {"<control id>": value}}` (checkbox=bool / number=number / buttons & select=raw option value / text=string); an empty object means "not answered"/cancelled. Permission's "remember this choice" is a checkbox control (id `remember`); the **rule is registered agent-side** (the permission handler consumes `values.remember`), the client holds no permission semantics.
+    - The descriptor is **required** for client HIL interrupts (producers build it with presets or hand-assembled blocks); interrupts handled by the host through the bus and never rendered by a client (e.g. subagent delegation) may keep it empty. A missing/invalid descriptor is a contract error (diagnostic line, non-interactive); unknown block kinds are ignored/degraded (forward compatible); **no backward compatibility is retained**.
+    - Hit areas are keyed by **block index** + control id + sub index; rendering and estimation are single-sourced: one layout pass (row model) yields both the elements and the row count, avoiding layout/estimate drift (see [interrupt_view.h](/agent/client/include/agentxx-client/io/tui/components/interrupt_view.h)); content blocks share one implementation with the plugin tool-decor items ([ui_components.h](/agent/client/include/agentxx-client/io/tui/ui_components.h)).
+  - Permission card with "Remember this choice" (declarative interrupt UI descriptor; the checkbox value is returned as `values.remember` and the rule is registered agent-side).
+  - Runtime model selector dialog.
+  - Right-hand sidebar (Log console, Information panels, Planning visualization).
+  - Pending user input queue: Inputs submitted during active turns queue up and dispatch automatically when the turn finishes. Synchronized via `MessageQueueUpdate`, supporting single item removal, full clear, and immediate interruption execution ("insert" button via `WireInterruptAndRunNext`).
+  - Deferred model application: Confirming a model change in the selector dialog does not switch immediately; it attaches to the next user message (`WireUserInput.model`), applying automatically when the agent starts the next turn (mirroring remote `--model` parameter behavior); immediate switching remains available via `WireSelectModel`.
+  - Multimodal file input (yaml `models[].image_input/audio_input/video_input`):
+    the `[+ Attach]` button appears at the input bar only when the current model supports
+    any multimodal input (no hotkey; mouse click opens FilePickerOverlay via `modal_->pushModal`);
+    the picker filters by model capability (images png/jpg/jpeg/webp/gif/bmp; audio
+    wav/mp3/ogg/m4a/aac/flac; video mp4/mov/webm/mkv; non-media hidden,
+    unsupported types dimmed and unselectable) with directory navigation
+    (Up/Down + Enter + Esc + mouse; the picker is a pure navigation list without
+    a filename filter input).
+    - **Same device**: the client reads the file and Base64-encodes it as an RFC 2397 Data URL,
+      mounts it to the attachment tray after size pre-check (image <=10MB / audio <=25MB /
+      video <=50MB / <=5 per message, oversize rejected via toast), and sends it with text via
+      `WireUserInput.attachments`; the server queues attachments and assembles them into
+      ChatMessage image/audio/video_urls for providers; the message list renders attachment
+      cards (click opens via system viewer, remote dataUrl is spooled to a temp dir first);
+      SQLite persistence strips dataUrl keeping only metadata; context compaction downgrades
+      old attachments to plain-text tags.
+    - **Cross device** (remote mode and client/server run on different devices): the picker adds
+      "local / server" tabs on top (Tab key or click; the tabs are not rendered on the same
+      device, so they cannot be hit there). The server tab lists **server-side** directories via
+      `WireListDir` / `WireListDirResult` (paths are UTF-8 on both sides; the scan runs on the
+      server thread pool and never blocks the agent io thread; the initial directory is the
+      server session work dir carried by HelloAck). Picking a server file builds an attachment
+      with `pathOrUrl` only (no base64), so large files are not relayed through the client:
+      the server reads and encodes the file itself before calling the provider. Device identity
+      comes from HelloAck's `serverDeviceId` (32-char MD5) compared with the client's own id;
+      the in-process direct mode is always "same device".
+  - File edit diff comparison rendering.
+  - Mermaid stateDiagram-v2 state machine rendering (renders ```mermaid blocks in messages, and Plan dialog roadmap state diagrams).
+  - Context token utilization status bar.
+  - Theme switching (persisted to `{dataDir}/sqlite/global.db`).
+  - Flat (surface-based) modal style: No borders or divider lines - title bar, content
+    area and bottom hint bar are told apart purely by background colors
+    (`surfaceHeaderColor` / `surfaceColor` / `surfaceFooterColor`; error modals use
+    `surfaceErrorHeaderColor` with error-colored title text), while `surfaceScrimColor`
+    fills the screen behind an open modal.
+  - Flat (+ corner) modal frame with built-in padding: A modal is a filled rectangle whose four
+    corners are drawn with "+" markers (the marker cell takes the body color as foreground and the
+    outside color as background; each marker spans 2 columns - the "+" plus its adjacent blank) and the
+    frame itself provides all spacing - 2 cells of padding on every side plus 1 blank row between
+    the title bar, content area and bottom hint bar, so titles and content rows carry no padding
+    of their own (translation entries no longer include decorative spaces either). Modals are
+    centered at their natural size; when the height is constrained the content area absorbs the
+    extra rows. Frame helpers live in
+    [surface.h](/agent/client/include/agentxx-client/io/tui/surface.h)
+    (`TuiSurfaceStyle` + `tuiSurfacePopup`/`tuiSurfaceFrame`), palette tokens in
+    [tui_theme.h](/agent/client/include/agentxx-client/io/tui/tui_theme.h).
+  - Session selector modal (F3): Lists persisted sessions (`WireListSessions`, keyset cursor pagination ordered by most recent activity), switching via `WireSwitchSession`, with server pushing new session Sync (tail-window paginated), model info, and context statistics.
+  - Settings modal: Items are grouped (Interface / Display / Update / Other) and the content area is height-capped and scrollable
+    when the terminal is too short (the selected item scrolls into view automatically; the wheel moves the selection).
+    The "Update" group holds the "check on startup" switch and a "check now" item; the "Other" group holds a "keybinds"
+    item showing the number of registered keybinds and opening a read-only list modal.
+  - Info sidebar footer (three lines): work directory line (`{dir} [ authorization button ] {abs path}` — the button shows and
+    toggles the current "fully authorized / ask" state; the state belongs to the agent-side permission middleware and the
+    client only mirrors it: initial value from the handshake/query, corrected by server broadcasts), an
+    `Agentxx <version> · connection` line, and (when a newer release exists) an update notice line that copies the release URL.
+  - Update check (optional): queries the GitHub Release three seconds after startup (`/releases/latest`, reading the 302
+    `Location` or JSON `tag_name`, 8-second timeouts, failures only logged) and only reports when the latest version is
+    greater than the compiled version; controlled by the `tui.checkUpdateOnStartup` setting. A manual check from the settings
+    item reports through a modal (new version) or a toast (already latest / failed).
+  - Paginated history loading: Restoring long sessions initially renders only the server's trailing window (100 items locally). Scrolling upward automatically paginates older history via `WireGetViewMessages`, anchoring scroll position stably until reaching session beginning (`historyWindowStart=0`).
+  - Connection status banner: Displays server-io connection states (Connecting / Failed with clickable [Retry] button / Connected). Local mode is set ready prior to `SessionServerAgentIO` driver loop; remote mode is driven via `mode_runners` connection coroutines (`TUIRenderState::connState`).
+  - Step-by-step startup progress banner: Initialization phases in `server-io init()` (model registry, middlewares, loading MCP/RAG/plugins — plugin loading includes runtime environment probing for python/node and PowerShell) report via `AgentContext::initNotifier` → `AgentIOBase::onServerProgress`. The banner dynamically reflects the active startup task, switching to keyboard shortcuts once ready.
+  - Top-of-screen toast notifications.
+  - Mouse drag-selection copying: Left-click drag and release copies text to the system clipboard (Win32 API on Windows, OSC 52 escape sequences on Linux/macOS subject to terminal support, confirmed via toast).
+  - Auto-scroll lock to bottom (`Scrollable` component).
+  - System resource metrics (CPU/RAM) & CodeGraph indexing status: Rendered via client-side plugin extensions (`agentxx_system_monitor` sidebar Info section + `/sysinfo` command / `agentxx_codegraph` Info section). Sampling and scheduling occur within plugins (`agentxx_system_monitor` samples periodically on agent side, publishing usage events forwarded to client plugins via `WirePluginData`). TUI core never initiates resource requests or parses plugin-specific payloads.
+  - Info panel Context section: the first section of the sidebar Info tab content area shows the
+  session's **cumulative** token usage (used / cached / input / output + cache hit rate); the
+  Append section (loaded components) and plugin Info sections follow it. The numbers arrive with
+  `WireContextStats` (the server sends the running totals each time, the client overwrites its
+  copy). This is not the same quantity as the status bar's context occupancy — the latter falls
+  back after compaction; the client shows "( no data )" until the server has reported any usage.
+- Plugin Info section injection: Client plugins inject custom sections (title + items conforming to panel schema) into the sidebar Info tab via `register_info_section`, rendered below the component list directly from client plugin registry snapshots.
+- **Modular TUI Rendering**: Message list, sidebar, overlays, and diff tools are cleanly split into dedicated source files.
+- **LazyScrollable (Flutter ListView.builder Paradigm)**: Message lists use a lazy virtual rendering architecture—describing lists via `itemCount`, `itemKey`, `estimateHeight`, and `buildItem` callbacks. Only viewport-intersecting children are constructed, laid out, and painted. Constructed children are cached in a bounded LRU cache (budgeted by both item count and source byte size), purging off-screen messages to decouple memory consumption from conversation length. Off-screen items utilize estimated heights, updated with measured heights upon entering view. Cache invalidation keys leverage message pointers combined with cheap O(1) mutations (`TUISharedState::mutableMessage`), avoiding expensive per-frame full-text hashing. Two-phase layout: builds and measures visible children (correcting estimated total heights) before calculating unified positioning, eliminating 1-line layout jitter during token streaming.
+- **TUILogSink**: Diverts `XX_LOG` output directly into the TUI right-hand log panel.
+- **CLI Mode**: Streamlined stdin/stdout terminal interaction.
+
+### Training System
+
+- **Evolutionary Training**: `EvolutionTrainingAgent` powers autonomous prompt optimization:
+  - Mutation Strategies: Character-level random mutations (UTF-8 codepoint safe) + LLM-generated mutations; pre-deduplication before offspring evaluation.
+  - Evaluation: Evaluates test suites supporting exact matching and LLM-assisted grading; test cases are randomized to avoid early-termination bias; single-case failures score 0 without halting training; evaluation sessions are immediately cleared (preventing memory/SQLite accumulation).
+  - Optimization: Feedback-driven LLM prompt patch generation; patches normalize and filter empty fields ("" indicates keep unchanged), preventing accidental prompt clearing.
+  - Elite Re-evaluation: Top N elites are re-evaluated each generation with Exponential Moving Average (EMA) smoothing (`PromptVariant.smoothedScore`), mitigating LLM grading noise in ranking and convergence checks.
+  - Convergence Detection & Deduplication: Hash checks followed by full field comparisons prevent collision misdeletions.
+  - Cancellation Support: Inspects `cancelToken` across generation and test case boundaries, saving progress for graceful termination (train mode handles SIGINT/SIGTERM via `asio::signal_set`, with repeated Ctrl+C triggering hard exits).
+  - Persistence: Atomic saving (temporary file + rename) with backup rotation; empty population archives are rejected.
+- **Training Configuration**: Supports independent models for training, scoring, and optimization; scorers and optimizers utilize lightweight `BaseAgent` instances (no toolchains), while the training agent runs full `CodeAgent`.
+
+### Extension Capabilities
+
+The following capabilities have been decoupled from the core library into standalone plugins under `agent/plugins/` (configured via YAML `plugins`; see `plugins.md`):
+
+| Module | Description |
+|---|---|
+| **ScreenCapture** | Screen capture and streaming (multi-monitor support; plugin `agentxx_screen_capture`, Windows only). |
+| **AudioStream** | System audio, microphone, and application audio stream capture (plugin `agentxx_audio_stream`, skipped on all platforms: implementation not enabled). |
+| **TextSelectionMonitor** | System-wide text selection event listener (plugin `agentxx_text_selection_monitor`, Windows UI Automation only). |
+| **CpuGpuMonitor** | CPU, RAM, and GPU utilization inspection (plugin `agentxx_system_monitor`: PDH/DXGI on Windows, `/proc` + sysfs on Linux/Android, mach `host_statistics` + IOKit `IOAccelerator` on macOS; tool + periodic sampling + client rendering). |
+| **CodeGraphManager** | Code indexing and symbol analysis based on `codegraph-cpp` (plugin `agentxx_codegraph`): Indexing scope configured via plugin args in YAML `plugins` (`paths` directory list, defaulting to current working directory if empty; `ignore_paths` with wildcard support; `use_gitignore` respecting `.gitignore` rules, `.gitmodules`, and `.git`). Traversal prunes ignored subtrees immediately, and filesystem watchers apply identical filters. SQLite indices reside at `{dataDir}/sqlite/codegraph/<hashed_path>/index.db`; skipped if `dataDir` is unconfigured. |
+
+### Dependency Injection
+
+- **DependencyContainer**: Lightweight DI container supporting registration and resolution by type and name.
+- **Factory Methods**: Supports factory function registrations returning `std::any`.
+- **Singleton Management**: Defaults to lazy initialization, resolving circular dependency risks.
+- **Named Registrations**: Supports multiple named dependencies under the same type.
+
+---
+
+## Usage Guide
+
+### Compilation
+
+```bash
+# Linux Debug
+bash agent/script/linux_debug_build.sh
+
+# Linux Release
+bash agent/script/linux_release_build.sh
+
+# Windows Debug
+agent\script\windows_debug_build.bat
+
+# Windows Release
+agent\script\windows_release_build.bat
+
+# Windows Release (Cross-compilation on Linux)
+bash agent/script/cross_windows_release_build.sh
+
+# Android (Cross-compilation on Linux)
+bash agent/script/cross_android_release_build.sh
+```
+
+Compilation artifacts output to the `agent/build/{platform}-{mode}/exec/` directory.
+
+### Running Tests
+
+```bash
+# Run all tests
+path/to/agentxx_test
+
+# Stop immediately upon first failure (fail-fast)
+path/to/agentxx_test --fail-fast
+
+# Run specified test modules only
+path/to/agentxx_test string_util regex agent
+```
+
+Available test modules (matching the registry list in `agent/test/test.cpp`):
+- Synchronous modules: `string_util`, `regex`, `json`, `json_view`, `json_reflection`, `diff_util`, `events`, `concurrency`, `misc_fixes`, `aho_corasick`, `util_misc`, `training`, `settings_db`, `toolcall_args`, `interrupt_ui`, `ui_items`, `ui_kit`, `ffi_c_api`, `plugin_runtime`, `plugin_sdk`, `plugin_bridge`.
+- Synchronous modules (client side, only with `AGENTXX_BUILD_CLIENT`): `config_loader`, `tui_settings`, `update_check`, `tui_input`, `tui_interrupt`, `tui_scroll`, `tui_sidebar`, `tui_context_overlay`, `tui_form`, `tui_stream`, `tui_surface`, `tui_theme`, `tui_tool_header`, `tui_ui_items`, `tui_widget`, `sessionId`, `mermaid_state`.
+- Asynchronous modules: `event_stream`, `event_bridge`, `interrupt_bus`, `subagent_bus`, `subagent_tool`, `agent_host`, `string_tools`, `math_tools`, `share_store`, `session_persistence`, `rag_search`, `datetime`, `filesystem`, `command`, `worktree`, `web_search`, `codegraph`, `screen_capture`, `cpu_gpu`, `text_selection`, `http`, `network_timeout`, `websocket`, `remote_agent`, `mcp`, `acp`, `a2a`, `openai_provider`, `anthropic_provider`, `plugins`, `plugin_resources`, `plugin_multi_instance`, `client_plugins`, `cancel`, `message_supplement`, `summarization`, `checkpoint_store`, `agent`, `memgrowth`.
+- Platform modules: `screen_capture`, `text_selection`.
+
+Test source directory layout: Root (entry `test.cpp`) / `core/` (lib core) / `plugin/` (plugin system & integrations) / `client/` (TUI/CLI, compiled only under `AGENTXX_BUILD_CLIENT`).
+Test headers live under `include/agentxx-test/` in the sub-directory matching their source group (`core/`, `plugin/`, `client/`) and sources include them as `#include "agentxx-test/<group>/test_xxx.h"`—the source directories are no longer include roots, so headers can never clash with same-named files from other libraries.
+Conventions for adding new test modules: Headers contain only function declarations; assertion counters are defined in anonymous namespaces within the module's `.cpp`, with `#define XX_TEST_PASSED g_xxx_passed` / `#define XX_TEST_FAILED g_xxx_failed` mapping assertion macros from `test_framework.h`, returning `TestResult{g_xxx_passed, g_xxx_failed}` at function end—macro overrides or `extern` exports in headers are strictly forbidden to prevent cross-TU macro contamination.
+
+### Configuration File
+
+Configuration files use YAML format (defaults to `{program_cwd}/agentxx-config.yaml`, overrideable via `agentxx_cli --config <path>`). Selected values support `${VAR}` environment variable expansion:
+
+```yaml
+model:
+  list:
+    - name: "my-model"
+      type: "openai"              # "openai" / "anthropic" / "openai-responses"
+      base_url: "https://api.example.com"
+      api_key: "${MY_API_KEY}"    # Resolved from .env or system environment
+      model_name: "gpt-4"
+      api_path: ""                # Custom API endpoint path (e.g. "/v1/chat/completions"); empty uses default
+      send_thinking: false        # Whether to echo thinking/reasoning_content back in context to the model
+      request_reasoning_summary: true # When send_thinking is true, requests reasoning summary from upstream
+                                  # (Responses API include parameter). Gateways like opencode-muse-spark do not
+                                  # support the reasoning.summary_text variant and require this to be false
+                                  # to avoid HTTP 400 errors; can also be overridden via extra_api_config include array
+      ssl_verify: null            # Explicitly toggle TLS certificate verification (true/false); omitted uses default
+      connect_timeout: 16
+      read_chunk_timeout: 60
+      max_concurrent_connections: 5   # Maximum concurrent HTTP connections for this model endpoint (default 5, 0=unlimited)
+                                      # LLM requests use an HTTP keep-alive connection pool: idle connections are reused;
+                                      # excess concurrent requests queue for available connections
+      image_input: false              # Whether image input is supported (multimodal; default false)
+      audio_input: false              # Whether audio input is supported (multimodal; default false)
+      video_input: false              # Whether video input is supported (multimodal; default false)
+                                      # When any is true, the TUI input bar shows a [+ Attach] button;
+                                      # the file picker filters by these types (images png/jpg/jpeg/webp/gif/bmp
+                                      # <=10MB; audio wav/mp3/ogg/m4a/aac/flac <=25MB;
+                                      # video mp4/mov/webm/mkv <=50MB; <=5 attachments per message).
+                                      # The client reads files and transmits them as RFC 2397 Data URL (Base64);
+                                      # on cross-device setups (remote client+server on different devices) the picker
+                                      # additionally offers a "server" tab; picking a server file sends only its path,
+                                      # the server reads and encodes it itself (see "Client UI / multimodal file input");
+                                      # SQLite persistence strips dataUrl keeping only metadata; during context
+                                      # compaction old attachments downgrade to plain-text tags
+      model_context_max_token: 128000
+      extra_headers:              # Additional HTTP request headers (e.g. custom authentication/gateway headers)
+        x-custom-header: "value"
+      extra_api_config:           # Extended configuration merged into request body
+        temperature: 0.7
+      # Max output tokens automatically selects parameter name: standard models send max_tokens,
+      # newer reasoning models (o1/o3/o4/gpt-5) automatically map to max_completion_tokens
+
+  use:
+    default: "my-model"           # Primary model
+    subagent: "my-model"          # Subagent model (falls back to primary if unspecified)
+    web_search: ""                # Model-driven search (empty uses traditional search)
+    acp: "my-model"               # ACP service mode model
+    train: "my-model"             # Training agent model
+    train_scorer: "my-model"      # Training scoring model
+    train_optimizer: "my-model"   # Training prompt optimizer model
+
+mcp:
+  list:
+    - namespace: "my_mcp"
+      url: "http://localhost:3000/mcp"
+      timeout: 120                     # Whole tool-call timeout in seconds (0=unlimited, default 120);
+                                       # internal fixed timeouts: single request 60s / initialization 10s
+
+  # Unified data root directory (leave empty/unconfigured = no persistence: settings/sessions/codegraph
+  # remain strictly in memory and will not survive restarts; supports ~ and ${VAR} expansion, relative
+  # paths resolve against working directory)
+  # Special keyword `default` (tui/cli modes only): uses the system data directory
+  #   - Linux/macOS: ~/.agentxx/
+  #   - Windows: %APPDATA%/agentxx/
+  # Sub-paths created under data_dir:
+  #   - {data_dir}/sqlite/global.db                     Global settings (TUI settings, themes, etc.)
+  #   - {data_dir}/sqlite/sessions/{sessionId}/          Session data (session.db, including store table)
+  #   - {data_dir}/sqlite/codegraph/<hashed_path>/index.db CodeGraph index database
+  # data_dir: ~/.agentxx
+
+  # Session working directory (leave empty/unconfigured = uses current process working directory)
+  # - Supports ~ and ${VAR} expansion, relative paths resolve against startup directory
+  # - Effective scope: default approval boundary for permission.mode=ask / base directory for filesystem
+  #   tools and permission checks / initial working directory for spawned child processes /
+  #   plugin projectRoot (get_config; e.g. codegraph indexes this path by default if paths is unconfigured)
+  # - Use case: In server deployments and multi-instance FFI embeddings, binds agent execution to a specific
+  #   directory independent of process launch path (empty behaves identically to default cwd)
+  # work_dir: ${AGENTXX_WORK_DIR}
+
+  # Skill directory list (progressive discovery and loading of SKILL.md; relative paths resolve to work_dir)
+skill:
+  list:
+    - "./skills"
+
+  # Context file list (Memory; content is appended to the system message,
+  # which is part of the stable prefix and can hit upstream KV/prefix caching)
+memory:
+  list:
+    - "./AGENT.md"
+
+  # Subagent delegation toggle (default true; when false, SubagentManagerMiddleware does not inject
+  # the `agentxx_subagent` tool, preventing model-initiated delegations; event bus service
+  # service.subagent.execute remains registered for internal uses like context compaction)
+subagent:
+  enable: true
+
+# Git worktree mode (default false)
+# - When enabled, registers `agentxx_git_worktree` tool + injects worktree behavior prompts each turn:
+#   instructs models to create dedicated worktrees and bind sessions when starting code modification tasks,
+#   enabling concurrent multi-session development in a shared repository (see "Git Worktree Mode" below)
+worktree:
+  enable: false
+
+# Plugin configuration (all plugins loaded dynamically via path; relative paths resolve to absolute
+# against process working directory; build artifacts reside under exec/plugins/<plugin_name>/;
+# CodeGraph loaded here: requires AGENTXX_ENABLE_PLUGIN_CODEGRAPH at compile time)
+plugin:
+  list:
+    - path: "./plugins/agentxx_codegraph"  # Path to plugin shared library or directory (with plugin.yaml)
+      enabled: true                        # Default true
+      sides: auto                          # auto|agent|client (for dual-sided plugins; auto detects via exports)
+      config: ""                           # Optional plugin configuration file or directory (supports ~ and ${VAR};
+                                           # resolved to an absolute path and passed to the plugin via
+                                           # get_plugin_config_path)
+      args:                                # Plugin arguments (passed verbatim to plugin, schema defined by plugin)
+        # ---- agentxx_codegraph args ----
+        paths:                             # Indexing paths list (optional, multiple directories)
+          - "/path/to/proj_a"
+        ignore_paths:                      # Ignore patterns (supports * wildcards; skipped on match)
+          - "**/third_party/**"
+        load_cwd: true                     # Indexes current working directory if paths is omitted
+        use_gitignore: true                # Respects .gitignore rules, .gitmodules submodules, and .git
+                                           # Index database: {data_dir}/sqlite/codegraph/<hashed_path>/index.db
+                                           # (skipped if data_dir is unconfigured)
+
+  # Permission prompt mode (default ask; see PermissionMode)
+  # - ask:     Allows reads/writes within working directory, prompts user for external paths (default)
+  # - all_ask: Prompts user for all file reads and writes
+  # - pass:    Allows all operations without prompt
+  # - deny:    Denies all operations without prompt
+permission:
+  mode: ask
+  whitelist:      # Always allowed paths (longest prefix matching with * wildcard; overrides mode default)
+    list: []
+  blacklist:      # Always denied paths (blacklists take precedence over whitelists on collision)
+    list: []
+```
+
+> **Codex (Responses API) Configuration Example**:
+> ```yaml
+> model:
+>   list:
+>     - name: "openai-responses"
+>       type: "openai-responses"          # OpenAI Responses API (/responses)
+>       base_url: "https://api.openai.com"  # Or ChatGPT Codex compatible gateway
+>       api_key: "${CODEX_API_KEY}"
+>       model_name: "gpt-5-codex"
+>       extra_api_config:                 # Optional overrides: reasoning effort, persistence, etc.
+>         reasoning:
+>           effort: "high"
+> ```
+
+Environment variable precedence: `Built-in variables` > `--env override file` > `.env file` > `System environment variables` > Retain `${VAR}` literal.
+Built-in variables (injected by `main` at startup for YAML expansion):
+- `${AGENTXX_WORK_DIR}`: Process working directory after launch (forward slash format).
+- `${AGENTXX_EXEC_DIR}`: Directory containing the `agentxx_cli` binary (forward slash format).
+
+**Layered configuration (base + overlay)**:
+
+| Layer | Config file | .env |
+|-------|-------------|------|
+| overlay | `--config` path (default `{cwd}/agentxx-config.yaml`) | `{cwd}/.env`, then `<config dir>/.env` |
+| base | `{data_dir}/agentxx-config.yaml` | `{data_dir}/.env` |
+
+- The base directory comes from the overlay's `data_dir` (`~` / `${VAR}` / relative paths /
+  keyword `default` supported); when the overlay has no `data_dir` (or no overlay config
+  exists) the system data directory is used (`~/.agentxx/`, Windows `%APPDATA%/agentxx/`),
+  i.e. a working directory without a config file loads the data directory config directly.
+- Only one base layer is loaded (the base's own `data_dir` is not followed further).
+- When base and overlay resolve to the same file (e.g. `--config <data_dir>/agentxx-config.yaml`)
+  it is loaded once, so items are not duplicated.
+- A missing/broken base only logs and is skipped; a broken overlay aborts startup.
+- `.env` precedence: built-ins > `--env` > overlay `.env` > base `.env` > system environment.
+  Merged variables expand `${VAR}` in both layers.
+
+**List sections** (`model` / `plugin` / `mcp` / `skill` / `memory` /
+`permission.whitelist` / `permission.blacklist`) use a fixed structure:
+
+```yaml
+model:
+    overwrite:                 # merge policy (optional; defaults to mode: merge)
+        mode: merge            # merge (default: inherit and stack base) | replace (only this layer)
+        remove:                # optional: drop entries from the merged result (matched by identity)
+            - old-model
+    list:                      # entries provided by this layer (omitted = empty list)
+        - name: my-model
+    use:                       # model section only: model per purpose (formerly top-level use_model)
+        default: my-model
+plugin:
+    overwrite: {mode: merge, remove: [agentxx_codegraph]}
+    list:
+        - path: builtin://agentxx_filesystem
+```
+
+- Identity used by `remove` (and by keyed merging): `model` by `name`, `plugin` by `path`
+  (`name` / `builtin://<name>` also match), `mcp` by `namespace`, `skill` / `memory` /
+  permission lists by the string itself.
+- `remove` applies in both modes (also to entries of this layer's own `list`); unmatched
+  entries produce a warning. Policies come from the overlay only.
+- Clear an inherited list: `overwrite: {mode: replace}` without `list`.
+- The old keys `models` / `plugins` / `use_model` are deprecated: use
+  `model.list` / `plugin.list` / `model.use`; they are warned about and ignored.
+- Other sections: scalars are overridden by the overlay, mappings merge key by key,
+  and lists inside mappings replace wholesale.
+
+### Command-Line Usage
+
+```bash
+agentxx_cli [mode] [options]
+```
+
+**Modes:**
+
+| Mode | Description |
+|---|---|
+| `tui` | Interactive TUI mode (default). |
+| `cli` | Interactive stdio command-line mode. |
+| `server` | Launches WebSocket agent service. |
+| `acp` | ACP stdio service mode. |
+| `train` | Evolutionary prompt training mode. |
+
+**Options:**
+
+| Option | Description |
+|---|---|
+| `-h, --help` | Displays help message. |
+| `-v, --version` | Prints the version (`Agentxx v<version>`; constant in `agentxx/version.h`). |
+| `--config <path>` | Configuration file path (default: `agentxx-config.yaml`). |
+| `--env <path>` | Path to override environment variables file. |
+| `--agent <url>` | Remote agent server address (`ws://host:port/agent`). |
+| `--token <token>` | Authentication token. |
+| `--model <model>` | Remote model name. |
+| `--host <host>` | Server bind address (default: `127.0.0.1`). |
+| `--port <port>` | Server bind port (default: `7007`). |
+
+**Typical Invocations:**
+
+```bash
+# Local TUI mode (Client + Agent in single process)
+agentxx_cli tui --config agentxx-config.yaml
+
+# Local CLI mode
+agentxx_cli cli --config agentxx-config.yaml
+
+# Launch WebSocket Server
+agentxx_cli server --host 0.0.0.0 --port 17000 --config agentxx-config.yaml
+
+# Connect to remote agent (TUI)
+agentxx_cli tui --agent ws://192.168.1.100:17000/agent --token xxx
+
+# Connect to remote agent (CLI)
+agentxx_cli cli --agent ws://192.168.1.100:17000/agent?token=xxx
+
+# ACP stdio service
+agentxx_cli acp --config agentxx-config.yaml
+
+# Prompt training mode
+agentxx_cli train --config agentxx-config.yaml
+```
+
+### Using as a Library
+
+```cpp
+#include "agentxx/agent/code_agent.h"
+
+auto config = std::make_shared<agentxx::agent::AgentConfig>();
+config->model.baseUrl   = "https://api.openai.com";
+config->model.apiKey    = "sk-...";
+config->model.modelName = "gpt-4";
+
+agentxx::agent::CodeAgent agent(config);
+
+asio::co_spawn(*agent.ioCtx, [&]() -> asio::awaitable<void> {
+    co_await agent.init();
+
+    // Single-turn conversation (non-streaming, returns full output text)
+    auto result = co_await agent.runSingleInputAsync("session_1", "Hello!");
+
+    // Session-based conversational turn (streaming deltas pushed via IO endpoint; nullptr for headless)
+    auto turn1 = co_await agent.runTurnAsync("session_1", "Hi", io);
+    auto turn2 = co_await agent.runTurnAsync("session_1", "Tell me more", io);
+
+    // Custom message turn (can supply custom system prompt, returns complete output)
+    std::vector<neograph::ChatMessage> msgs = {
+        {.role = "system", .content = "You are helpful."},
+        {.role = "user", .content = "Hello"},
+    };
+    auto output = co_await agent.runOverMsgsTurnAsync("session_2", msgs);
+}, asio::detached);
+
+agent.ioCtx->run();
+```
+
+---
+
+## Architectural Design
+
+### Overall Architecture
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                              Client Layer                              │
+│  ┌────────────────────┐  ┌────────────────────┐  ┌──────────────────┐  │
+│  │ TUIClientAgentIO   │  │ StdIOClientAgentIO │  │ Remote Client(WS)│  │
+│  │     (FTXUI)        │  │     (stdio)        │  │WsAgentIOTransport│  │
+│  └─────────┬──────────┘  └─────────┬──────────┘  └────────┬─────────┘  │
+│            │                       │                      │            │
+│            └───────────────────────┼──────────────────────┘            │
+│                                    ▼                                   │
+│                               AgentIOBase                              │
+│                     (sendToPeer / onPeerMessage /                      │
+│                      getInput / handleInterrupt)                       │
+├────────────────────────────────────┬───────────────────────────────────┤
+│                     Transport Layer (AgentIOTransportBase)             │
+│  ┌─────────────────────────────────┴────────────────────────────────┐  │
+│  │  ChannelAgentIOTransport (In-process, zero-serialization Channel)│  │
+│  │  WsAgentIOTransport (Cross-process/network, JSON over WebSocket) │  │
+│  │  connect() / recv() / send() / close() / alive()                 │  │
+│  └─────────────────────────────────┬────────────────────────────────┘  │
+├────────────────────────────────────┼───────────────────────────────────┤
+│                               Agent Layer                              │
+│  ┌─────────────────────────────────┴────────────────────────────────┐  │
+│  │  AgentServer (WS Service) / SessionServerAgentIO (Session Driver)│  │
+│  │  SessionServerAgentIO: delta buffer / replay / grace period      │  │
+│  └─────────────────────────────────┬────────────────────────────────┘  │
+│                                    ▼                                   │
+│  ┌──────────────────────────────────────────────────────────────────┐  │
+│  │                      BaseAgent / CodeAgent                       │  │
+│  │  ┌────────────────────────────────────────────────────────────┐  │  │
+│  │  │                    GraphEngine (ReAct Loop)                │  │  │
+│  │  │                                                            │  │  │
+│  │  │  __start__ → agent_start → llm → [has_tools?]              │  │  │
+│  │  │                             ↑         │                    │  │  │
+│  │  │                             └── tools ┘                    │  │  │
+│  │  │                                  │                         │  │  │
+│  │  │                              agent_end                     │  │  │
+│  │  │                                  │                         │  │  │
+│  │  │                               __end__                      │  │  │
+│  │  └────────────────────────────────────────────────────────────┘  │  │
+│  │                                                                  │  │
+│  │  BaseAgent: Core infrastructure + ReAct loop + Session execution │  │
+│  │  CodeAgent: Inherits BaseAgent, adds programming tools/middleware│  │
+│  │                                                                  │  │
+│  │  ┌──────────────┐ ┌──────────────┐ ┌──────────────────────────┐  │  │
+│  │  │  ModelCall   │ │   Toolcall   │ │     AgentStart/End       │  │  │
+│  │  │  WrapNode    │ │   WrapNode   │ │        WrapNode          │  │  │
+│  │  └──────┬───────┘ └──────┬───────┘ └────────────┬─────────────┘  │  │
+│  │         └────────────────┼──────────────────────┘                │  │
+│  │                          ▼                                       │  │
+│  │  ┌────────────────────────────────────────────────────────────┐  │  │
+│  │  │                     Middleware Stack                       │  │  │
+│  │  │  SubagentManager → Summarization → Permission              │  │  │
+│  │  │  → Skill → MemoryFile → LogPrint                           │  │  │
+│  │  │  (planning/worktree are plugin+tool forms, not middleware) │  │  │
+│  │  └────────────────────────────────────────────────────────────┘  │  │
+│  │                                                                  │  │
+│  │  ┌────────────────────────────────────────────────────────────┐  │  │
+│  │  │                          Tools                             │  │  │
+│  │  │  Filesystem | Command | Web | RAG | CodeGraph              │  │  │
+│  │  │  Planning | SubAgent | ShareStore | MCP | ...              │  │  │
+│  │  └────────────────────────────────────────────────────────────┘  │  │
+│  │                                                                  │  │
+│  │  ┌────────────────────────────────────────────────────────────┐  │  │
+│  │  │                        Providers                           │  │  │
+│  │  │  OpenAIProvider | AnthropicProvider                        │  │  │
+│  │  │  ModelProviderRegistry (Runtime dynamic switching)         │  │  │
+│  │  └────────────────────────────────────────────────────────────┘  │  │
+│  └──────────────────────────────────────────────────────────────────┘  │
+│                                                                        │
+│  ┌──────────────────────────────────────────────────────────────────┐  │
+│  │                       EventBus (Event Bus)                       │  │
+│  │  EventStream<T> (Unidirectional) | RequestResponseStream<Req,Resp│  │
+│  │  Topics: Token / ToolCall / Interrupt / Permission / Subagent... │  │
+│  └──────────────────────────────────────────────────────────────────┘  │
+│                                                                        │
+│  ┌──────────────────────────────────────────────────────────────────┐  │
+│  │                       Protocol Servers                           │  │
+│  │  McpServer | A2aServer | StdioAcpServer                          │  │
+│  └──────────────────────────────────────────────────────────────────┘  │
+│                                                                        │
+│  ┌──────────────────────────────────────────────────────────────────┐  │
+│  │                     Dependency Injection                         │  │
+│  │  deps::DependencyContainer (Factory / Singleton / Named Registry)│  │
+│  └──────────────────────────────────────────────────────────────────┘  │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+### Data Flow
+
+#### Local Mode (Direct In-Process Channel)
+
+```
+User Input → TUIClientAgentIO / StdIOClientAgentIO
+    → AgentIOBase.sendUserInput()
+    → ChannelAgentIOTransport::send() (client side, in-process channel)
+    → ChannelAgentIOTransport::recv() (server side)
+    → SessionServerAgentIO.onPeerMessage()
+    → SessionServerAgentIO.run() → BaseAgent.runTurnAsync()
+        → GraphEngine (ReAct Loop)
+            → ModelCallWrapNode → OpenAI/Anthropic Provider → LLM API
+            → ToolcallWrapNode → Tools (filesystem/command/web/...)
+        → Delta Event Stream
+    → SessionServerAgentIO.sendToPeer() (new deltas recorded to replay buffer and forwarded)
+    → ChannelAgentIOTransport::send() (server side)
+    → ChannelAgentIOTransport::recv() (client side)
+    → TUIClientAgentIO / StdIOClientAgentIO.onPeerMessage() → onDelta() (protected passive callback)
+    → UI Rendering
+```
+
+#### Remote Mode (WebSocket)
+
+```
+User Input → TUIClientAgentIO / StdIOClientAgentIO
+    → AgentIOBase.sendUserInput()
+    → WsAgentIOTransport::send() (client, JSON serialization)
+    → WebSocket Network Transmission
+    → AgentServer.handleWs()
+    → WsAgentIOTransport::recv() (server, JSON deserialization)
+    → SessionServerAgentIO.onPeerMessage()
+    → ... (same execution flow as local mode)
+    → SessionServerAgentIO.sendToPeer() (new deltas recorded to replay buffer and forwarded)
+    → WsAgentIOTransport::send() (server, JSON serialization)
+    → WebSocket Network Transmission
+    → WsAgentIOTransport::recv() (client, JSON deserialization)
+    → TUIClientAgentIO / StdIOClientAgentIO.onPeerMessage() → onDelta() (protected passive callback)
+    → UI Rendering
+```
+
+> The topology in both modes is identical (client endpoint + server endpoint + transport), differing only in transport implementation. **Mandatory Transport Policy**: All communication between endpoints must pass through a transport; direct connection without transport does not exist, except in headless `runTurnAsync(io=nullptr)` execution (where no IO implies no event output).
+
+### Core Design Patterns
+
+#### 1. Graph Engine + ReAct Loop
+
+BaseAgent's core execution pipeline is built on the NeoGraph engine, implementing a ReAct (Reasoning + Acting) loop:
+
+```
+__start__ → agent_start → llm → [conditional: has_tool_calls?]
+                                  ├─ yes → tools → llm (loop)
+                                  └─ no  → agent_end → __end__
+```
+
+- **agent_start**: Initializes session state, injects system prompt, flushes ephemeral scratchpads.
+- **llm (ModelCallWrapNode)**: Dispatches LLM API calls with dynamic model switching, message repair, and retries.
+- **tools (ToolcallWrapNode)**: Dispatches tool executions, automatically compressing verbose outputs.
+- **agent_end**: Cleans up ephemeral state and persists finalized outputs.
+- **Node events**: Each node execution emits `NodeStart`/`NodeEnd` events carrying node names.
+
+#### 2. Stacked Middleware (WrapHandleBaseNode)
+
+Middlewares execute in an interceptor stack similar to HTTP middleware:
+
+```
+start1 → start2 → start3
+            ↓         ↓
+          error     baseRun
+            ↓         ↓
+end1  ←   end2  ←   end3
+```
+
+- Each middleware implements `onHandleStart` / `onHandleEnd` hooks (mountable to `agent_start`, `modelcall`, or `toolcall`).
+- On exceptions during `start`, `baseRun` is bypassed, jumping directly to unwind corresponding `end` handlers.
+- Explicitly rethrows `CancelledException` and `NodeInterrupt`.
+- Middlewares maintain isolated `State` per session (`sessionId`).
+- Actual registration order (push order into `handles`; BaseAgent pushes SubagentManager/Summarization/Permission first, CodeAgent then pushes Skill/MemoryFile/LogPrint): SubagentManager → Summarization → Permission → Skill → MemoryFile → LogPrint. Planning (`agentxx_planning` plugin, injected via the prompt table `appendSystemPrompts[planning]`) and worktree (static system-prompt append at CodeAgent init + `agentxx_git_worktree` tool) are plugin/tool forms, no longer standalone middlewares (historical `PlanningMiddleware` / `WorktreeMiddleware` have been removed).
+
+#### Cancellation Design (CancelToken Dual Channels)
+
+Cancellation relies on `neograph::graph::CancelToken` (created per turn, stored in `Session`) with two propagation channels:
+
+1. **Polling Checks (Primary Path)**: Explicit calls to `throw_if_cancelled()` / `is_cancelled()` at logical boundaries provide deterministic cancellation points and expected exception paths:
+   - Between graph super-steps (engine).
+   - Before toolcall dispatch and before/after each tool execution (`ToolcallWrapNode`).
+   - Before LLM invocations and after retry delays (`ModelCallWrapNode`).
+2. **asio Signal Interruption (For safely abortable long-running IO)**: `CancelToken::cancel()` emits a `cancellation_signal` via the bound executor, interrupting in-flight LLM HTTP streams, socket IO, and timers. This manifests at `co_await` points as `system_error(operation_aborted)`. This is the only context where `operation_aborted` is expected.
+
+Boundary conversion rules (`exception.h` `isCancelAbort` / `wrap_handle.h`):
+
+- `operation_aborted` + token is cancelled ⇒ converted to `CancelledException` propagating upward (cancellation semantics); `catchError/catchErrorAsync` with `cancelToken` enables this conversion.
+- `operation_aborted` + token not cancelled/missing ⇒ treated as timeout error ("timeout: ...").
+- All catch-all / `catch(std::exception&)` blocks must rethrow `CancelledException` and `NodeInterrupt`, never swallowing cancellation signals (`EventStream::publish`, `WrapHandleBaseNode`, `catchError`, etc.).
+- Tools implement `ContextualAsyncTool` to receive `ToolExecutionContext{cancel_token}`, allowing them to poll cancellation or propagate it to underlying transports. On cancellation, completed tool results are preserved in `graphData` (`interruptToolcallCache`) before rethrowing.
+- Thread-pool offloading (`offloadCancellableAsync`): Worker threads execute synchronously without suspending, immune to asio signals. Overloads accepting `CancelToken` spawn a watcher coroutine polling the token, asserting `cancelFlag` upon cancellation to notify worker threads to exit (integrated in `filesystem_list`/`glob`/`grep`).
+
+Critical cleanup/persistence phases must explicitly guard against cancellations using `asio::this_coro::reset_cancellation_state` or `catch(CancelledException) -> finalize -> rethrow`.
+
+#### 3. AgentIOBase Endpoint Model + Transport Layer
+
+Both Client and Server inherit from `AgentIOBase`, communicating via `AgentIOTransportBase`. Communication between endpoints is symmetrical: **Outbound via `sendToPeer()` (sole outbound entry), Inbound via `runTransportLoop()` → `onPeerMessage()` dispatching to protected passive callbacks**.
+Interface methods categorized by role: [Bidirectional] / [Client] / [Server]:
+
+```
+AgentIOBase (Public Contract)
+    ├── sendToPeer() [Bidirectional]   → Sends WireMessage to peer (virtual, sole outbound port;
+    │                                     requires configured transport, otherwise logs error and drops)
+    ├── requestCancel() [Client]       → Requests cancellation
+    ├── requestSelectModel() [Client]  → Switches model
+    ├── requestAppendComponentInfo() [Client] → Queries startup info (Plugin/MCP/Skill/Memory)
+    ├── sendUserInput() [Client]       → Sends user input
+    ├── getInput() [Bidirectional]     → Supplies user input (polled by BaseAgent on server,
+    │                                     invoked by local input loop on client)
+    ├── handleInterrupt() [Bidirectional] → Handles HITL interactions (invoked by BaseAgent on server,
+    │                                     called upon WireInterruptRequest on client)
+    ├── registerOnBus() [Server]       → Binds to session EventBus (registers interrupt/permission handlers)
+    ├── setTransport()/runTransportLoop() [Bidirectional] → Transport configuration & receive loop
+    └── (protected)
+        ├── onPeerMessage() [Bidirectional] → Inbound dispatch (routes to 4 callbacks below; overrideable)
+        ├── onDelta() [Client]         ← Incremental event (dispatched only by onPeerMessage)
+        ├── onSync() [Client]          ← Full sync calibration
+        ├── onTurnResult() [Client]    ← Turn completion notification
+        └── onContextStats() [Client]  ← Context token stats update
+
+AgentIOBase (Client Endpoints: TUIClientAgentIO / StdIOClientAgentIO)
+    ├── onDelta/onSync/onTurnResult/onContextStats (protected) ← Receives peer events → Render
+    ├── getInput()         → Reads input from stdin / FTXUI
+    ├── handleInterrupt()  → Renders the interrupt form inline in the message list and awaits
+    │                        submit/cancel (TUI: Role::Interrupt message + InterruptView; CLI: item-by-item Q&A)
+    └── onPeerMessage()    → Overridden: handles InterruptRequest / Log / ModelInfo, etc.
+
+AgentIOBase (Server Endpoint: SessionServerAgentIO)
+    ├── sendToPeer()       → Overridden: new Delta events (with monotonic seq guard) are written
+    │                          to replay buffer before transmission; replayed deltas skip buffer
+    ├── onDelta/onSync     → Protected no-op implementations (satisfies pure virtual contract)
+    ├── getInput()         → Awaits client input from inputChannel_
+    ├── handleInterrupt()  → Sends InterruptRequest, awaiting client response (with timeout/expiration)
+    ├── onPeerMessage()    → Overridden: processes Hello / UserInput / Cancel / SelectModel /
+    │                          InterruptResponse / GetModel / GetAppendComponentInfo / GetContext /
+    │                          ListSessions / SwitchSession / GetViewMessages /
+    │                          ClearMessageQueue / RemoveQueueItem / InterruptAndRunNext /
+    │                          ListDir / GetPermissionState / SetFullAuth / PluginDataUp
+    ├── run()              → Driver loop: fetch input → execute turn → push result
+    ├── stop()             → Halts driver loop (closes channel / cancels turn / fails pending)
+    ├── onDisconnect()     → Triggers grace period timer on disconnect (cancels turn if grace expires)
+    ├── handleGetViewMessages() → History pagination: slices [before-count, before) by absolute index,
+    │                              returning WireViewMessagesPage (append-only index is race-free;
+    │                              mismatched session returns empty page, count=0 defaults to 100)
+    └── switchSession()    → Switches session: rebinds sessionId, clears delta replay buffer,
+                             resets firstTurn_, returns new session Sync (tail-window paginated) +
+                             model info + context stats
+
+AgentIOTransportBase (Transport Layer Abstraction)
+    ├── connect(hello)     → Establishes transport connection and sends initial handshake
+    ├── recv()             → Receives WireMessage (coroutine blocking)
+    ├── send(msg)          → Sends WireMessage
+    ├── close()            → Shuts down transport
+    └── alive()            → Checks transport vitality
+```
+
+Event Emission Flow: `BaseAgent` directly invokes its driven server endpoint in-process—deltas push via `io->sendToPeer(Delta)` (buffered and sent over transport to client), and stats push via `io->sendToPeer(WireContextStats)`; `BaseAgent` remains agnostic of transport specifics. Headless `runTurnAsync(io=nullptr)` produces zero events.
+
+##### EventBridge: GraphEvent → Incremental Delta + EventBus Adapter
+
+`EventBridge` serves as the sole event translator between BaseAgent and the NeoGraph engine:
+
+```
+NeoGraph GraphEngine (run_stream_async)
+    └── GraphStreamCallback (invoked per event)
+          └── EventBridge::operator()(GraphEvent)
+                ├── 1. Forwards original callback origCb (if present)
+                ├── 2. Dispatches by event type:
+                │     ├── LLM_TOKEN     → publishModelToken (bus event, zero-cost if no subscribers)
+                │     │                   + emitDelta(TextToken/ThinkToken, with intra-node timing)
+                │     ├── CHANNEL_WRITE → handleChannelWrite:
+                │     │                   - "message_tip" channel → Delta::MessageTip
+                │     │                   - "messages" channel:
+                │     │                     assistant(tool_calls) → appendViewMessage
+                │     │                       + Delta::ToolStart stream
+                │     │                     tool → appendViewMessage + backfill update
+                │     │                       (edit tools include diff fields) + Delta::ToolEnd stream
+                │     │                     assistant → appendViewMessage
+                │     │                   - Pushes WireContextStats when LLM output is present
+                │     ├── NODE_START/END → Node timing + Delta::NodeStart/NodeEnd
+                │     └── ERROR          → publishError (bus event; reported via WireTurnResult)
+                └── emitDelta: Allocates monotonic seq per session (via Session::nextDeltaSeq,
+                       shared by EventBridge and SessionServerAgentIO), pushing via io->sendToPeer
+```
+
+- Stateful: Tracks active chunk types (content/thinking transitions) and node start timestamps.
+- Lifetime: `makeCallback()` captures `shared_from_this()`; `AgentContext` holds a `weak_ptr`, locking prior to bus publishing.
+- New GraphEvent types can be supported purely by extending `EventBridge` without modifying `BaseAgent`.
+
+**TPS (Token/s) Generation Rate Tracking** (Dual-level statistics in EventBridge):
+- Stream Level (Windowed Pushing): Timed from the start of each ModelCall stream (first token after node start), pushing the average rate of the **most recent window** every `tpsPushIntervalSec_` (default 3s) via `WireContextStats.tps` (tokens in window / window duration, reflecting real-time speed rather than cumulative average). Finalized upon stream completion or error.
+- Turn Level (TurnEnd Reporting): Cumulative estimated tokens across all ModelCalls in a turn divided by cumulative streaming duration, embedded in the TurnEnd Delta and rendered in turn summary banners.
+- Token estimation uses `countTokensForUtf8Str` (matching `SummarizationMiddleware`: ASCII ≈ 4 chars/token, non-ASCII ≈ 1.1 chars/token; internal fallback if summarization is absent).
+
+#### 4. EventBus Strongly-Typed Events
+
+```cpp
+// Unidirectional event stream
+auto& stream = bus.get<EventModelToken>("agent.model.token");
+stream.subscribe([](const EventModelToken& e) -> asio::awaitable<void> {
+    // Process token
+});
+co_await stream.publish(EventModelToken{.token = "hello"});
+
+// Request-Response stream (HITL)
+auto& rr = bus.getRR<ReqPermission, RespPermission>("service.permission");
+rr.serve([](const ReqPermission& req, size_t corrId) -> asio::awaitable<RespPermission> {
+    co_return RespPermission{.decision = RespPermission::Decision::Allow};
+});
+auto resp = co_await rr.request(ReqPermission{.category = "filesystem_write"});
+```
+
+Topic Naming Convention: `<scope>.<subject>[.<detail>]`
+
+| Topic | Event Type | Direction | Description |
+|---|---|---|---|
+| `agent.turn.start` | EventAgentTurnStart | Unidirectional | Conversational turn begins |
+| `agent.turn.end` | EventAgentTurnEnd | Unidirectional | Conversational turn ends |
+| `agent.model.start` | EventModelCallStart | Unidirectional | Model invocation begins |
+| `agent.model.token` | EventModelToken | Unidirectional | Model output token |
+| `agent.model.end` | EventModelCallEnd | Unidirectional | Model invocation ends |
+| `agent.tool.start` | EventToolCallStart | Unidirectional | Tool invocation begins |
+| `agent.tool.end` | EventToolCallEnd | Unidirectional | Tool invocation ends |
+| `subagent.progress` | EventSubagentProgress | Unidirectional | Subagent progress update |
+| `io.display` | EventDisplay | Unidirectional | Generic display output |
+| `io.user_input` | EventUserInput | Unidirectional | User input |
+| `io.cancel` | EventCancel | Unidirectional | Cancellation signal |
+| `agent.error` | EventError | Unidirectional | Error notification |
+| `service.interrupt` | ReqInterrupt / RespInterrupt | Req/Resp | HITL Interrupt |
+| `service.permission` | ReqPermission / RespPermission | Req/Resp | Permission check |
+| `service.subagent` | ReqSubagentBatch / RespSubagentBatch | Req/Resp | Subagent delegation (batch semantics; single task = 1 item) |
+| `service.crossagent` | ReqCrossAgent / RespCrossAgent | Req/Resp | Cross-agent query |
+
+Host Bus (`HostBus`, owned by `AgentHost` for inter-agent routing):
+
+| Topic | Type | Description |
+|---|---|---|
+| `agent.spawn` | ReqHostSpawn / RespHostSpawn | Req/Resp | Spawns subagents (host enforces depth and concurrency budgets) |
+| `agent.message` | ReqHostMessage / RespHostMessage | Req/Resp | Inter-agent messaging (mailbox / A2A bridge) |
+| `agent.progress` | EventHostProgress | Unidirectional | Progress events from any agent |
+| `agent.done` | EventHostDone | Unidirectional | Agent completion (signals host to reclaim AgentNode) |
+
+#### 5. Session Isolation & Lock-Free Design
+
+```
+AgentHost (Process-Level Host)
+    ├── ioCtx                (Shared io_context, single-threaded interleaved multi-agent coroutines)
+    ├── blockingPool         (Shared thread pool for blocking operations, avoiding per-agent redundancy)
+    ├── hostBus              (Host bus: agent.spawn / message / progress / done)
+    └── AgentRegistry        (AgentNode registry: root agent and subagents are equal peers)
+         ├── "root" → AgentNode (Root agent, dedicated BaseAgent)
+         └── "agent_N" → AgentNode (Subagent, dedicated BaseAgent)
+
+AgentContext
+    ├── agentConfig          (Global shared configuration)
+    ├── middlewareHandleContext (Middleware handles)
+    ├── bus                  (Global event bus)
+    ├── modelRegistry        (Model registry)
+    ├── host                 (Host reference injected during attachRoot or spawning)
+    └── sessions (SessionsManager)
+         ├── "session_1" → Session
+         │     ├── io                    (AgentIOBase)
+         │     ├── bus                   (Session-level event bus)
+         │     ├── contextStats          (std::atomic fields, cross-thread safe)
+         │     ├── activity              (Activity)
+         │     ├── viewMessages + chainHash (IO thread exclusive read/write; client receives wire copies)
+         │     ├── deltaSeq              (Standard uint64_t, incremented only on IO thread)
+         │     ├── cancelToken           (IO thread exclusive)
+         │     └── modelName             (IO thread exclusive, switched via Wire)
+         └── "session_2" → Session
+               └── ...
+
+Thread-Safety Policy:
+  - IO Thread: Reads and writes viewMessages / llmMessages / chainHash / deltaSeq (assertIoThread enforced).
+  - Client / UI: Never reads internal memory directly, receiving wire copies (Sync / Delta).
+  - Cancellation & Model Switching: Dispatched via Wire messages to the agent thread.
+  - SessionsManager: Accessed strictly on the agent io_context thread, requiring no locks.
+  - contextStats: std::atomic fields, safe for cross-thread reads (written by Summarization, pushed by IO).
+  - AsyncMutex: Coroutine-aware mutex protecting critical sections across co_await suspensions.
+```
+
+### Connection & Reconnection Mechanism
+
+#### WsAgentIOTransport Internal Architecture (Client Mode)
+
+```
+Client (WsAgentIOTransport)
+  ├── establishConnection(): wsConnect + backoff retry (reconnectBackoff, cancellable)
+  ├── writeLoop():    writeQueue (concurrent_channel, cap=4096) → ws send
+  ├── readLoop():     ws recv → deserialization → recvQueue (concurrent_channel, cap=256)
+  │                     → consumed by recv(); on disconnect, enters auto-reconnect loop:
+  │                       reconnect → reconstruct writeQueue → send Hello(lastSeq, tailHash)
+  │                       → server incremental replay (falls back to full Sync if seq broken)
+  ├── heartbeatLoop(): sends Ping every heartbeatInterval
+  └── Delta Deduplication: updates lastDeltaSeq_ on receipt, dropping replayed
+      deltas where seq <= last to prevent duplicate UI rendering
+```
+
+- Write and read queues use bounded `concurrent_channel` buffers; `try_send` drops messages when saturated. Closing channels causes pending `async_receive` calls to throw exceptions, terminating loops cleanly.
+- `HelloAck` is consumed during the `connect()` handshake and does not enter the `runTransportLoop` message stream.
+- Server mode (WsClient injected by AgentServer): does not send `Hello` or initiate reconnects; handshake is managed by `AgentServer::serveTransport`.
+
+```
+Client                              Server
+  │                                    │
+  │──── Hello (thread, token, seq,    │
+  │      tailHash, model) ───────────→│
+  │                                    │ Validates token
+  │                                    │ Finds/creates SessionServerAgentIO
+  │←── HelloAck (ok, models, hash) ───│
+  │                                    │
+  │──── UserInput (text) ────────────→│
+  │                                    │ runTurnAsync()
+  │←── Delta (text_token, seq=1) ─────│
+  │←── Delta (text_token, seq=2) ─────│
+  │←── Delta (tool_start, seq=3) ─────│
+  │←── Delta (tool_end, seq=4) ───────│
+  │←── Delta (text_token, seq=5) ─────│
+  │←── TurnResult ────────────────────│
+  │                                    │
+  │  [Connection Severed]              │ Grace timer started
+  │                                    │
+  │──── Hello (seq=3, tailHash) ─────→│ Incremental replay of deltas where seq > 3
+  │←── HelloAck + Delta replay ───────│ Falls back to full Sync if seq discontinuous
+  │                                    │
+  │──── Cancel ──────────────────────→│ Cancels active turn
+  │                                    │
+  │──── SelectModel (model) ─────────→│ Switches session model
+  │                                    │
+  │──── GetModel ────────────────────→│ Queries current model information
+  │←── ModelInfo ─────────────────────│
+  │                                    │
+  │──── GetAppendComponentInfo ──────→│ Queries Plugin/MCP/Skill/Memory components
+  │←── AppendComponentInfo ───────────│
+  │                                    │
+  │──── GetContext ──────────────────→│ Queries active llmMessages
+  │←── ContextMessages ───────────────│
+  │                                    │
+  │ (Optional) Log Forwarding          │
+  │←── Log (level, message) ─────────│ Real-time server log streaming
+  │                                    │
+  │ (Optional) Context Statistics      │
+  │←── ContextStats ──────────────────│ Token usage & windowed TPS updates
+  │                                    │
+  │ No upstream permission-rule       │
+  │ messages: "remember this choice"  │
+  │ rides on the interrupt result     │
+  │ values.remember (answered via     │
+  │ InterruptResponse); the server    │
+  │ permission handler registers it   │
+  │                                    │
+  │ (Optional) Session Modal (TUI F3)  │
+  │──── ListSessions ─────────────────│ Lists persisted sessions (offloaded to thread pool)
+  │←── SessionList ───────────────────│
+  │──── SwitchSession (sessionId) ───│ Switches session: clears replay buffer,
+  │                                   │ pushes new session Sync (tail paginated) + model + stats
+  │                                   │ (requests for the target session arriving during the switch
+  │                                   │  are held, then handled in order after the binding commits)
+  │                                    │
+  │ (Optional) History Pagination      │
+  │──── GetViewMessages (before, n) ──│ Slices [max(0, before-n), before)
+  │←── ViewMessagesPage ──────────────│ (startIndex/totalCount/messages);
+  │                                   │ Client prepends with scroll anchoring
+  │                                    │
+  │ (Optional) Cross-Device Attachment Picking
+  │            (only when client and server run on different devices: the file picker
+  │             then shows a "server" tab in addition to the local one)
+  │──── ListDir (path, allowed exts) ─→│ Server scans the directory on its thread pool
+  │←── ListDirResult ─────────────────│ (UTF-8 paths); returns directories and media files,
+  │                                   │ each entry flagged `supported` for the active model.
+  │                                   │ Picking a server-side file sends only pathOrUrl
+  │                                   │ (no base64), the server reads and encodes it itself
+  │                                    │
+  │ (Optional) Full Authorization State (Info sidebar button)
+  │──── GetPermissionState ──────────→│ Query current state (initial value also in HelloAck)
+  │←── PermissionState {fullAuth} ────│
+  │──── SetFullAuth {fullAuth} ──────→│ Toggle and broadcast the new state (other
+  │                                   │ attached endpoints follow)
+  │                                    │
+  │ (Optional) Interrupt Expiration    │
+  │←── InterruptExpired ──────────────│ On timeout, grace expiry, or cancel, client
+  │                                   │ marks prompt as expired and ends waiting state
+```
+
+### Dependency Injection Container
+
+```
+deps::DependencyContainer
+    ├── registerSingleton<T>(factory)       → Registers default singleton
+    ├── registerNamedSingleton<T>(name, fn) → Registers named singleton
+    ├── resolve<T>()                        → Resolves default instance
+    ├── resolveNamed<T>(name)               → Resolves named instance
+    └── hasType<T>()                        → Checks type existence
+```
+
+---
+
+## Code Structure
+
+```
+agent/
+├── lib/                          # libagentxx core library
+│   ├── include/agentxx/
+│   │   ├── agentxx.h             # Umbrella library header
+│   │   ├── ffi_api.h             # FFI pure C ABI export contract (sole cross-language stable interface; see ffi.md)
+│   │   ├── version.h             # Version constant (agentxx::kVersion; used by --version and the TUI update check)
+│   │   ├── agent/                # Agent Core
+│   │   │   ├── base_agent.h      # BaseAgent base class (core infrastructure + ReAct loop + session execution)
+│   │   │   ├── code_agent.h      # CodeAgent (inherits BaseAgent, programming tools/middlewares)
+│   │   │   ├── agent_host.h      # AgentHost process-level host (primary agent & subagents register/derive/reclaim peer-to-peer)
+│   │   │   │                     #   AgentNode / AgentRegistry / spawnBatch / HostBus / A2A bridging
+│   │   │   ├── agent_runner.h    # AgentRunner unified "engine run + interrupt handle + resume" loop (shared by primary & subagents)
+│   │   │   ├── resource_applier.h # Applies and freezes plugin session resources (Skill/Memory/MCP)
+│   │   │   ├── config.h          # AgentConfig / ModelConfig configuration
+│   │   │   ├── config_static.h   # Static paths configuration
+│   │   │   ├── context.h         # AgentContext / Session / SessionsManager / ContextStats
+│   │   │   │                     #   Session: thread-bound (viewMessages / chainHash read/write on single thread)
+│   │   │   ├── checkpoint_store.h # Single checkpoint store: SingleCheckpointStore policy base class +
+│   │   │   │                     #   InMemorySingleCheckpointStore (only newest per thread, auto-prunes history on save: O(super-steps) -> O(threads))
+│   │   │   ├── conversation_types.h # Delta (NodeStart/End/seq/timing) / SyncPayload /
+│   │   │   │                     #   ViewMessage (UI presentation message with role-specific substructures) /
+│   │   │   │                     #   ChainHash / AppendComponentNotification
+│   │   │   ├── model_registry.h  # ModelProviderRegistry (runtime model switching)
+│   │   │   ├── session_store.h   # Session SQLite persistence: single database session.db
+│   │   │   │                     #   (view_message/llm_context/meta/store four tables, including share store KV),
+│   │   │   │                     #   partitioned by sessionId directory, read paths never create empty directories
+│   │   │   ├── prompt.h          # AgentPrompt / ToolPrompt declarations (prompt text lives in
+│   │   │   │                     #   src/agent/prompt.cpp, with session placeholders
+│   │   │   │                     #   ${work_dir}/${temp_dir}/${session_id})
+│   │   │   ├── training.h        # EvolutionTrainingAgent evolutionary training (mutate/evaluate/optimize/convergence checks)
+│   │   │   └── io/               # Remote Communication
+│   │   │       ├── agent_server.h    # AgentServer (WS server with token authentication; serveTransport for in-process reuse)
+│   │   │       ├── session_server_agent_io.h # SessionServerAgentIO (session driver, delta buffering/replay, grace timer,
+│   │   │       │                          #   server message queue, plugin event forwarding via WirePluginData)
+│   │   │       ├── wire_protocol.h   # Wire Protocol message types and serialization
+│   │   │       ├── agent_io.h        # AgentIOBase endpoint base class (client/server operational contract)
+│   │   │       ├── client_event_sink.h # Client event sink (forwards endpoint events to client plugin system)
+│   │   │       ├── agent_io_transport.h # Transport layer abstract base class (connect/recv/send/close/alive)
+│   │   │       ├── channel_io_transport.h # In-process Channel transport (zero-copy / zero-serialization)
+│   │   │       └── ws_io_transport.h  # WebSocket transport (JSON codec / heartbeats / reconnection)
+│   │   ├── deps/                 # Dependency Injection
+│   │   │   └── injector.h        # DependencyContainer (factory / singleton / named registrations)
+│   │   ├── event/                # Strongly-typed Event System
+│   │   │   ├── events.h          # Event type definitions (Topic namespace / Event structs)
+│   │   │   ├── event_stream.h    # EventBus / EventStream / RequestResponseStream
+│   │   │   └── event_host.h      # HostBus event types (agent.spawn/message/progress/done)
+│   │   ├── nodes/                # Graph Nodes
+│   │   │   ├── wrap_handle.h     # WrapHandleBaseNode stacked middleware base class
+│   │   │   ├── modelcall.h       # ModelCallWrapNode (LLM invocation, dynamic model switching)
+│   │   │   ├── toolcall.h        # ToolcallWrapNode (tool dispatch, automatic output compaction)
+│   │   │   └── agentcall.h       # AgentStart/EndCallWrapNode (session lifecycle hooks)
+│   │   ├── plugin/               # Plugin System (hot-swappable native C++ plugins, pure C ABI, API v1 — frozen core vtable + 18 agent tables + 9 client tables)
+│   │   │   ├── api/              # Plugin API headers (shared C ABI contract + plugin SDK; host references use api/ prefix)
+│   │   │   │   ├── plugin_api.h      # Pure C ABI contract (sole cross-version stable interface; see plugins.md) — frozen core vtable + COM QueryInterface
+│   │   │   │   ├── client_plugin_api.h # Client-side plugin pure C ABI contract (UI-agnostic semantic layer)
+│   │   │   │   ├── plugin_kit.h      # C++ SDK header-only (PluginBase/Task/awaiters/tool/hook/capability/spawn under namespace agentxx::plugin; includes interface table aggregation & sync tool adapters)
+│   │   │   │   └── plugin_guard.h    # Exception boundary handling header-only for C ABI (namespace agentxx::plugin)
+│   │   │   ├── op_driver.h       # Async operation driver (AgentxxOpNotify Done protocol)
+│   │   │   ├── plugin_manager.h  # PluginManager lifecycle (load/enable/disable/unload) /
+│   │   │   │                     #   PluginTool (C callback -> thread pool offload execution) /
+│   │   │   │                     #   PluginHookDispatchHandle (host-wide single dispatcher, 7 hooks) /
+│   │   │   │                     #   CapabilityRegistry / NativeLoader (dlopen <-> LoadLibraryW)
+│   │   │   ├── plugin_manager_base.h # Common base class for plugin managers (shared by agent/client: instance base, IO posting, waiting, memory management pair)
+│   │   │   ├── plugin_common.h   # Host-side common plugin utilities
+│   │   │   ├── client_plugin_manager.h # ClientPluginManager (client-side loading, UI registry, command pipeline)
+│   │   │   └── tool_registry.h   # Dynamic plugin tool lookup table (shared_ptr keepalive, static tool name conflict detection)
+│   │   ├── middlewares/          # Middlewares
+│   │   │   ├── middleware.h      # BaseMiddlewareHandle / MiddlewareContext / State base classes
+│   │   │   ├── permission.h      # PermissionMiddleware (tool invocation permission HITL)
+│   │   │   ├── skill.h           # SkillMiddleware (skill discovery and execution)
+│   │   │   ├── memory_file.h     # MemoryFileMiddleware (context memory files injection)
+│   │   │   ├── subagent_manager.h # SubagentManagerMiddleware (subagent delegation management, owns agentxx_subagent)
+│   │   │   └── summarization.h   # SummarizationMiddleware (context compaction)
+│   │   ├── tools/                # Tools (lib only retains share_store / subagent / tool_skill_search template / git_worktree;
+│   │   │                         #   filesystem, command, websearch, RAG, string, system datetime, and planning migrated to independent plugins under agent/plugins/)
+│   │   │   ├── tool.h            # XXToolBase / XXToolWrap tool base classes
+│   │   │   ├── share_store.h     # Session-level variable storage (agentxx_share_store)
+│   │   │   ├── subagent.h        # Subagent management tool (agentxx_subagent)
+│   │   │   ├── tool_skill_search.h # Tool/skill lazy-retrieval search subagent task (logic inlined; currently not registered as standalone tool)
+│   │   │   └── git_worktree.h    # Git Worktree tool (create/info/status/remove; enabled via YAML worktree.enable)
+│   │   ├── protocol/             # Protocol Implementations
+│   │   │   ├── openai_provider.h  # OpenAI Chat Completions API (streaming / non-streaming / SSE)
+│   │   │   ├── anthropic_provider.h # Anthropic Messages API (thinking / tool_use)
+│   │   │   ├── mcp_client.h      # MCP Client (HTTP SSE + stdio, multi-version negotiation)
+│   │   │   ├── mcp_server.h      # MCP Server (HTTP + stdio, tool/resource/prompt)
+│   │   │   ├── a2a_client.h      # A2A Client (Agent Card / SendMessage / Task management)
+│   │   │   ├── a2a_server.h      # A2A Server (JSON-RPC, task state machine)
+│   │   │   ├── acp_server.h      # ACP Server (stdio mode)
+│   │   │   ├── provider_common.h # Shared helpers for LLM providers / model-call node
+│   │   │   │                     #   (unique tool_call id, empty-response check)
+│   │   │   └── protocol_base.h   # Protocol base class
+│   │   ├── ui/                  # (removed) the descriptor layer moved into the standalone
+│   │   │   │                     #   cxx_pluginxx_ui library (agent/third_party/, namespace pluginxx::ui;
+│   │   │   │                     #   see docs/zh-cn/design/ui-layer.md for integration and the GUI guide)
+│   │   └── util/                 # Utilities — graph-engine/host coupled headers + host-only database helpers
+│   │       ├── exception.h       # Exception classification & unified catching (neograph cancel/interrupt semantics + utilxx_base::catchError*)
+│   │       ├── neograph_json_bridge.h # utilxx_base::Json <-> neograph::json bridge
+│   │       ├── cancel_adapter.h  # neograph::graph::CancelToken -> utilxx::CancelToken adapter
+│   │       ├── sqlite.h          # Lightweight RAII sqlite3 wrapper (SqliteDb/Stmt, WAL + busy_timeout)
+│   │       └── settings_db.h     # Global settings KV store ({dataDir}/sqlite/global.db)
+│   │       (note: all other general utilities were split into the standalone projects under
+│   │        third_party/cxx_utilxx*; sqlite/settings_db stay host-side)
+│   └── src/                      # Source files (mirrors include directory structure;
+│                                 #   util/ holds sqlite.cpp / settings_db.cpp, ui/ holds item.cpp / text_width.cpp)
+│
+├── client/                       # agentxx_cli executable
+│   ├── main.cpp                  # Entry point: argument parsing -> config loading -> mode dispatch
+│   ├── include/agentxx-client/
+│   │   ├── config_loader.h       # YAML configuration loading / .env parsing / environment variable expansion
+│   │   ├── mode_runners.h        # Execution mode runners (local/remote × tui/cli unified invocation)
+│   │   ├── update_check.h        # GitHub Release update check (302 Location / JSON paths, version comparison)
+│   │   ├── io/
+│   │   │   ├── stdio/
+│   │   │   │   ├── agent_stdio.h # StdIOClientAgentIO (stdin/stdout interaction)
+│   │   │   │   ├── cli_plugin_adapter.h # CLI plugin adapter (command pipeline / client event forwarding)
+│   │   │   │   └── stdin_reader.h # Asynchronous stdin reader
+│   │   │   └── tui/
+│   │   │       ├── agent_tui.h   # TUIClientAgentIO (FTXUI terminal UI: reception/rendering/queues/permissions/logging)
+│   │   │       ├── tui_plugin_adapter.h # TUI plugin adapter (UI registry / command pipeline / client event forwarding)
+│   │   │       ├── scrollable.h  # Scrollable (fully-constructed scrollable container for short lists such as sidebars)
+│   │   │       ├── lazy_scrollable.h # LazyScrollable (lazy construction + bounded LRU cache + viewport partial rendering)
+│   │   │       ├── scroll_common.h # Logic shared by both scroll containers (measure / wheel events)
+│   │   │       ├── markdown_block.h # Markdown block render cache (per-block caching for LazyScrollable)
+│   │   │       ├── plugin_ui_items.h # Client plugin UI descriptor registry snapshot (panels/Info/status items/decors/overlays)
+│   │   │       ├── ui_components.h   # The single renderer of agentxx.ui.item descriptors (render + measure + intra-element hit regions)
+│   │   │       ├── tui_keybind.h  # Key normalization and FTXUI event -> key string (plugin keybind matching)
+│   │   │       ├── tui_theme.h   # TUI theme styling and palettes
+│   │   │       ├── framework/    # TUI Framework Layer
+│   │   │       │   ├── tui_state.h       # Aggregated TUI state (messages, sidebar, pending input queue, etc.)
+│   │   │       │   ├── tui_context.h     # TUI rendering context (theme / state / terminal dimensions / server info)
+│   │   │       │   ├── tui_settings.h    # Global TUI settings singleton (theme / animation / log level / update-check switch)
+│   │   │       │   ├── modal_container.h # Modal container (blocks events and rendering for the covered UI)
+│   │   │       │   ├── ui_hit.h          # Hit registry UiHitRegistry (cleared per frame + registered while rendering + coordinate lookup)
+│   │   │       │   ├── ui_action_list.h  # Declarative item list (keyboard/mouse/selection/group headers in one place)
+│   │   │       │   ├── owned_reflect.h   # Element-owned reflect box (keeps Box alive when elements are cached across frames)
+│   │   │       │   └── tui_i18n.h       # UI translation table (en/zh columns, fallback for missing keys)
+│   │   │       └── components/   # TUI Render Components
+│   │   │           ├── message_list.h # Message list rendering
+│   │   │           ├── interrupt_view.h # Generic interrupt form view (render/measure/interaction driven by descriptor data)
+│   │   │           ├── sidebar.h      # Right-hand sidebar (Log / Info / Planning tabs)
+│   │   │           ├── overlays.h     # Overlays (model/session/settings/about/update notice/queue/context/
+│   │   │           │                  #   mermaid/text/diff/custom/file picker; the file picker implementation lives in
+│   │   │           │                  #   src/io/tui/components/file_picker_overlay.cpp)
+│   │   │           ├── input_bar.h    # Input entry bar
+│   │   │           ├── status_bar.h   # Status bar (token context utilization / activity status / plugin status items)
+│   │   │           └── spinner.h      # Loading spinner animations
+│   │   ├── train/                # Training mode (train.h: EvolutionTrainingAgent wiring / test case loading / evolutionary loop entry)
+│   │   └── util/                 # Client utilities (util.h helpers / clipboard.h clipboard / open_url.h open-in-browser)
+│   └── src/                      # Source files
+│       ├── main.cpp
+│       ├── config_loader.cpp
+│       ├── mode_runners.cpp
+│       ├── io/
+│       │   ├── stdio/agent_stdio.cpp, stdin_reader.cpp
+│       │   └── tui/
+│       │       ├── agent_tui.cpp
+│       │       ├── tui_theme.cpp
+│       │       ├── scrollable.cpp
+│       │       ├── lazy_scrollable.cpp  # LazyScrollable virtual rendering implementation
+│       │       ├── markdown_block.cpp, plugin_ui_items.cpp
+│       │       ├── tui_theme.cpp, tui_settings.cpp, tui_i18n.cpp
+│       │       ├── text_layout.cpp          # Text layout (wrapping / line estimation)
+│       │       ├── ui_components.cpp        # Single renderer of component descriptors (render/measure/hit regions)
+│       │       ├── tui_sidebar_content.cpp # Sidebar content (Log / Info / Planning)
+│       │       ├── tui_log_sink.cpp        # TUI log sink
+│       │       ├── framework/              # TUI framework implementation (ui_action_list/tui_settings/...)
+│       │       └── components/             # Render components implementation: message_list / sidebar / overlays /
+│       │                                   #   file_picker_overlay / input_bar / status_bar / interrupt_view / spinner
+│       ├── train/train.cpp        # Training implementation
+│       └── util/                  # util.cpp / clipboard.cpp / open_url.cpp
+│
+├── test/                         # agentxx_test test executable
+│   ├── test.cpp                  # Test entry point: module registration and scheduling (synchronous/asynchronous grouping)
+│   ├── core/                     # Core library test implementations (*.cpp)
+│   ├── plugin/                   # Plugin test implementations (*.cpp; dso_plugins/ and negative_compile/ hold separately built fixtures)
+│   ├── client/                   # Client-side test implementations (*.cpp; compiled only with AGENTXX_BUILD_CLIENT)
+│   └── include/agentxx-test/     # Single test-header root (sources include them as "agentxx-test/<group>/<module>.h"; kept apart from sources to avoid name clashes)
+│       ├── test_framework.h                   # Test framework (assertion macros / TestResult)
+│       ├── test_toolcall_args.h               # Tool argument automatic type coercion tests
+│       ├── test_ffi_c_api.h                   # FFI C API tests (lifecycle / interaction / HITL / event queue)
+│       ├── core/                              # Core library test headers (module names match core/*.cpp)
+│       │   ├── test_agent.h                   # CodeAgent integration tests (mock LLM Server: tool calls / multi-turn / permissions / retry exhaustion / exception handling)
+│       │   │                                  #   test_agent.h provides shared mock LLM simulator (DaSimServer),
+│       │   │                                  #   reused by agent_host/session_persistence/remote_agent/cancel/memgrowth, etc.
+│       │   ├── test_agent_host.h              # AgentHost host tests (subagent derivation / depth concurrency budget / reclamation)
+│       │   ├── test_training.h                # Evolutionary training tests (mutation / evaluation / optimization / convergence / persistence)
+│       │   ├── test_events.h                  # Event type tests
+│       │   ├── test_event_stream.h            # EventBus / EventStream / RequestResponseStream tests
+│       │   ├── test_json.h                    # In-house Json parsing/serialization tests
+│       │   ├── test_json_view.h               # JsonView read-only view tests
+│       │   ├── test_json_reflection.h         # JSON reflection (struct <-> Json) tests
+│       │   ├── test_interrupt_ui.h            # Interrupt descriptor schema (blocks/controls/result contract) tests
+│       │   ├── test_ui_items.h                # Component descriptor parsing/validation/plain-text fallback tests
+│       │   ├── test_event_bridge.h            # EventBridge event translation tests
+│       │   ├── test_interrupt_bus.h           # Interrupt bus HITL tests
+│       │   ├── test_subagent_bus.h            # Subagent bus tests (including batch delegation / cross-agent routing)
+│       │   ├── test_concurrency.h             # Concurrency tests
+│       │   ├── test_cancel.h                  # Cancellation semantics tests (CancelToken dual channels / operation_aborted translation)
+│       │   ├── test_message_supplement.h      # Message completion and repair tests
+│       │   ├── test_summarization.h           # Context compaction tests (token accounting / deduplication / LLM summarization)
+│       │   ├── test_checkpoint_store.h        # Single checkpoint store tests (InMemorySingleCheckpointStore)
+│       │   ├── test_memgrowth.h               # Multi-turn memory growth tests (leak detection)
+│       │   ├── test_session_persistence.h     # Session SQLite persistence tests (messages / context / share store persistence and recovery)
+│       │   ├── test_remote_agent.h            # Remote Agent tests (WebSocket transport / SessionServerAgentIO)
+│       │   ├── test_mcp.h                     # MCP protocol tests (multi-version / HTTP / stdio)
+│       │   ├── test_a2a.h                     # A2A protocol tests
+│       │   ├── test_acp.h                     # ACP protocol tests
+│       │   ├── test_websocket.h               # WebSocket tests
+│       │   ├── test_http.h                    # HTTP client and server tests
+│       │   ├── test_network_timeout.h         # Network timeout behavior tests
+│       │   ├── test_openai_provider.h         # OpenAI Provider tests (SSE / thinking / tool_calls / rate limits)
+│       │   ├── test_anthropic_provider.h      # Anthropic Provider tests
+│       │   ├── test_string_util.h             # String utility tests
+│       │   ├── test_regex.h                   # Regex engine tests
+│       │   ├── test_diff_util.h               # Diff utility tests
+│       │   ├── test_aho_corasick.h            # Aho-Corasick multi-pattern search tests
+│       │   ├── test_util_misc.h               # Miscellaneous utility tests
+│       │   ├── test_settings_db.h             # Global settings SQLite database tests
+│       │   ├── test_misc_fixes.h              # Miscellaneous bug fix regressions
+│       │   ├── test_share_store.h             # ShareStore tests
+│       │   ├── test_subagent_tool.h           # Subagent tool argument validation and recovery tests
+│       │   ├── test_worktree.h                # Git worktree wrapper and filesystem isolation tests
+│       │   ├── test_filesystem_tools.h        # Filesystem tool tests (directly testing shared *_impl.h implementation)
+│       │   ├── test_command_tools.h           # Command execution tool tests (directly testing shared implementation)
+│       │   ├── test_math_tools.h              # Mathematical computation tool tests (directly testing shared implementation)
+│       │   ├── test_web_search_tools.h        # Web search tool tests (directly testing shared implementation)
+│       │   ├── test_rag_search_tools.h        # RAG search tests (directly testing shared implementation)
+│       │   ├── test_string_tools.h            # String tool tests (html2md / regexp; directly testing shared implementation)
+│       │   └── test_datetime_tool.h           # Datetime tool tests (directly testing shared implementation)
+│       ├── plugin/                            # Plugin test headers (module names match plugin/*.cpp)
+│       │   ├── test_plugins.h                 # Plugin system tests (loading / tools / hooks / events / hot-reloading; module name `plugins`)
+│       │   ├── test_plugin_runtime.h          # Plugin runtime tests (lifecycle / retry / cancellation / multi-instance handles)
+│       │   ├── test_plugin_sdk.h              # Plugin SDK tests (kit tools / forms / components / timers & keybinds + legacy-host degradation)
+│       │   ├── test_plugin_bridge.h           # Plugin bridge tests (coroutine driver bridge / controlled polling / cross-plugin calls)
+│       │   ├── test_plugin_resources.h        # Plugin session resource extension tests (Skills / Memory / MCP declarative + runtime)
+│       │   ├── test_plugin_multi_instance.h   # Plugin multi-instance isolation tests (The Three Iron Rules)
+│       │   ├── test_client_plugins.h          # Client-side plugin tests (skipped during monolithic built-in compilation)
+│       │   ├── test_codegraph_tools.h         # CodeGraph plugin integration tests (5 tools: search/context/callers/callees/path)
+│       │   ├── test_cpu_gpu_use.h             # system_monitor plugin integration tests (system resource monitoring)
+│       │   ├── test_screen_capture.h          # screen_capture plugin integration tests (Windows only)
+│       │   └── test_text_selection_monitor.h  # text_selection_monitor plugin integration tests (Windows only)
+│       └── client/                            # Client-side test headers (module names match client/*.cpp)
+│           ├── test_config_loader.h           # YAML configuration loading tests
+│           ├── test_mermaid_state.h           # Mermaid state machine parser tests
+│           ├── test_thread_id.h               # sessionId uniqueness tests (module name `sessionId`)
+│           ├── test_update_check.h            # GitHub Release version parse/compare and failure paths
+│           ├── test_tui_input.h               # TUI input handling tests
+│           ├── test_tui_interrupt.h           # TUI interrupt interaction tests
+│           ├── test_tui_scroll.h              # TUI scrolling tests
+│           ├── test_tui_settings.h            # TUI settings persistence / update entries / notice dialog tests
+│           ├── test_tui_sidebar.h             # TUI sidebar content and section tests
+│           ├── test_tui_context_overlay.h     # Context overlay hit-testing tests
+│           ├── test_tui_form.h                # Plugin/interrupt form interaction tests
+│           ├── test_tui_stream.h              # TUI token streaming tests
+│           ├── test_tui_surface.h             # Popup surface frame / padding / corner marker tests
+│           ├── test_tui_theme.h               # Theme palette and dim-routing tests
+│           ├── test_tui_ui_items.h            # Component descriptor render/measure/hit-region tests
+│           ├── test_tui_widget.h              # Overlay/status bar/input bar hit-testing and event consumption tests
+│           └── test_tui_tool_header.h         # TUI tool header rendering tests
+│
+├── benchmark/                    # Benchmark tests (typically compiled only in Release mode)
+│
+├── third_party/                  # Third-party dependencies
+│   ├── boost/                    # asio / beast / process / exception
+│   ├── codegraph-cpp/            # Code graph analysis
+│   ├── curl/                     # HTTP
+│   ├── fmt/                      # Formatting
+│   ├── FTXUI/                    # Terminal UI
+│   ├── glob/                     # File globbing
+│   ├── html2md/                  # HTML to Markdown
+│   ├── hyperscan/                # Regex engine
+│   ├── iconv/                    # Character encoding conversion
+│   ├── liburing/                 # io_uring
+│   ├── markdown_ftxui/           # markdown-ui: Markdown rendering (cmark-gfm parser + FTXUI DOM),
+│   │                            #   includes Mermaid stateDiagram-v2 rendering (state_diagram.*)
+│   ├── NeoGraph/                 # Graph execution engine (LLM calls / tool dispatch)
+│   ├── OpenSSL/                  # TLS/SSL
+│   ├── quickjs/                  # QuickJS (JavaScript plugin engine; submodule quickjs-ng, AGENTXX_ENABLE_PLUGIN_JS)
+│   ├── simdjson/                 # JSON parsing
+│   ├── sqlite3/                  # Database
+│   ├── uchardet/                 # Character encoding detection
+│   ├── yaml-cpp/                 # YAML parser
+│   └── zlib/                     # Compression
+│
+├── ffi/                          # Language binding generation configs & client packages
+│   ├── dart/                     # Dart FFI bindings (ffigen.yaml generates
+│   │                             #   agentxx_ffi_bindings.dart from ffi_api.h; dart pub get + ffigen)
+│   └── dart_wire/                # Pure Dart wire client package (message models + JSON codecs +
+│                                 #   WebSocket connection management; no FFI or native dependency)
+│
+├── example/                      # Embedding and binding examples
+│   └── ffi/dart/                 # Dart CLI example (drives libagentxx via FFI:
+│                                 #   streaming rendering, HITL permissions, session switching, mock LLM smoke checks)
+│
+├── plugins/                      # Plugins (standalone dynamic libraries/directories, depends only on plugin_api.h;
+│                                 #   artifacts output to exec/plugins/<plugin_name>/)
+│   ├── example_plugin/           # Example C++ plugin (dual-sided): tools, hooks, events, capabilities, client entry
+│   ├── example_graph_node/       # Graph extension sample plugin (custom node types + set_graph_json graph modification; depends on agent.graph)
+│   ├── example_js/               # Example JavaScript plugin (C++ shell wrapper + plugin.js; depends: javascript_engine)
+│   ├── example_js_execute_command/ # JS code execution tool plugin (example_js_execute_command; depends: javascript_engine)
+│   ├── example_resources/        # Session resource contribution example (declarative & programmatic MCP/Skills/rules)
+│   ├── agentxx_javascript_engine/ # QuickJS engine plugin (exports capability interpreter.js; dedicated JS thread + sandbox)
+│   ├── agentxx_codegraph/        # CodeGraph code analysis plugin (search/context/callers/callees/path, 5 tools + client Info section)
+│   ├── agentxx_filesystem/       # Filesystem tools plugin (6 tools: list/read/write/edit/glob/grep)
+│   ├── agentxx_execute_command/  # Command execution plugin (2 tools: bash/windows)
+│   ├── agentxx_math/             # Math computation plugin (agentxx_math_calculate)
+│   ├── agentxx_websearch/        # Web search plugin (3 tools: search/fetch/fetch_markdown)
+│   ├── agentxx_rag_search/       # Vector semantic search plugin
+│   ├── agentxx_string/           # String processing plugin (2 tools: html_to_markdown/regexp)
+│   ├── agentxx_system/           # System clock plugin (get_current_datetime)
+│   ├── agentxx_planning/         # Task planning plugin + client-side Plan rendering (type-level renderer / runtime decor / Info section)
+│   ├── agentxx_screen_capture/   # Screen capture plugin (Windows only)
+│   ├── agentxx_computer_use/     # Mouse and keyboard automation plugin (Windows only; depends: screen_capture)
+│   ├── agentxx_system_monitor/   # System resource monitoring plugin (tools + background periodic sampling + client status bar rendering)
+│   ├── agentxx_audio_stream/     # Audio stream capture plugin (skipped on all platforms: implementation not enabled)
+│   └── agentxx_text_selection_monitor/ # Text selection event listener plugin (Windows UI Automation only)
+│
+└── script/                       # Build and test scripts
+    ├── linux_debug_build.sh
+    ├── linux_release_build.sh
+    ├── windows_debug_build.bat
+    ├── windows_release_build.bat
+    ├── cross_windows_release_build.sh
+    └── cross_android_release_build.sh
+```
+
+### Key Dependencies
+
+```
+BaseAgent (Base Class)
+  ├── GraphEngine (NeoGraph) + per-agent GraphRegistry
+  │     ├── ModelCallWrapNode → OpenAIProvider / AnthropicProvider
+  │     ├── ToolcallWrapNode → XXToolBase tool collection
+  │     └── AgentStart/EndCallWrapNode
+  ├── AgentRunner (Unified interrupt loop, shared by primary & subagents)
+  ├── MiddlewareContext → Middleware stack
+  ├── AgentContext
+  │     ├── sessions (SessionsManager) → Session (per sessionId)
+  │     │     ├── viewMessages + chainHash (single IO thread read/write; transferred to client via Wire copies)
+  │     │     ├── llmMessages (IO thread read/write)
+  │     │     ├── cancelToken / modelName (IO thread read/write)
+  │     │     ├── activity / contextStats (atomic, cross-thread safe)
+  │     │     ├── deltaSeq (plain uint64_t, incremented strictly on IO thread)
+  │     │     └── io / bus (session level)
+  │     ├── sessions->sessionStore (SessionStore, SQLite persistence; nullable)
+  │     ├── ModelProviderRegistry
+  │     └── EventBus
+  └── AgentConfig → ModelConfig / AgentPrompt
+
+CodeAgent (Inherits BaseAgent)
+  ├── Tools: lib only retains share_store / subagent / git_worktree (+ lazy-loading wiring);
+  │   Filesystem, command execution, websearch, RAG, string utilities, system clock,
+  │   planning, CodeGraph, etc., are all injected as plugins (via YAML plugins section)
+  └── Middlewares: SubagentManager → Summarization → Permission → Skill → MemoryFile → LogPrint
+      (planning/worktree exist as plugins + tools rather than middlewares)
+
+SessionServerAgentIO (Remote Session Driver)
+  ├── AgentIOBase (Server-side endpoint)
+  ├── BaseAgent.runTurnAsync()
+  ├── deltaBuf (Disconnection buffer) + grace timer
+  └── AgentIOTransportBase (Supplied from AgentServer)
+
+Client (agentxx_cli)
+  ├── TUIClientAgentIO / StdIOClientAgentIO → AgentIOBase
+  ├── ChannelAgentIOTransport / WsAgentIOTransport → AgentIOTransportBase
+  ├── ConfigLoader → YAML + .env
+  └── ModeRunners → local/remote × tui/cli combinations
+     ├── runLocalTuiUnified / runLocalCliUnified
+     └── runRemoteTui / runRemoteCli
+
+EventBus (Event Bus)
+  ├── EventStream<T> (Unidirectional: publish / subscribe / unsubscribe)
+  ├── RequestResponseStream<Req, Resp> (Bidirectional: request / serve)
+  └── Topic table (Topic namespace constants)
+```
+
+---
+
+
+## Appendix A: Core Data Models (conversation_types.h)
+
+### ViewMessage (UI Presentation Message)
+- Common fields: `id` (`msgId`, allocated by `appendViewMessage`), `role`, `text`, `startTimeMs`/`durationMs`, `collapsed`.
+- Role enumeration (`Role`): `User` / `Assistant` / `Think` / `System` / `Tool` / `Interrupt` / `Tip`.
+- Role-specific optional sub-structures:
+  - Tool: `ToolData` (`toolName`, `toolCallId`, `toolResult`, `diff`, `toolFinished`).
+  - Think: `ThinkData` (`reasoningTokens`, `isEncrypted`).
+  - Tip: `TipData` (`tipLevel`: `Info`/`Warning`/`Error`)—system notifications and turn statistics are atomically inserted via `InsertMessage`.
+  - Interrupt: `InterruptData` (`interruptId`, `ui` = declarative form descriptor, status `Waiting`/`Confirmed`/`Cancelled`/`Expired`, `interruptResult` = submitted values display text).
+- Serialization: `toJson`/`fromJson` shared between Wire Sync and chained hashing.
+
+### Delta (Streaming Incremental Event, Unified seq)
+- Type: `TextToken` / `ThinkToken` / `ToolStart` / `ToolEnd` / `TurnStart` / `TurnEnd` / `NodeStart` / `NodeEnd` / `MessageUITip` / `InsertMessage` / `UpdateMessage`.
+- Common fields: `seq` (monotonically increasing per session, shared by `EventBridge` and `SessionServerAgentIO` via `Session::nextDeltaSeq`), `text`, `msgId`, `toolName`/`toolCallId`/`arguments`/`result`/`hasError`, `nodeName`, `think` (`ThinkData`), `tipType` (for `MessageUITip`), `message` (contains full `ViewMessage` pointer for `InsertMessage`/`UpdateMessage`), `historyCount`/`tailHash`, `startTimeMs`/`durationMs`, `tps` (turn-level average rate for `TurnEnd`).
+- `MessageUITip`: Transient message rendered in UI without persisting to `viewMessages`.
+- `InsertMessage`: Atomically inserts a complete `ViewMessage` (tips, statistics) into history and synchronizes it across clients.
+- `UpdateMessage`: Updates an already-inserted message in place by `msgId` (e.g. tool result backfill).
+
+### SyncPayload / MessageQueueItem
+- `SyncPayload`: `{fromIndex, messages[], tailHash, totalMessages, messageQueue[]}`
+  - Full Sync: `fromIndex=0`, `totalMessages == messages.size()`.
+  - Tail-window Sync: `fromIndex > 0` (indicating older unrendered messages exist upstream), `totalMessages` reflects full conversation count; client paginates older messages via `WireGetViewMessages`.
+- `MessageQueueItem`: `{id, text, model, createdAtMs}`.
+- `ChainHash`: FNV-1a chained hash accumulated via `append(string)`, exposing `tailHex` for `Hello`/`Sync` validation.
+
+### Wire Protocol Pagination Semantics
+- `ListSessions`: Keyset cursor `{beforeMs, beforeId, limit}` paginates descending by `lastActiveMs`; server replies with `WireSessionList {sessions[], totalCount, hasMore}`.
+- `GetViewMessages`: Requests slice `[max(0, before-count), before)` via `{beforeIndex, count}`; server replies with `WireViewMessagesPage {startIndex, totalCount, messages[]}` (append-only indices are immutable and race-free).
+- `GetContext` and synchronous queries: Blocks waiting for server reply (max 10s timeout; only one concurrent in-flight query per handle).
+
+---
+
+## Appendix B: Plugin System v1 Key Concepts (See plugins.md)
+
+- COM-style interface table query: Frozen core vtable (`alloc`/`free` + `query_interface`; the former `strdup` slot was removed from the vtable in favor of the header-inline `pluginxx_strdup` built on `alloc`), querying dedicated interface tables via string `IID`s (with independent table version fields, all currently 1); loading performs `>=` version compatibility checks.
+- Agent side: 16 interface tables (`tools`, `hooks`, `events`, `capabilities`, `scheduler`, `session`, `plugins`, `config` including get/set_language, `model`, `cancel`, `prompt`, `json`, `log`, `resources`, `graph`, `tasks`; the tasks table takes `notify` as an out-param for host-managed background tasks).
+- Client side: 7 interface tables (`ui` v2 with tool renderers + instance decors, `events`, `session`, `wire`, `self`, `json`, `log`; see `client_plugin_api.h`).
+- Modern SDK (`plugin_kit.h`):
+  - `AGENTXX_PLUGIN_AGENT_EXPORT` / `AGENTXX_PLUGIN_CLIENT_EXPORT` declarative macros wrapping C ABI exception boundaries and context management.
+  - `ToolSchemaBuilder` fluent schema generator auto-merged with host `toolPrompt`.
+  - `ArgReader` error-tolerant parameter parser with smart type conversions.
+  - `CancelRegistry` centralized event-driven cancellation manager with `ScopedRegistration` RAII protection.
+  - `PluginBase` state base + `Task<T>` coroutines + awaiters (`sleep`/`yield`/`offload`/`call_tool`/`invoke_cap`) + registration family (`tool`/`fast_tool`/`blocking_tool`/`hook`/`capability`/`spawn`).
+- Three Iron Rules of Multi-Instance Safety: No mutable global statics / State recovered via `user_data` closures / Cache interface tables in instance contexts.
+- Export control: `-fvisibility=hidden` + version script whitelist (`PLUGINXX_EXPORT`).
+- Platform matrix: Evaluated at the start of each plugin's `CMakeLists.txt` via `plugin_platform_support.cmake`.
+- Utility reuse: Built-in plugins link statically against `cxx_utilxx_base` / `cxx_utilxx` (symbols hidden without conflict); the host-only `sqlite` / `settings_db` helpers stayed in `agentxx/util/`.
+
+---
+
+## Appendix C: Session Working Directory Multi-Source Fallback (AgentContext::getSessionWorkDir)
+
+Fallback precedence (highest to lowest):
+1. `Session::WorktreeBinding.path` (Worktree mode active and bound).
+2. `AgentContext::sessionWorkDirs_[sessionId]` (Session-level override, e.g. client cwd passed in ACP `session/new`, thread-safe via mutex).
+3. `AgentConfig::resolvedWorkDir()` (YAML `work_dir` / process cwd).
+- Callers uniformly retrieve paths via `getSessionWorkDir(sessionId)` rather than querying process `cwd` or `workDir` directly.
+- Returns an empty string on invalidation, prompting caller-defined fallback (e.g. Permission Ask mode registers no default allow rules if workDir is empty).
+
+`AgentContext::getSessionBaseWorkDir(sessionId)` returns the same fallback chain without item 1
+(worktree binding), i.e. the session's "real" directory (session override > agent config /
+process cwd), for display purposes: the worktree binding is a temporary state toggled at runtime
+by the `agentxx_git_worktree` tool (whose result already tells the model that relative paths
+resolve there), so the system prompt's working-directory placeholder uses the base value —
+entering or leaving a worktree never changes the system prompt.
+
+### Session Temp Directory and Prompt Placeholders
+
+- Session temp directory: `AgentContext::sessionTempDir(sessionId)` = `{system temp dir}/agentxx/{session id}/`
+  (`std::filesystem::temp_directory_path` plus a path segment sanitized by
+  `SessionStore::sanitizeSessionId` — same rules as session data directories: invalid
+  characters replaced, over-long names truncated with a hash suffix, empty id becomes `default`)
+  - Path assembly only, no directory creation (the write tool creates parent directories);
+    returns an empty string when the system temp directory is unavailable
+- System prompt placeholders (written in the prompt text, substituted by
+  `AgentPrompt::renderVars`; see the substitution at the end of `AgentContext::buildSystemPrompt`):
+  | token | value |
+  |-------|-------|
+  | `${work_dir}` | session working directory base value (no worktree binding, see above) |
+  | `${temp_dir}` | session temp directory (previous item) |
+  | `${session_id}` | session id (empty session id becomes `default`) |
+  - Plain token replacement, no fmt template parsing: `{` `}` in a custom prompt (JSON
+    fragments, paths) never triggers a parse error; a value that cannot be resolved becomes `unknown`
+  - Substitution runs once after assembly, so a custom `systemPrompt` and every appended
+    section (`appendSystemPrompts`) are covered
+- All prompt text lives in `agent/lib/src/agent/prompt.cpp` (initialized in the constructor):
+  `prompt.h` only declares members and the substitution API, so editing prompt text no longer
+  rebuilds every translation unit that includes the header
+

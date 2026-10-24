@@ -1,0 +1,78 @@
+name: 🐞 Bug report
+description: Report a bug. Please search existing issues and discussions first.
+title: '[Bug] '
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to fill out this issue. Please write a concise and appropriate title for this issue in the title field, and then fill out the form below step by step.
+
+  - type: checkboxes
+    id: check-answer
+    attributes:
+      label: Solution checklist
+      description: To avoid duplicate reports, please confirm the following. Duplicate issues may be closed directly.
+      options:
+        - label: I have searched the [Issue list](https://github.com/any-listen/any-listen/issues?q=is%3Aissue+) and found no similar issue.
+          required: true
+        - label: I have searched the [Discussions](https://github.com/any-listen/any-listen/discussions) and found no similar topic.
+          required: true
+        - label: I agree to follow the [Code of Conduct](https://github.com/any-listen/any-listen/blob/main/CODE_OF_CONDUCT.md).
+          required: true
+
+  - type: dropdown
+    id: check-app-type
+    attributes:
+      label: App type
+      description: Which edition of Any Listen has this issue?
+      options:
+        - Desktop
+        - Web server
+        - Both (Desktop & Web server)
+    validations:
+      required: true
+  - type: textarea
+    id: actual-behavior
+    attributes:
+      label: Actual behavior and expected behavior
+      description: |
+        Clearly and concisely describe what happened and what you expected.
+        Please also include steps to reproduce the issue, e.g.:
+        1. Go to '...'
+        2. Click on '...'
+        3. See error
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Any Listen version
+      description: Which version of Any Listen are you using?
+      placeholder: e.g. 0.7.0
+    validations:
+      required: true
+  - type: input
+    id: last-known-working-version
+    attributes:
+      label: Last known working version
+      description: If applicable, enter the last version that worked normally.
+      placeholder: e.g. 0.6.0
+  - type: input
+    id: operating-system-version
+    attributes:
+      label: Operating system version
+      description: |
+        Which OS version are you using?
+        On macOS, click "Apple menu > About This Mac";
+        On Linux, run `lsb_release` or `uname -a`;
+        On Windows, click "Start > Settings > System > About"
+      placeholder: 'e.g. Windows 11 25H2, macOS 27.0, or Ubuntu 26.04'
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional-information
+    attributes:
+      label: Additional information
+      description: Add more details here if your issue needs further explanation or is hard to reproduce. (You can drag images/videos directly into the editor)

@@ -1,0 +1,1141 @@
+#include "agentxx/nodes/modelcall.h"
+
+#include "agentxx/agent/model_registry.h"
+#include "agentxx/agent/session_store.h"
+#include "agentxx/event/event_stream.h"
+#include "agentxx/event/events.h"
+#include "agentxx/nodes/llm_error.h"
+#include "agentxx/nodes/provider_call_scope.h"
+#include "agentxx/nodes/session_context.h"
+#include "agentxx/plugin/tool_registry.h"
+#include "agentxx/protocol/openai_provider.h"
+#include "agentxx/protocol/provider_common.h"
+#include "agentxx/util/exception.h"
+#include "agentxx/util/observability.h"
+#include "asio/steady_timer.hpp"
+#include "asio/use_awaitable.hpp"
+#include "fmt/format.h"
+#include "fmt/ranges.h"
+#include "utilxx_base/hash.h"
+#include "utilxx_base/log.h"
+#include "utilxx_base/string_util.h"
+#include <algorithm>
+#include <chrono>
+#include <set>
+#include <unordered_map>
+#include <unordered_set>
+
+namespace agentxx {
+namespace nodes {
+
+inline static constexpr std::string_view defaultExceptionTip{"[Exception aborted]"};
+inline static constexpr std::string_view defaultUserCancelTip{"[User cancelled]"};
+inline static constexpr std::string_view defaultContinueTip{"[Please continue]"};
+
+// 生成唯一的 tool_call id: 毫秒时间戳 + 32 位随机数
+// - 无需与已有 id 比较, 碰撞概率 ~2^-32 (同一毫秒内), 跨毫秒必然不同
+// - 相比按下标回填 call_{i}, 不会与 LLM 返回的 call_N 形式 id 冲突
+// - 实现与各 Provider 共用 (见 provider_common.h), 避免多处拷贝漂移
+using agentxx::protocol::makeUniqueToolCallId;
+
+ModelCallWrapNode::ModelCallWrapNode(
+    std::string_view                            name,
+    const neograph::graph::NodeContext&         ctx,
+    std::weak_ptr<agentxx::agent::AgentContext> in_agentContext
+) :
+    WrapHandleBaseNode<neograph::graph::LLMCallNode>(name, in_agentContext, ctx) {
+    if (ctx.extra_config.is_object() && ctx.extra_config.contains(defUseModelRegistryKey)) {
+        useDynamicModel_ = ctx.extra_config.at(defUseModelRegistryKey).get<bool>();
+    }
+    if (ctx.extra_config.is_object() && ctx.extra_config.contains(defAutoRouteKey)) {
+        autoRoute_ = ctx.extra_config.at(defAutoRouteKey).get<bool>();
+    }
+}
+
+std::shared_ptr<neograph::Provider>
+    ModelCallWrapNode::resolveCurrentProvider(std::string_view sessionId) {
+    if (useDynamicModel_) {
+        auto ctxPtr = agentContext.lock();
+        if (ctxPtr && ctxPtr->modelRegistry) {
+            std::string selected;
+            if (auto session = ctxPtr->sessions->get(sessionId)) {
+                selected = session->getModelName();
+            }
+            auto provider = ctxPtr->modelRegistry->getProvider(selected);
+            if (provider) {
+                return provider;
+            }
+        }
+    }
+    return provider_;
+}
+
+std::string ModelCallWrapNode::resolveCurrentModelName(std::string_view sessionId) const {
+    if (useDynamicModel_) {
+        auto ctxPtr = agentContext.lock();
+        if (ctxPtr && ctxPtr->modelRegistry) {
+            std::string selected;
+            if (auto session = ctxPtr->sessions->get(sessionId)) {
+                selected = session->getModelName();
+            }
+            const auto& modelName = ctxPtr->modelRegistry->getModelConfig(selected).modelName;
+            if (false == modelName.empty()) {
+                return modelName;
+            }
+        }
+    }
+    return model_;
+}
+
+asio::awaitable<neograph::ChatCompletion> ModelCallWrapNode::onReceiveToken(
+    neograph::CompletionParams& params,
+    neograph::graph::NodeInput& input
+) {
+    auto agentCtx = agentContext.lock();
+    auto ctxPtr   = agentCtx->middlewareHandleContext;
+
+    auto                               callback = input.stream_cb;
+    neograph::FormatDataStreamCallback onToken;
+    if (nullptr != callback) {
+        onToken = [&input, callback, ctxPtr, agentCtx, this](
+                      const neograph::ChatStreamChunk& token
+                  ) {
+            switch (token.type) {
+                case neograph::ChatStreamChunk::TYPE_CONTENT: {
+                    // 关键指标: 本轮首个正文/思考 token 的时间 (TTFT;
+                    // 同一轮只记第一次, 见 KeyMetrics) —— 这里只记"有内容到达"的事件
+                    if (agentCtx && agentCtx->metrics) {
+                        agentCtx->metrics->noteFirstToken();
+                    }
+                    // 记录 本次请求的临时LLM消息，以便触发异常时处理
+                    ctxPtr->modifyGraphDataItemValue<std::string>(
+                        input.ctx.thread_id,
+                        agentxx::middleware::MiddlewareContext::graphDataKey_tempLLMContent,
+                        [&token](std::string& msg) {
+                            msg += token.data;
+                        }
+                    );
+                } break;
+                case neograph::ChatStreamChunk::TYPE_THINKING: {
+                    if (agentCtx && agentCtx->metrics) {
+                        agentCtx->metrics->noteFirstToken();
+                    }
+                    ctxPtr->modifyGraphDataItemValue<std::string>(
+                        input.ctx.thread_id,
+                        agentxx::middleware::MiddlewareContext::graphDataKey_tempLLMThinking,
+                        [&token](std::string& msg) {
+                            msg += token.data;
+                        }
+                    );
+                } break;
+                default:
+                    // 生成阶段标记 (请求已发出 / 工具调用开始, 见
+                    // protocol/provider_common.h): 不是模型输出文本, 不参与正文与
+                    // 思考累积, 只随下面的事件转发给 UI (占位提示)
+                    break;
+            }
+
+            if (nullptr != callback) {
+                neograph::json neoJson;
+                neograph::to_json(neoJson, token);
+                (*callback)(neograph::graph::GraphEvent{
+                    neograph::graph::GraphEvent::Type::LLM_TOKEN,
+                    nodeName,
+                    neoJson,
+                });
+            }
+        };
+    }
+
+    auto provider = resolveCurrentProvider(input.ctx.thread_id);
+    // 用量记录里记录本次实际使用的模型名 (会话可能已切换模型)
+    auto modelName = resolveCurrentModelName(input.ctx.thread_id);
+    // 用量记录: 每次模型调用记一行, 成功记用量, 失败记原因
+    // - detail: 补充用量 (缓存读/写), provider 经 message.extra 单独回报
+    auto recordUsage = [&agentCtx, &input, &modelName](
+                           const neograph::ChatCompletion::Usage& usage,
+                           const agentxx::protocol::UsageDetail&  detail,
+                           bool                                   ok,
+                           std::string_view                       errorKind
+                       ) {
+        if (!agentCtx || !agentCtx->sessions) {
+            return;
+        }
+        agentxx::agent::SessionStore::UsageRecord rec;
+        rec.timeMs = static_cast<int64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()
+            )
+                .count()
+        );
+        rec.model                  = modelName;
+        rec.promptTokens           = usage.prompt_tokens;
+        rec.completionTokens       = usage.completion_tokens;
+        rec.totalTokens            = usage.total_tokens;
+        // 命中缓存的读取量: 额外字段里有明确值时以它为准 (Anthropic 会把读取量从
+        // input_tokens 里剔除, 与 OpenAI 的 cached_tokens 同一套规则)
+        rec.cachedPromptTokens     = detail.cacheReadTokens > 0 ? detail.cacheReadTokens
+                                                               : usage.cached_prompt_tokens;
+        rec.cacheWritePromptTokens = detail.cacheWriteTokens;
+        rec.reasoningTokens        = usage.reasoning_tokens;
+        rec.ok                     = ok;
+        rec.errorKind              = std::string{errorKind};
+        if (agentCtx->sessions->sessionStore) {
+            agentCtx->sessions->sessionStore->addUsage(input.ctx.thread_id, rec);
+        }
+        // 会话累计用量 (界面显示"本会话已消耗多少 token"): 与用量台账在同一处记账,
+        // 保证界面数字与落盘记录使用同一套规则 (不持久化时界面照样有数字);
+        // 失败记录的用量为 0, 累加不影响结果
+        if (auto session = agentCtx->sessions->get(input.ctx.thread_id);
+            session && session->contextStats) {
+            auto& totals = session->contextStats->usage;
+            totals.promptTokens += rec.promptTokens;
+            totals.completionTokens += rec.completionTokens;
+            totals.totalTokens += rec.totalTokens;
+            totals.cachedPromptTokens += rec.cachedPromptTokens;
+        }
+    };
+    // 关键指标: 模型调用与用量 (失败在错误分类处记)
+    auto noteMetrics = [&agentCtx](
+                           const neograph::ChatCompletion::Usage& usage,
+                           const agentxx::protocol::UsageDetail&  detail,
+                           bool                                   ok
+                       ) {
+        if (!agentCtx || !agentCtx->metrics || !ok) {
+            return;
+        }
+        agentCtx->metrics->noteModelCall(
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            detail.cacheReadTokens > 0 ? detail.cacheReadTokens : usage.cached_prompt_tokens,
+            detail.cacheWriteTokens
+        );
+    };
+
+    neograph::ChatCompletion completion;
+    bool                     callFailed   = false;
+    std::string              callErrorMsg;
+    std::exception_ptr       callErrorEx;
+    // 生成阶段提示 (见 protocol/provider_common.h): 通知 UI 本次请求已发出,
+    // 首个 token 尚未到达 (UI 展示"等待响应"占位提示, 直到正文/思考/工具消息到达)
+    // - 重试路径每次尝试都会重新下发 (上一轮的提示已在上次失败时收尾)
+    if (onToken) {
+        onToken(neograph::ChatStreamChunk{
+            agentxx::protocol::chunk_type::kGenerationStart,
+            std::string{},
+        });
+    }
+    // provider 调用包一层错误记录: 取消/中断按控制流原样抛出 (catchErrorAsync
+    // 未提供 onRethrow 时的默认行为), 其余异常记录用量记录后按原异常类型重抛,
+    // 不改动上层原有的错误处理与重试语义
+    co_await agentxx::util::catchErrorAsync<bool>(
+        [&]() -> asio::awaitable<bool> {
+            completion = co_await provider->invoke_format_data(params, onToken);
+            co_return true;
+        },
+        [&](std::string errmsg) -> asio::awaitable<bool> {
+            callFailed   = true;
+            callErrorMsg = errmsg;
+            callErrorEx  = std::current_exception();
+            recordUsage({}, {}, false, errmsg);
+            if (agentCtx && agentCtx->metrics) {
+                agentCtx->metrics->noteModelError(
+                    std::string{llmErrorKindText(classifyLlmError(errmsg))}
+                );
+            }
+            co_return false;
+        }
+    );
+    if (callFailed) {
+        if (callErrorEx) {
+            std::rethrow_exception(callErrorEx);
+        }
+        throw std::runtime_error{callErrorMsg};
+    }
+
+    // 记录 token使用量
+    ctxPtr->setGraphDataItemValue<int>(
+        input.ctx.thread_id,
+        agentxx::middleware::MiddlewareContext::graphDataKey_LLMTokenUsage,
+        completion.usage.total_tokens
+    );
+    // 补充用量 (缓存读/写): 取出即置空, 不把记账字段带进会话消息
+    const auto usageDetail = agentxx::protocol::takeUsageDetail(completion);
+    recordUsage(completion.usage, usageDetail, true, {});
+    noteMetrics(completion.usage, usageDetail, true);
+    co_return completion.message;
+}
+
+neograph::CompletionParams ModelCallWrapNode::build_params(std::string_view sessionId) const {
+    // 上下文以会话为唯一权威 (图状态不再持有 messages 通道): 直接取会话的 typed
+    // 上下文, 由 provider 侧做一次 typed -> 请求体 JSON 转换, 不经图状态中转
+    auto ctxPtr = agentContext.lock();
+    auto messages = std::vector<neograph::ChatMessage>{};
+    if (ctxPtr) {
+        const auto& sessionMsgs = agentxx::nodes::sessionMessages(ctxPtr, sessionId);
+        messages.assign(sessionMsgs.begin(), sessionMsgs.end());
+    }
+
+    // Ensure exactly one system message, carrying `instructions_` (issue #93).
+    //
+    // The contract: when a node is configured with instructions, the model sees
+    // those instructions as its single system prompt. State that already holds
+    // a system message — seeded by the caller, or restored from a checkpoint
+    // written when instructions_ was different — is replaced, not stacked on
+    // top of. Two system messages is malformed for a single-system-prompt API
+    // such as Anthropic's, and undefined for the OpenAI family.
+    //
+    // Replacing (rather than deferring to the state's message) is also what the
+    // previous code effectively did: it inserted instructions_ at position 0,
+    // ahead of any existing system message, so instructions already won on
+    // precedence. Only the duplicate goes away.
+    if (!instructions_.empty()) {
+        // [@coolight] 当存在 system 消息时不再添加
+        bool has_system = !messages.empty() && messages[0].role == "system";
+        if (!has_system) {
+            neograph::ChatMessage sys;
+            sys.role    = "system";
+            sys.content = instructions_;
+            messages.insert(messages.begin(), sys);
+        }
+    }
+
+    // Build tool definitions
+    std::vector<neograph::ChatTool> tool_defs;
+    tool_defs.reserve(tools_.size());
+    for (auto* tool : tools_) {
+        tool_defs.push_back(tool->get_definition());
+    }
+
+    // 动态插件工具: 追加到 LLM 侧工具 schema (热插拔工具对模型可见的关键)
+    // - 插件工具注册后, 下一轮 modelcall 即随请求发送给 LLM
+    // - 插件工具卸载后, 定义从列表消失, 模型不再选择调用
+    if (auto ctxPtr = agentContext.lock()) {
+        if (ctxPtr->toolRegistry) {
+            ctxPtr->toolRegistry->appendDefinitions(tool_defs);
+        }
+    }
+
+    // 动态段 (每轮都可能变化的中间件片段; 记忆文件/技能清单已改为稳定附加段,
+    // 见 buildSystemPromptStable): 作为请求末尾的独立消息附加, 不写进 system 消息
+    // - 角色用 user: openai-responses 与 anthropic 都会把 system 消息归并到系统
+    //   字段 (放到请求最前面), 用 system 会让非稳定内容进入前缀, 破坏前缀缓存
+    // - 用来源标签包裹, 模型能看出这是主程序注入的上下文, 不是用户发言
+    // - 只在本请求可见, 不改写会话上下文 (权威 transcript 不含动态段)
+    // - 代价: 位置在稳定前缀之外, 每次调用都要重新发送且命中不了缓存, 会明显拉低
+    //   KV 缓存命中率 (下方存在性检查会告警, 当前无写入方)
+    if (ctxPtr) {
+        auto sections = ctxPtr->buildDynamicContextSections(sessionId);
+        if (!sections.empty()) {
+            // 检查与告警: 动态段不在稳定前缀内, 每次调用都全额重发且无缓存命中;
+            // 内容不随轮次变化的片段应写入稳定附加段
+            // (MiddlewareContext::graphDataKey_appendSystemMessageStable)
+            std::string sources;
+            for (const auto& [source, text] : sections) {
+                if (!sources.empty()) {
+                    sources += ", ";
+                }
+                sources += source;
+            }
+            XX_LOGW(
+                "[modelcall] dynamic context section(s) [{}] present: content is attached at "
+                "the request tail, outside the stable prefix, so every call resends it without "
+                "cache hits and the KV cache hit rate drops noticeably; keep content that does "
+                "not change per turn in the stable appended sections "
+                "(graphDataKey_appendSystemMessageStable)",
+                sources
+            );
+            std::string dynamic;
+            for (const auto& [source, text] : sections) {
+                dynamic += fmt::format(
+                    "<dynamic_context source=\"{}\">\n{}\n</dynamic_context>\n",
+                    source,
+                    text
+                );
+            }
+            neograph::ChatMessage dynMsg{
+                .role    = "user",
+                .content = std::move(dynamic),
+            };
+            dynMsg.flags = neograph::MessageFlag::AutoInserted;
+            messages.push_back(std::move(dynMsg));
+        }
+    }
+
+    neograph::CompletionParams params;
+    params.model    = resolveCurrentModelName(sessionId);
+    params.messages = std::move(messages);
+    params.tools    = std::move(tool_defs);
+    if (!sessionId.empty()) {
+        params.extra_fields[std::string(agentxx::protocol::kExtraFieldSessionId)]
+            = std::string{sessionId};
+    }
+
+    // 稳定段指纹: system 消息 + 工具 schema
+    // - 连续请求中该指纹不变 = provider 前缀缓存有效; 变化时计数并记日志
+    if (ctxPtr && ctxPtr->sessions && !sessionId.empty()) {
+        if (auto session = ctxPtr->sessions->get(sessionId); session) {
+            uint64_t h = 0;
+            for (const auto& m : params.messages) {
+                if (m.role != "system") {
+                    continue;
+                }
+                h = utilxx_base::hash::fnv1a64(
+                    fmt::format("{}|{}", h, m.content)
+                );
+            }
+            for (const auto& tool : params.tools) {
+                h = utilxx_base::hash::fnv1a64(
+                    fmt::format("{}|{}|{}", h, tool.name, tool.description)
+                );
+            }
+            if (session->noteStablePrefixHash(h)) {
+                XX_LOGI(
+                    "[modelcall] stable prompt prefix changed ({} change(s) so far, session={})"
+                    "; provider prefix cache is invalidated",
+                    session->stablePrefixChanges(),
+                    sessionId
+                );
+            }
+        }
+    }
+    return params;
+}
+
+asio::awaitable<neograph::graph::NodeOutput>
+    ModelCallWrapNode::callLLM(neograph::graph::NodeInput& in) {
+    XX_LOGT("ModelCallWrapNode::callLLM START");
+    // 安全边界: 请求装配前取用待注入输入
+    // - next-step: 作为 user 消息进入权威上下文与展示历史 (本请求即包含)
+    // - inject:    只拼进本次请求 (不改写上下文)
+    // 放在 build_params 之前: next-step 追加的消息由 build_params 一并复制
+    auto injections
+        = agentxx::nodes::drainPendingSessionInputs(agentContext.lock(), in, in.ctx.thread_id, nodeName);
+    auto params = build_params(in.ctx.thread_id);
+    // 单次调用的取消域: 运行取消照常级联, 消费方放弃时只中止本次调用
+    // (正在进行的 HTTP/SSE 请求立即结束, 不必等响应读完或套接字超时)
+    agentxx::nodes::ProviderCallScope callScope{in.ctx.cancel_token};
+    params.cancel_token = callScope.token();
+    for (auto& injected : injections.requestScoped) {
+        params.messages.push_back(std::move(injected));
+    }
+
+    neograph::ChatCompletion completion;
+    try {
+        completion = co_await onReceiveToken(params, in);
+        // 调用已收尾 (含 provider 抛错后由上层重试/结束): 不再视为"消费方放弃"
+        callScope.markDone();
+    } catch (...) {
+        // provider 抛错时调用同样已经结束 (上层负责分类/重试): 标记完成后原样抛出,
+        // 避免把"错误路径"误当成"消费方放弃"再取消一次
+        callScope.markDone();
+        throw;
+    }
+    neograph::graph::record_usage(in.ctx, completion); // #88
+
+    // 部分 OpenAI 兼容 API (如 Ollama) 流式响应不返回 tool_call id，
+    // 此处补充合成 ID，确保下游 ToolStart/ToolEnd 能正确关联；
+    // 时间戳+随机数生成, 天然唯一, 不会与 LLM 返回的 id 冲突
+    size_t index = 0;
+    for (auto& tc : completion.message.tool_calls) {
+        if (tc.id.empty()) {
+            tc.id = makeUniqueToolCallId(++index);
+        }
+    }
+
+    // assistant 回复定稿: 直接写入会话上下文 (唯一权威) 并发出与旧 messages
+    // 通道写入同形的事件 (UI 展开 view 消息 + 请求节流持久化)
+    const bool hasToolCalls = !completion.message.tool_calls.empty();
+    agentxx::nodes::appendSessionMessages(
+        agentContext.lock(),
+        in,
+        std::vector<neograph::ChatMessage>{std::move(completion.message)},
+        nodeName
+    );
+
+    // ReAct 循环路由: 由本节点直接给出下一节点, 不再依赖
+    // "读末尾消息判断 xx_has_tool_calls" 的条件边 (上下文已不在图状态里)
+    // - 有 tool_calls → tools; 无 → agent_end (本轮结束)
+    // - 图定义显式关闭自动路由 (xx_autoRoute=false) 时不给出 Command, 由图的边决定
+    neograph::graph::NodeOutput out;
+    if (autoRoute_) {
+        out.command = neograph::graph::Command{
+            .goto_node = hasToolCalls ? std::string{"tools"} : std::string{"agent_end"},
+        };
+    }
+    XX_LOGT("ModelCallWrapNode::callLLM END");
+    co_return out;
+}
+
+asio::awaitable<void> ModelCallWrapNode::onHandleStart(
+    agentxx::middleware::BaseMiddlewareHandleInterface& item,
+    neograph::graph::NodeInput&                         in
+) {
+    co_await item.onModelcallStartFunc(in);
+}
+
+asio::awaitable<void> ModelCallWrapNode::onHandleEnd(
+    agentxx::middleware::BaseMiddlewareHandleInterface& item,
+    const neograph::graph::NodeInput&                   in,
+    neograph::graph::NodeOutput&                        result
+) {
+    co_await item.onModelcallEndFunc(in, result);
+}
+
+void ModelCallWrapNode::repairMessages(neograph::graph::NodeInput& in) {
+    auto agentCtxPtr = agentContext.lock();
+    auto session     = (agentCtxPtr && agentCtxPtr->sessions)
+                           ? agentCtxPtr->sessions->getOrCreate(in.ctx.thread_id)
+                           : nullptr;
+    if (!session) {
+        return;
+    }
+
+    // 最后一条消息应当是 system/user/tool
+    const auto& curMsgs = session->messages();
+    if (!curMsgs.empty()) {
+        const auto& role = curMsgs.back().role;
+        if ("system" == role || "user" == role || "tool" == role) {
+            // 无需修复
+        } else {
+            // 插入 user msg 修正消息顺序
+            auto userMsg = neograph::ChatMessage{
+                .role    = "user",
+                .content = std::string{defaultContinueTip},
+                .flags   = neograph::MessageFlag::AutoInserted,
+            };
+            // 与旧实现一致: 直接写入上下文但不产生通道事件 (不在 UI 层插入该消息),
+            // 因此这里只追加 (不请求节流落盘; 紧随其后的轮末权威保存会落盘)
+            session->appendMessages({std::move(userMsg)}, false);
+        }
+    }
+
+    if (agentCtxPtr->agentConfig->repairMessages) {
+        // - 最终兜底处理，一般生成 message 的代码应该自己处理异常、补充消息
+        // - 这里作为最终的预防处理
+        auto msgs = session->messages(); // 拷贝一份: 修复过程需要就地改写
+
+        bool haveChange = false;
+        // 清理悬挂的 assistant tool_calls:
+        // - 取消/异常后重新从图开始节点执行时, 上下文可能以
+        //   "assistant(tool_calls) 但无对应 tool 结果" 结尾 (如 toolcall 节点执行前被
+        //   取消), 悬挂的 tool_calls 会让 LLM 误以为工具已被调用, 这里清空其 tool_calls
+        // - 若所有声明的 tool_call_id 都已有 tool 结果消息 (如 toolcall 内取消时已由
+        //   ToolcallWrapNode 补齐 [User canceled]), 则不清空
+        // - 对全部 assistant 消息逐一检查 (不只最后一条): 历史中任意位置的悬挂组
+        //   (中断/取消残留在中间轮次) 都会污染上下文, 一并修正
+        {
+            // 待删除的孤儿 tool 结果标记 (按原始索引)
+            std::vector<bool> removeOrphan(msgs.size(), false);
+            bool              haveDangling = false;
+
+            // 从后往前遍历: 清空/删除只影响当前组之后的消息, 前面的组索引不受影响
+            for (int64_t i = static_cast<int64_t>(msgs.size()) - 1; i >= 0; --i) {
+                if ("assistant" != msgs[i].role || msgs[i].tool_calls.empty()) {
+                    continue;
+                }
+                // 收集本组声明的 tool_call ids
+                std::set<std::string> ids;
+                for (const auto& tc : msgs[i].tool_calls) {
+                    if (!tc.id.empty()) {
+                        ids.insert(tc.id);
+                    }
+                }
+                if (ids.empty()) {
+                    continue;
+                }
+                // 在本组之后 (直到下一条 agent 消息) 的 tool 结果中查找回复:
+                // - 下一条 agent 消息 = 下一条非 tool 消息 (user/system 或 任意
+                //   assistant); 若是带 tool_calls 的 assistant 则为另一组, 其
+                //   tool 结果属于该组, 不能纳入本组的回复/删除范围
+                std::set<std::string> replied;
+                size_t                nextAgentMsg = msgs.size();
+                for (size_t j = static_cast<size_t>(i) + 1; j < msgs.size(); ++j) {
+                    if ("tool" == msgs[j].role) {
+                        if (!msgs[j].tool_call_id.empty()) {
+                            replied.insert(msgs[j].tool_call_id);
+                        }
+                        continue;
+                    }
+                    nextAgentMsg = j;
+                    break;
+                }
+                const bool allReplied
+                    = std::all_of(ids.begin(), ids.end(), [&](const std::string& id) {
+                          return replied.count(id) > 0;
+                      });
+                if (allReplied) {
+                    continue;
+                }
+                // 悬挂: 清空本组 tool_calls, 并标记其后的孤儿 tool 结果删除
+                // - 悬挂声明清空后, 这些结果成为孤儿 (无对应声明), 会让 LLM API
+                //   校验失败 (如 OpenAI 的 invalid tool_call_id / Anthropic 的
+                //   orphan tool result 400), 也破坏角色顺序
+                // - 正常路径 toolcall 节点会补齐 tool 结果, 走到这里说明该组确实
+                //   未完成, 这些结果要么是异常占位 ([Exception aborted]/
+                //   [User canceled]) 要么是过期残留, 全部删除是安全的
+                msgs[i].tool_calls.clear();
+                for (size_t j = static_cast<size_t>(i) + 1; j < nextAgentMsg; ++j) {
+                    removeOrphan[j] = true;
+                }
+                haveDangling = true;
+                XX_LOGD("RepairMessages: clear dangling toolcalls (msg {})", i);
+            }
+
+            if (haveDangling) {
+                // 从后往前删除标记的孤儿 tool 结果, 避免索引位移
+                size_t removedCount = 0;
+                for (size_t j = msgs.size(); j > 0; --j) {
+                    if (removeOrphan[j - 1]) {
+                        msgs.erase(msgs.begin() + (j - 1));
+                        ++removedCount;
+                    }
+                }
+                if (removedCount > 0) {
+                    XX_LOGD("RepairMessages: clear {} orphan tool result(s)", removedCount);
+                }
+                XX_LOGD("RepairMessages: clear dangling toolcalls before LLM call");
+                haveChange = true;
+            }
+        }
+
+        // 检查并修复 tool_call_id 重复:
+        // - LLM 可能返回重复的 tool_call id (重试/多轮时复用), provider 自动回填的
+        //   call_{i} 也可能与 LLM 返回的 id 冲突, 重复 id 会让 tool 结果消息无法
+        //   精确匹配对应的 assistant tool_call
+        // - 重命名重复出现的 assistant tool_call id, 并按出现顺序同步更新对应
+        //   tool 结果消息的 tool_call_id (第 1 个调用对应第 1 个结果, 依次类推)
+        {
+            // 重复项位置: (消息索引, tool_calls 内索引, 新 id)
+            struct DupToolCall {
+                size_t      msgIdx;
+                size_t      tcIdx;
+                std::string newId;
+            };
+
+            // old id -> 重复项列表 (第 2 次及以后出现), 按 assistant 出现顺序精确配对 tool 结果
+            std::unordered_map<std::string, std::vector<DupToolCall>> dupMap;
+            // old id -> 对应 tool 结果消息索引 (按出现顺序, 仅在第二遍收集)
+            std::unordered_map<std::string, std::vector<size_t>> toolResultIdxs;
+            // 全局已见 id (assistant tool_calls + tool 结果), 生成新 id 时避开碰撞
+            std::unordered_set<std::string> seenIds;
+            // 全局去重序号, 避免同毫秒内 makeUniqueToolCallId(ti) 碰撞
+            static std::atomic<uint64_t> dupSeq{0};
+
+            // 第一遍: 按 assistant 声明顺序收集重复项, 新 id 用全局 seq 保证唯一且不与 seenIds 碰撞
+            for (size_t mi = 0; mi < msgs.size(); ++mi) {
+                auto& msg = msgs[mi];
+                if ("assistant" == msg.role) {
+                    for (size_t ti = 0; ti < msg.tool_calls.size(); ++ti) {
+                        const auto& id = msg.tool_calls[ti].id;
+                        if (id.empty()) {
+                            continue;
+                        }
+                        if (!seenIds.insert(id).second) {
+                            // 第 2 次及以后出现: 生成全局唯一 id, 循环直到与 seenIds 无碰撞
+                            std::string newId;
+                            do {
+                                newId = makeUniqueToolCallId(dupSeq.fetch_add(1));
+                            } while (!seenIds.insert(newId).second);
+                            // 回退一次插入(上面已插入), 下面 dupMap 持有 newId, seenIds
+                            // 已占位防后续碰撞
+                            dupMap[id].push_back(DupToolCall{mi, ti, std::move(newId)});
+                        }
+                    }
+                } else if ("tool" == msg.role && !msg.tool_call_id.empty()) {
+                    // tool 结果 id 纳入已见, 防止新 id 与之碰撞
+                    seenIds.insert(msg.tool_call_id);
+                }
+            }
+
+            if (!dupMap.empty()) {
+                // 第二遍: 收集 tool 结果索引 (按消息顺序)
+                for (size_t mi = 0; mi < msgs.size(); ++mi) {
+                    if ("tool" == msgs[mi].role && !msgs[mi].tool_call_id.empty()) {
+                        toolResultIdxs[msgs[mi].tool_call_id].push_back(mi);
+                    }
+                }
+                // 第三遍: 按 assistant 声明顺序一一回填 tool 结果 (k+1 偏移: 第1个结果对应原始调用)
+                // - 若 tool 结果缺失/乱序, 仅对存在的 k+1 位置回填, 不会错配到其他 id
+                for (auto& [oldId, infos] : dupMap) {
+                    auto                       it = toolResultIdxs.find(oldId);
+                    const std::vector<size_t>* resultIdxs
+                        = (it == toolResultIdxs.end()) ? nullptr : &it->second;
+                    for (size_t k = 0; k < infos.size(); ++k) {
+                        auto& info                                  = infos[k];
+                        msgs[info.msgIdx].tool_calls[info.tcIdx].id = info.newId;
+                        if (resultIdxs && k + 1 < resultIdxs->size()) {
+                            msgs[(*resultIdxs)[k + 1]].tool_call_id = info.newId;
+                        } else if (resultIdxs && resultIdxs->size() == 1 && k == 0) {
+                            // 边界: 仅1个 tool 结果但出现重复 assistant(重试场景),
+                            // 不回填保持原结果对应首次调用
+                        }
+                        XX_LOGW(
+                            "RepairMessages: duplicate tool_call_id '{}' -> '{}' (msg {} tc {})",
+                            oldId,
+                            info.newId,
+                            info.msgIdx,
+                            info.tcIdx
+                        );
+                    }
+                }
+                haveChange = true;
+            }
+        }
+
+        // 合并连续的 user 消息:
+        // - 部分 Provider (如 Anthropic/部分 OpenAI 兼容网关) 要求 user/assistant 交替,
+        //   连续 user 会导致 400 ("consecutive user messages" / "unexpected role").
+        //   如历史中因重试/中断/客户端竞态出现 user+user, 这里在发送前合并为一条.
+        // - 合并策略: content / reasoning_content 以 "\n\n" 拼接, 多模态附件数组直接追加,
+        //   history_contents/tool_calls 追加, flags 按位或, extra 对象字段合并(后者覆盖).
+        {
+            if (msgs.size() >= 2) {
+                bool hasConsecutiveUser = false;
+                for (size_t i = 1; i < msgs.size(); ++i) {
+                    if (msgs[i - 1].role == "user" && msgs[i].role == "user") {
+                        hasConsecutiveUser = true;
+                        break;
+                    }
+                }
+                if (hasConsecutiveUser) {
+                    std::vector<neograph::ChatMessage> merged;
+                    merged.reserve(msgs.size());
+                    size_t mergedCount = 0;
+                    for (auto& m : msgs) {
+                        if (!merged.empty() && merged.back().role == "user" && m.role == "user") {
+                            auto& prev = merged.back();
+                            // content: "\n\n" 拼接, 避免空串产生多余分隔符
+                            if (!m.content.empty()) {
+                                if (!prev.content.empty()) {
+                                    prev.content += "\n\n";
+                                    prev.content += m.content;
+                                } else {
+                                    prev.content = std::move(m.content);
+                                }
+                            }
+                            // reasoning_content 同理
+                            if (!m.reasoning_content.empty()) {
+                                if (!prev.reasoning_content.empty()) {
+                                    prev.reasoning_content += "\n\n";
+                                    prev.reasoning_content += m.reasoning_content;
+                                } else {
+                                    prev.reasoning_content = std::move(m.reasoning_content);
+                                }
+                            }
+                            // 多模态附件
+                            if (!m.image_urls.empty()) {
+                                prev.image_urls.insert(
+                                    prev.image_urls.end(),
+                                    std::make_move_iterator(m.image_urls.begin()),
+                                    std::make_move_iterator(m.image_urls.end())
+                                );
+                            }
+                            if (!m.audio_urls.empty()) {
+                                prev.audio_urls.insert(
+                                    prev.audio_urls.end(),
+                                    std::make_move_iterator(m.audio_urls.begin()),
+                                    std::make_move_iterator(m.audio_urls.end())
+                                );
+                            }
+                            if (!m.video_urls.empty()) {
+                                prev.video_urls.insert(
+                                    prev.video_urls.end(),
+                                    std::make_move_iterator(m.video_urls.begin()),
+                                    std::make_move_iterator(m.video_urls.end())
+                                );
+                            }
+                            if (!m.history_contents.empty()) {
+                                prev.history_contents.insert(
+                                    prev.history_contents.end(),
+                                    std::make_move_iterator(m.history_contents.begin()),
+                                    std::make_move_iterator(m.history_contents.end())
+                                );
+                            }
+                            // user 正常不应带 tool_calls, 但若异常携带则追加保留
+                            if (!m.tool_calls.empty()) {
+                                prev.tool_calls.insert(
+                                    prev.tool_calls.end(),
+                                    std::make_move_iterator(m.tool_calls.begin()),
+                                    std::make_move_iterator(m.tool_calls.end())
+                                );
+                            }
+                            // tool_call_id/tool_name 不处理 (user 角色无此字段)
+                            // flags 合并
+                            prev.flags = prev.flags | m.flags;
+                            // extra 合并: 对象则字段级合并, 否则有值时覆盖
+                            if (!m.extra.is_null() && !m.extra.empty()) {
+                                if (prev.extra.is_null() || prev.extra.empty()) {
+                                    prev.extra = std::move(m.extra);
+                                } else if (prev.extra.is_object() && m.extra.is_object()) {
+                                    for (auto kv : m.extra.items()) {
+                                        prev.extra[kv.first] = kv.second;
+                                    }
+                                } else {
+                                    // 非对象 extra 直接以新值覆盖旧值
+                                    prev.extra = std::move(m.extra);
+                                }
+                            }
+                            ++mergedCount;
+                        } else {
+                            merged.push_back(std::move(m));
+                        }
+                    }
+                    if (merged.size() != msgs.size()) {
+                        XX_LOGD(
+                            "RepairMessages: merged {} consecutive user message(s): {} -> {}",
+                            mergedCount,
+                            msgs.size(),
+                            merged.size()
+                        );
+                        msgs       = std::move(merged);
+                        haveChange = true;
+                    }
+                }
+            }
+        }
+
+        auto checkInfo
+            = agentCtxPtr->middlewareHandleContext->getGraphDataItemValue<utilxx_base::Json>(
+                in.ctx.thread_id,
+                agentxx::middleware::MiddlewareContext::graphDataKey_messageCheckInfo
+            );
+
+        if (checkInfo.contains("message_length") && checkInfo["message_length"].is_number_integer()
+            && checkInfo.value<size_t>("message_length", 0) > msgs.size()) {
+            XX_LOGW(
+                "LLM Messages length reduce: old({}) -> current({})",
+                checkInfo.value<size_t>("message_length", 0),
+                msgs.size()
+            );
+        }
+        checkInfo["message_length"] = msgs.size();
+
+        for (auto& msg : msgs) {
+            bool doPrint = false;
+            if (msg.role == "system") {
+                const auto sysPromptHash = utilxx_base::hash::fnv1a64(msg.content);
+                if (checkInfo.contains("system_prompt_hash")
+                    && checkInfo["system_prompt_hash"].is_number_integer()
+                    && checkInfo.value<uint64_t>("system_prompt_hash", 0) != sysPromptHash) {
+                    XX_LOGE(
+                        "LLM System-Prompt content hash changed: old({:016x}) -> current({:016x}) (length: {})",
+                        checkInfo.value<uint64_t>("system_prompt_hash", 0),
+                        sysPromptHash,
+                        msg.content.size()
+                    );
+                    doPrint = true;
+                }
+                checkInfo["system_prompt_hash"] = sysPromptHash;
+            }
+            // 检查消息非空
+            if (msg.reasoning_content.empty() && msg.content.empty() && msg.tool_calls.empty()) {
+                // 修正
+                msg.content = "[Empty]";
+                XX_LOGE("  - Message is Empty: ");
+                doPrint = true;
+            }
+            // 检查是否符合 utf8
+            if (utilxx_base::utf8Repair(msg.reasoning_content)) {
+                XX_LOGE("  - Message.reasoning_content is not utf8 available: ");
+                doPrint = true;
+            }
+            if (utilxx_base::utf8Repair(msg.content)) {
+                XX_LOGE("  - Message.content is not utf8 available: ");
+                doPrint = true;
+            }
+            for (auto& tool : msg.tool_calls) {
+                if (utilxx_base::utf8Repair(tool.arguments)) {
+                    XX_LOGE(
+                        "  - Message.toolcall is not utf8 available: {}/{}",
+                        tool.name,
+                        tool.id
+                    );
+                    doPrint = true;
+                }
+            }
+            if (doPrint) {
+                haveChange = true;
+                agentxx::middleware::BaseMiddlewareHandleInterface::printMessage(msg);
+            }
+        }
+        agentCtxPtr->middlewareHandleContext->setGraphDataItemValue<utilxx_base::Json>(
+            in.ctx.thread_id,
+            agentxx::middleware::MiddlewareContext::graphDataKey_messageCheckInfo,
+            std::move(checkInfo)
+        );
+
+        if (haveChange) {
+            // 修复后的上下文整体覆盖回会话 (唯一权威); 修复属"纠错"不产生
+            // UI 消息增量, 与旧实现 (state.overwrite 不发通道事件) 语义一致
+            session->replaceMessages(std::move(msgs));
+            agentxx::nodes::updateMessagesMeta(agentCtxPtr, in.state, in.ctx.thread_id);
+        }
+    }
+}
+
+asio::awaitable<void> ModelCallWrapNode::baseRun(
+    std::vector<std::shared_ptr<agentxx::middleware::BaseMiddlewareHandleInterface>>& handles,
+    neograph::graph::NodeInput&                                                       in,
+    neograph::graph::NodeOutput&                                                      result
+) {
+    auto agentCtxPtr = agentContext.lock();
+    auto session     = agentCtxPtr->sessions->getOrCreate(in.ctx.thread_id);
+
+    {
+        // 添加/更新 system Msg (上下文以会话为唯一权威)
+        // - 首条已是 system 消息: 保留其余字段, 就地更新内容 (每轮重建的系统提示词)
+        // - 否则在开头插入一条
+        std::vector<neograph::ChatMessage> msgs = session->messages(); // 拷贝一份后改写
+        bool                               haveSystemMsg = false;
+        if (!msgs.empty() && msgs.front().role == "system") {
+            haveSystemMsg = true;
+        }
+        neograph::ChatMessage newSystemMsg{.role = "system"};
+        if (haveSystemMsg) {
+            newSystemMsg = msgs.front();
+        }
+        if (agentCtxPtr) {
+            // 稳定段 (systemPrompt + 静态附加段 + 运行时稳定附加段: 记忆文件/技能清单)
+            // 随 system 消息下发, 属于稳定前缀; 动态段由 build_params 作为请求末尾的
+            // 独立消息附加, 不写进 system 消息
+            newSystemMsg.content = agentCtxPtr->buildSystemPromptStable(in.ctx.thread_id);
+        }
+        if (haveSystemMsg) {
+            msgs.front() = std::move(newSystemMsg);
+        } else {
+            msgs.insert(msgs.begin(), std::move(newSystemMsg));
+        }
+        // 不请求节流落盘: 系统提示词属每轮重建的派生内容, 由轮末权威保存落库
+        session->replaceMessages(std::move(msgs), false);
+        agentxx::nodes::updateMessagesMeta(agentCtxPtr, in.state, in.ctx.thread_id);
+    }
+
+    auto ctxPtr = agentContext.lock()->middlewareHandleContext;
+    auto timer  = asio::steady_timer(co_await asio::this_coro::executor);
+    // 连续重试次数 (用于退避延时计算): 达到配置上限后停止重试, 不因部分输出重置,
+    // 保证总失败次数严格不超过 llmMaxRetry, 避免消息无限堆积
+    size_t retry = 0;
+    /// 本轮是否已经用掉"上下文超限 → 压缩一次后重试"的机会:
+    /// 每次溢出只压缩一次, 再次溢出直接按失败处理, 避免反复压缩
+    bool overflowCompactUsed = false;
+
+    // 插入 assistant 兜底消息 (保留部分输出, 或插入异常/取消提示):
+    // - 保证消息上下文完整, 用户能看到本次 LLM 调用失败
+    // - 保证末尾消息角色为 assistant 且无 tool_calls, 使重试耗尽/取消路径
+    //   直接以 agent_end 结束本轮, 而不是把悬挂的 tool_calls 误路由回 tools
+    //   节点重复执行
+    auto appendAbortMessage = [&](const std::string& content, const std::string& thinking) {
+        auto msg = neograph::ChatMessage{
+            .role              = "assistant",
+            .content           = content,
+            .reasoning_content = thinking,
+            .flags             = neograph::MessageFlag::AutoInserted,
+        };
+        agentxx::nodes::appendSessionMessages(
+            agentContext.lock(),
+            in,
+            std::vector<neograph::ChatMessage>{std::move(msg)},
+            nodeName
+        );
+    };
+
+    do {
+        // 清理过时的 临时 LLM 消息
+        ctxPtr->removeGraphDataItem(
+            in.ctx.thread_id,
+            agentxx::middleware::MiddlewareContext::graphDataKey_tempLLMThinking
+        );
+        ctxPtr->removeGraphDataItem(
+            in.ctx.thread_id,
+            agentxx::middleware::MiddlewareContext::graphDataKey_tempLLMContent
+        );
+        // 重试时 messages 可能已经发生更改，因此允许在重试时再次执行
+        // 但要实现 [handle->onModelcallRunFunc] 的地方自己保证重复执行没有问题
+        for (auto& handle : handles) {
+            co_await handle->onModelcallRunFunc(in);
+        }
+        // 修正上下文角色顺序
+        repairMessages(in);
+
+        // 取消检查点: 进入 LLM 调用前检查 (重试路径可能已经处于取消状态)
+        if (in.ctx.cancel_token) {
+            in.ctx.cancel_token->throw_if_cancelled("before llm call");
+        }
+
+        bool               isCancel = false;
+        std::string        errInfo;
+        std::exception_ptr errorPtr;
+
+        try {
+            // 触发异常时，本次 LLM 消息不会添加到 result 中，因此需要额外处理
+            result = co_await callLLM(in);
+            co_return;
+        } catch (const neograph::graph::CancelledException&) {
+            isCancel = true;
+            errInfo  = "Cancelled";
+            errorPtr = std::current_exception();
+            // } catch (const neograph::graph::NodeInterrupt&) {
+            // isCancel = true;
+            // llm node 无 Interrupt
+        } catch (const boost::exception& e) {
+            // 注意: boost::exception 需在 std::exception 之前捕获,
+            // 同时继承两者的异常 (如 boost::system::system_error) 才能取到完整诊断信息
+            errInfo  = utilxx_base::autoTryConvertToUtf8(boost::diagnostic_information(e));
+            errorPtr = std::current_exception();
+        } catch (const std::exception& e) {
+            errInfo  = utilxx_base::autoTryConvertToUtf8(e.what());
+            errorPtr = std::current_exception();
+        } catch (...) {
+            errInfo  = "unknown";
+            errorPtr = std::current_exception();
+        }
+
+        // 触发异常: 本次调用失败
+        auto lastMsgThinking = ctxPtr->getGraphDataItemValue<std::string>(
+            in.ctx.thread_id,
+            agentxx::middleware::MiddlewareContext::graphDataKey_tempLLMThinking
+        );
+        auto lastMsgContent = ctxPtr->getGraphDataItemValue<std::string>(
+            in.ctx.thread_id,
+            agentxx::middleware::MiddlewareContext::graphDataKey_tempLLMContent
+        );
+
+        // 错误分类与重试策略 (见 llm_error.h):
+        // - 鉴权/额度/请求非法: 重试无意义, 直接结束本轮 (省掉无用的等待与请求)
+        // - 上下文超限: 压缩一次后立即重试; 再次超限则按失败结束
+        // - 其余 (限流/超时/服务端/未知): 有界指数退避 + 抖动后重试
+        const auto        errKind   = classifyLlmError(errInfo);
+        const bool        retryable = isLlmErrorRetryable(errKind);
+        const bool        overflow  = isLlmContextOverflow(errKind);
+        // 本轮已用掉"溢出压缩重试"机会: 不再压缩, 避免反复压缩 (压缩本身也要花时间)
+        if (overflow) {
+            if (overflowCompactUsed) {
+                // 已压缩过一次仍超限: 走失败路径 (由上层按需硬截断)
+                XX_LOGW(
+                    "LLMCallNode context overflow again after compaction; stop retrying: {}",
+                    errInfo
+                );
+            } else {
+                overflowCompactUsed = true;
+            }
+        }
+
+        // - 取消 / 不可重试 / 连续重试达到配置上限: 停止重试, 抛出原始异常结束本轮执行
+        if (isCancel || !retryable
+            || (overflow && overflowCompactUsed && retry > 0)
+            || retry >= agentCtxPtr->agentConfig->llmMaxRetry) {
+            // 抛出前检查末尾消息角色: 若末尾不是 assistant, 或末尾 assistant
+            // 仍带 tool_calls (悬挂), 插入兜底提示消息
+            // - 覆盖 无输出/短输出 失败的情况 (上轮未插入过)
+            // - 已有 ≥512 部分输出时, 上轮已插入 assistant 保留消息, 无需重复插入
+            // - 保证本轮以错误结束而不是把悬挂的 tool_calls 误路由回 tools 节点
+            const auto& curMsgs        = session->messages();
+            const bool  hasLastMsg     = !curMsgs.empty();
+            const bool  lastIsAssistant = hasLastMsg && curMsgs.back().role == "assistant";
+            const bool  lastHasToolCalls
+                = hasLastMsg && !curMsgs.back().tool_calls.empty();
+            if (false == lastIsAssistant || lastHasToolCalls) {
+                appendAbortMessage(
+                    fmt::format(
+                        "{}\n{}",
+                        lastMsgContent,
+                        isCancel ? defaultUserCancelTip : defaultExceptionTip
+                    ),
+                    lastMsgThinking
+                );
+            }
+            std::rethrow_exception(errorPtr);
+        }
+
+        // 有部分响应成功 (≥512 字符): 保留已有的 llm 消息而不是丢弃, 插入
+        // assistant 消息后继续重试; retry 不重置, 达到配置上限即停止, 避免
+        // "部分输出 -> 重置 retry" 导致无限重试与消息无限堆积
+        if (lastMsgThinking.size() + lastMsgContent.size() >= 512) {
+            appendAbortMessage(
+                fmt::format("{}\n{}", lastMsgContent, defaultExceptionTip),
+                lastMsgThinking
+            );
+        }
+
+        // 自动重试
+        retry++;
+
+        // 上下文超限 (首次): 触发一次压缩后立即重试, 不再按退避等待 ——
+        // 压缩把历史换成摘要, 请求长度立刻下降, 是唯一能真正解决问题的一步
+        if (overflow && overflowCompactUsed) {
+            auto bus = (agentCtxPtr && agentCtxPtr->bus) ? agentCtxPtr->bus : nullptr;
+            if (bus) {
+                XX_LOGW(
+                    "LLMCallNode context overflow: compact session context once and retry: {}",
+                    errInfo
+                );
+                if (nullptr != in.stream_cb) {
+                    neograph::json tipJson = neograph::json{
+                        {"channel", "message_tip"},
+                        {"value",
+                         neograph::json{
+                             {"tipType", "warning"},
+                             {"text",
+                              "LLM 请求超出上下文长度，已压缩会话上下文后重试一次"},
+                         }},
+                    };
+                    (*in.stream_cb)(neograph::graph::GraphEvent{
+                        neograph::graph::GraphEvent::Type::CHANNEL_WRITE,
+                        nodeName,
+                        std::move(tipJson),
+                    });
+                }
+                co_await bus->publish<events::EventCompactContext>(
+                    events::Topic::SummarizationCompact,
+                    events::EventCompactContext{.sessionId = std::string{in.ctx.thread_id}}
+                );
+                continue; // 立即重试 (不等待退避)
+            }
+            // 无总线 (嵌入式/无压缩服务): 无处触发压缩, 按不可恢复处理
+            XX_LOGW("LLMCallNode context overflow without event bus; stop retrying");
+            std::rethrow_exception(errorPtr);
+        }
+
+        size_t delaySec = static_cast<size_t>(llmRetryDelaySeconds(errKind, retry, errInfo));
+        XX_LOGD(
+            "LLMCallNode Retry delay {} seconds: {}/{} | kind={} | {}",
+            delaySec,
+            retry,
+            agentCtxPtr->agentConfig->llmMaxRetry,
+            llmErrorKindText(errKind),
+            errInfo
+        );
+        // 通知 UI 层: LLM API 调用失败, 即将自动重试 (经 base_agent 转为 WireDelta::MessageUITip,
+        // 由 client 端 (TUI/stdio) 插入提示消息)
+        if (nullptr != in.stream_cb) {
+            neograph::json tipJson = neograph::json{
+                {"channel", "message_tip"},
+                {"value",
+                 neograph::json{
+                     {"tipType", "warning"},
+                     {"text",
+                      fmt::format(
+                          "LLM API 请求失败 ({}), {} 秒后自动重试 ({}/{})，错误: {}",
+                          llmErrorKindText(errKind),
+                          delaySec,
+                          retry,
+                          agentCtxPtr->agentConfig->llmMaxRetry,
+                          errInfo
+                      )},
+                 }                       },
+            };
+            (*in.stream_cb)(neograph::graph::GraphEvent{
+                neograph::graph::GraphEvent::Type::CHANNEL_WRITE,
+                nodeName,
+                std::move(tipJson),
+            });
+        }
+        // 逐渐延长延时等待 (appendDelay 单位: 秒, 与 UI 提示 delaySec 一致)
+        timer.expires_after(std::chrono::seconds(delaySec));
+        co_await timer.async_wait(asio::use_awaitable);
+    } while (true);
+}
+
+} // namespace nodes
+} // namespace agentxx
