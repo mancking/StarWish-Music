@@ -25,7 +25,31 @@ android {
             ignoreAssetsPattern '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
         }
     }
+    flavorDimensions "device"
+    productFlavors {
+        phone {
+            dimension "device"
+            applicationIdSuffix ".phone"
+            versionNameSuffix "-phone"
+            manifestPlaceholders = [deviceLabel: "手机版"]
+        }
+        tablet {
+            dimension "device"
+            applicationIdSuffix ".tablet"
+            versionNameSuffix "-tablet"
+            manifestPlaceholders = [deviceLabel: "平板版"]
+        }
+        automotive {
+            dimension "device"
+            applicationIdSuffix ".automotive"
+            versionNameSuffix "-automotive"
+            manifestPlaceholders = [deviceLabel: "车机版"]
+        }
+    }
+
     buildTypes {
+        debug {
+        }
         release {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'

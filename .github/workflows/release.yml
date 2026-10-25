@@ -126,8 +126,11 @@ jobs:
           # 解成乱码（历史上出现过 "-2.3.4-.exe"），且 GitHub 资产 URL 也拒绝中文。
           VER="${GITHUB_REF_NAME#v}"
           cd dist/final
-          [ -f app-debug.apk ] && mv app-debug.apk "StarWish-${VER}-android-debug.apk"
-          [ -f app-release.apk ] && mv app-release.apk "StarWish-${VER}-android.apk"
+          # Android：3 设备形态（phone/tablet/automotive）× debug/release
+          for f in app-*.apk; do
+            [ -f "$f" ] || continue
+            mv "$f" "StarWish-${VER}-android-${f#app-}"
+          done
           [ -f StarWish-unsigned.ipa ] && mv StarWish-unsigned.ipa "StarWish-${VER}-ios-unsigned.ipa"
           cd -
           ls -la dist/final

@@ -65,15 +65,8 @@
     </queries>
 
     <!--
-      车机端（Android Automotive OS 及国内 Android 车机）兼容声明。
-      这两条 required=false 是「允许安装」而非「要求能力」：
-      · type.automotive —— 让 AAOS 车机允许安装本应用；
-      · touchscreen 不设为必需 —— 部分车机以旋钮/方向盘按键为主要输入，
-        默认要求触摸屏会把这些设备挡在安装之外。
-      不声明 leanback（电视）与 automotive 必需，手机端与车机端共用同一个 APK。
+      设备形态声明（手机的触摸+竖屏、平板的横屏、车机的 automotive required）
+      已按 productFlavor 下沉到 src/{phone,tablet,automotive}/AndroidManifest.xml，
+      由各 flavor 独立声明。此处只保留三端共有的权限、组件与 queries。
     -->
-    <uses-feature android:name="android.hardware.type.automotive" android:required="false" />
-    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
-    <uses-feature android:name="android.hardware.screen.landscape" android:required="false" />
-    <uses-feature android:name="android.hardware.screen.portrait" android:required="false" />
 </manifest>

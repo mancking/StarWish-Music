@@ -1,7 +1,8 @@
 name: Build Mobile (Android / iOS)
 
 # 移动端产物：
-#   - Android：debug APK（可直接侧载），无需签名配置
+#   - Android：3 个设备形态 flavor（phone/tablet/automotive）× 2 种 buildType
+#     （debug 可侧载 / release 正式）共 6 个 APK
 #   - iOS：未签名 ipa（不上架 App Store，用户自签 / AltStore 安装）
 #     iOS 默认关闭，需要在仓库 Settings → Variables 里设置 ENABLE_IOS=true 才执行。
 on:
@@ -93,14 +94,15 @@ jobs:
           echo "dist/mobile assets: $DIST_N"
           grep -q "index.mobile" android/app/src/main/assets/public/index.html && echo "index.html references ok"
 
-      - name: Gradle assembleDebug
+      - name: Gradle assemble (all flavors & build types)
         working-directory: app/android
         run: |
           chmod +x gradlew
           set +e
           # gradle.properties 里为本地开发写死了 Windows JDK 路径（org.gradle.java.home），
           # runner 上不存在，用命令行参数覆盖成 runner 的 JAVA_HOME。
-          ./gradlew assembleDebug --no-daemon -Dorg.gradle.java.home="$JAVA_HOME" > /tmp/gradle.log 2>&1
+          # assemble 构建全部 3 flavor（phone/tablet/automotive）的 debug + release
+          ./gradlew assemble --no-daemon -Dorg.gradle.java.home="$JAVA_HOME" > /tmp/gradle.log 2>&1
           code=$?
           if [ $code -ne 0 ]; then
             tail -45 /tmp/gradle.log | while IFS= read -r line; do
@@ -110,17 +112,29 @@ jobs:
           fi
           tail -5 /tmp/gradle.log
 
-      - name: Assert APK contains entry page
+      - name: Assert all APKs contain entry page
         working-directory: app/android
         run: |
-          unzip -l app/build/outputs/apk/debug/app-debug.apk | grep -q "assets/public/index.html" || { echo "::error::APK missing assets/public/index.html"; exit 1; }
-          echo "APK integrity ok"
+          FLAVORS="phone tablet automotive"
+          BUILD_TYPES="debug release"
+          for flavor in $FLAVORS; do
+            for bt in $BUILD_TYPES; do
+              apk="app/build/outputs/apk/${flavor}/${bt}/app-${flavor}-${bt}.apk"
+              if [ -f "$apk" ]; then
+                unzip -l "$apk" | grep -q "assets/public/index.html" || { echo "::error::$apk missing assets/public/index.html"; exit 1; }
+                echo "OK: $apk"
+              else
+                echo "warn: $apk not found (may be skipped by buildType filter)"
+              fi
+            done
+          done
 
-      - name: Upload APK
+      - name: Upload all APKs
         uses: actions/upload-artifact@v4
         with:
           name: starwish-android-apk
-          path: app/android/app/build/outputs/apk/debug/*.apk
+          path: |
+            app/android/app/build/outputs/apk/*/*/*.apk
           if-no-files-found: error
           retention-days: 14
 
