@@ -140,7 +140,9 @@ jobs:
 
   ios:
     name: ios-unsigned-ipa
-    # 首次运行会用 `cap add ios` 生成 ios/ 工程；后续建议把 ios/ 提交进仓库以保证可复现。
+    # 首次运行会用 `cap add ios` 生成 ios/ 工程；同一份生成源被构建两次，
+    # 分别裁剪为「仅 iPhone」与「仅 iPad」两个设备形态（UIDeviceFamily 不同、
+    # bundle id 不同、方向支持不同），产出两个不可互换的 unsigned ipa。
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
@@ -167,31 +169,55 @@ jobs:
           npx cap add ios || true
           npx cap sync ios
 
-      - name: Xcode archive (unsigned)
-        working-directory: app/ios/App
+      # 每次 xcodebuild 前先清掉上次 derivedData，避免两形态产物混用缓存目录
+      - name: Build & package iPhone (unsigned)
+        working-directory: app
         run: |
+          node scripts/ios-configure.mjs phone
+          cd ios/App
+          rm -rf build
           xcodebuild -workspace App.xcworkspace \
             -scheme App \
             -configuration Release \
             -sdk iphoneos \
             -derivedDataPath build \
+            PRODUCT_BUNDLE_IDENTIFIER=com.starwish.music.phone \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             build
-
-      - name: Package unsigned ipa
-        working-directory: app/ios/App
-        run: |
           APP_PATH=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' | head -1)
-          echo "app: $APP_PATH"
+          echo "iphone app: $APP_PATH"
           rm -rf Payload && mkdir Payload
           cp -R "$APP_PATH" Payload/
-          zip -qry StarWish-unsigned.ipa Payload
+          zip -qry StarWish-iPhone-unsigned.ipa Payload
 
-      - name: Upload ipa
+      - name: Build & package iPad (unsigned)
+        working-directory: app
+        run: |
+          node scripts/ios-configure.mjs ipad
+          cd ios/App
+          rm -rf build
+          xcodebuild -workspace App.xcworkspace \
+            -scheme App \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            PRODUCT_BUNDLE_IDENTIFIER=com.starwish.music.ipad \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build
+          APP_PATH=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' | head -1)
+          echo "ipad app: $APP_PATH"
+          rm -rf Payload && mkdir Payload
+          cp -R "$APP_PATH" Payload/
+          zip -qry StarWish-iPad-unsigned.ipa Payload
+
+      - name: Upload ipa (iPhone + iPad)
         uses: actions/upload-artifact@v4
         with:
           name: starwish-ios-ipa
-          path: app/ios/App/StarWish-unsigned.ipa
+          path: |
+            app/ios/App/StarWish-iPhone-unsigned.ipa
+            app/ios/App/StarWish-iPad-unsigned.ipa
           if-no-files-found: error
           retention-days: 14
