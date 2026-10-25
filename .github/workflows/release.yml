@@ -139,6 +139,25 @@ jobs:
           cd -
           ls -la dist/final
 
+      - name: Drop superseded assets
+        # 设备形态拆分前的旧资产（无 flavor 的 android-debug、单 ipa 的 ios-unsigned）
+        # 不会被本轮上传覆盖，但会和新产物并存造成「下错包」。发布前统一清掉，
+        # 让 Release 资产清单与当前设备形态一一对应。
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          VER: ${{ github.ref_name }}
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          gh release view "$TAG" --json assets --jq '.assets[].name' 2>/dev/null | while read -r name; do
+            case "$name" in
+              "StarWish-${VER}-android-debug.apk"|"StarWish-${VER}-android-release-unsigned.apk"|"StarWish-${VER}-ios-unsigned.ipa")
+                echo "delete superseded asset: $name"
+                gh release delete-asset "$TAG" "$name" --yes
+                ;;
+            esac
+          done
+
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
