@@ -1,0 +1,15 @@
+{
+  "id": "metal-rock",
+  "name": "金属摇滚",
+  "author": "星河主题工坊",
+  "version": "1.0.0",
+  "colors": {
+    "primary": "#6b7280",
+    "accent": "#ef4444",
+    "bg": "#0c0c0e",
+    "text": "#f3f4f6"
+  },
+  "playerBg": "spectrum",
+  "fontScale": 0.95,
+  "borderRadius": 0
+}

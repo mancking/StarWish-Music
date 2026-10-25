@@ -1,0 +1,15 @@
+{
+  "id": "candy-party",
+  "name": "糖果派对",
+  "author": "星河主题工坊",
+  "version": "1.0.0",
+  "colors": {
+    "primary": "#ec4899",
+    "accent": "#8b5cf6",
+    "bg": "#160e1a",
+    "text": "#ffe4f1"
+  },
+  "playerBg": "particle",
+  "fontScale": 1.05,
+  "borderRadius": 20
+}

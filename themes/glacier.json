@@ -1,0 +1,15 @@
+{
+  "id": "glacier",
+  "name": "冰川蓝",
+  "author": "星河主题工坊",
+  "version": "1.0.0",
+  "colors": {
+    "primary": "#7dd3fc",
+    "accent": "#e0f2fe",
+    "bg": "#0b1420",
+    "text": "#eef7ff"
+  },
+  "playerBg": "cover",
+  "fontScale": 0.95,
+  "borderRadius": 8
+}

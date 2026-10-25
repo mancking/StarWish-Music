@@ -1,0 +1,15 @@
+{
+  "id": "nebula",
+  "name": "星云紫",
+  "author": "星河主题工坊",
+  "version": "1.0.0",
+  "colors": {
+    "primary": "#a855f7",
+    "accent": "#ec4899",
+    "bg": "#0d0618",
+    "text": "#f3e8ff"
+  },
+  "playerBg": "particle",
+  "fontScale": 1.05,
+  "borderRadius": 12
+}

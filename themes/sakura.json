@@ -1,0 +1,15 @@
+{
+  "id": "sakura",
+  "name": "和风樱",
+  "author": "星河主题工坊",
+  "version": "1.0.0",
+  "colors": {
+    "primary": "#f472b6",
+    "accent": "#fbcfe8",
+    "bg": "#170e13",
+    "text": "#ffe8f4"
+  },
+  "playerBg": "particle",
+  "fontScale": 1.05,
+  "borderRadius": 18
+}

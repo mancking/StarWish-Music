@@ -1,0 +1,15 @@
+{
+  "id": "lavender-haze",
+  "name": "薰衣草雾",
+  "author": "星河主题工坊",
+  "version": "1.0.0",
+  "colors": {
+    "primary": "#8b7cf6",
+    "accent": "#c4b5fd",
+    "bg": "#14101f",
+    "text": "#ece8fa"
+  },
+  "playerBg": "gradient",
+  "fontScale": 1.0,
+  "borderRadius": 12
+}

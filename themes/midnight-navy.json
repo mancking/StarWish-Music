@@ -1,0 +1,15 @@
+{
+  "id": "midnight-navy",
+  "name": "深空藏蓝",
+  "author": "星河主题工坊",
+  "version": "1.0.0",
+  "colors": {
+    "primary": "#3b82f6",
+    "accent": "#93c5fd",
+    "bg": "#060b16",
+    "text": "#dbeafe"
+  },
+  "playerBg": "cover",
+  "fontScale": 0.95,
+  "borderRadius": 10
+}

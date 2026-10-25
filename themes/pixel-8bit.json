@@ -1,0 +1,15 @@
+{
+  "id": "pixel-8bit",
+  "name": "像素游戏",
+  "author": "星河主题工坊",
+  "version": "1.0.0",
+  "colors": {
+    "primary": "#22d3ee",
+    "accent": "#a3e635",
+    "bg": "#0d1117",
+    "text": "#eaf2f8"
+  },
+  "playerBg": "solid",
+  "fontScale": 0.9,
+  "borderRadius": 2
+}

@@ -1,0 +1,15 @@
+{
+  "id": "amber-glow",
+  "name": "琥珀橙",
+  "author": "星河主题工坊",
+  "version": "1.0.0",
+  "colors": {
+    "primary": "#f59e0b",
+    "accent": "#fbbf24",
+    "bg": "#171006",
+    "text": "#fdf0d8"
+  },
+  "playerBg": "spectrum",
+  "fontScale": 1.05,
+  "borderRadius": 12
+}

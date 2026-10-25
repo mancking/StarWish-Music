@@ -1,0 +1,322 @@
+[
+  {
+    "kind": "theme",
+    "id": "lavender-haze",
+    "name": "薰衣草雾",
+    "version": "1.0.0",
+    "author": "星河主题工坊",
+    "description": "柔和薰衣草紫渐变，低刺激护眼，适合长时间沉浸听歌",
+    "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Theme-Library/themes/lavender-haze.json",
+    "hash": "2935ed66375ccfa6b886dee16ac5f6099afc1d60ef2110526a46ce2f48c17c7e"
+  },
+  {
+    "kind": "theme",
+    "id": "rose-blush",
+    "name": "珊瑚粉",
+    "version": "1.0.0",
+    "author": "星河主题工坊",
+    "description": "温柔珊瑚粉红系，光谱频谱动效，浪漫少女氛围",
+    "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Theme-Library/themes/rose-blush.json",
+    "hash": "63263221b0a83df0fb6086c57cb0566d5c64d75d561373bdbfc05cea2f7b9bc1"
+  },
+  {
+    "kind": "theme",
+    "id": "ocean-breeze",
+    "name": "海盐蓝",
+    "version": "1.0.0",
+    "author": "星河主题工坊",
+    "description": "清新海盐蓝，封面大图作背景，清爽通透的海洋感",
+    "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Theme-Library/themes/ocean-breeze.json",
+    "hash": "8b7a9add198f86efa36dad21a0fff8d5082cca48828fdc45814a9ef871ce497f"
+  },
+  {
+    "kind": "theme",
+    "id": "mint-fresh",
+    "name": "薄荷青",
+    "version": "1.0.0",
+    "author": "星河主题工坊",
+    "description": "薄荷绿纯色底，低饱和清新，眼疲劳友好",
+    "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Theme-Library/themes/mint-fresh.json",
+    "hash": "66573c818158f30a57bd4e0fb404a28eac48fc4a97f0bcfd31019fc6884f69bf"
+  },
+  {
+    "kind": "theme",
+    "id": "jade-vein",
+    "name": "翡翠绿",
+    "version": "1.0.0",
+    "author": "星河主题工坊",
+    "description": "翡翠绿渐变，沉稳典雅，绿意盎然",
+    "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Theme-Library/themes/jade-vein.json",
+    "hash": "b7e7dbca9d6a5a69512bd31b46819d83e4857c1a4d6d911d1a50baf115c4dcfa"
+  },
+  {
+    "kind": "theme",
+    "id": "amber-glow",
+    "name": "琥珀橙",
+    "version": "1.0.0",
+    "author": "星河主题工坊",
+    "description": "琥珀暖橙，频谱跃动，温暖治愈系",
+    "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Theme-Library/themes/amber-glow.json",
+    "hash": "e332288da19baa716817f9d66adb79fc051f085e57a6d7ac501cc49213a29ea2"
+  },
+  {
+    "kind": "theme",
+    "id": "sunset-crimson",
+    "name": "落日红",
+    "version": "1.0.0",
+    "author": "星河主题工坊",
+    "description": "落日红橙渐变，热烈浓郁，黄昏余晖氛围",
+    "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Theme-Library/themes/sunset-crimson.json",
+    "hash": "acfcb927bad04c938cc3062c639faa76ec19b927f8b79ab9308f791ec32953ef"
+  },
+  {
+    "kind": "theme",
+    "id": "lemon-zest",
+    "name": "柠檬黄",
+    "version": "1.0.0",
+    "author": "星河主题工坊",
+    "description": "明快柠檬黄，粒子动效，活力轻快",
+    "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Theme-Library/themes/lemon-zest.json",
+    "hash": "aa0d28315a115d571b090f21590bef6a0d4e2b2d95d789622bd29d3bf65b7d5a"
+  },
+  {
+    "kind": "theme",
+    "id": "slate-fog",
+    "name": "雾霾灰",
+    "version": "1.0.0",
+    "author": "星河主题工坊",
+    "description": "低饱和雾灰蓝，字体加大，长时间阅读友好",
+    "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Theme-Library/themes/slate-fog.json",
+    "hash": "8274b33f7bb1777c9816d991b28414d1b4f75289973fb7415f33df8cfc920b43"
+  },
+  {
+    "kind": "theme",
+    "id": "cocoa-warm",
+    "name": "暖棕可可",
+    "version": "1.0.0",
+    "author": "星河主题工坊",
+    "description": "可可暖棕，歌词墙背景，咖啡店般的松弛感",
+    "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Theme-Library/themes/cocoa-warm.json",
+    "hash": "40a826d1600605dc2ebaa72d6db717fa2eb3c992ede70e4c3a5667585d0290ee"
+  },
+  {
+    "kind": "theme",
+    "id": "midnight-navy",
+    "name": "深空藏蓝",
+    "version": "1.0.0",
+    "author": "星河主题工坊",
+    "description": "深夜藏蓝，封面背景，静谧专注",
+    "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Theme-Library/themes/midnight-navy.json",
+    "hash": "d391a1c8e4b59b5821d4b3969d13bfaadbe1ae5adcbb5fcb1e528dd1ca509086"
+  },
+  {
+    "kind": "theme",
+    "id": "berry-purple",
+    "name": "莓果紫红",
+    "version": "1.0.0",
+    "author": "星河主题工坊",
+    "description": "莓果紫红，频谱动效，甜美又带锋芒",
+    "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Theme-Library/themes/berry-purple.json",
+    "hash": "74243e062684a54c517b29dee68de08b7e193156532d5748316602080c513b3e"
+  },
+  {
+    "kind": "theme",
+    "id": "gold-black",
+    "name": "黑金奢华",
+    "version": "1.0.0",
+    "author": "星河主题工坊",
+    "description": "黑金撞色，直角硬朗，奢华质感",
+    "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Theme-Library/themes/gold-black.json",
+    "hash": "10dda6fe340d4433684b4fbb8e18ef744da4f485a77e8515804fa4addfbb4c98"
+  },
+  {
+    "kind": "theme",
+    "id": "pure-white",
+    "name": "极简纯白",
+    "version": "1.0.0",
+    "author": "星河主题工坊",
+    "description": "亮色主题，纯白底蓝强调，清爽极简办公风",
+    "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Theme-Library/themes/pure-white.json",
+    "hash": "fed0deb14622010e12442ba58ae557e69895ef2cffc8069ec30160701cdf5ce0"
+  },
+  {
+    "kind": "theme",
+    "id": "glassy",
+    "name": "玻璃拟态",
+    "version": "1.0.0",
+    "author": "星河主题工坊",
+    "description": "亮色玻璃拟态，青蓝透明感，现代通透",
+    "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Theme-Library/themes/glassy.json",
+    "hash": "dbe873c93563ac0b97ac18614d8317a504b1f9d4c5d20e2c5de4aa25d12050dd"
+  },
+  {
+    "kind": "theme",
+    "id": "cyber-neon",
+    "name": "赛博霓虹",
+    "version": "1.0.0",
+    "author": "星河主题工坊",
+    "description": "青粉霓虹，锐利直角，赛博朋克粒子夜",
+    "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Theme-Library/themes/cyber-neon.json",
+    "hash": "14d42c4a19ba31e7005e4b06f413d089d8b8817c29fc65771156b156fde12c46"
+  },
+  {
+    "kind": "theme",
+    "id": "vaporwave",
+    "name": "蒸汽波",
+    "version": "1.0.0",
+    "author": "星河主题工坊",
+    "description": "蒸汽波粉青渐变，复古未来感",
+    "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Theme-Library/themes/vaporwave.json",
+    "hash": "e849913628163bbf1e4d901cad95064288d2ab369dee4d3889941ee530264888"
+  },
+  {
+    "kind": "theme",
+    "id": "aurora",
+    "name": "极光幻彩",
+    "version": "1.0.0",
+    "author": "星河主题工坊",
+    "description": "绿紫极光渐变，梦幻深邃",
+    "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Theme-Library/themes/aurora.json",
+    "hash": "058f3818f0e0226957d01050c4e095d5733b5085abe8e52eba95c80591c267e5"
+  },
+  {
+    "kind": "theme",
+    "id": "nebula",
+    "name": "星云紫",
+    "version": "1.0.0",
+    "author": "星河主题工坊",
+    "description": "星云紫粉，粒子星尘，太空浪漫",
+    "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Theme-Library/themes/nebula.json",
+    "hash": "9cadadc018166e47158142fbb44d34438d13975e064ab8a4aef99cd3cb95180c"
+  },
+  {
+    "kind": "theme",
+    "id": "magma",
+    "name": "熔岩赤",
+    "version": "1.0.0",
+    "author": "星河主题工坊",
+    "description": "熔岩炽红橙，频谱如火焰跃动，激情澎湃",
+    "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Theme-Library/themes/magma.json",
+    "hash": "effb48526db3b7f8406484d9732b7d98ba675866b9d5cff99f4fb1509596acd3"
+  },
+  {
+    "kind": "theme",
+    "id": "glacier",
+    "name": "冰川蓝",
+    "version": "1.0.0",
+    "author": "星河主题工坊",
+    "description": "冰川浅蓝，封面背景，清冷通透",
+    "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Theme-Library/themes/glacier.json",
+    "hash": "918697ef238ff3138e0b0a2e804c469534ebea7696df3ac32d4f49bc979fe5a4"
+  },
+  {
+    "kind": "theme",
+    "id": "desert-dune",
+    "name": "沙漠驼色",
+    "version": "1.0.0",
+    "author": "星河主题工坊",
+    "description": "沙漠金驼，歌词墙背景，粗粝旷远",
+    "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Theme-Library/themes/desert-dune.json",
+    "hash": "544aa237100be9ca4dcdad7f4db0886ae83b4c18952e418af32a56612935c249"
+  },
+  {
+    "kind": "theme",
+    "id": "deep-forest",
+    "name": "森林幽绿",
+    "version": "1.0.0",
+    "author": "星河主题工坊",
+    "description": "幽林深绿，纯色底，沉静安宁",
+    "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Theme-Library/themes/deep-forest.json",
+    "hash": "c4cc8a693979ce63fe32b3713c878c4cb79181f193c982a7d16d4574c47a8064"
+  },
+  {
+    "kind": "theme",
+    "id": "abyss-ocean",
+    "name": "深渊海洋",
+    "version": "1.0.0",
+    "author": "星河主题工坊",
+    "description": "深海蓝青，封面背景，深邃幽远",
+    "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Theme-Library/themes/abyss-ocean.json",
+    "hash": "d8373c411ed649b55c33a1cef38923d3bedade8a048a9823dfd8a58d3855096e"
+  },
+  {
+    "kind": "theme",
+    "id": "sakura",
+    "name": "和风樱",
+    "version": "1.0.0",
+    "author": "星河主题工坊",
+    "description": "樱花粉粒子，和风柔美，落樱氛围",
+    "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Theme-Library/themes/sakura.json",
+    "hash": "b462f93685dca24ca091d36a5d23753dcfae920fac67e1af07e0a19130e0a7ed"
+  },
+  {
+    "kind": "theme",
+    "id": "cinnabar",
+    "name": "中式朱砂",
+    "version": "1.0.0",
+    "author": "星河主题工坊",
+    "description": "朱砂红纯色，中式方正，庄重典雅",
+    "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Theme-Library/themes/cinnabar.json",
+    "hash": "9c4421e3d620678e777e391f61c2f3ad1c09760b0cb045f5adb5dda046aa1932"
+  },
+  {
+    "kind": "theme",
+    "id": "nord-minimal",
+    "name": "北欧极简",
+    "version": "1.0.0",
+    "author": "星河主题工坊",
+    "description": "北欧灰蓝，直角极简，冷静高效",
+    "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Theme-Library/themes/nord-minimal.json",
+    "hash": "4dd450f8c9380f550bf41c5919254afc5d1c6fafd10e4e8f4e37aa9fbdf2d609"
+  },
+  {
+    "kind": "theme",
+    "id": "pop-art",
+    "name": "波普撞色",
+    "version": "1.0.0",
+    "author": "星河主题工坊",
+    "description": "波普粉黄撞色，频谱动效，大胆张扬",
+    "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Theme-Library/themes/pop-art.json",
+    "hash": "b2c79fc3aa825d32d55c6ffce56e7fe5c58caf647c862819efbecb005fde83a8"
+  },
+  {
+    "kind": "theme",
+    "id": "retro-tape",
+    "name": "复古磁带",
+    "version": "1.0.0",
+    "author": "星河主题工坊",
+    "description": "磁带棕金属灰，复古直角，怀旧电台感",
+    "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Theme-Library/themes/retro-tape.json",
+    "hash": "9295d9bb52952ae00f33834145a771afd35a66e3b04ec5e42a918458f0061e11"
+  },
+  {
+    "kind": "theme",
+    "id": "metal-rock",
+    "name": "金属摇滚",
+    "version": "1.0.0",
+    "author": "星河主题工坊",
+    "description": "钢灰血红，硬核直角，摇滚现场感",
+    "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Theme-Library/themes/metal-rock.json",
+    "hash": "bdd17aa96bd78e65c480336c263927b09ce4f84dbcd7b8ece482e08def715c1f"
+  },
+  {
+    "kind": "theme",
+    "id": "candy-party",
+    "name": "糖果派对",
+    "version": "1.0.0",
+    "author": "星河主题工坊",
+    "description": "糖果粉紫，大圆角粒子，甜美派对",
+    "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Theme-Library/themes/candy-party.json",
+    "hash": "1497144ae4b80b9af58d4248fe799dd6500af870f02314020a1a8b30dfe18702"
+  },
+  {
+    "kind": "theme",
+    "id": "pixel-8bit",
+    "name": "像素游戏",
+    "version": "1.0.0",
+    "author": "星河主题工坊",
+    "description": "像素青绿，方块直角，8bit 游戏风",
+    "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Theme-Library/themes/pixel-8bit.json",
+    "hash": "162ae7625800db0928d31a65bda22063ebbe01401612222844e423a9f822bcf8"
+  }
+]

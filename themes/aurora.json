@@ -1,0 +1,15 @@
+{
+  "id": "aurora",
+  "name": "极光幻彩",
+  "author": "星河主题工坊",
+  "version": "1.0.0",
+  "colors": {
+    "primary": "#34d399",
+    "accent": "#818cf8",
+    "bg": "#060d1a",
+    "text": "#e7f7f5"
+  },
+  "playerBg": "gradient",
+  "fontScale": 1.0,
+  "borderRadius": 16
+}

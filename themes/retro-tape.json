@@ -1,0 +1,15 @@
+{
+  "id": "retro-tape",
+  "name": "复古磁带",
+  "author": "星河主题工坊",
+  "version": "1.0.0",
+  "colors": {
+    "primary": "#d97706",
+    "accent": "#a8a29e",
+    "bg": "#141210",
+    "text": "#f0e6d8"
+  },
+  "playerBg": "lyric-wall",
+  "fontScale": 1.0,
+  "borderRadius": 2
+}

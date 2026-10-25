@@ -1,0 +1,15 @@
+{
+  "id": "jade-vein",
+  "name": "翡翠绿",
+  "author": "星河主题工坊",
+  "version": "1.0.0",
+  "colors": {
+    "primary": "#10b981",
+    "accent": "#6ee7b7",
+    "bg": "#071410",
+    "text": "#e9fdf5"
+  },
+  "playerBg": "gradient",
+  "fontScale": 1.0,
+  "borderRadius": 8
+}

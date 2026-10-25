@@ -1,0 +1,15 @@
+{
+  "id": "deep-forest",
+  "name": "森林幽绿",
+  "author": "星河主题工坊",
+  "version": "1.0.0",
+  "colors": {
+    "primary": "#22c55e",
+    "accent": "#bbf7d0",
+    "bg": "#071309",
+    "text": "#e8fbe8"
+  },
+  "playerBg": "solid",
+  "fontScale": 1.0,
+  "borderRadius": 10
+}

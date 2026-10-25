@@ -1,0 +1,15 @@
+{
+  "id": "nord-minimal",
+  "name": "北欧极简",
+  "author": "星河主题工坊",
+  "version": "1.0.0",
+  "colors": {
+    "primary": "#64748b",
+    "accent": "#94a3b8",
+    "bg": "#101418",
+    "text": "#e6eaef"
+  },
+  "playerBg": "solid",
+  "fontScale": 1.1,
+  "borderRadius": 4
+}

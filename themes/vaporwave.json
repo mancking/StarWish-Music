@@ -1,0 +1,15 @@
+{
+  "id": "vaporwave",
+  "name": "蒸汽波",
+  "author": "星河主题工坊",
+  "version": "1.0.0",
+  "colors": {
+    "primary": "#ff71ce",
+    "accent": "#01cdfe",
+    "bg": "#1a0b2e",
+    "text": "#ffe6fb"
+  },
+  "playerBg": "gradient",
+  "fontScale": 1.0,
+  "borderRadius": 12
+}

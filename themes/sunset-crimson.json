@@ -1,0 +1,15 @@
+{
+  "id": "sunset-crimson",
+  "name": "落日红",
+  "author": "星河主题工坊",
+  "version": "1.0.0",
+  "colors": {
+    "primary": "#ef4444",
+    "accent": "#fb923c",
+    "bg": "#1a0b0b",
+    "text": "#ffe9e9"
+  },
+  "playerBg": "gradient",
+  "fontScale": 1.0,
+  "borderRadius": 10
+}

@@ -1,0 +1,15 @@
+{
+  "id": "pure-white",
+  "name": "极简纯白",
+  "author": "星河主题工坊",
+  "version": "1.0.0",
+  "colors": {
+    "primary": "#2563eb",
+    "accent": "#0ea5e9",
+    "bg": "#f8fafc",
+    "text": "#1e293b"
+  },
+  "playerBg": "solid",
+  "fontScale": 1.05,
+  "borderRadius": 10
+}

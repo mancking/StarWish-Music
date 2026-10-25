@@ -1,0 +1,15 @@
+{
+  "id": "rose-blush",
+  "name": "珊瑚粉",
+  "author": "星河主题工坊",
+  "version": "1.0.0",
+  "colors": {
+    "primary": "#ff6b8a",
+    "accent": "#ffd0da",
+    "bg": "#170f12",
+    "text": "#ffeef2"
+  },
+  "playerBg": "spectrum",
+  "fontScale": 1.05,
+  "borderRadius": 14
+}

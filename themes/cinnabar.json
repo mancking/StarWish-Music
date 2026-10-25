@@ -1,0 +1,15 @@
+{
+  "id": "cinnabar",
+  "name": "中式朱砂",
+  "author": "星河主题工坊",
+  "version": "1.0.0",
+  "colors": {
+    "primary": "#dc2626",
+    "accent": "#fca5a5",
+    "bg": "#120808",
+    "text": "#ffecec"
+  },
+  "playerBg": "solid",
+  "fontScale": 1.0,
+  "borderRadius": 6
+}

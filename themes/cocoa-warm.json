@@ -1,0 +1,15 @@
+{
+  "id": "cocoa-warm",
+  "name": "暖棕可可",
+  "author": "星河主题工坊",
+  "version": "1.0.0",
+  "colors": {
+    "primary": "#b08968",
+    "accent": "#e6ccb2",
+    "bg": "#15100b",
+    "text": "#f5ebe0"
+  },
+  "playerBg": "lyric-wall",
+  "fontScale": 1.0,
+  "borderRadius": 8
+}

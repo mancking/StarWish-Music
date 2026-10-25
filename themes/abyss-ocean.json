@@ -1,0 +1,15 @@
+{
+  "id": "abyss-ocean",
+  "name": "深渊海洋",
+  "author": "星河主题工坊",
+  "version": "1.0.0",
+  "colors": {
+    "primary": "#0ea5e9",
+    "accent": "#67e8f9",
+    "bg": "#04121e",
+    "text": "#dcf5ff"
+  },
+  "playerBg": "cover",
+  "fontScale": 0.95,
+  "borderRadius": 12
+}

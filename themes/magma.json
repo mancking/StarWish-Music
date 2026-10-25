@@ -1,0 +1,15 @@
+{
+  "id": "magma",
+  "name": "熔岩赤",
+  "author": "星河主题工坊",
+  "version": "1.0.0",
+  "colors": {
+    "primary": "#ff4d1c",
+    "accent": "#ffb26b",
+    "bg": "#150604",
+    "text": "#ffe8d6"
+  },
+  "playerBg": "spectrum",
+  "fontScale": 1.0,
+  "borderRadius": 6
+}

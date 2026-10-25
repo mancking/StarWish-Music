@@ -1,0 +1,15 @@
+{
+  "id": "lemon-zest",
+  "name": "柠檬黄",
+  "author": "星河主题工坊",
+  "version": "1.0.0",
+  "colors": {
+    "primary": "#eab308",
+    "accent": "#fde047",
+    "bg": "#141206",
+    "text": "#fdf9e3"
+  },
+  "playerBg": "particle",
+  "fontScale": 0.9,
+  "borderRadius": 18
+}

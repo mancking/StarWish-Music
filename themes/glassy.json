@@ -1,0 +1,15 @@
+{
+  "id": "glassy",
+  "name": "玻璃拟态",
+  "author": "星河主题工坊",
+  "version": "1.0.0",
+  "colors": {
+    "primary": "#0284c7",
+    "accent": "#38bdf8",
+    "bg": "#eef6fd",
+    "text": "#0f172a"
+  },
+  "playerBg": "lyric-wall",
+  "fontScale": 1.0,
+  "borderRadius": 14
+}

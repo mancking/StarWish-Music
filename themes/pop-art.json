@@ -1,0 +1,15 @@
+{
+  "id": "pop-art",
+  "name": "波普撞色",
+  "author": "星河主题工坊",
+  "version": "1.0.0",
+  "colors": {
+    "primary": "#ff5c8a",
+    "accent": "#ffd166",
+    "bg": "#101016",
+    "text": "#fff3d9"
+  },
+  "playerBg": "spectrum",
+  "fontScale": 1.0,
+  "borderRadius": 14
+}

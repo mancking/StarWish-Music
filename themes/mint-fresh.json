@@ -1,0 +1,15 @@
+{
+  "id": "mint-fresh",
+  "name": "薄荷青",
+  "author": "星河主题工坊",
+  "version": "1.0.0",
+  "colors": {
+    "primary": "#2dd4a7",
+    "accent": "#86efc8",
+    "bg": "#081712",
+    "text": "#e8fff4"
+  },
+  "playerBg": "solid",
+  "fontScale": 0.95,
+  "borderRadius": 16
+}

@@ -1,0 +1,15 @@
+{
+  "id": "cyber-neon",
+  "name": "赛博霓虹",
+  "author": "星河主题工坊",
+  "version": "1.0.0",
+  "colors": {
+    "primary": "#00e5ff",
+    "accent": "#ff2bd6",
+    "bg": "#05060f",
+    "text": "#e6faff"
+  },
+  "playerBg": "particle",
+  "fontScale": 0.9,
+  "borderRadius": 0
+}

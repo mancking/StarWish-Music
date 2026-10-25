@@ -1,0 +1,15 @@
+{
+  "id": "desert-dune",
+  "name": "沙漠驼色",
+  "author": "星河主题工坊",
+  "version": "1.0.0",
+  "colors": {
+    "primary": "#d97706",
+    "accent": "#fbbf24",
+    "bg": "#171009",
+    "text": "#fdeecb"
+  },
+  "playerBg": "lyric-wall",
+  "fontScale": 1.0,
+  "borderRadius": 6
+}

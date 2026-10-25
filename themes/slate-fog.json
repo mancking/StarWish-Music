@@ -1,0 +1,15 @@
+{
+  "id": "slate-fog",
+  "name": "雾霾灰",
+  "author": "星河主题工坊",
+  "version": "1.0.0",
+  "colors": {
+    "primary": "#94a3b8",
+    "accent": "#cbd5e1",
+    "bg": "#0e1116",
+    "text": "#f1f5f9"
+  },
+  "playerBg": "solid",
+  "fontScale": 1.1,
+  "borderRadius": 6
+}

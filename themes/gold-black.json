@@ -1,0 +1,15 @@
+{
+  "id": "gold-black",
+  "name": "黑金奢华",
+  "author": "星河主题工坊",
+  "version": "1.0.0",
+  "colors": {
+    "primary": "#d4af37",
+    "accent": "#f5e08a",
+    "bg": "#0d0a04",
+    "text": "#f7efd6"
+  },
+  "playerBg": "solid",
+  "fontScale": 1.0,
+  "borderRadius": 4
+}
