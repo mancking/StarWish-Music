@@ -19,18 +19,43 @@
 
 ## 平台构建产物
 
-| 平台 | 产物 | 状态 |
-|------|------|------|
-| Android 手机/平板/车机 | APK (release + debug) | ✅ 本机构建 |
-| Windows 安装版 | Setup.exe (NSIS x64) | ✅ 本机构建 |
-| Windows 便携版 | win-portable.exe | ✅ 本机构建 |
-| Linux x64 | AppImage + deb | ☁️ GitHub Actions |
-| macOS x64/arm64 | dmg + zip | ☁️ GitHub Actions |
-| iOS 手机/iPad | IPA | ☁️ GitHub Actions (需macOS runner) |
+每条产物均可从本 Release 页面直接下载。
+
+### Android（3 设备形态 × 2 构建类型 = 6 个 APK）
+
+| 设备形态 | ApplicationId | Release (未签名) | Debug |
+|----------|---------------|------------------|-------|
+| 手机 | `com.starwish.music.phone` | `StarWish-1.0.0-android-phone-release-unsigned.apk` | `StarWish-1.0.0-android-phone-debug.apk` |
+| 平板 | `com.starwish.music.tablet` | `StarWish-1.0.0-android-tablet-release-unsigned.apk` | `StarWish-1.0.0-android-tablet-debug.apk` |
+| 车机 | `com.starwish.music.automotive` | `StarWish-1.0.0-android-automotive-release-unsigned.apk` | `StarWish-1.0.0-android-automotive-debug.apk` |
+
+### iOS（2 设备形态、未签名）
+
+| 设备 | BundleId | 产物 |
+|------|----------|------|
+| 手机 | `com.starwish.music.phone` | `StarWish-iPhone-1.0.0-unsigned.ipa` |
+| 平板 | `com.starwish.music.ipad` | `StarWish-iPad-1.0.0-unsigned.ipa` |
+
+### 桌面
+
+| 平台 | 产物 |
+|------|------|
+| Windows 安装版 (x64) | `StarWish-1.0.0-Setup.exe` |
+| Windows 便携版 (x64) | `StarWish-1.0.0-win-portable.exe` |
+| Windows 绿色版 (x64) | `StarWish-1.0.0-win-x64.zip` |
+| Linux AppImage (x64) | `StarWish-1.0.0-linux-x86_64.AppImage` |
+| Linux deb (x64) | `StarWish-1.0.0-linux-amd64.deb` |
+| macOS dmg (x64) | `StarWish-1.0.0-mac-x64.zip` |
+| macOS dmg (arm64) | `StarWish-1.0.0-mac-arm64.zip` |
+
+## 安装引导
+
+- **Android 侧载**：下载对应设备形态的 `debug` APK 直接安装；`release-unsigned` APK 需自签名或用 `jarsigner` 处理后安装
+- **iOS 侧载**：下载对应设备的 `unsigned.ipa`，通过 AltStore / SideStore / TrollStore 自签安装（需 Apple ID）
+- **桌面**：安装版双击 Setup.exe；便携版解压即用
 
 ## 说明
 
 - 第三方音源不随包分发：请到「设置 → 源市场」安装
-- Android 车机兼容已内置（AndroidManifest 声明 automotive，同一 APK 自动适配）
-- Linux/macOS/iOS 产物通过 GitHub Actions 自动构建（推送标签后触发）
+- Linux/macOS 产物通过 GitHub Actions 自动构建（推送标签后触发）
 - 无广告、无埋点、不采集个人信息
