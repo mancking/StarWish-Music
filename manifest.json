@@ -1,7 +1,7 @@
 {
   "name": "星河官方插件库",
   "description": "星河音乐官方插件市场，提供可在线安装/更新的音源与歌词插件。",
-  "updated": "2026-10-19",
+  "updated": "2026-10-25",
   "plugins": [
     {
       "name": "5sing",
@@ -132,6 +132,46 @@
         "lyric"
       ],
       "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E7%BD%91%E6%98%93%E4%BA%91.js"
+    },
+    {
+      "name": "星河聚合音源",
+      "file": "starwish-unified.js",
+      "version": "1.1.0",
+      "author": "StarWish Team",
+      "platform": "wy/kg/kw/qq",
+      "description": "自研多平台聚合：网易云/酷狗/酷我/QQ 搜索取链 + 跨平台换链兜底（取链失败自动换平台搜同曲）",
+      "types": [
+        "music"
+      ],
+      "kind": "lx-source",
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/starwish-unified.js"
+    },
+    {
+      "name": "星河国际曲库",
+      "file": "starwish-builtin.js",
+      "version": "1.0.0",
+      "author": "StarWish Team",
+      "platform": "it/kw",
+      "description": "iTunes 国际曲库直链 + 酷我备用直链（无歌词/封面依赖重）",
+      "types": [
+        "music"
+      ],
+      "kind": "lx-source",
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/starwish-builtin.js"
+    },
+    {
+      "name": "星河B站视频源",
+      "file": "starwish-video.js",
+      "version": "1.0.0",
+      "author": "StarWish Team",
+      "platform": "bili",
+      "description": "B站视频/MV 视频源（videoSearch/videoInfo/videoParts/videoUrl 四函数）：搜索/详情/分P/取链，接管视频页全部数据",
+      "types": [
+        "music",
+        "video"
+      ],
+      "kind": "video-source",
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/starwish-video.js"
     }
   ]
 }
