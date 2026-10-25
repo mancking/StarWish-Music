@@ -3,15 +3,8 @@ dist/
 out/
 release/
 
-# 例外：允许仓库根的打包产物进版本控制
-!星河音乐-2.0.0-win-unpacked/
-!星河音乐-2.0.0-win-unpacked/**/*
-!星河音乐-2.0.0-便携版.exe
-!星河音乐-2.0.0-portable.exe
-!星河音乐-2.0.0-Setup.exe
-!星河音乐-2.0.0.exe
-!星河音乐-2.0.0-android.apk
-!星河音乐-2.0.0-android-debug.apk
+# 打包产物统一由 CI 发布到 Release，不入版本控制
+# （历史例外条目已随版本号统一为 1.0.0 移除）
 
 # 本地数据与测试产物
 .smoke-data/
@@ -71,10 +64,14 @@ SPlayer*.jpg
 docs/ui-preview*
 docs/screenshots/
 
-# 第三方音源脚本（仅保留自研示例）
-app/sources/*.js
-!app/sources/starwish-unified.js
-!app/sources/starwish-bilibili.js
+# 规划书/研发文档（不入源码库）
+docs/星河音乐-全端播放模块开发规格书.html
+docs/round16-*
+docs/research/
+docs/_spec_*.txt
+
+# 开发期内置音源（仅 dev 通道使用，release 通道不随包分发）
+app/dev-sources/
 app/verify-final-state.json
 
 # 本地诊断产物
@@ -96,12 +93,30 @@ app/dist/mobile/
 # bili 二维码登录缓存（含 bvid，不入库）
 bili-login.json
 
-# 本地诊断脚本
+# 本地诊断脚本（一次性探针/实验，不入库）
 app/scripts/cdp-*.mjs
 app/scripts/feature-check.cjs
 app/scripts/mv-*.cjs
 app/scripts/ui-shots.cjs
 app/scripts/browser-bundle-probe.mjs
+app/scripts/diag-*.mjs
+app/scripts/probe-*.mjs
+app/scripts/probe-*.cjs
+app/scripts/exp-*.mjs
+app/scripts/resolve-probe.mjs
+app/scripts/audit-bleed.mjs
+app/scripts/check-v236.cjs
+app/scripts/verify-v429.mjs
+app/scripts/_clean-plan-refs.cjs
+
+# 会话临时产物与研究草稿
+.tmp-research/
+_cleanpreview/
+_plan.md
+session_prior.txt
+tmp_esbuild/
+docs/_shots/
+docs/_spec_*.txt
 
 # 一次性探针与调试输出（点前缀的 .xxx-err/.xxx-log 等）
 app/probe-*
@@ -119,3 +134,30 @@ V261017/
 # 桌面自检产生的临时用户数据
 app/.check-data-v235/
 app/.tmp/
+
+# 平台工具（开发者本地工具，不入库）
+platform-tools/
+
+# 测试文件
+ttest/
+
+# 一次性研发脚本与 mock
+app/scripts/test-*.ts
+app/scripts/mini-dom-stub.mjs
+app/scripts/gate-zero-source.mjs
+app/scripts/copy-dev-sources.mjs
+app/scripts/release-android.mjs
+app/scripts/release-build.mjs
+app/scripts/test-hooks.mjs
+
+# 移动端种子/测试文件
+app/src/mobile/base64.ts
+app/src/mobile/seed-empty.ts
+app/src/mobile/seed-files.ts
+app/src/mobile/seed-source.ts
+
+# 旧版本号文件
+docs/StarWish-Music-v2.3.5-发布说明.md
+
+# 版本号注释清理前旧引用
+app/verify-final-state.json

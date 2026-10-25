@@ -21,7 +21,7 @@ const os = /Mac|iP(hone|ad|od)/.test(navigator.userAgent)
     : 'linux'
 document.documentElement.dataset.platform = 'desktop'
 document.documentElement.dataset.os = os
-// 规格书 v2.7 · 0.1 / 0.3 / 0.5：四端断点、性能档位、xinyuan_* 键统一入口
+//四端断点、性能档位、xinyuan_* 键统一入口
 initPlatform()
 
 const app = createApp(App)
@@ -49,7 +49,7 @@ window.addEventListener('unhandledrejection', e => {
 })
 
 /**
- * 启动流程（v2.3.4 优化）：
+ * 启动流程（v1.0.0 优化）：
  * 旧实现先 await 三个 store 的 init（含全量本地曲库扫描 + 历史读取）才 mount，
  * 导致首帧被推迟数秒到十余秒，窗口长时间空白。
  * 现在：先 mount 出界面骨架（splash 覆盖其上），再并行拉取数据，
@@ -64,7 +64,7 @@ async function bootstrap(): Promise<void> {
   app.mount('#app')
   ;(window as any).__swStores = { player, library, ui }
 
-  // 音效（规格书 v2.7 · 1.11）：状态与预设在本进程，滤波在隐藏音频宿主的
+ // 音效 ：状态与预设在本进程，滤波在隐藏音频宿主的
   // AudioContext 里做；宿主未就绪时主进程会排队补发，不会丢曲线。
   registerEqBackend({
     setBands: bands => {
@@ -79,18 +79,20 @@ async function bootstrap(): Promise<void> {
     setTimeout(() => splash.remove(), 450)
   }
 
-  // Bug 55：splash 8s 超时兜底（任一 init 挂起时强制淡出，不永驻）
-  const splashGuard = window.setTimeout(hideSplash, 8000)
+ //splash 8s 超时兜底（任一 init 挂起时强制淡出，不永驻）
+ // Bug C：splash 超时兜底从 8s 降到 3s
+  // 旧实现从 bootstrap 开头起算，ui 慢时 splash 早逝、界面白屏）
+  const splashGuard = window.setTimeout(hideSplash, 3000)
 
   // 设置最优先（决定主题），其余并行；任何一个失败都不阻塞界面
   await ui.init().catch(() => {})
 
-  // F-21：首次启动引导（onboarded=false → /welcome 三屏）
+ //首次启动引导（onboarded=false → /welcome 三屏）
   if ((ui.settings as any).onboarded === false && router.currentRoute.value.path !== '/welcome') {
     void router.replace('/welcome')
   }
 
-  // Bug 54：播放器/曲库就绪后再撤 splash，避免露出空骨架
+ //播放器/曲库就绪后再撤 splash，避免露出空骨架
   void Promise.allSettled([player.init(), library.init()]).then(() => {
     window.clearTimeout(splashGuard)
     hideSplash()

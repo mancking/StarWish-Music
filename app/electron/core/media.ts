@@ -75,7 +75,7 @@ function isVideoUrl(target: string): boolean {
   }
 }
 
-/** 音频类资源（规格书 v2.8 · 1.12 播放缓存只处理音频） */
+/** 音频类资源 */
 function isAudioUrl(target: string): boolean {
   try {
     const ext = path.extname(new URL(target).pathname).toLowerCase()
@@ -173,7 +173,7 @@ function offlineKey(bvid: string, cid: string): string {
   return offlineKeyOf(bvid, cid)
 }
 
-/** 离线缓存 manifest 键（Bug 109 三端统一契约：渲染层可自行计算或传 bvid+cid） */
+/** 离线缓存 manifest 键（三端统一契约：渲染层可自行计算或传 bvid+cid） */
 export function offlineKeyOf(bvid: string, cid: string): string {
   return crypto.createHash('sha1').update(`${bvid}:${cid}`).digest('hex')
 }
@@ -343,7 +343,7 @@ export function registerMediaProtocol(getBiliCookie: () => string): void {
       }
     }
 
-    // 规格书 v2.8 · 1.12：在线歌曲播放缓存（命中直接本地服务，不再请求远端）
+ //在线歌曲播放缓存（命中直接本地服务，不再请求远端）
     if (!isVideoUrl(target)) {
       const cached = audioCacheFile(target)
       if (cached) {
@@ -465,10 +465,10 @@ export function registerMediaProtocol(getBiliCookie: () => string): void {
                 if (done) {
                   await state.fh.close().catch(() => {})
                   streamStates.delete(key)
-                  // Bug 82：无 Content-Length（total=0）按已收字节升格缓存，不再丢弃
+ //无 Content-Length（total=0）按已收字节升格缓存，不再丢弃
                   if ((!state.total && state.written > 0) || (state.total && state.written >= state.total)) {
                     await fsp.rename(state.file, path.join(streamDir(), `${key}${state.ext}`)).catch(() => {})
-                    // 规格书 v2.8 · 1.12：视频缓存总量上限 1GB，超出清理最旧
+ //视频缓存总量上限 1GB，超出清理最旧
                     pruneVideoCache()
                   }
                   controller.close()
@@ -495,7 +495,7 @@ export function registerMediaProtocol(getBiliCookie: () => string): void {
         }
       }
 
-      // 规格书 v2.8 · 1.12：在线歌曲播放缓存——边播边收集，播完落盘（上限 50 首 / 500MB）
+ //在线歌曲播放缓存——边播边收集，播完落盘（上限 50 首 / 500MB）
       if (body && isAudioUrl(target) && res.status === 200 && !range) {
         const chunks: Buffer[] = []
         const src = body

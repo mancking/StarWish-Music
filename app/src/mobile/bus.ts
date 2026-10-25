@@ -5,13 +5,15 @@ const handlers = new Map<string, Set<Handler>>()
 
 export const EVENT_WHITELIST = new Set([
   'player:state', 'player:tick', 'player:error', 'player:queue', 'toast',
-  'scan:progress', 'sources:changed', 'settings:changed', 'window:state',
+  'scan:progress', 'sources:changed', 'settings:changed', 'theme:changed', 'window:state',
   'app:navigate', 'lyric:payload', 'player:sleep',
   // 下载进度（移动端 download:progress 与桌面同语义，此前漏登记导致进度条永不更新）
   'download:progress',
   'audio:extract:progress',
   // 应用内更新：原生下载进度与安装阶段
   'update:progress',
+ // 下拉刷新：顶部下拉手势广播，各页面自行刷新数据
+  'app:pull-refresh',
 ])
 
 export function emit(channel: string, payload: any): void {

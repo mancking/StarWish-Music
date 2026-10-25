@@ -11,6 +11,7 @@ import { useLibraryStore } from '@/stores/library'
 import { useUiStore } from '@/stores/ui'
 import { useDownloadStore } from '@/stores/download'
 import { platformLabel } from '@/utils/labels'
+import { coverOf } from '@/stores/covers'
 
 const props = withDefaults(
   defineProps<{
@@ -156,7 +157,7 @@ function albumOf(s: Song): string {
         <span class="col-name">
           <Cover
             v-if="showCover"
-            :src="s.pic"
+            :src="coverOf(s)"
             :alt="s.name"
             :size="compact ? 34 : 40"
             :radius="8"
@@ -165,7 +166,6 @@ function albumOf(s: Song): string {
           <span class="name-text">
             <span class="title-line">
               <span class="title ellipsis">{{ s.name }}</span>
-              <span v-if="platformTag(s)" class="tag src-tag">{{ platformTag(s) }}</span>
               <span v-if="qualityTag(s)" class="tag" :class="{ quality: qualityTag(s) === '24bit' }">{{ qualityTag(s) }}</span>
             </span>
             <span class="sub ellipsis">{{ s.singer }}</span>

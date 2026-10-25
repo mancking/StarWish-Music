@@ -3,7 +3,7 @@ import fs from 'node:fs'
 import { app } from 'electron'
 
 /**
- * 音频提取（规格书 2.12 / Bug 8 · 独立模块）
+ * 音频提取
  *
  * 视频音频模式下「提取音频」：把当前视频音轨解码后经 lamejs 转码为 MP3。
  * - 输入：swmedia 可拉流的音频直链（桌面主进程 fetch，含防盗链头）

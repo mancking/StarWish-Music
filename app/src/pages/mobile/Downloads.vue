@@ -32,7 +32,7 @@ function statusText(t: { status: string; error?: string }): string {
   return t.error || '失败'
 }
 
-/** 规格书 3.5：暂停 / 继续 */
+/**暂停 / 继续 */
 async function togglePause(t: { id: string; status: string }): Promise<void> {
   if (t.status === 'paused') await dl.resume(t.id)
   else await dl.pause(t.id)

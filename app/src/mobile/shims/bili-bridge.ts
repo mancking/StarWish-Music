@@ -67,7 +67,7 @@ export function initBiliLogin(): void {
  * 取真实 buvid3/buvid4（finger/spi）。B 站对假 buvid 的 passport 请求有风控
  * （-352 / 二维码获取失败），generate/poll 前确保带真实 buvid。
  */
-async function ensureBuvid(): Promise<void> {
+export async function ensureBuvid(): Promise<void> {
   if (state.buvid3 && state.buvid4) return
   try {
     const res = await request('https://api.bilibili.com/x/frontend/finger/spi', {

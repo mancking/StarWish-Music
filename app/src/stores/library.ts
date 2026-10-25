@@ -19,7 +19,7 @@ export const useLibraryStore = defineStore('library', () => {
   const scanProgress = ref<ScanProgress>({ phase: 'idle', found: 0, parsed: 0, current: '' })
   const loading = ref(false)
 
-  /** 规格书 4.1：本地曲库分页懒加载，首屏只拉一页 */
+ /**本地曲库分页懒加载，首屏只拉一页 */
   const LOCAL_PAGE = 200
 
   const favoriteCount = computed(() => favorites.value.length)
@@ -48,7 +48,7 @@ export const useLibraryStore = defineStore('library', () => {
         void refreshLocal()
       }
     })
-    // Bug 122：sources:changed 真实消费者 —— 音源增删后刷新平台列表与本地状态
+ //sources:changed 真实消费者 —— 音源增删后刷新平台列表与本地状态
     on('sources:changed', async () => {
       try {
         // 平台缓存失效：播放器/搜索层下次直接重取（platformList 变化）
@@ -144,7 +144,7 @@ export const useLibraryStore = defineStore('library', () => {
     localTotal.value = total
   }
 
-  /** 追加下一页本地曲目；返回是否还有更多（规格书 4.1 分页懒加载） */
+ /** 追加下一页本地曲目；返回是否还有更多 */
   async function loadMoreLocal(): Promise<boolean> {
     if (localSongs.value.length >= localTotal.value) return false
     const next = await call<Song[]>('library:songs', {

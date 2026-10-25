@@ -52,6 +52,11 @@ export interface SourceInfo {
   enabled: boolean
   builtin: boolean
   platforms: SourcePlatform[]
+  /**
+   * 初始化状态（落雪口径）：idle=未初始化 / initing=初始化中 / ready=就绪 / failed=失败。
+   * 停用后再启用会走一次「初始化中 → 就绪/失败」，UI 据此展示提示。
+   */
+  initState?: 'idle' | 'initing' | 'ready' | 'failed'
 }
 
 /** MusicFree 协议插件（歌词/音源），与 lx-music 音源协议不同 */
@@ -72,6 +77,8 @@ export interface PluginInfo {
   enabled: boolean
   /** 是否随包内置（内置插件删除需恢复，不写用户目录） */
   builtin?: boolean
+  /** 初始化状态（落雪口径）：idle / initing / ready / failed */
+  initState?: 'idle' | 'initing' | 'ready' | 'failed'
 }
 
 /** 插件订阅源：一个返回插件清单的地址 */
@@ -155,15 +162,26 @@ export interface AppSettings {
   animations: boolean
   particle: boolean
   skipOnError: boolean
-  /** 播放页背景：模糊专辑封面 / 动态渐变 / 自定义壁纸 / 纯色 */
-  playerBg: 'cover' | 'gradient' | 'wallpaper' | 'solid'
-  /** 壁纸图片路径（playerBg === 'wallpaper' 时生效；旧字段，启动时自动迁移到壁纸库） */
-  playerWallpaper: string
+  /**
+   * 播放页背景（3.14 四视觉模式 + 4.7+ ② 壁纸子项）：
+   * cover 封面魔法色渐变 / lyric-wall 歌词墙 / particle 粒子 / spectrum 舞台频谱；
+   * gradient 低性能降级、solid 兜底；wallpaper = 「主题与壁纸」壁纸子项（本地库 + 开源壁纸，4.7+ ②）。
+   */
+  playerBg: 'cover' | 'lyric-wall' | 'particle' | 'spectrum' | 'gradient' | 'solid' | 'wallpaper'
+  /** 当前应用主题 id（4.7+：预置皮肤或已装主题包，default = 星河默认） */
+  activeTheme: string
+  /** 4.7+ ② 开源壁纸源 API Key（可选，存主进程；空 = 用无 key 兜底源 Picsum） */
+  pixabayKey: string
+  pexelsKey: string
+  /** 唱片转速档（3.14：24/16/8 秒一圈，默认 16；车机固定 24 低速档） */
+  playerSpinSec: 8 | 16 | 24
   /** MV 播放器音量（独立记忆，0-1） */
   mvVolume: number
+ /** 主音量持久化（0~100， */
+  playerVolume: number
 
-  /* ---------------- 壁纸引擎（仅图片） ---------------- */
-  /** 启用壁纸库（playerBg === 'wallpaper' 时从库中取图） */
+ /* ---------------- 壁纸引擎（旧字段， 后播放页背景不再消费；保留仅向后兼容读取） ---------------- */
+  /** 启用壁纸库（旧字段，已不参与播放页背景） */
   wallpaperEnabled: boolean
   /** 当前壁纸 id，空表示使用库中第一张 */
   wallpaperId: string
@@ -213,13 +231,13 @@ export interface AppSettings {
   danmakuAntiSubtitle: boolean
   /** 屏蔽词，换行分隔 */
   danmakuBlockWords: string
-  /** F-17：音源调试日志开关 */
+ /**音源调试日志开关 */
   sourceDebug: boolean
-  /** F-21：首次启动引导标记 */
+ /**首次启动引导标记 */
   onboarded: boolean
-  /** N29：自定义源市场 URL */
+ /**自定义源市场 URL */
   marketUrl: string
-  /** N31：git 下载令牌 */
+ /**git 下载令牌 */
   gitToken: string
 
   /* ---------------- WebDAV 备份（单向：本地 → 远端） ---------------- */
@@ -325,14 +343,14 @@ export interface PlaylistTagGroup {
   tags: PlaylistTagItem[]
 }
 
-/** MV 档位（规格书 2.17：统一 ≤6 档 {qn,label}） */
+/** MV 档位 */
 export interface MvQualityOption {
   qn: number
   label: string
 }
 
 /**
- * MV 统一结构（规格书 2.17 / N18 多源字段槽）：
+ * MV 统一结构
  * source=bili|wy|qq|kg|kw|外部音源平台；B 站老数据 bvid 兼容映射（optional）。
  */
 export interface MvItem {
@@ -346,7 +364,7 @@ export interface MvItem {
   author: string
   pic: string
   duration: string
-  /** 秒数（number）：卡片与记忆位置统一用秒（N18） */
+ /** 秒数（number）：卡片与记忆位置统一用秒 */
   durationSec?: number
   play: number
   danmaku: number

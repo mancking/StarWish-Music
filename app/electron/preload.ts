@@ -9,6 +9,7 @@ const EVENT_WHITELIST = new Set([
   'scan:progress',
   'sources:changed',
   'settings:changed',
+  'theme:changed',
   'window:state',
   'app:navigate',
   'lyric:payload',
@@ -17,6 +18,8 @@ const EVENT_WHITELIST = new Set([
   'download:progress',
   'update:progress',
   'audio:extract:progress',
+ //搜索/列表封面异步回填完成后的增量推送（主进程 → 渲染层打补丁）
+  'cover:patched',
 ])
 
 const api = {

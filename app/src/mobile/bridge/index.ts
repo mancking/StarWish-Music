@@ -24,6 +24,8 @@ import { initDb, setSqlJsLoader } from '../../../electron/core/db'
 import { lxHost } from '../../../electron/core/lx-host'
 import * as mfHost from '../../../electron/core/mf-host'
 import * as marketHost from '../../../electron/core/market-host'
+import { listThemes, importThemeContent, applyTheme, removeTheme, getActiveTheme } from '../../../electron/core/theme-host'
+import { listOnlineWallpapers } from '../../../electron/core/wallpaper-online'
 import { loadSettings, saveSettings, getSettings } from '../../../electron/core/settings'
 import { userDataDir } from '../../../electron/core/paths'
 import { dbStats, playStats, favoriteIds, favoriteSongs, toggleFavorite, historySongs, addHistory, clearHistory, listPlaylists, createPlaylist, updatePlaylist, deletePlaylist, playlistSongs, addSongsToPlaylist, removeSongFromPlaylist, reorderPlaylist, getSongs, saveSongs, localSongs, localCount, removeLocalSongs, dbGetSetting, dbSetSetting, isFavorite, recentHistory } from '../../../electron/core/db'
@@ -81,7 +83,7 @@ async function boot(): Promise<void> {
   })
 
   // 3) 设置与数据库、音源沙箱：两者互不依赖（lx-host 只依赖上面的 vfs 种子），
-  //    v2.3.1 起并行初始化，缩短真机冷启动白屏时间
+  //    v1.0.0 起并行初始化，缩短真机冷启动白屏时间
   loadSettings()
   const dbReady = initDb().then(() => initBiliLogin())
   const lxReady = (async () => {
@@ -288,7 +290,7 @@ const handlers: Record<string, Handler> = {
    * 应用内下载安装包（APK）：原生 SwBridge 插件下载到应用私有目录，
    * 完成后拉起系统安装器——不再跳浏览器手动下载。
    *
-   * 注意：v2.3.4 之前这里调的是 'SwUpdate'，而原生只注册了 'SwBridge'
+   * 注意：v1.0.0 之前这里调的是 'SwUpdate'，而原生只注册了 'SwBridge'
    * （MainActivity.registerPlugin(SwBridgePlugin.class)），插件名不匹配导致
    * 调用必然 reject——这正是「移动端无法应用内更新」的直接根因。
    */
@@ -355,12 +357,34 @@ const handlers: Record<string, Handler> = {
   },
   'sources:platforms': () => lxHost.platformList(),
   'sources:toggle': ({ file, enabled }: any) => {
-    lxHost.setEnabled(file, enabled)
+    // 启用时重新初始化脚本（落雪式状态机）；失败自动回滚为停用并带回原因
+    const r = lxHost.setEnabled(file, enabled)
     dbSetSetting('sources.disabled', lxHost.getDisabledList())
     dbSetSetting('sources.enabled', lxHost.getUserEnabledList())
     emit('sources:changed', lxHost.list())
-    return lxHost.list()
+    return { sources: lxHost.list(), ok: r.ok, message: r.message }
   },
+  /* ---------------- 主题自定义体系（4.7+，移动端对等） ---------------- */
+  'theme:list': () => ({ themes: listThemes(), active: getActiveTheme().id }),
+  'theme:import': ({ content, origin }: any) => {
+    const r = importThemeContent(String(content || ''), origin === 'market' ? 'market' : 'local')
+    return { theme: r.theme, dropped: r.dropped }
+  },
+  'theme:apply': ({ id }: any) => {
+    const t = applyTheme(String(id || 'default'))
+    // 修移动端「预置皮肤切换无效」：桌面由 broadcast 通知渲染层，桥内必须手动 emit
+    emit('theme:changed', t)
+    emit('settings:changed', getSettings())
+    return t
+  },
+  'theme:remove': ({ id }: any) => {
+    const r = removeTheme(String(id))
+    emit('theme:changed', { id: 'default' })
+    emit('settings:changed', getSettings())
+    return r
+  },
+  'wallpaper:online:list': ({ page, q, refresh }: any) => listOnlineWallpapers({ page, q, refresh }),
+
   'sources:import': async ({ url, content, file }: any) => {
     const r = await lxHost.importSource({ url, content, file })
     emit('sources:changed', lxHost.list())
@@ -387,9 +411,10 @@ const handlers: Record<string, Handler> = {
   'plugins:market': async ({ url }: any) => await fetchMarketManifest(String(url || '')),
   'plugins:code': ({ file }: any) => mfHost.getSourceCode(file),
   'plugins:toggle': async ({ file, enabled }: any) => {
-    await mfHost.togglePlugin(file, enabled)
+    // 启用走重新初始化（落雪式状态机），失败回滚为停用并带回原因
+    const r = mfHost.togglePlugin(file, enabled)
     emit('plugins:changed', mfHost.list())
-    return mfHost.list()
+    return { ...r }
   },
   'plugins:delete': async ({ file }: any) => {
     await mfHost.deletePlugin(file)
@@ -416,12 +441,13 @@ const handlers: Record<string, Handler> = {
     emit('plugins:changed', mfHost.list())
     return mfHost.listSubscriptions()
   },
-  /* C-25：订阅立即刷新 */
+ /*订阅立即刷新 */
   'plugins:subs:refresh': async ({ url, name }: any) => await mfHost.importSubscription(url, name),
-  /* Bug 127：回滚到上一版 */
+ /*回滚到上一版 */
   'plugins:rollback': ({ file }: any) => mfHost.rollbackPlugin(file),
-  /* 统一源市场（0.10）：移动端与桌面对等（F-27/F-28） */
-  'market:list': async ({ url }: any) => await marketHost.listMarket(String(url || '')),
+ /* 统一源市场（0.10）：移动端与桌面对等 */
+  'market:list': async ({ url, force }: any) => await marketHost.listMarket(String(url || ''), !!force),
+  'market:themes': async ({ url, force }: any) => await marketHost.listThemeMarket(String(url || ''), !!force),
   'market:channels': () => marketHost.channels(),
   'market:install': async ({ item }: any) => await marketHost.installItem(item),
   'market:update': async ({ item }: any) => await marketHost.updateItem(item),
@@ -430,7 +456,7 @@ const handlers: Record<string, Handler> = {
   'plugins:lyric': ({ file, musicItem }: any) => mfHost.getLyric(file, musicItem),
   'plugins:url': ({ file, musicItem, quality }: any) => mfHost.getMediaSource(file, musicItem, quality),
 
-  /* ---- 局域网同步（规格书 4.8）：移动端为客户端，桌面为宿主 ---- */
+ /* ---- 局域网同步 ：移动端为客户端，桌面为宿主 ---- */
   'lan:info': () => ({ active: false, role: 'client' }),
   'lan:sync': async ({ ip, pin }: any) => await lanSyncRun(String(ip || ''), String(pin || '')),
 
@@ -449,8 +475,17 @@ const handlers: Record<string, Handler> = {
   'music:toplist': ({ platform, id }: any) => getToplist(platform, id),
   'music:new': () => getNewSongs(),
   'music:importPlaylist': ({ input, platform }: any) => importPlaylist(input, platform),
-  /* MV 多音源（规格书 2.17 / 3.10）：与桌面同契约 */
-  'music:mv': ({ keyword, page, source }: any) => searchMv(keyword || '音乐', page || 1, source || 'bili'),
+ /* MV 多音源 ：与桌面同契约 */
+ //聚合模式下若全平台皆空（个别平台在 WebView 侧网络受限），
+  // 回退到 B站 单源，保证视频页至少有内容，不再是空白骨架
+  'music:mv': async ({ keyword, page, source }: any) => {
+    const src = source || 'bili'
+    const list = await searchMv(keyword || '音乐', page || 1, src)
+    if (src === 'all' && !list.length) {
+      return searchMv(keyword || '音乐', page || 1, 'bili')
+    }
+    return list
+  },
   'music:mvinfo': ({ bvid, source }: any) => getMvInfo(source || 'bili', bvid),
   'music:mvurl': ({ bvid, cid, qn, source }: any) => getMvUrl(source || 'bili', bvid, cid, qn),
   'music:mvparts': ({ bvid, source }: any) => getMvParts(source || 'bili', bvid),
@@ -512,7 +547,7 @@ const handlers: Record<string, Handler> = {
   'db:songs': ({ ids }: any) => getSongs(ids || []),
   'db:stats': () => dbStats(),
 
-  /* ---- 本地音乐：v2.3.5 起走系统媒体库（SwBridge.scanLocal + /swlocal/ 回放） ---- */
+  /* ---- 本地音乐：v1.0.0 起走系统媒体库（SwBridge.scanLocal + /swlocal/ 回放） ---- */
   'library:pick': () => scanLocalMusic(),
   'library:scan': () => scanLocalMusic(),
   'library:cancel': NOP_OK,
@@ -555,7 +590,7 @@ const handlers: Record<string, Handler> = {
     dlAborts.get(String(id))?.abort()
     return true
   },
-  /* 暂停/继续（规格书 1.12）：移动端按「取消当前流 + 保留任务」实现，
+ /* 暂停/继续 ：移动端按「取消当前流 + 保留任务」实现，
      不做断点续传；继续时进度归零重新拉流。 */
   'download:pause': ({ id }: any) => {
     const t = dlTasks.get(String(id))
@@ -598,9 +633,9 @@ const handlers: Record<string, Handler> = {
     return true
   },
 
-  /* ---- 弹幕（规格书 2.x）：移动端直接拉 B 站 XML 弹幕并解析 ---- */
+ /* ---- 弹幕 ：移动端直接拉 B 站 XML 弹幕并解析 ---- */
   'mv:danmaku': async ({ cid }: any) => await fetchDanmaku(String(cid || '')),
-  /* 视频离线缓存（规格书 1.12 / 2.x）：移动端把整片保存进系统视频库，并在本地留一份索引 */
+ /* 视频离线缓存 ：移动端把整片保存进系统视频库，并在本地留一份索引 */
   'video:offline:file': () => null,
   'video:offline:save': async ({ url, title }: any) => await saveVideoOffline(String(url || ''), title ? String(title) : ''),
   'video:offline:list': () => {
@@ -666,7 +701,7 @@ type DlTask = {
 const dlTasks = new Map<string, DlTask>()
 const dlAborts = new Map<string, AbortController>()
 const dlUris = new Map<string, string>()
-/** 被用户暂停的任务（规格书 1.12：暂停后保留任务，继续时重新拉流） */
+/** 被用户暂停的任务 */
 const dlPaused = new Set<string>()
 let dlChain: Promise<void> = Promise.resolve()
 
@@ -739,7 +774,7 @@ export function nativeCall(plugin: string, method: string, opts: any): Promise<a
 }
 
 /**
- * 扫描系统媒体库（MediaStore）并入库（规格书 3.4 / 4.4）。
+ * 扫描系统媒体库（MediaStore）并入库。
  *
  * 真机 WebView 没有文件系统遍历能力，改由原生 SwBridge.scanLocal 返回
  * MediaStore 索引；音频字节由 SwMediaClient 的 /swlocal/?id= 按 Range 回放，
@@ -923,7 +958,7 @@ async function runDownload(t: DlTask): Promise<void> {
     t.finishedAt = Date.now()
   } catch (e: any) {
     if (ctl.signal.aborted || e?.name === 'AbortError') {
-      // 规格书 1.12：暂停与取消要区分开，暂停保留任务可继续
+ //暂停与取消要区分开，暂停保留任务可继续
       if (dlPaused.has(t.id)) {
         t.status = 'paused'
         t.error = null

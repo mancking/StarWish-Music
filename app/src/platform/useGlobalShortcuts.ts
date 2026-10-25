@@ -22,7 +22,7 @@ function isTyping(e: KeyboardEvent): boolean {
 }
 
 /**
- * 规格书 v2.8 · 1.9 桌面快捷键（全局唯一入口，不在页面里重复注册）：
+ *，不在页面里重复注册）
  * 空格 播放/暂停；←/→ 快退/快进 5s；↑/↓ 音量 ±5%；Ctrl+←/→ 上/下一首；
  * Ctrl+L 循环；Ctrl+D 桌面歌词；Ctrl+K 搜索。输入框聚焦时播放类快捷键不响应。
  */
@@ -31,7 +31,7 @@ export function installGlobalShortcuts(opts: ShortcutOptions): () => void {
 
   function onKey(e: KeyboardEvent): void {
     if (opts.disabled?.()) return
-    // Bug 73：平板/车机触屏设备豁免（避免输入态/虚拟键盘误触跳曲）
+ //平板/车机触屏设备豁免（避免输入态/虚拟键盘误触跳曲）
     if (/Android|iPad|iPhone/i.test(navigator.userAgent) && !('keyboard' in navigator)) {
       /* 触屏平板保留媒体类快捷键之外的应用内按键交给系统 */
     }
@@ -47,7 +47,20 @@ export function installGlobalShortcuts(opts: ShortcutOptions): () => void {
       e.preventDefault()
       void player.toggle()
     } else if (e.key === 'Escape') {
-      player.queueOpen = false
+ //ESC 分层返回——播放页/视频页等全屏路由返回首页（音乐不打断）；
+      // 队列抽屉开着先关抽屉。视频页自身先退自己的全屏（页面内处理，此处只在非视频页生效）。
+      if (player.queueOpen) {
+        player.queueOpen = false
+        return
+      }
+      const path = opts.router.currentRoute.value.path
+      const isVideoPage = path.startsWith('/mv')
+      const isFullScreenPage = !!opts.router.currentRoute.value.meta?.fullscreen
+      if (!isVideoPage && isFullScreenPage) {
+ // （用户裁定）：ESC = 收起播放页，回到展开前的页面（历史回退；无历史则回首页）
+        if ((window.history.state as any)?.back) opts.router.back()
+        else opts.router.push('/').catch(() => undefined)
+      }
     } else if (mod && e.key === 'ArrowRight') {
       e.preventDefault()
       void player.next()

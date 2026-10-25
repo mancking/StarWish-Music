@@ -118,7 +118,7 @@ const volIcon = computed(() => {
             :max="1"
             :step="0.01"
             thin
-            @change="onVolume"
+            @update:model-value="onVolume"
           />
           <span class="vol-num">{{ Math.round((player.state.muted ? 0 : player.state.volume) * 100) }}</span>
         </div>

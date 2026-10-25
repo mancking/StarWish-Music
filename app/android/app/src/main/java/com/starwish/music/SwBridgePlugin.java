@@ -219,6 +219,57 @@ public class SwBridgePlugin extends Plugin {
         call.resolve();
     }
 
+    /**
+     * 锁定/解锁屏幕方向（v2.3.5 视频播放器全屏横屏）。
+     *
+     * WebView 里的 CSS `orientation: landscape` 只旋转内容不旋转 Activity，
+     * 真实设备上仍是竖屏窗口 —— 必须走原生 setRequestedOrientation 才能真正转屏。
+     * 语义：
+     *   orientation = "landscape" → 强制横屏（视频全屏）
+     *   orientation = "portrait"  → 强制竖屏（音乐播放页）
+     *   orientation = "unlock"    → 交回系统（跟随传感器/用户旋转锁）
+     *
+     * 注意：Android 12+ 折叠屏/大屏设备上系统可能忽略强制方向（不崩溃即可）。
+     */
+    @PluginMethod
+    public void setOrientation(PluginCall call) {
+        String orientation = call.getString("orientation");
+        if (orientation == null) {
+            orientation = "unlock";
+        }
+        try {
+            int value;
+            switch (orientation) {
+                case "landscape":
+                    value = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE;
+                    break;
+                case "portrait":
+                    value = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT;
+                    break;
+                case "portrait-up":
+                    value = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT;
+                    break;
+                case "landscape-left":
+                    value = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE;
+                    break;
+                case "landscape-right":
+                    value = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_REVERSE_LANDSCAPE;
+                    break;
+                default:
+                    // unlock：跟随系统（用户旋转锁优先）
+                    value = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED;
+                    break;
+            }
+            final int target = value;
+            getActivity().runOnUiThread(() -> {
+                getActivity().setRequestedOrientation(target);
+                call.resolve();
+            });
+        } catch (Exception e) {
+            call.reject("设置屏幕方向失败：" + e.getMessage());
+        }
+    }
+
     @PluginMethod
     public void deleteMedia(PluginCall call) {
         String uri = call.getString("uri");

@@ -2,7 +2,7 @@ import type { MvItem, PlaylistMeta, Song, ToplistItem, ToplistTree } from '../..
 import { getJson, hostOf, limited, qs, request, sleep, stripHtml, UA } from './http'
 import { followRedirect } from './redirect'
 import { createLogger } from './log'
-import { biliCookie, biliHeaders, biliStatus } from './bili'
+import { ensureBuvid, biliCookie, biliHeaders, biliStatus } from './bili'
 import * as nodeCrypto from 'node:crypto'
 const crypto = {
   createCipheriv: nodeCrypto.createCipheriv,
@@ -59,10 +59,12 @@ function parseDate(v: any): number {
 
 export async function searchNetease(keyword: string, page = 1, limit = 30): Promise<Song[]> {
   const offset = (Math.max(1, page) - 1) * limit
+ // 顺序即耗时：`/search/get/web` 实测恒返回 code=400，
+  // 放在首位等于每次搜索白等一次往返；把可用接口提到最前，首包时间明显下降。
   const endpoints = [
-    `https://music.163.com/api/search/get/web?${qs({ s: keyword, type: 1, offset, limit, total: 'true' })}`,
     `https://music.163.com/api/search/get?${qs({ s: keyword, type: 1, offset, limit })}`,
     `https://music.163.com/api/cloudsearch/pc?${qs({ s: keyword, type: 1, offset, limit })}`,
+    `https://music.163.com/api/search/get/web?${qs({ s: keyword, type: 1, offset, limit, total: 'true' })}`,
   ]
   for (const url of endpoints) {
     try {
@@ -82,7 +84,8 @@ export async function searchNetease(keyword: string, page = 1, limit = 30): Prom
           duration: Math.round(num(s.duration || s.dt) / 1000),
           pic: https(album.picUrl || album.picUrl_str || ''),
           qualitys: ['128k', '320k'],
-          extra: { albumId: album.id },
+ // search/get/web 不返回 picUrl 只有 picId（封面由 song/detail 批量回填）
+          extra: { albumId: album.id, picId: album.picId || '' },
         } as Song
       })
     } catch (e: any) {
@@ -93,7 +96,7 @@ export async function searchNetease(keyword: string, page = 1, limit = 30): Prom
 }
 
 /**
- * 歌单关键词搜索（规格书 3.7 / Bug 17「歌单 Tab」）。
+ * 歌单关键词搜索。
  * 网易云搜索 type=1000；QQ/酷狗无稳定公开歌单搜索接口时返回空，
  * 前端对该 Tab 显示空态即可（规格：无结果的 Tab 显示空态，不整页空）。
  */
@@ -655,6 +658,66 @@ export async function kugouPlaylists(cat: string, _order: string, page = 1): Pro
 }
 
 /** 酷我歌单列表（落雪 wapi getRcmPlayList，无标签概念，cat 忽略） */
+/**
+ * 酷我歌单「按分类关键词」检索
+ *
+ * 背景：酷我官方的分类标签接口（getTagList / getTagPlayList）能取到标签，
+ * 但按标签取歌单恒返回 total=0（已下线），所以标签式筛选在酷我上不可用。
+ * 唯一仍可用的是歌单关键词检索 `ft=playlist`，因此把分类名当作检索词，
+ * 让酷狗/酷我这类「无标签体系」的平台也能真正按分类筛。
+ */
+export async function kuwoSearchPlaylists(keyword: string, page = 1, limit = 30): Promise<PlaylistMeta[]> {
+  const body = await getJson<any>(
+    `http://search.kuwo.cn/r.s?${qs({
+      all: keyword,
+      ft: 'playlist',
+      pn: Math.max(0, page - 1),
+      rn: limit,
+      rformat: 'json',
+      encoding: 'utf8',
+    })}`,
+    { 'User-Agent': UA, Referer: 'http://www.kuwo.cn/' },
+    12000
+  )
+  const list: any[] = body?.abslist || []
+  return list
+    .map(p => ({
+      id: String(p.DC_TARGETID || p.playlistid || ''),
+      name: String(p.name || ''),
+      pic: https(p.hts_pic || p.pic || ''),
+      author: String(p.nickname || ''),
+      count: num(p.songnum),
+      played: num(p.playcnt),
+      description: String(p.intro || ''),
+      source: 'kw',
+      kind: 'remote',
+    }))
+    .filter(p => p.id && p.name) as PlaylistMeta[]
+}
+
+/** 酷狗歌单「按分类关键词」检索：与酷我同口径，分类名即检索词 */
+export async function kugouSearchPlaylists(keyword: string, page = 1, limit = 30): Promise<PlaylistMeta[]> {
+  const body = await getJson<any>(
+    `http://mobilecdn.kugou.com/api/v3/search/special?${qs({ keyword, page, pagesize: limit })}`,
+    { 'User-Agent': UA },
+    12000
+  )
+  const list: any[] = body?.data?.info || []
+  return list
+    .map(p => ({
+      id: String(p.specialid || ''),
+      name: String(p.specialname || ''),
+      pic: https(String(p.imgurl || '').replace('{size}', '480')),
+      author: String(p.nickname || ''),
+      count: num(p.songcount),
+      played: num(p.playcount),
+      description: String(p.intro || ''),
+      source: 'kg',
+      kind: 'remote',
+    }))
+    .filter(p => p.id && p.name) as PlaylistMeta[]
+}
+
 export async function kuwoPlaylists(cat: string, order: string, page = 1): Promise<PlaylistMeta[]> {
   const url = `http://wapi.kuwo.cn/api/pc/classify/playlist/getRcmPlayList?${qs({
     loginUid: 0,
@@ -1083,6 +1146,12 @@ export async function toplistTree(force = false): Promise<ToplistTree> {
       }
       walk(body?.child || [])
       const items: ToplistItem[] = []
+      for (const fallback of FALLBACK_TREE.kw?.groups.flatMap(g => g.items) || []) {
+        const nameId = KW_BANGID[fallback.n] || KW_BANGID[fallback.n.replace(/^酷我/, '')]
+        const fallbackId = fallback.id ? KW_BANGID[fallback.id] : undefined
+        const id = nameId || fallbackId
+        if (id && !items.some(item => item.id === id)) items.push({ n: fallback.n, id })
+      }
       for (const l of leaves) {
         const bangid = KW_BANGID[l.n] || KW_BANGID[l.n.replace(/^酷我/, '')]
         if (!bangid) continue
@@ -1294,14 +1363,60 @@ export async function toplistSongs(platform: string, id: string): Promise<{ name
 
 /* ============================ B 站 ============================ */
 
+/* ---------------- ：wbi 签名（nav img_key/sub_key → mixinKey → md5 → w_rid） ---------------- */
+const WBI_MIXIN_TAB = [
+  46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49, 33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30, 4, 22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52,
+]
+let wbiKeysCache: { img: string; sub: string; at: number } | null = null
+
+async function getWbiMixinKey(): Promise<string | null> {
+  try {
+    // 密钥每日轮换，缓存 12 小时
+    if (wbiKeysCache && Date.now() - wbiKeysCache.at < 12 * 3600_000) {
+      return (wbiKeysCache.img + wbiKeysCache.sub).slice(0, 32)
+    }
+    await ensureBuvid()
+    const res = await request('https://api.bilibili.com/x/web-interface/nav', {
+      headers: biliHeaders(),
+      timeout: 10000,
+    })
+    const w = res.body?.data?.wbi_img
+    if (!w?.img_url || !w?.sub_url) return null
+    const img = String(w.img_url).split('/').pop()!.split('.')[0]!
+    const sub = String(w.sub_url).split('/').pop()!.split('.')[0]!
+    wbiKeysCache = { img, sub, at: Date.now() }
+    const raw = img + sub
+    return WBI_MIXIN_TAB.map(i => raw[i]).join('').slice(0, 32)
+  } catch {
+    return null
+  }
+}
+
+/** 计算 wbi 签名参数（w_rid + wts）；无密钥返回 null（调用方走未签名 fallback） */
+async function wbiSign(params: Record<string, string | number>): Promise<string | null> {
+  const mixin = await getWbiMixinKey()
+  if (!mixin) return null
+  const clean: Record<string, string | number> = { ...params, wts: Math.floor(Date.now() / 1000) }
+  // 官方 chrFilter：剔除 !'()* 
+  const filtered = Object.fromEntries(
+    Object.entries(clean).map(([k, v]) => [k, String(v).replace(/[!'()*]/g, '')])
+  )
+  const query = Object.keys(filtered)
+    .sort()
+    .map(k => `${encodeURIComponent(k)}=${encodeURIComponent(filtered[k]!)}`)
+    .join('&')
+  const w_rid = nodeCrypto.createHash('md5').update(query + mixin).digest('hex')
+  return `${query}&w_rid=${w_rid}`
+}
+
 export async function searchBiliVideo(keyword: string, page = 1): Promise<MvItem[]> {
-  // wbi 版接口在某些网络/风控下会返回 code=-412 且 data.result 为空（真机 5G 常见），
-  // 这里先打 wbi 接口，拿不到结果再退回未签名的老接口，两条都空才报出真实原因。
-  const query = qs({ search_type: 'video', keyword, page, page_size: 20 })
-  const endpoints = [
-    `https://api.bilibili.com/x/web-interface/wbi/search/type?${query}`,
-    `https://api.bilibili.com/x/web-interface/search/type?${query}`,
-  ]
+ //先按 wbi 签名请求（风控网络下 code=0）；签名不可用或空结果再退回未签名老接口。
+  await ensureBuvid()
+  const base = { search_type: 'video', keyword, page, page_size: 20 }
+  const signed = await wbiSign(base)
+  const endpoints: string[] = []
+  if (signed) endpoints.push(`https://api.bilibili.com/x/web-interface/wbi/search/type?${signed}`)
+  endpoints.push(`https://api.bilibili.com/x/web-interface/search/type?${qs(base)}`)
   let lastCode: number | undefined
   let lastMsg = ''
   let items: any[] = []
@@ -1348,6 +1463,7 @@ export async function biliVideoInfo(
   pubdate: number
   desc: string
 }> {
+  await ensureBuvid()
   const res = await request(`https://api.bilibili.com/x/web-interface/view?${qs({ bvid })}`, {
     headers: biliHeaders(),
     timeout: 15000,
@@ -1371,17 +1487,26 @@ export async function biliVideoInfo(
   }
 }
 
-export async function biliParts(bvid: string): Promise<{ cid: string; page: number; part: string; duration: number }[]> {
+export async function biliParts(
+  bvid: string
+): Promise<{ cid: string; page: number; title: string; part: string; duration: number; pic: string }[]> {
   const res = await request(`https://api.bilibili.com/x/player/pagelist?${qs({ bvid })}`, {
     headers: biliHeaders(),
     timeout: 12000,
   })
   const list: any[] = res.body?.data || []
+  // VideoPart 契约字段为 title（useVideoSession）；part 保留兼容旧读取方
+ // 分P封面：pagelist 每项自带 first_frame = 该 P 首帧直链，
+  // 一次请求拿全部分P封面（B站 web 选集面板同源）。旧实现按 cid 逐个请求
+  // videoshot 雪碧图再裁第一格，既慢（143P = 143 次请求）又因雪碧图网格
+  // 参数不可靠而裁错格 —— 已整体废弃。
   return list.map((p: any) => ({
     cid: String(p.cid || ''),
     page: Number(p.page) || 0,
+    title: String(p.part || `P${p.page}`),
     part: String(p.part || `P${p.page}`),
     duration: Number(p.duration) || 0,
+    pic: String(p.first_frame || '').replace(/^\/\//, 'https://').replace(/^http:\/\//, 'https://'),
   }))
 }
 

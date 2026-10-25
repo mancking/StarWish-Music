@@ -7,18 +7,19 @@ import { lsGet, lsSet, platform } from '@/platform'
 import { useUiStore } from './ui'
 
 /**
- * 播放页视觉模式（规格书 v2.7 · 1.4）
- * 0 封面 / 1 歌词 / 2 粒子 / 3 舞台频谱，循环切换并持久化到 xinyuan_visual_mode。
- * 旧版本用 'sw.stage' 存 lyrics|particle|cinema|podcast，这里做一次迁移映射。
+ * 播放页页面态
+ * 页面级双切换只有两页：cover 封面页 / lyrics 歌词页（左右滑切换）。
+ * 旧的「粒子/舞台」视觉模式已并入播放页背景 settings.playerBg
+ * （cover/lyric-wall/particle/spectrum，，不再作为页面态。
+ * 旧版本 xinyuan_visual_mode 存 particle/stage 的，映射回 cover。
  */
-export type StageMode = 'cover' | 'lyrics' | 'particle' | 'stage'
+export type StageMode = 'cover' | 'lyrics'
 
-const STAGE_ORDER: StageMode[] = ['cover', 'lyrics', 'particle', 'stage']
 const STAGE_LEGACY: Record<string, StageMode> = {
   cover: 'cover',
   lyrics: 'lyrics',
-  particle: 'particle',
-  stage: 'stage',
+  particle: 'cover',
+  stage: 'cover',
   cinema: 'cover',
   podcast: 'cover',
 }
@@ -72,7 +73,7 @@ export const usePlayerStore = defineStore('player', () => {
   let baseAt = performance.now()
   let raf = 0
   let lyricToken = 0
-  /** Bug 78：无歌词歌曲的负缓存（key → 时间戳） */
+ /**无歌词歌曲的负缓存（key → 时间戳） */
   const lyricNegative = new Map<string, number>()
   let lastSongId = ''
   let lastAccentSrc = ''
@@ -114,7 +115,13 @@ export const usePlayerStore = defineStore('player', () => {
     try {
       const s = await call<PlayerState>('player:state')
       applyState(s, true)
-      // 规格书 1.7：循环模式持久化（xinyuan_loop_mode），重启后恢复
+ //音量持久化恢复（settings.playerVolume 0~100）
+      const savedVol = Number((ui.settings as any).playerVolume)
+      if (Number.isFinite(savedVol) && savedVol >= 0 && Math.abs(s?.volume - savedVol / 100) > 0.02) {
+        state.value.volume = Math.min(1, Math.max(0, savedVol / 100))
+        void call('player:volume', { volume: state.value.volume }).catch(() => undefined)
+      }
+ //循环模式持久化（xinyuan_loop_mode），重启后恢复
       const savedLoop = readLoopMode()
       if (savedLoop && s?.mode !== savedLoop) void setMode(savedLoop)
     } catch (e: any) {
@@ -185,7 +192,7 @@ export const usePlayerStore = defineStore('player', () => {
     }
 
     try {
-      // Bug 78：空歌词负缓存（30 分钟内同一首不再重复 IPC）
+ //空歌词负缓存（30 分钟内同一首不再重复 IPC）
       const key = `${s.source}:${s.songId || s.id}`
       const negAt = lyricNegative.get(key)
       if (negAt && Date.now() - negAt < 30 * 60_000) {
@@ -273,9 +280,21 @@ export const usePlayerStore = defineStore('player', () => {
   }
 
   async function setVolume(v: number): Promise<void> {
-    state.value.volume = v
+    const nv = Math.max(0, Math.min(1, v))
+    state.value.volume = nv
+ //拖音量滑条即解除静音（否则静音下拖动永远无声）
+    if (nv > 0 && state.value.muted) {
+      state.value.muted = false
+      try {
+        await call('player:mute', { muted: false })
+      } catch {
+        /* ignore */
+      }
+    }
     try {
-      await call('player:volume', { volume: v })
+      await call('player:volume', { volume: nv })
+ // 音量持久化：跨页/重启不再回到默认值
+      void ui.patch({ playerVolume: Math.round(nv * 100) })
     } catch {
       /* ignore */
     }
@@ -290,7 +309,7 @@ export const usePlayerStore = defineStore('player', () => {
   }
 
   async function cycleMode(): Promise<void> {
-    // 规格书 v2.7 · 1.7：列表 → 单曲 → 随机 → 关闭；车机只保留两态
+ //列表 → 单曲 → 随机 → 关闭；车机只保留两态
     const order: PlayMode[] = platform.value.car
       ? ['repeat-all', 'repeat-one']
       : ['repeat-all', 'repeat-one', 'shuffle', 'order']
@@ -409,12 +428,7 @@ export const usePlayerStore = defineStore('player', () => {
     }
   }
 
-  /** 视觉模式按钮：封面 → 歌词 → 粒子 → 舞台，循环（车机不提供该按钮） */
-  function cycleStage(): void {
-    const order = platform.value.car ? (['cover', 'lyrics'] as StageMode[]) : STAGE_ORDER
-    const idx = order.indexOf(stage.value)
-    setStage(order[(idx + 1) % order.length])
-  }
+
 
   watch(
     () => state.value.status,
@@ -459,7 +473,6 @@ export const usePlayerStore = defineStore('player', () => {
     move,
     clearQueue,
     setStage,
-    cycleStage,
     reloadLyric,
     sleepUntil,
     setRate,

@@ -1,17 +1,17 @@
 import { onBeforeUnmount, ref, type Ref } from 'vue'
 
 /**
- * 视频播放手势（规格书 2.8，仅手机 / 平板）
+ * 视频播放手势
  *
  * - 左半屏上下滑：亮度
  * - 右半屏上下滑：音量
  * - 左右滑：时间偏移预览，松手跳转
  * - 双击：左半屏 −10s / 右半屏 +10s / 中间播放暂停
  * - 单击：显示或隐藏控件
- * - 长按（≥500ms 无位移，规格书 2.7 / 6.4）：右下区域 1.5 倍速播放，
- *   松手恢复原倍速；pressing 状态供页面显示中央大字浮层。
+ * - 长按（≥400ms 无位移， .15 倍速与手势行）：2.0x 快进播放，
+ *   松手恢复原倍速；boostRate 供页面右上角显示「2.0x」badge。
  *
- * 车机不做手势（规格书 2.8 / 3.0）。
+ * 车机不做手势。
  */
 export type VideoGestureMode = '' | 'bright' | 'vol' | 'seek'
 
@@ -33,8 +33,10 @@ export interface VideoGestures {
   brightness: Ref<number>
   mode: Ref<VideoGestureMode>
   hint: Ref<string>
-  /** 长按加速生效中（2.7）：页面据此显示中央浮层 */
+ /** 长按加速生效中：页面据此显示右上角「2.0x」badge */
   pressing: Ref<boolean>
+  /** 长按加速倍率（2.0x） */
+  boostRate: Ref<number>
   onTouchStart: (e: TouchEvent) => void
   onTouchMove: (e: TouchEvent) => void
   onTouchEnd: (e: TouchEvent) => void
@@ -45,11 +47,14 @@ export function useVideoGestures(hooks: VideoGestureHooks): VideoGestures {
   const mode = ref<VideoGestureMode>('')
   const hint = ref('')
   const pressing = ref(false)
+  const boostRate = ref(2)
 
   let hintTimer = 0
   let tapTimer = 0
   let lastTapAt = 0
   let pressTimer = 0
+  let lastTouchToggleAt = 0
+  let touchToggleTimer = 0
   let savedRate = 0
 
   const g = {
@@ -89,17 +94,17 @@ export function useVideoGestures(hooks: VideoGestureHooks): VideoGestures {
     g.w = box.width || 1
     g.h = box.height || 1
     mode.value = ''
-    // 2.7 长按加速：500ms 内无明显位移 → 1.5x（仅未成手势模式时）
+ //长按加速 = 2.0x，按压 ≥400ms 触发（仅未成手势模式时）
     window.clearTimeout(pressTimer)
     pressTimer = window.setTimeout(() => {
       if (!g.active || mode.value || !hooks.canBoost?.()) return
       const t = e.touches[0]
       if (t && (Math.abs(t.clientX - g.x) > 12 || Math.abs(t.clientY - g.y) > 12)) return
       savedRate = hooks.getRate?.() ?? 1
-      hooks.onBoost?.(1.5)
+      boostRate.value = 2
+      hooks.onBoost?.(2)
       pressing.value = true
-      showHint('1.5x 倍速中', 60_000)
-    }, 500)
+    }, 400)
   }
 
   function onTouchMove(e: TouchEvent): void {
@@ -178,10 +183,10 @@ export function useVideoGestures(hooks: VideoGestureHooks): VideoGestures {
     if (now - lastTapAt < 300) {
       window.clearTimeout(tapTimer)
       lastTapAt = 0
-      if (ratio < 0.35) {
+      if (ratio < 0.25) {
         hooks.seekTo(Math.max(0, hooks.getPosition() - 10))
         showHint('快退 10s')
-      } else if (ratio > 0.65) {
+      } else if (ratio > 0.75) {
         hooks.seekTo(Math.min(hooks.getDuration(), hooks.getPosition() + 10))
         showHint('快进 10s')
       } else {
@@ -201,5 +206,5 @@ export function useVideoGestures(hooks: VideoGestureHooks): VideoGestures {
     window.clearTimeout(tapTimer)
   })
 
-  return { brightness, mode, hint, pressing, onTouchStart, onTouchMove, onTouchEnd }
+  return { brightness, mode, hint, pressing, boostRate, onTouchStart, onTouchMove, onTouchEnd }
 }

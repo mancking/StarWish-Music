@@ -1,18 +1,19 @@
 <script setup lang="ts">
 /**
- * 歌词面板（规格书 1.3）
+ * 歌词面板
  *
- * - phone：16px / 行高 2.4 / 当前行 #A78BFA / 其他 #63636F / 居中
- * - pad：14px / 行高 2.2 / 左对齐 / 当前行白色 600
- * - desktop：14px / 行高 2.2 / 左对齐 / 当前行白色 600（外面还有 11px "LYRICS" 小标题）
- *
- * 点击任意行跳转到该行时间点（手机 / 平板 / 桌面都必须实现）。
- * 卡拉OK 逐字高亮：仅当前行按单字拆分 span（当前字 100% 主色、其余字 40%
- * 透明度），其余行整行着色（性能约定，规格书 1.3）。
+ * - 高亮行 21px / bold（手机）、19px（平板）、17px 600（桌面）；非高亮 16px rgba(255,255,255,.5)
+ * - 行间距 ~20px；当前行垂直居中（ScrollAlign.CENTER）；暂停即停滚（跟随播放状态由数据驱动）
+ * - 副行三态：无 / 翻译（音源歌词字段驱动），字号小 2px
+ * - 卡拉OK 逐字渐变 reveal（主案）：当前行按字 background-clip:text 渐变填充，
+ *   随行内进度 0→1 平滑推进（0.12s 前瞻已由 useLyricSync activeIndex + wordProgress 提供）；
+ *   无逐字数据 / 低性能档降级三态离散（当前字 100% 主色、其余 40% 透明）
+ * - 点击任意行 seek 到该行行首时间（逐字行点击 = 跳到该行行首，与整行口径一致）
  */
 import { computed, nextTick, ref, watch } from 'vue'
 import type { LyricViewLine } from '@/player-music/lyrics'
 import { wordProgress } from '@/player-music/lyrics'
+import { platform } from '@/platform'
 
 const props = withDefaults(
   defineProps<{
@@ -21,8 +22,10 @@ const props = withDefaults(
     variant?: 'phone' | 'pad' | 'desktop'
     /** 当前播放位置（秒）：逐字着色按它推进 */
     position?: number
+ /** 低性能档：逐字降级三态离散 */
+    lowPerf?: boolean
   }>(),
-  { variant: 'phone', position: 0 }
+  { variant: 'phone', position: 0, lowPerf: false }
 )
 
 const emit = defineEmits<{ (e: 'seek', time: number): void }>()
@@ -50,16 +53,18 @@ watch(
   }
 )
 
+const revealMode = computed(() => !props.lowPerf && platform.value.kind !== 'car')
+
 /** 当前行逐字进度（0~1 数组）；无逐字数据返回 null 走整行渲染 */
 const activeChars = computed(() => {
   const line = props.lines[props.activeIndex]
   if (!line?.words?.length) return null
   const prog = wordProgress(line, props.position)
   if (!prog) return null
-  // 按字拆分（含代理对安全拆分）：与 words 一一对应
   return line.words.map((w, i) => ({
     text: w.w,
-    state: (prog[i] || 0) >= 1 ? 'done' : (prog[i] || 0) > 0 ? 'now' : 'todo',
+    /** 0~1 填充比例，渐变 reveal 用 */
+    p: Math.min(1, Math.max(0, prog[i] || 0)),
   }))
 })
 </script>
@@ -76,12 +81,21 @@ const activeChars = computed(() => {
         :class="{ active: i === activeIndex }"
         @click="emit('seek', l.time)"
       >
-        <template v-if="i === activeIndex && activeChars">
+        <template v-if="i === activeIndex && activeChars && revealMode">
+          <span
+            v-for="(c, ci) in activeChars"
+            :key="ci"
+            class="karaoke reveal"
+            :style="{ '--p': c.p }"
+            >{{ c.text }}</span
+          >
+        </template>
+        <template v-else-if="i === activeIndex && activeChars">
           <span
             v-for="(c, ci) in activeChars"
             :key="ci"
             class="karaoke"
-            :class="`k-${c.state}`"
+            :class="c.p >= 1 ? 'k-done' : c.p > 0 ? 'k-now' : 'k-todo'"
             >{{ c.text }}</span
           >
         </template>
@@ -103,9 +117,9 @@ const activeChars = computed(() => {
   display: none;
 }
 .row {
-  margin: 0;
+  margin: 0 0 20px;
   cursor: pointer;
-  transition: color 180ms ease;
+  transition: color 180ms ease, font-size 180ms ease;
 }
 .txt {
   display: block;
@@ -114,7 +128,7 @@ const activeChars = computed(() => {
   display: block;
   font-size: 0.86em;
   opacity: 0.85;
-  margin-top: 2px;
+  margin-top: 4px;
 }
 .empty {
   margin: 0;
@@ -122,56 +136,76 @@ const activeChars = computed(() => {
   color: #63636f;
   font-size: 14px;
 }
-/* 卡拉OK 逐字（规格书 1.3）：当前字 100% 主色、其余 40% 透明 */
+/* ---- 卡拉OK 逐字---- */
 .karaoke {
   display: inline;
 }
+/* 主案：background-clip:text 渐变 reveal（在唱字随行内进度 0→1 平滑填充） */
+.karaoke.reveal {
+  background-image: linear-gradient(
+    90deg,
+    #a78bfa calc(var(--p) * 100%),
+    rgba(255, 255, 255, 0.4) calc(var(--p) * 100%)
+  );
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  color: transparent;
+}
+/* 降级三态：当前字 100% 主色、其余 40% 透明 */
 .k-done,
 .k-now {
   opacity: 1;
+  color: #a78bfa;
 }
 .k-todo {
   opacity: 0.4;
-}
-.is-phone .k-done,
-.is-phone .k-now {
   color: #a78bfa;
 }
-.is-pad .k-done,
-.is-pad .k-now,
-.is-desktop .k-done,
-.is-desktop .k-now {
-  color: #a78bfa;
-}
-/* 手机：居中、16px、行高 2.4 */
+/* ---- 手机：高亮行 21px/bold、非高亮 16px@50%、居中（3.14） ---- */
 .is-phone {
   padding: 24px 20px;
   text-align: center;
 }
 .is-phone .row {
   font-size: 16px;
-  line-height: 2.4;
-  color: #63636f;
-  padding: 2px 0;
+  line-height: 1.6;
+  color: rgba(255, 255, 255, 0.5);
 }
 .is-phone .row.active {
-  color: #a78bfa;
+  font-size: 21px;
+  font-weight: 700;
+  color: #ffffff;
+  line-height: 1.5;
 }
-/* 平板 / 桌面：左对齐、14px、行高 2.2、当前行白色 600 */
-.is-pad,
+/* ---- 平板：高亮 19px（等比缩放），左对齐 ---- */
+.is-pad {
+  padding: 12px 18px;
+  text-align: left;
+}
+.is-pad .row {
+  font-size: 16px;
+  line-height: 1.7;
+  color: rgba(255, 255, 255, 0.5);
+}
+.is-pad .row.active {
+  font-size: 19px;
+  font-weight: 700;
+  color: #ffffff;
+}
+/* ---- 桌面：高亮 17px 600，左对齐 ---- */
 .is-desktop {
   padding: 12px 18px;
   text-align: left;
 }
-.is-pad .row,
 .is-desktop .row {
   font-size: 14px;
-  line-height: 2.2;
-  color: #63636f;
+  line-height: 1.7;
+  color: rgba(255, 255, 255, 0.5);
 }
-.is-pad .row.active,
 .is-desktop .row.active {
-  color: #ececf1;
+  font-size: 17px;
   font-weight: 600;
+  color: #ffffff;
 }
 </style>

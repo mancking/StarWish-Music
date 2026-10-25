@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { computed, defineOptions, onMounted, ref } from 'vue'
+import { computed, defineOptions, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import Icon from '@/components/Icon.vue'
 import Toggle from '@/components/Toggle.vue'
 import { call, on } from '@/api'
+import { registerPopupCloser } from '@/mobile/popup-stack'
 import { checkUpdate, type UpdateInfo } from '@/utils/update-check'
 import { defsOf, type SettingCat, type SettingDef } from '@/settings/schema'
 import { useUiStore } from '@/stores/ui'
@@ -12,7 +13,7 @@ import { useDownloadStore } from '@/stores/download'
 import type { AppSettings, SourceInfo } from '@shared/types'
 
 /**
- * 移动端设置页 —— 模板级重写（v2.3.4）。
+ * 移动端设置页 —— 模板级重写（v1.0.0）。
  *
  * 结构对齐市面移动 App 的「一级分组入口 + 二级分组页」范式（iOS 设置 /
  * 小米音乐 / QQ 音乐一致）：
@@ -31,22 +32,136 @@ const ui = useUiStore()
 const player = usePlayerStore()
 const download = useDownloadStore()
 
-type Group = 'appearance' | 'playback' | 'lyric' | 'download' | 'sources' | 'account' | 'network' | 'about'
+type Group = 'appearance' | 'playback' | 'lyric' | 'download' | 'sources' | 'network' | 'about'
 /** '' = 一级分组列表；否则为该分组二级页 */
 const group = ref<Group | ''>('')
 
 const groups: { key: Group; label: string; desc: string; icon: string }[] = [
-  { key: 'appearance', label: '外观', desc: '主题、强调色、列表密度', icon: 'palette' },
+ //外观与主题与壁纸两个分组内容重叠，移动端同样合并为一个分组
+  { key: 'appearance', label: '外观与主题', desc: '主题、强调色、皮肤、壁纸', icon: 'palette' },
   { key: 'playback', label: '播放', desc: '音质、倍速、播放模式', icon: 'play-circle' },
   { key: 'lyric', label: '歌词', desc: '字号、偏移、字体', icon: 'lyric' },
   { key: 'download', label: '下载', desc: '下载音质与保存位置', icon: 'download' },
   { key: 'sources', label: '音源与插件', desc: '音源开关、插件市场', icon: 'plug' },
-  { key: 'account', label: '账号', desc: 'B 站登录（视频源）', icon: 'user' },
   { key: 'network', label: '网络与缓存', desc: '代理、缓存上限', icon: 'wifi' },
   { key: 'about', label: '关于与更新', desc: '版本、检查更新', icon: 'info' },
 ]
 
 const settings = computed(() => ui.settings)
+
+
+/* ---------------- 主题与壁纸（4.7+ · 移动端对等） ---------------- */
+interface ThemeItem {
+  id: string
+  name: string
+  author: string
+  version: string
+  colors: { primary?: string; accent?: string }
+  kind: string
+}
+const themes = ref<ThemeItem[]>([])
+const activeThemeId = ref('default')
+const THEME_SWATCHES = ['#a78bfa', '#f472b6', '#60a5fa', '#34d399', '#fbbf24', '#f87171', '#22d3ee', '#c084fc', '#fb923c', '#4ade80', '#e879f9', '#94a3b8']
+
+async function loadThemes(): Promise<void> {
+  try {
+    const r = await call<{ themes: ThemeItem[]; active: string }>('theme:list')
+    themes.value = r?.themes || []
+    activeThemeId.value = r?.active || 'default'
+  } catch {
+    themes.value = []
+  }
+}
+async function useTheme(id: string): Promise<void> {
+  try {
+    await call('theme:apply', { id })
+    activeThemeId.value = id
+    ui.apply()
+    ui.toast('主题已应用', 'success', 1400)
+  } catch (e: any) {
+    ui.toast(e?.message || '应用失败', 'error', 1800)
+  }
+}
+async function pickSwatch(c: string): Promise<void> {
+  await ui.patch({ accentMode: 'custom', accent: c })
+  ui.apply()
+}
+
+/** 色相滑杆（0~360°）：与桌面端同口径，转 HEX 后走 custom accent */
+const themeHue = ref(262)
+function hslToHex(h: number, s = 0.72, l = 0.62): string {
+  const f = (n: number): number => {
+    const k = (n + h / 30) % 12
+    const a = s * Math.min(l, 1 - l)
+    return Math.round(255 * (l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1))))
+  }
+  return `#${[f(0), f(8), f(4)].map(x => x.toString(16).padStart(2, '0')).join('')}`
+}
+async function pickHue(h: number): Promise<void> {
+  await ui.patch({ accentMode: 'custom', accent: hslToHex(h) })
+  ui.apply()
+}
+
+/* 开源壁纸（浏览 + 保存到系统媒体库；播放页背景壁纸模式依赖本地库） */
+interface OnlineWall { id: string; thumb: string; full: string; w: number; h: number; source: string }
+const onlineWalls = ref<OnlineWall[]>([])
+const onlineLoading = ref(false)
+const onlineFailed = ref(false)
+const onlineEnd = ref(false)
+const onlineQ = ref('')
+let onlinePage = 0
+let onlineTimer = 0
+async function loadOnline(reset = false): Promise<void> {
+  if (onlineLoading.value) return
+  onlineLoading.value = true
+  onlineFailed.value = false
+  try {
+    const page = reset ? 1 : onlinePage + 1
+    const r = await call<{ list: OnlineWall[]; degraded: boolean; end: boolean }>('wallpaper:online:list', { page, q: onlineQ.value, refresh: reset })
+    const list = r?.list || []
+    onlineWalls.value = reset ? list : [...onlineWalls.value, ...list]
+    onlinePage = page
+    onlineEnd.value = !!r?.end
+    onlineFailed.value = !!r?.degraded
+  } catch {
+    onlineFailed.value = true
+  } finally {
+    onlineLoading.value = false
+  }
+}
+function onOnlineQ(e: Event): void {
+  const v = (e.target as HTMLInputElement).value
+  window.clearTimeout(onlineTimer)
+  onlineTimer = window.setTimeout(() => {
+    onlineQ.value = v.trim()
+    void loadOnline(true)
+  }, 300)
+}
+async function saveWallToMedia(w: OnlineWall): Promise<void> {
+  try {
+    const res = await fetch(w.full)
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const buf = new Uint8Array(await res.arrayBuffer())
+    const { nativeCall } = await import('@/mobile/bridge')
+    const { bytesToBase64 } = await import('@/mobile/base64')
+    await nativeCall('SwBridge', 'saveToMedia', {
+      name: `星河壁纸-${w.id}.jpg`,
+      mime: 'image/jpeg',
+ //分块 base64，不再展开实参（4MB spread 必崩）
+      data: bytesToBase64(buf),
+    })
+    ui.toast('壁纸已保存到相册/媒体库', 'success', 1800)
+  } catch (e: any) {
+    ui.toast(e?.message || '保存失败', 'error', 1800)
+  }
+}
+watch(group, g => {
+ // 外观与主题合并后，皮肤/壁纸数据随该分组一并预取
+  if (g === 'appearance') {
+    if (!themes.value.length) void loadThemes()
+    if (!onlineWalls.value.length) void loadOnline(true)
+  }
+})
 
 /* ---------------- 二级页：schema 驱动的设置项 ---------------- */
 function defsOfGroup(g: Group): SettingDef[] {
@@ -56,7 +171,6 @@ function defsOfGroup(g: Group): SettingDef[] {
     lyric: 'lyric',
     download: 'download',
     sources: 'sources',
-    account: 'shortcuts',
     network: 'cache',
     about: 'about',
   }
@@ -96,7 +210,7 @@ async function pickOption(v: any): Promise<void> {
 
 /* ---------------- 音源 ---------------- */
 const sources = ref<SourceInfo[]>([])
-/* F-22/F-23：移动端音源管理动作 */
+/* /F-23：移动端音源管理动作 */
 async function importSourceUrl(): Promise<void> {
   const url = window.prompt('粘贴音源 .js 的 http(s) 直链')
   if (!url) return
@@ -166,7 +280,11 @@ async function loadSources(): Promise<void> {
 
 async function toggleSource(s: SourceInfo): Promise<void> {
   try {
-    sources.value = await call<SourceInfo[]>('sources:toggle', { file: s.file, enabled: !s.enabled })
+    // 启用走重新初始化（落雪式状态机）：返回 {sources, ok, message}
+    const r = await call<{ sources: SourceInfo[]; ok: boolean; message?: string }>('sources:toggle', { file: s.file, enabled: !s.enabled })
+    sources.value = r.sources
+    if (r.ok) ui.toast(s.enabled ? `已停用 ${s.name}` : `${s.name} 初始化成功`, 'success', 1600)
+    else ui.toast(r.message || `${s.name} 初始化失败，已回滚为停用`, 'error', 3200)
   } catch (e: any) {
     ui.toast(e.message, 'error')
   }
@@ -176,7 +294,7 @@ async function toggleSource(s: SourceInfo): Promise<void> {
 /** 官方插件库 manifest 地址（与桌面端保持一致） */
 const OFFICIAL_SUB_URL = 'https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/manifest.json'
 type MarketEntry = {
-  kind?: 'lx-source' | 'musicfree-plugin' | 'video-source'
+  kind?: 'lx-source' | 'musicfree-plugin' | 'video-source' | 'theme'
   name: string
   file?: string
   version?: string
@@ -208,14 +326,113 @@ async function loadInstalledPlugins(): Promise<void> {
   }
 }
 
-/** 打开插件市场：拉取在线目录（走 bridge 的 plugins:market，移动端此前缺失该通道） */
-async function loadMarket(): Promise<void> {
+/** 市场 Tab 过滤 + 搜索（0.10.3 移动端对等：全部/音源/插件/视频源/主题） */
+const marketTab = ref<'all' | 'lx-source' | 'musicfree-plugin' | 'video-source'>('all')
+// Guard against legacy theme entries accidentally published to the plugin manifest.
+const marketQ = ref('')
+/** 插件市场与主题市场是两个不同分支：主题不混入插件市场（走独立「主题市场」入口） */
+const MARKET_TABS = [
+  { key: 'all', label: '全部' },
+  { key: 'lx-source', label: '音源' },
+  { key: 'musicfree-plugin', label: '插件' },
+  { key: 'video-source', label: '视频源' },
+] as const
+const marketShown = computed(() => {
+  const q = marketQ.value.trim().toLowerCase()
+  return marketEntries.value.filter(m => {
+    if (m.kind === 'theme') return false
+    if (marketTab.value !== 'all' && (m.kind || 'musicfree-plugin') !== marketTab.value) return false
+    if (q && !`${m.name} ${m.description || ''} ${m.author || ''}`.toLowerCase().includes(q)) return false
+    return true
+  })
+})
+function kindLabel(m: MarketEntry): string {
+  const map: Record<string, string> = {
+    'lx-source': '音源',
+    'musicfree-plugin': '插件',
+    'video-source': '视频源',
+    theme: '主题',
+  }
+  return map[m.kind || 'musicfree-plugin'] || '插件'
+}
+/** 来源标注（0.10.3）：市场/订阅/本地/URL */
+function originLabel(m: MarketEntry): string {
+  const o = (m as any).origin
+  return o === 'subscribe' ? '订阅' : o === 'local' ? '本地' : o === 'url' ? 'URL' : '市场'
+}
+
+/** 在线主题库（独立分支 Star-Wish-Theme-Library，与插件市场分离） */
+const THEME_MARKET_URL =
+  'https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Theme-Library/manifest.json'
+const tmOpen = ref(false)
+const tmTab = ref<'theme' | 'wallpaper'>('theme')
+const tmItems = ref<MarketEntry[]>([])
+const tmLoading = ref(false)
+const tmErr = ref('')
+const tmUpdating = ref('')
+async function loadThemeMarket(force = false): Promise<void> {
+  tmLoading.value = true
+  tmErr.value = ''
+  try {
+    tmItems.value = await call<MarketEntry[]>('market:themes', { url: THEME_MARKET_URL, force })
+  } catch (e: any) {
+    tmItems.value = []
+    tmErr.value = e?.message || '主题库加载失败'
+  } finally {
+    tmLoading.value = false
+  }
+}
+/** 主题市场入口：独立分支（不再复用插件市场面板） */
+async function openThemeMarket(): Promise<void> {
+  tmOpen.value = true
+  if (!tmItems.value.length) void loadThemeMarket()
+}
+async function installTm(m: MarketEntry): Promise<void> {
+  tmUpdating.value = m.url
+  try {
+    await call(m.installed && m.canUpdate ? 'market:update' : 'market:install', { item: m as any })
+    ui.toast(`${m.installed && m.canUpdate ? '已更新' : '已安装'} ${m.name}`, 'success', 1800)
+    await Promise.all([loadThemes(), loadThemeMarket()])
+  } catch (e: any) {
+    ui.toast(`安装失败：${e?.message || e}`, 'error', 3200)
+  } finally {
+    tmUpdating.value = ''
+  }
+}
+async function uninstallTm(m: MarketEntry): Promise<void> {
+  tmUpdating.value = m.url
+  try {
+    await call('market:uninstall', { item: m as any })
+    ui.toast(`已卸载 ${m.name}`, 'info', 1600)
+    await Promise.all([loadThemes(), loadThemeMarket()])
+  } catch (e: any) {
+    ui.toast(`卸载失败：${e?.message || e}`, 'error', 2800)
+  } finally {
+    tmUpdating.value = ''
+  }
+}
+
+/** 落雪式初始化状态文案 */
+function initStateLabel(s: SourceInfo): { text: string; cls: string } {
+  const st = (s as any).initState
+  if (s.loadError || st === 'failed') return { text: s.loadError ? '初始化失败' : '初始化失败', cls: 'bad' }
+  if (st === 'initing') return { text: '初始化中…', cls: 'busy' }
+  if (s.enabled) return { text: '就绪', cls: 'ok' }
+  return { text: '已停用', cls: 'off' }
+}
+
+
+
+/** 打开插件市场：拉取在线目录（market:list，带安装态）。force=true 绕过缓存强制拉远端 */
+async function loadMarket(force = false): Promise<void> {
   marketOpen.value = true
   marketLoading.value = true
   marketError.value = ''
   try {
-    const list = await call<MarketEntry[]>('plugins:market', { url: OFFICIAL_SUB_URL })
-    marketEntries.value = list || []
+ //改用 market:list（宿主侧带 installed/canUpdate），
+    // 旧的 plugins:market 只回 manifest 原始条目，安装态靠名字猜，更新永远判不出来
+    const list = await call<MarketEntry[]>('market:list', { url: (settings.value as any).marketUrl || OFFICIAL_SUB_URL, force })
+    marketEntries.value = (list || []).filter(x => x.kind !== 'theme').map(x => ({ ...x, installed: !!(x as any).installed }))
     if (!marketEntries.value.length) marketError.value = '目录为空，请稍后重试'
   } catch (e: any) {
     marketEntries.value = []
@@ -226,16 +443,18 @@ async function loadMarket(): Promise<void> {
 }
 
 function isInstalled(entry: MarketEntry): boolean {
+  if (entry.installed) return true
   if (entry.file && installedFiles.value.includes(entry.file)) return true
   return installedNames.value.includes(entry.name)
 }
 
-/** F-31：统一安装/更新（kind 路由），装完刷新市场条目状态 */
+/**统一安装/更新（kind 路由），装完刷新市场条目状态 */
 async function installFromMarket(entry: MarketEntry): Promise<void> {
   marketUpdating.value = entry.url
+  const isUpdate = !!entry.installed && !!entry.canUpdate
   try {
-    await call(entry.installed ? 'market:update' : 'market:install', { item: entry })
-    ui.toast(`${entry.installed ? '已更新' : '已安装'} ${entry.name}`, 'success', 2000)
+    await call(isUpdate ? 'market:update' : 'market:install', { item: entry })
+    ui.toast(`${isUpdate ? '已更新' : '已安装'} ${entry.name}`, 'success', 2000)
     await Promise.all([loadInstalledPlugins(), loadSources()])
     await loadMarket()
   } catch (e: any) {
@@ -245,7 +464,7 @@ async function installFromMarket(entry: MarketEntry): Promise<void> {
   }
 }
 
-/** 卸载（按 sourceUrl 匹配，Bug 126） */
+/** 卸载（按 sourceUrl 匹配， */
 async function uninstallFromMarket(entry: MarketEntry): Promise<void> {
   marketUpdating.value = entry.url
   try {
@@ -366,6 +585,8 @@ async function openReleasePage(): Promise<void> {
 
 /* 原生下载进度 */
 let offProgress: (() => void) | null = null
+/** 统一返回栈登记（onBeforeUnmount 注销） */
+let offViewCloser: (() => void) | null = null
 onMounted(() => {
   void loadAppInfo()
   void loadSources()
@@ -375,6 +596,21 @@ onMounted(() => {
     dlReceived.value = Number(p?.received || 0)
     dlTotal.value = Number(p?.total || 0)
   })
+  // 多级页纳入统一返回栈（本轮需求：设置多级页面是返回手势重灾区）。
+  // 系统返回键 / 边缘滑动 → handleBack → closeTopPopup 走到这里：
+  //   市场浮层 → 选择器 → 二级分组页 → 一级列表（返回 false 穿透到路由栈）
+  // closer 约定：真的降级了才 return true，否则让返回穿透到上一层。
+  offViewCloser = registerPopupCloser(() => {
+    if (marketOpen.value) { marketOpen.value = false; return true }
+    if (pickerOpen.value) { pickerOpen.value = false; return true }
+    if (group.value) { group.value = ''; return true }
+    return false
+  })
+})
+
+onBeforeUnmount(() => {
+  offProgress?.()
+  offViewCloser?.()
 })
 
 function back(): void {
@@ -446,6 +682,63 @@ const version = computed(() => String(appInfo.value?.version || __APP_VERSION__)
             </button>
           </div>
         </div>
+      </section>
+
+
+      <!-- 皮肤 · 主题包 · 壁纸（外观与主题） -->
+      <section v-if="group === 'appearance'" class="set-group">
+        <div class="set-card">
+          <div class="set-item">
+            <div class="it-meta"><span class="it-label">主题市场</span><span class="it-desc">独立分支（主题包 + 开源壁纸），与插件市场分离</span></div>
+            <button class="it-value" @click="openThemeMarket">进入<Icon name="chevron-right" :size="14" /></button>
+          </div>
+        </div>
+      </section>
+
+      <section v-if="group === 'appearance'" class="set-group">
+        <div class="set-card">
+          <div class="set-item" style="flex-direction: column; align-items: stretch">
+            <div class="it-meta"><span class="it-label">预置皮肤</span><span class="it-desc">本地内置 5 套，无网络可切换</span></div>
+            <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 8px">
+              <button
+                v-for="t in themes.filter(x => x.kind === 'preset')"
+                :key="t.id"
+                class="mtheme"
+                :class="{ on: activeThemeId === t.id }"
+                @click="useTheme(t.id)"
+              >
+                <span class="mtc" :style="{ background: `linear-gradient(135deg, ${t.colors.primary}, ${t.colors.accent})` }" />
+                <span class="mtn">{{ t.name }}</span>
+              </button>
+            </div>
+          </div>
+          <div class="set-item" style="flex-direction: column; align-items: stretch">
+            <div class="it-meta"><span class="it-label">主题色</span><span class="it-desc">色谱任选：预设色 + 色相滑杆（即时生效）</span></div>
+            <div style="display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px">
+              <button
+                v-for="c in THEME_SWATCHES"
+                :key="c"
+                class="msw"
+                :class="{ on: String(settings.accent || '').toLowerCase() === c }"
+                :style="{ background: c }"
+                @click="pickSwatch(c)"
+              />
+            </div>
+            <div style="display: flex; align-items: center; gap: 10px; margin-top: 10px">
+              <input
+                v-model.number="themeHue"
+                type="range"
+                min="0"
+                max="360"
+                step="1"
+                style="flex: 1"
+                @change="pickHue(themeHue)"
+              />
+              <span class="it-desc" style="width: 40px; text-align: right">{{ themeHue }}°</span>
+            </div>
+          </div>
+        </div>
+
       </section>
 
       <!-- 播放 -->
@@ -548,12 +841,15 @@ const version = computed(() => String(appInfo.value?.version || __APP_VERSION__)
         </div>
       </section>
 
-      <!-- 音源与插件（F-22/F-23：与桌面对等 —— 导入 URL/本地 JS、订阅、恢复内置、删除） -->
+ <!-- 音源与插件（与桌面对等 —— 导入 URL/本地 JS、订阅、恢复内置、删除） -->
       <section v-else-if="group === 'sources'" class="set-group">
         <div class="set-card">
           <div v-for="s in sources" :key="s.file" class="set-item">
             <div class="it-meta" @click="showSource(s)">
-              <span class="it-label">{{ s.name }}</span>
+              <span class="it-label">
+                {{ s.name }}
+                <span class="init-badge" :class="initStateLabel(s).cls">{{ initStateLabel(s).text }}</span>
+              </span>
               <span class="it-desc">{{ s.loadError ? s.loadError : s.description || s.platforms?.join(' · ') || '音源脚本' }}</span>
             </div>
             <div class="it-acts">
@@ -586,7 +882,7 @@ const version = computed(() => String(appInfo.value?.version || __APP_VERSION__)
             </div>
             <Icon name="chevron-right" :size="16" class="set-arrow" />
           </button>
-          <button class="set-item link" @click="loadMarket">
+          <button class="set-item link" @click="loadMarket(false)">
             <div class="it-meta">
               <span class="it-label">源市场</span>
               <span class="it-desc">安装与更新插件 / 音源 / 视频源</span>
@@ -597,19 +893,6 @@ const version = computed(() => String(appInfo.value?.version || __APP_VERSION__)
       </section>
 
       <!-- 账号 -->
-      <section v-else-if="group === 'account'" class="set-group">
-        <div class="set-card">
-          <div class="set-item">
-            <div class="it-meta">
-              <span class="it-label">B 站账号</span>
-              <span class="it-desc">用于 MV / 视频源的高清晰度与会员内容</span>
-            </div>
-            <span class="it-value static">在「视频」页登录</span>
-          </div>
-        </div>
-        <p class="set-tip">星河音乐不收集个人信息，账号信息仅保存在本机。</p>
-      </section>
-
       <!-- 网络与缓存 -->
       <section v-else-if="group === 'network'" class="set-group">
         <div class="set-card">
@@ -725,24 +1008,89 @@ const version = computed(() => String(appInfo.value?.version || __APP_VERSION__)
       </div>
     </Transition>
 
-    <!-- 插件市场（MusicFree 协议）：紧凑底部抽屉，参照 B 站播放设置面板 -->
+    <!-- 主题市场（独立分支）：编辑器式固定头，Tab = 主题包 / 开源壁纸 -->
+    <div v-if="tmOpen" class="mk-mask" @click.self="tmOpen = false">
+      <div class="mk-card">
+        <div class="mk-head">
+          <b>主题市场</b>
+          <button class="mk-close" @click="tmOpen = false"><Icon name="close" :size="16" /></button>
+        </div>
+        <p class="mk-tip">独立主题库分支（Star-Wish-Theme-Library）：在线主题包一键安装；开源壁纸浏览并保存</p>
+        <div class="mk-tabs">
+          <button :class="{ on: tmTab === 'theme' }" @click="tmTab = 'theme'">主题包</button>
+          <button :class="{ on: tmTab === 'wallpaper' }" @click="tmTab = 'wallpaper'">开源壁纸</button>
+        </div>
+        <div v-if="tmTab === 'theme'" class="mk-list">
+          <div v-if="tmLoading" class="mk-loading">正在拉取主题库…</div>
+          <template v-else>
+            <div v-for="m in tmItems" :key="m.url" class="mk-item">
+              <div class="mk-main">
+                <div class="mk-title">
+                  <b>{{ m.name }}</b>
+                  <span v-if="m.version" class="mk-ver">v{{ m.version }}</span>
+                </div>
+                <div v-if="m.description" class="mk-desc">{{ m.description }}</div>
+              </div>
+              <div class="mk-acts">
+                <button class="mk-btn" :disabled="tmUpdating === m.url" @click="installTm(m)">
+                  {{ tmUpdating === m.url ? '处理中…' : m.installed ? (m.canUpdate ? '更新' : '已装') : '安装' }}
+                </button>
+                <button v-if="m.installed" class="mk-btn ghost" :disabled="tmUpdating === m.url" @click="uninstallTm(m)">卸载</button>
+              </div>
+            </div>
+            <div v-if="!tmItems.length" class="mk-empty">主题库暂未上架，敬请期待（可先用预置皮肤或本地导入）</div>
+          </template>
+        </div>
+        <div v-else class="mk-list">
+          <input class="minput" placeholder="搜索壁纸（过滤，清空回默认）" @input="onOnlineQ" />
+          <p v-if="onlineFailed && !onlineWalls.length" class="it-desc" style="color: #f87171">源不可达，请检查网络</p>
+          <div class="mwall-grid">
+            <button v-for="w in onlineWalls" :key="w.id" class="mwall" @click="saveWallToMedia(w)">
+              <img :src="w.thumb" loading="lazy" alt="" />
+            </button>
+          </div>
+          <button v-if="!onlineEnd" class="it-value" style="justify-content: center; width: 100%" :disabled="onlineLoading" @click="loadOnline()">
+            {{ onlineLoading ? '加载中…' : '加载更多' }}
+          </button>
+        </div>
+        <div v-if="tmTab === 'theme'" class="mk-foot">
+          <button class="mk-btn ghost" :disabled="tmLoading" @click="loadThemeMarket(true)">
+            <Icon name="refresh" :size="14" />刷新
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 插件市场：编辑器式固定头（标题/Tab/搜索/底部操作固定，仅列表滚动，
+         修「搜索框与 Tab 随内容上下变化」与触控目标过小） -->
     <div v-if="marketOpen" class="mk-mask" @click.self="marketOpen = false">
       <div class="mk-card">
         <div class="mk-head">
           <b>插件市场</b>
           <button class="mk-close" @click="marketOpen = false"><Icon name="close" :size="16" /></button>
         </div>
-        <p class="mk-tip">统一源市场：音源 / 插件 / 视频源，一键安装与更新</p>
+        <p class="mk-tip">插件与音源独立目录：音源 / 插件 / 视频源，一键安装、更新与卸载</p>
+        <!-- Tab 过滤 + 搜索（0.10.3 移动端对等） -->
+        <div class="mk-tabs">
+          <button
+            v-for="t in MARKET_TABS"
+            :key="t.key"
+            :class="{ on: marketTab === t.key }"
+            @click="marketTab = t.key"
+          >{{ t.label }}</button>
+        </div>
+        <input v-model="marketQ" class="mk-search" placeholder="搜索名称 / 描述 / 作者" />
         <div v-if="marketLoading" class="mk-list">
           <div class="mk-loading">正在拉取插件目录…</div>
           <div v-for="i in 3" :key="i" class="mk-sk" />
         </div>
         <div v-else-if="marketError" class="mk-err">{{ marketError }}</div>
         <div v-else class="mk-list">
-          <div v-for="m in marketEntries" :key="m.file" class="mk-item">
+          <div v-for="m in marketShown" :key="m.file || m.url" class="mk-item">
             <div class="mk-main">
               <div class="mk-title">
                 <b>{{ m.name }}</b>
+                <span class="mk-kind">{{ kindLabel(m) }} · {{ originLabel(m) }}</span>
                 <span v-if="m.version" class="mk-ver">v{{ m.version }}</span>
                 <span v-if="m.canUpdate" class="mk-ver upd">可更新</span>
               </div>
@@ -759,10 +1107,10 @@ const version = computed(() => String(appInfo.value?.version || __APP_VERSION__)
               </button>
             </div>
           </div>
-          <div v-if="!marketEntries.length" class="mk-empty">目录为空</div>
+          <div v-if="!marketShown.length" class="mk-empty">{{ marketEntries.length ? '没有匹配的条目' : '目录为空' }}</div>
         </div>
         <div class="mk-foot">
-          <button class="mk-btn ghost" :disabled="marketLoading" @click="loadMarket">
+          <button class="mk-btn ghost" :disabled="marketLoading" @click="loadMarket(true)">
             <Icon name="refresh" :size="14" />刷新
           </button>
         </div>
@@ -1074,13 +1422,34 @@ const version = computed(() => String(appInfo.value?.version || __APP_VERSION__)
 }
 .mk-card {
   width: 100%;
-  max-height: 68vh;
+  height: min(86vh, 820px);
   display: flex;
   flex-direction: column;
-  padding: 14px 16px calc(16px + env(safe-area-inset-bottom));
+  padding: 18px 18px calc(16px + env(safe-area-inset-bottom));
   border-radius: 20px 20px 0 0;
   background: var(--bg-2);
   border-top: 1px solid var(--line);
+}
+/* 固定头部与触控目标；仅结果列表滚动。 */
+.mk-tabs {
+  flex: none;
+}
+.mk-tabs button {
+  min-height: 42px;
+  padding: 0 18px;
+  font-size: 14px;
+}
+.mk-search {
+  flex: none;
+  height: 48px;
+  margin: 0 0 12px;
+  padding: 0 14px;
+  font-size: 15px;
+  border-radius: 10px;
+}
+.mk-head,
+.mk-tip {
+  flex: none;
 }
 .mk-head {
   display: flex;
@@ -1107,8 +1476,7 @@ const version = computed(() => String(appInfo.value?.version || __APP_VERSION__)
   color: var(--text-3);
 }
 .mk-list {
-  flex: 0 1 auto;
-  max-height: 46vh;
+  flex: 1 1 0;
   min-height: 0;
   overflow-y: auto;
   display: flex;
@@ -1208,5 +1576,125 @@ const version = computed(() => String(appInfo.value?.version || __APP_VERSION__)
   50% {
     opacity: 0.85;
   }
+}
+/* 主题与壁纸（4.7+） */
+.mtheme {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 4px;
+  border: 1px solid var(--line, #262633);
+  border-radius: 12px;
+  background: transparent;
+  color: var(--text-2, #9b9ba8);
+}
+.mtheme.on {
+  border-color: var(--accent, #a78bfa);
+  color: var(--accent, #a78bfa);
+}
+.mtc {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+}
+.mtn {
+  font-size: 12px;
+}
+.msw {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  border: 2px solid transparent;
+}
+.msw.on {
+  border-color: #fff;
+}
+.minput {
+  height: 38px;
+  border-radius: 10px;
+  border: 1px solid var(--line, #262633);
+  background: var(--panel, #13131b);
+  color: var(--text-1, #ececf1);
+  padding: 0 12px;
+  font-size: 13px;
+  margin-top: 8px;
+  width: 100%;
+  box-sizing: border-box;
+}
+.mwall-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  margin-top: 10px;
+}
+.mwall {
+  aspect-ratio: 16 / 10;
+  border: 0;
+  border-radius: 10px;
+  overflow: hidden;
+  padding: 0;
+  background: var(--panel, #13131b);
+}
+.mwall img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+</style>
+
+<style scoped>
+/* 落雪式初始化状态徽标 */
+.init-badge {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 7px;
+  border-radius: 9px;
+  font-size: 10.5px;
+  font-weight: 600;
+  vertical-align: 1px;
+}
+.init-badge.ok { color: #34d399; background: rgba(52, 211, 153, 0.14); }
+.init-badge.bad { color: #f87171; background: rgba(248, 113, 113, 0.14); }
+.init-badge.busy { color: var(--accent); background: rgba(167, 139, 250, 0.16); }
+.init-badge.off { color: var(--text-3); background: rgba(255, 255, 255, 0.08); }
+
+/* 市场 Tab 过滤 + 搜索框 */
+.mk-tabs {
+  display: flex;
+  gap: 6px;
+  padding: 0 14px 8px;
+  overflow-x: auto;
+}
+.mk-tabs button {
+  flex: none;
+  padding: 5px 12px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 12px;
+}
+.mk-tabs button.on {
+  color: #fff;
+  background: var(--accent);
+  border-color: var(--accent);
+  font-weight: 600;
+}
+.mk-search {
+  margin: 0 14px 10px;
+  height: 34px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+  color: var(--text-1);
+  font-size: 13px;
+}
+.mk-kind {
+  margin-left: 6px;
+  font-size: 10.5px;
+  color: var(--text-3);
 }
 </style>

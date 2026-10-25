@@ -6,6 +6,7 @@ let feedCache: any = null
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import Icon from '@/components/Icon.vue'
+import NebulaBg from '@/components/NebulaBg.vue'
 import Cover from '@/components/Cover.vue'
 import SongList from '@/components/SongList.vue'
 import PlaylistCard from '@/components/PlaylistCard.vue'
@@ -14,7 +15,6 @@ import { usePlayerStore } from '@/stores/player'
 import { useLibraryStore } from '@/stores/library'
 import { useUiStore } from '@/stores/ui'
 import type { Song } from '@shared/types'
-import brand from '@/assets/brand-cover.png'
 import brandIcon from '@/assets/brand-icon.png'
 
 const router = useRouter()
@@ -44,13 +44,6 @@ const dateText = computed(() => {
 
 const daily = computed<Song[]>(() => feed.value?.daily || [])
 
-/** 规格书 v2.8 · 3.1：搜索框在顶部右侧，与问候语同一行 */
-const searchText = ref('')
-function submitSearch(): void {
-  const q = searchText.value.trim()
-  if (!q) return
-  void router.push({ path: '/search', query: { q } })
-}
 const continueList = computed<Song[]>(() => feed.value?.continueListening || [])
 const playlists = computed<any[]>(() => feed.value?.playlists || [])
 const toplists = computed<any[]>(() => feed.value?.toplists || [])
@@ -58,8 +51,7 @@ const moods = computed<any[]>(() => feed.value?.moods || [])
 const newSongs = computed<Song[]>(() => feed.value?.newSongs || [])
 const onRepeat = computed<Song[]>(() => feed.value?.onRepeat || [])
 const memory = ref<any>(null)
-const sourceCount = ref(0)
-/** F-21：无可用音源（全部失效或被禁用）时展示导入 banner */
+/**无可用音源（全部失效或被禁用）时展示导入 banner */
 const noSources = ref(false)
 const podcasts = computed<any[]>(() => feed.value?.podcasts || [])
 
@@ -119,15 +111,13 @@ async function load(force = false): Promise<void> {
   else loading.value = true
   error.value = ''
   try {
-    const [f, m, platforms] = await Promise.all([
+    const [f, m] = await Promise.all([
       call('home:feed', { force }),
       call('music:memory').catch(() => null),
-      call<string[]>('sources:platforms').catch(() => null),
     ])
     feed.value = f
     feedCache = f
     memory.value = m
-    if (Array.isArray(platforms)) sourceCount.value = platforms.filter(Boolean).length
     try {
       const list = await call<any[]>('sources:list').catch(() => [])
       noSources.value = !list.some((x: any) => x.enabled && !x.loadError)
@@ -222,46 +212,46 @@ onMounted(() => {
     </div>
 
     <template v-else>
-      <!-- F-21：无可用音源时首页顶部常驻 banner -->
+ <!--无可用音源时首页顶部常驻 banner -->
       <div v-if="noSources" class="no-src-banner" @click="router.push('/settings?cat=sources')">
         <Icon name="wifi" :size="15" />
         <span>当前无可用音源，点此导入</span>
         <Icon name="chevron-right" :size="14" />
       </div>
-      <!-- 顶部搜索框（规格书 3.1 ①：页面顶端右对齐，Ctrl+K 聚焦；问候区不放搜索入口） -->
-      <div class="topbar-row">
-        <button class="refresh" :class="{ spin: refreshing }" title="刷新推荐" @click="load(true)">
-          <Icon name="refresh" :size="15" />
-        </button>
-        <form class="top-search" @submit.prevent="submitSearch">
-          <Icon name="search" :size="16" />
-          <input v-model="searchText" type="search" placeholder="搜索歌曲、歌手、专辑" />
-          <button type="submit" class="btn primary sm">搜索</button>
-        </form>
-      </div>
-
-      <!-- 欢迎区（3.1 ②③）：日期行 → 问候语 → 引导文案；无图标、无大图 hero -->
-      <section class="welcome">
-        <div class="kicker">{{ dateText }}</div>
-        <h1>{{ greeting }}，欢迎回来</h1>
-        <p class="sub">从星河里捞一首歌，陪你度过此刻。</p>
-        <div class="hero-actions">
-          <button class="btn primary lg" @click="playDaily">
-            <Icon name="play" :size="15" />播放每日推荐
-          </button>
-          <button class="btn ghost lg" @click="router.push('/favorites')">
-            <Icon name="heart" :size="15" />我喜欢的音乐
-          </button>
-          <button class="btn ghost lg" @click="router.push('/discover')">
-            <Icon name="compass" :size="15" />发现音乐
+ <!-- 主视觉欢迎区：深色星云固定品牌视觉卡片 + 顶部品牌 Logo 行 + 欢迎内容 -->
+      <section class="hero">
+        <NebulaBg />
+        <div class="hero-head">
+          <div class="brand-mark" aria-label="星河音乐">
+            <img class="brand-mark-logo" :src="brandIcon" alt="星河音乐" draggable="false" />
+            <span class="brand-mark-text">星河<i>STARWISH MUSIC</i></span>
+          </div>
+          <button class="refresh" :class="{ spin: refreshing }" title="刷新推荐" @click="load(true)">
+            <Icon name="refresh" :size="15" />
           </button>
         </div>
-        <div class="hero-stats">
-          <div><b>{{ daily.length || 30 }}</b><span>每日推荐</span></div>
-          <i />
-          <div><b>{{ feed?.totalToplists || 0 }}</b><span>榜单</span></div>
-          <i />
-          <div><b>{{ sourceCount }}</b><span>音源平台</span></div>
+        <!-- 欢迎区（3.1 ②③）：日期行 → 问候语 → 引导文案 → 三按钮 → 统计行；卡片内不放搜索框 -->
+        <div class="hero-inner">
+          <div class="kicker">{{ dateText }}</div>
+          <h1>{{ greeting }}，欢迎回来</h1>
+          <p class="sub">从星河里捞一首歌，陪你度过此刻。</p>
+          <div class="hero-actions">
+            <button class="btn primary lg" @click="playDaily">
+              <Icon name="play" :size="15" />播放每日推荐
+            </button>
+            <button class="btn ghost lg" @click="router.push('/favorites')">
+              <Icon name="heart" :size="15" />我喜欢的音乐
+            </button>
+            <button class="btn ghost lg" @click="router.push('/discover')">
+              <Icon name="compass" :size="15" />发现音乐
+            </button>
+          </div>
+ <!-- 统计行（3.1 ⑤）：仅每日推荐 / 榜单两项，不显示音源平台计数 -->
+          <div class="hero-stats">
+            <div><b>{{ daily.length || 30 }}</b><span>每日推荐</span></div>
+            <i />
+            <div><b>{{ feed?.totalToplists || 0 }}</b><span>榜单</span></div>
+          </div>
         </div>
       </section>
 
@@ -459,14 +449,7 @@ onMounted(() => {
         </div>
       </section>
 
-      <!-- 底部星河 Logo 背景卡片（规格书 3.1：右对齐、半透明） -->
-      <section class="brand-card">
-        <div class="bc-text">
-          <div class="bc-title">星河音乐</div>
-          <div class="bc-sub">StarWish Music · 全端同步的私人曲库</div>
-        </div>
-        <img class="bc-art" :src="brand" alt="星河" draggable="false" />
-      </section>
+ <!-- 用户指令：不做底部 logo 背景卡片（3.1 该项撤销），logo 已置顶 -->
 
       <div class="foot-note">
         <Icon name="sparkles" :size="13" />
@@ -493,161 +476,96 @@ onMounted(() => {
   font-size: 13px;
   cursor: pointer;
 }
-.topbar-row {
+/* 主视觉欢迎区卡片：深色星云 = 固定品牌视觉，不随主题变化 */
+.hero {
+  position: relative;
+  overflow: hidden;
+  border-radius: 20px;
+  margin-bottom: 20px;
+  background: #0d1030;
+  isolation: isolate;
+}
+/* 顶部品牌 Logo 行（3.1 ①）：右对齐、半透明 0.6~0.8，与右侧艺术字不重叠 */
+.hero-head {
+  position: relative;
+  z-index: 2;
   display: flex;
   align-items: center;
   justify-content: flex-end;
-  gap: 12px;
-  margin-bottom: 14px;
+  gap: 10px;
+  padding: 14px 16px 0;
 }
-/* 规格 3.1 ①：圆角胶囊搜索框，高 40~48、宽 320~480，右对齐 */
-.top-search {
+.brand-mark {
   display: flex;
   align-items: center;
-  gap: 10px;
-  height: 44px;
-  padding: 0 8px 0 14px;
-  border-radius: 22px;
-  background: var(--panel);
-  border: 1px solid var(--line);
-  width: min(480px, 44vw);
-  min-width: 320px;
-  color: var(--text-3);
+  gap: 7px;
+  opacity: 0.78;
 }
-.top-search input {
-  flex: 1;
-  min-width: 0;
-  background: transparent;
-  border: 0;
-  outline: 0;
-  color: var(--text);
-  font-size: 13.5px;
+.brand-mark-logo {
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
 }
-.top-search input::placeholder {
-  color: var(--text-3);
-}
-.top-search .btn.sm {
-  height: 32px;
-  padding: 0 14px;
-  font-size: 12.5px;
-  border-radius: 16px;
-  flex: none;
-}
-/* 欢迎区（3.1 ②）：日期 13px → 问候 24~28px/600 → 引导文案 14px */
-.welcome {
-  padding: 6px 2px 4px;
-}
-.welcome h1 {
-  font-size: 28px;
-  font-weight: 600;
-  letter-spacing: 0.5px;
-  color: var(--text);
-}
-.welcome .sub {
-  margin-top: 8px;
-  font-size: 14px;
-  color: var(--text-3);
-}
-.hero-actions {
+.brand-mark-text {
   display: flex;
-  gap: 10px;
-  margin-top: 20px;
-}
-.btn.lg {
-  height: 40px;
-  padding: 0 18px;
-  border-radius: 20px;
+  flex-direction: column;
+  align-items: flex-start;
+  color: rgba(255, 255, 255, 0.85);
   font-size: 13px;
+  font-weight: 600;
+  line-height: 1.15;
 }
-.btn.ghost.lg {
-  background: var(--panel);
-  color: var(--text);
+.brand-mark-text i {
+  font-style: normal;
+  font-size: 8.5px;
+  font-weight: 500;
+  letter-spacing: 2.4px;
+  color: rgba(255, 255, 255, 0.5);
 }
-.btn.ghost.lg:hover {
-  background: var(--hover);
-}
-/* 统计行（3.1 ⑤） */
-.hero-stats {
+.refresh {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
   display: flex;
   align-items: center;
-  gap: 18px;
-  margin-top: 18px;
-  font-size: 12.5px;
-  color: var(--text-3);
-}
-.hero-stats b {
-  font-size: 17px;
-  color: var(--text);
-  margin-right: 5px;
-  font-variant-numeric: tabular-nums;
-}
-.hero-stats i {
-  width: 1px;
-  height: 14px;
-  background: var(--line);
-}
-.kicker {
-  margin-bottom: 6px;
-}
-.hero-search {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  height: 44px;
-  padding: 0 8px 0 14px;
-  border-radius: 22px;
+  justify-content: center;
+  color: rgba(255, 255, 255, 0.6);
   background: rgba(255, 255, 255, 0.08);
-  border: 1px solid rgba(255, 255, 255, 0.14);
-  backdrop-filter: blur(10px);
-  min-width: 300px;
-  flex: 0 1 480px;
 }
-.hero-search input {
-  flex: 1;
-  min-width: 0;
-  background: transparent;
-  border: 0;
-  outline: 0;
-  color: #ececf1;
-  font-size: 13.5px;
+.refresh:hover {
+  color: #fff;
+  background: rgba(255, 255, 255, 0.16);
 }
-.hero-search input::placeholder {
-  color: rgba(255, 255, 255, 0.45);
+.refresh.spin :deep(svg) {
+  animation: spin 0.9s linear infinite;
 }
-.hero-search .btn.sm {
-  height: 32px;
-  padding: 0 14px;
-  font-size: 12.5px;
-  border-radius: 16px;
-  flex: none;
-}
-.hero .sub,
-.hero-actions,
-.hero-stats {
-  max-width: 58%;
-}
-@media (max-width: 1180px) {
-  .top-search {
-    min-width: 0;
-    flex: 1 1 320px;
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
   }
 }
+/* 欢迎内容（3.1 ②）：日期 13px → 问候 24~28px/600 → 文案 14px → 三按钮 → 统计行 */
+.hero-inner {
+  position: relative;
+  z-index: 1;
+  padding: 14px 30px 26px;
+  max-width: 58%;
+}
 .kicker {
   font-size: 13px;
-  letter-spacing: 1.4px;
-  color: #b9a7ff;
+  letter-spacing: 1.6px;
+  color: rgba(255, 255, 255, 0.72);
   margin-bottom: 8px;
-  text-transform: uppercase;
 }
-.hero h1 {
+.hero-inner h1 {
   font-size: 27px;
   font-weight: 600;
   letter-spacing: 0.5px;
   color: #fff;
 }
-.hero .sub {
+.hero-inner .sub {
   margin-top: 7px;
-  font-size: 12.5px;
+  font-size: 13.5px;
   color: rgba(255, 255, 255, 0.62);
 }
 .hero-actions {
@@ -658,7 +576,7 @@ onMounted(() => {
 .btn.lg {
   height: 38px;
   padding: 0 18px;
-  border-radius: 11px;
+  border-radius: 19px;
   font-size: 13px;
 }
 .btn.ghost.lg {
@@ -668,6 +586,7 @@ onMounted(() => {
 .btn.ghost.lg:hover {
   background: rgba(255, 255, 255, 0.17);
 }
+/* 统计行（3.1 ⑤）：仅每日推荐 / 榜单两项 */
 .hero-stats {
   display: flex;
   align-items: center;
@@ -691,31 +610,6 @@ onMounted(() => {
   color: #fff;
   font-weight: 650;
   font-variant-numeric: tabular-nums;
-}
-.refresh {
-  position: absolute;
-  right: 18px;
-  top: 16px;
-  width: 28px;
-  height: 28px;
-  border-radius: 8px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  color: rgba(255, 255, 255, 0.6);
-  background: rgba(255, 255, 255, 0.08);
-}
-.refresh:hover {
-  color: #fff;
-  background: rgba(255, 255, 255, 0.16);
-}
-.refresh.spin :deep(svg) {
-  animation: spin 0.9s linear infinite;
-}
-@keyframes spin {
-  to {
-    transform: rotate(360deg);
-  }
 }
 
 .recent-row {
@@ -1019,97 +913,6 @@ onMounted(() => {
 .mem-right {
   color: rgba(255, 255, 255, 0.25);
 }
-/* 首页胶囊搜索框（规格书 3.1：40~48px） */
-.hero-search {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  width: 100%;
-  max-width: 420px;
-  height: 44px;
-  margin: 14px 0 4px;
-  padding: 0 6px 0 14px;
-  border: 1px solid var(--line);
-  border-radius: 22px;
-  background: rgba(255, 255, 255, 0.06);
-}
-.hero-search:focus-within {
-  border-color: var(--accent);
-  background: rgba(255, 255, 255, 0.1);
-}
-.hs-icon {
-  flex: none;
-  color: var(--text-3);
-}
-.hero-search input {
-  flex: 1;
-  min-width: 0;
-  height: 100%;
-  border: 0;
-  outline: none;
-  background: transparent;
-  color: var(--text);
-  font-size: 13px;
-}
-.hero-search input::placeholder {
-  color: var(--text-3);
-}
-.hero-search input::-webkit-search-cancel-button {
-  display: none;
-}
-.hs-go {
-  flex: none;
-  height: 32px;
-  padding: 0 16px;
-  border: 0;
-  border-radius: 16px;
-  background: var(--accent);
-  color: #fff;
-  font-size: 12.5px;
-  cursor: pointer;
-}
-
-/* 底部星河 Logo 背景卡片：右对齐、半透明 */
-.brand-card {
-  position: relative;
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 14px;
-  margin-top: 30px;
-  padding: 18px 22px;
-  border: 1px solid var(--line);
-  border-radius: 18px;
-  overflow: hidden;
-  background: linear-gradient(120deg, rgba(167, 139, 250, 0.1), rgba(244, 114, 182, 0.06));
-}
-.bc-text {
-  position: relative;
-  z-index: 1;
-  text-align: right;
-  margin-right: 84px;
-}
-.bc-title {
-  font-size: 15px;
-  font-weight: 650;
-  color: rgba(255, 255, 255, 0.72);
-}
-.bc-sub {
-  margin-top: 3px;
-  font-size: 11.5px;
-  color: var(--text-3);
-}
-.bc-art {
-  position: absolute;
-  right: 14px;
-  top: 50%;
-  width: 70px;
-  height: 70px;
-  transform: translateY(-50%);
-  border-radius: 14px;
-  opacity: 0.55;
-  object-fit: cover;
-}
 
 .foot-note {
   display: flex;
@@ -1146,7 +949,7 @@ onMounted(() => {
   .two-col {
     grid-template-columns: 1fr;
   }
-  .hero-content {
+  .hero-inner {
     max-width: 78%;
   }
 }

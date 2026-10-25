@@ -3,7 +3,7 @@ import os from 'node:os'
 import { app } from 'electron'
 
 /**
- * 局域网同步（规格书 4.8 · 无服务器方案 · 独立模块）
+ * 局域网同步
  *
  * 桌面宿主：Electron 主进程内嵌 http 服务（默认 :42717），
  *  - GET  /lan/ping   → 能力通告（设备发现用 IP 直连，WebView 不解析 .local）

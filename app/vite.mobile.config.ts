@@ -39,6 +39,8 @@ export default defineConfig({
       './bili': path.resolve(__dirname, 'src/mobile/shims/bili-bridge.ts'),
       // paths.ts 的 sourcesDir 指向虚拟 fs 种子目录
       './paths': path.resolve(__dirname, 'src/mobile/shims/paths-mobile.ts'),
+      // 音源种子文件：dev 通道内联 dev-sources，release 通道为空种子
+      './seed-source': path.resolve(__dirname, process.env.BUILD_CHANNEL === 'release' ? 'src/mobile/seed-empty.ts' : 'src/mobile/seed-files.ts'),
       // 跟跳转：移动端走原生 CapacitorHttp（拿得到 302 的 Location）
       './redirect': path.resolve(__dirname, 'src/mobile/shims/redirect-mobile.ts'),
       // db.ts 里 require('sql.js')
@@ -50,6 +52,7 @@ export default defineConfig({
     'process.env.NODE_ENV': '"production"',
     __MOBILE__: 'true',
     __APP_VERSION__: JSON.stringify(pkg.version),
+    __BUILD_CHANNEL__: JSON.stringify(process.env.BUILD_CHANNEL || 'dev'),
   },
   build: {
     outDir: path.resolve(__dirname, 'dist/mobile'),

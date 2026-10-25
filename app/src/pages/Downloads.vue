@@ -35,7 +35,7 @@ function statusText(t: { status: string; error?: string }): string {
   return t.error || '失败'
 }
 
-/** 规格书 3.5：暂停 / 继续（继续即从头重下，不做断点续传） */
+/**暂停 / 继续（继续即从头重下，不做断点续传） */
 async function togglePause(t: { id: string; status: string }): Promise<void> {
   if (t.status === 'paused') {
     await dl.resume(t.id)

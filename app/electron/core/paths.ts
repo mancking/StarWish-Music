@@ -107,6 +107,7 @@ export function sourcesDir(): string {
   if (envDir && fs.existsSync(envDir)) return envDir
   const candidates = [
     path.join(process.resourcesPath || '', 'sources'),
+    path.join(__dirname, '..', '..', 'dev-sources'),
     path.join(__dirname, '..', '..', 'sources'),
     path.join(process.cwd(), 'sources'),
   ]

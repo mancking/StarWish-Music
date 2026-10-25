@@ -11,6 +11,7 @@ def swVersionCode = swMajor * 1000000 + swMinor * 1000 + swPatch
 android {
     namespace "com.starwish.music"
     compileSdk rootProject.ext.compileSdkVersion
+    buildToolsVersion "36.0.0"
     defaultConfig {
         applicationId "com.starwish.music"
         minSdkVersion rootProject.ext.minSdkVersion

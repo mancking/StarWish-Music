@@ -1,9 +1,11 @@
 <script setup lang="ts">
 import { computed, defineOptions, nextTick, onMounted, onBeforeUnmount, ref, watch } from 'vue'
+import { onPullRefresh, refreshDone } from '@/mobile/pull-refresh'
 import { useRouter } from 'vue-router'
 import Icon from '@/components/Icon.vue'
 import Cover from '@/components/Cover.vue'
 import { call } from '@/api'
+import { isVideoPlayed, markVideoPlayed, onVideoPlayed } from '@/utils/video-played'
 import QRCode from 'qrcode'
 import { useUiStore } from '@/stores/ui'
 import type { MvItem } from '@shared/types'
@@ -115,7 +117,7 @@ async function pollQr(): Promise<void> {
       await loadBiliStatus()
       ui.toast('视频源账号登录成功', 'success')
       setTimeout(() => (loginOpen.value = false), 600)
-      void search()
+      void search(true)
     } else if (r.status === 'expired' || r.status === 'error') {
       stopPoll()
     }
@@ -140,7 +142,7 @@ async function pwdLogin(): Promise<void> {
     pwdUser.value = ''
     pwdPass.value = ''
     loginOpen.value = false
-    void search()
+    void search(true)
   } catch (e: any) {
     pwdErr.value = e?.message || '登录失败'
   } finally {
@@ -162,7 +164,7 @@ async function ckLogin(): Promise<void> {
     ui.toast('视频源账号登录成功', 'success')
     ckText.value = ''
     loginOpen.value = false
-    void search()
+    void search(true)
   } catch (e: any) {
     ckErr.value = e?.message || '登录失败'
   } finally {
@@ -181,17 +183,21 @@ async function biliLogout(): Promise<void> {
   }
 }
 
-/** 源 Tab（F-14 / 3.10）：bili 默认兜底；kg/kw 元数据置灰 */
-const source = ref('bili')
+/** 聚合模式：默认四平台聚合为一个信息流；胶囊只做本地来源过滤 */
+const source = ref('all')
 const SOURCE_TABS = [
+  { key: 'all', label: '全部' },
   { key: 'bili', label: 'B站' },
-  { key: 'wy', label: '网易云' },
-  { key: 'qq', label: 'QQ' },
+  { key: 'wy', label: '云村' },
+  { key: 'qq', label: 'Q音' },
   { key: 'kg', label: '酷狗' },
   { key: 'kw', label: '酷我' },
 ]
+const shown = computed(() =>
+  source.value === 'all' ? list.value : list.value.filter(v => (v.source || 'bili') === source.value)
+)
 function sourceLabel(v: MvItem): string {
-  const map: Record<string, string> = { bili: 'B站', wy: '网易', qq: 'QQ', kg: '酷狗', kw: '酷我' }
+  const map: Record<string, string> = { bili: 'B站', wy: '云村', qq: 'Q音', kg: '酷狗', kw: '酷我' }
   return map[v.source || 'bili'] || v.source || 'B站'
 }
 function isSignedSource(v: MvItem): boolean {
@@ -200,25 +206,61 @@ function isSignedSource(v: MvItem): boolean {
 function mvId(v: MvItem): string {
   return v.sourceId || v.bvid || ''
 }
+/** 播放足迹：播放过的视频隐去卡片播放按钮（v1.0.0 用户口径） */
+const playedIds = ref<Set<string>>(new Set())
+function vid(v: MvItem): string {
+  return `${v.source || 'bili'}:${mvId(v)}`
+}
+function refreshPlayed(): void {
+  playedIds.value = new Set(list.value.filter(v => isVideoPlayed(vid(v))).map(vid))
+}
+let offPlayed: (() => void) | null = null
+
 function openMv(v: MvItem): void {
-  if (isSignedSource(v)) return
-  router.push(`/mv/${v.source || 'bili'}/${mvId(v)}`)
+  markVideoPlayed(vid(v))
+ // 带兜底元数据，Q音/酷狗/酷我 详情不含标题封面
+  router.push({
+    path: `/mv/${v.source || 'bili'}/${mvId(v)}`,
+    query: {
+      title: v.title || '',
+      pic: v.pic || '',
+      author: v.author || '',
+      dur: String(v.durationSec || 0),
+    },
+  })
 }
 function switchSource(k: string): void {
-  if (source.value === k) return
   source.value = k
-  void search()
 }
 
-async function search(): Promise<void> {
+/**
+ * 模块级结果缓存（切视频页加载耗时治理）：
+ * 旧实现每次进入 /mv 都要重新聚合五源搜索（B站+网易+QQ+酷狗+酷我并发），
+ * 真机弱网下首屏要等全部源返回 —— 表现为「切换视频页面后加载时间过长」。
+ * 现在：同关键词 60s 内直接复用上次结果秒开，下拉刷新/主动搜索才强制重拉。
+ */
+const feedCache = new Map<string, { at: number; items: MvItem[] }>()
+const FEED_TTL = 60_000
+
+async function search(force = false): Promise<void> {
   const k = keyword.value.trim() || '音乐'
+  if (!force) {
+    const hit = feedCache.get(k)
+    if (hit && Date.now() - hit.at < FEED_TTL && hit.items.length) {
+      list.value = hit.items
+      hasMore.value = true
+      loading.value = false
+      return
+    }
+  }
   loading.value = true
   error.value = ''
   page.value = 1
   hasMore.value = true
   try {
-    const res = await call<MvItem[]>('music:mv', { keyword: k, page: 1, source: source.value })
+    const res = await call<MvItem[]>('music:mv', { keyword: k, page: 1, source: 'all' })
     list.value = res
+    feedCache.set(k, { at: Date.now(), items: res })
     hasMore.value = res.length > 0
     if (!res.length) error.value = '没有找到相关视频，换个关键词试试'
   } catch (e: any) {
@@ -230,13 +272,13 @@ async function search(): Promise<void> {
 
 function submit(): void {
   keyword.value = draft.value.trim() || keyword.value
-  void search()
+  void search(true)
 }
 
 function quick(k: string): void {
   draft.value = k
   keyword.value = k
-  void search()
+  void search(true)
 }
 
 function fmtPlay(n: number): string {
@@ -269,7 +311,7 @@ async function loadMore(): Promise<void> {
   loadingMore.value = true
   try {
     const next = page.value + 1
-    const res = await call<MvItem[]>('music:mv', { keyword: keyword.value.trim() || '音乐', page: next, source: source.value })
+    const res = await call<MvItem[]>('music:mv', { keyword: keyword.value.trim() || '音乐', page: next, source: 'all' })
     const seen = new Set(list.value.map(v => `${v.source || 'bili'}:${mvId(v)}`))
     const fresh = res.filter(v => !seen.has(`${v.source || 'bili'}:${mvId(v)}`))
     if (!fresh.length && !res.length) hasMore.value = false
@@ -288,15 +330,27 @@ let observer: IntersectionObserver | null = null
 const PLACEHOLDER = computed(() => (keyword.value ? keyword.value : '搜索视频 / MV'))
 const HOT_SUGGESTIONS = HOT
 
+/* 下拉刷新：重新搜索当前关键词，不回首页、不闪白屏 */
+const offPull = onPullRefresh(async () => {
+  await search(true)
+  refreshDone()
+})
+onBeforeUnmount(() => offPull())
+
 onMounted(() => {
   void loadBiliStatus()
   void search()
   watchSentinel()
+  offPlayed = onVideoPlayed(() => refreshPlayed())
 })
-watch(list, () => void nextTick(watchSentinel))
+watch(list, () => {
+  void nextTick(watchSentinel)
+  refreshPlayed()
+})
 onBeforeUnmount(() => {
   observer?.disconnect()
   stopPoll()
+  offPlayed?.()
 })
 </script>
 
@@ -318,7 +372,7 @@ onBeforeUnmount(() => {
       <div class="mv-hot">
         <button v-for="k in HOT_SUGGESTIONS" :key="k" class="mv-hot-tag" @click="quick(k)">{{ k }}</button>
       </div>
-      <!-- 源 Tab（F-14 / 3.10） -->
+ <!-- 源 Tab（.10） -->
       <div class="mv-src-tabs">
         <button
           v-for="t in SOURCE_TABS"
@@ -329,7 +383,7 @@ onBeforeUnmount(() => {
           {{ t.label }}
         </button>
       </div>
-      <!-- 视频源登录入口（规格书 2.x：登录后解锁高清晰度；入口常驻视频页顶部） -->
+ <!-- 视频源登录入口 -->
       <div class="mv-account">
         <button class="mv-acc-btn" :class="{ on: bili.loggedIn }" @click="openLogin">
           <Icon :name="bili.loggedIn ? 'user' : 'qr'" :size="14" />
@@ -347,18 +401,18 @@ onBeforeUnmount(() => {
     <div v-else-if="error && !list.length" class="empty" style="padding: 60px 16px">
       <Icon name="video" :size="32" :stroke="1.3" />
       <div class="empty-title">{{ error }}</div>
-      <button class="btn primary" style="margin-top: 12px" @click="search">重试</button>
+      <button class="btn primary" style="margin-top: 12px" @click="search(true)">重试</button>
     </div>
 
     <!-- 视频卡：2 列 -->
     <template v-else>
       <div class="mv-grid">
-        <button v-for="v in list" :key="`${v.source || 'bili'}:${mvId(v)}`" class="mv-card" :class="{ dim: isSignedSource(v) }" @click="openMv(v)">
+        <button v-for="v in shown" :key="`${v.source || 'bili'}:${mvId(v)}`" class="mv-card" @click="openMv(v)">
           <div class="mv-cover-wrap">
             <Cover :src="picUrl(v.pic)" :size="180" radius="12" class="mv-cover" />
             <span class="mv-badge src">{{ sourceLabel(v) }}</span>
             <span v-if="v.duration" class="mv-badge">{{ v.duration }}</span>
-            <span v-if="v.play" class="mv-badge play"><Icon name="play" :size="10" />{{ fmtPlay(v.play) }}</span>
+            <span v-if="v.play" class="mv-badge play"><Icon v-if="!playedIds.has(vid(v))" name="play" :size="10" />{{ fmtPlay(v.play) }}</span>
           </div>
           <div class="mv-title">{{ v.title }}</div>
           <div class="mv-sub">{{ v.author || '' }}</div>
@@ -368,6 +422,8 @@ onBeforeUnmount(() => {
       <div v-else-if="!hasMore && list.length" class="mv-more">没有更多了</div>
       <div ref="sentinel" style="height: 1px" />
     </template>
+
+
 
     <!-- 视频源登录面板：扫码 / 账号密码 / Cookie -->
     <div v-if="loginOpen" class="lg-mask" @click.self="closeLogin">

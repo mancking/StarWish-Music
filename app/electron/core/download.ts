@@ -33,7 +33,7 @@ export interface DownloadTask {
   received: number
   total: number
   file?: string
-  /** 断点续传：半成品文件（规格书 1.12 .part + Range/206） */
+ /** 断点续传：半成品文件 */
   partPath?: string
   error?: string
   createdAt: number
@@ -43,7 +43,7 @@ export interface DownloadTask {
 const tasks = new Map<string, DownloadTask>()
 const queue: string[] = []
 const aborters = new Map<string, AbortController>()
-/** 被用户暂停的任务：abort 后落到 paused 而不是 canceled（规格书 3.5「暂停」） */
+/** 被用户暂停的任务：abort 后落到 paused 而不是 canceled */
 const pausedIds = new Set<string>()
 let running = 0
 let lastEmit = 0
@@ -146,7 +146,7 @@ async function fetchCover(url?: string): Promise<{ mime: string; data: Uint8Arra
   }
 }
 
-/** 单流空闲超时（Bug 81）：30s 无数据即失败，释放并发槽 */
+/** 单流空闲超时：30s 无数据即失败，释放并发槽 */
 const STREAM_IDLE_TIMEOUT_MS = 30_000
 
 /**
@@ -216,7 +216,7 @@ async function streamTo(
   }
 }
 
-/** 启动清理（N15）：下载目录里没有任务认领的 .part 残留直接删除 */
+/** 启动清理：下载目录里没有任务认领的 .part 残留直接删除 */
 export function sweepOrphanParts(): void {
   try {
     const dir = downloadDir()
@@ -271,7 +271,7 @@ async function runOne(id: string): Promise<void> {
       file = task.file || file
     }
 
-    // 断点续传（Bug 7 / N14）：.part 已有字节数作为 Range 起点，追加写入
+ // 断点续传（：.part 已有字节数作为 Range 起点，追加写入
     let startAt = 0
     try {
       startAt = fs.existsSync(task.partPath) ? fs.statSync(task.partPath).size : 0
@@ -287,7 +287,7 @@ async function runOne(id: string): Promise<void> {
       throttleEmit(task)
     }, startAt)
 
-    // 完成：.part 改名正式文件（规格书 1.12）
+ // 完成：.part 改名正式文件
     await fsp.rename(task.partPath!, file)
     task.partPath = undefined
 
@@ -308,7 +308,7 @@ async function runOne(id: string): Promise<void> {
     task.file = file
     task.finishedAt = Date.now()
 
-    // 规格书 1.12：原格式不转码 + 写入 ID3 封面（仅 MP3 生效，失败不阻塞）
+ //原格式不转码 + 写入 ID3 封面（仅 MP3 生效，失败不阻塞）
     const cover = await fetchCover(task.song.pic)
     await writeId3(file, {
       title: task.song.name,
@@ -317,7 +317,7 @@ async function runOne(id: string): Promise<void> {
       cover: cover || undefined,
     })
 
-    // 规格书 1.12：已下载识别为本地曲目——下载目录并入本地库
+ //已下载识别为本地曲目——下载目录并入本地库
     try {
       await scanLibrary([dir], () => {})
     } catch {
@@ -413,7 +413,7 @@ export function cancelDownload(id: string): boolean {
   return true
 }
 
-/** 暂停（规格书 3.5）：排队中直接挂起；下载中中断流并标记 paused。 */
+/** 暂停 ：排队中直接挂起；下载中中断流并标记 paused。 */
 export function pauseDownload(id: string): boolean {
   const t = tasks.get(id)
   if (!t) return false
@@ -432,7 +432,7 @@ export function pauseDownload(id: string): boolean {
   return true
 }
 
-/** 继续下载（Bug 7）：不清零进度，按 .part 已收字节断点续传。 */
+/** 继续下载：不清零进度，按 .part 已收字节断点续传。 */
 export function resumeDownload(id: string): boolean {
   const t = tasks.get(id)
   if (!t || t.status !== 'paused') return false

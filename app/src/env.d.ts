@@ -8,6 +8,9 @@ declare global {
   /** 构建期注入的应用版本号（来自 app/package.json），避免各端硬编码版本 */
   const __APP_VERSION__: string
 
+  /** 构建期注入的构建通道标识（dev | release），控制零音源等构建差异 */
+  const __BUILD_CHANNEL__: 'dev' | 'release'
+
   interface Window {
     sw: {
       invoke<T = any>(channel: string, payload?: any): Promise<{ ok: boolean; data?: T; error?: string }>

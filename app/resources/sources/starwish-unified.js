@@ -11,7 +11,7 @@
  * ============================================================ */
 const unified = {
   name: 'StarWish 聚合音源',
-  version: '1.0.0',
+  version: '1.1.0',
   author: 'StarWish Team',
   description: '自研多平台聚合：网易云/酷狗/酷我/QQ（lx-music v2 协议范本）',
   homepage: '',
@@ -27,7 +27,8 @@ function req(url, opts) {
   return new Promise((resolve, reject) => {
     lx.request(url, opts || {}, (err, res) => {
       if (err) return reject(err);
-      if (!res || res.statusCode !== 200) return reject(new Error('HTTP ' + (res && res.statusCode)));
+      const code = res && (res.statusCode || res.status);
+      if (!res || code !== 200) return reject(new Error('HTTP ' + (res ? code : 'no-res')));
       resolve(res.body);
     });
   });
@@ -51,7 +52,7 @@ async function searchNetease(kw, page, size) {
   }));
 }
 async function searchKugou(kw, page, size) {
-  const r = await req('http://mobilecdn.kugou.com/api/v3/search/song?' + qs({ format: 'json', keyword: kw, page, pagesize: size, showtype: 1, plat: 0 }), { headers: { 'User-Agent': UA } });
+  const r = await req('https://mobiles.kugou.com/api/v3/search/song?' + qs({ format: 'json', keyword: kw, page, pagesize: size, showtype: 1, plat: 0 }), { headers: { 'User-Agent': UA } });
   const info = (r && r.data && r.data.info) || [];
   return info.map(s => ({
     name: s.songname, singer: s.singername || '未知歌手', albumName: s.album_name || '',
@@ -87,8 +88,13 @@ async function urlNetease(mi, type) {
 async function urlKugou(mi) {
   const hash = mi.hash || mi.songId;
   if (!hash) throw new Error('缺酷狗 hash');
-  const r = await req('http://m.kugou.com/app/i/getSongInfo.php?' + qs({ cmd: 'playInfo', hash, plat: 0 }), { headers: { 'User-Agent': UA } });
-  if (!r || !r.url) throw new Error('酷狗无播放地址');
+  let r = null;
+  try {
+    r = await req('http://m.kugou.com/app/i/getSongInfo.php?' + qs({ cmd: 'playInfo', hash, plat: 0 }), { headers: { 'User-Agent': UA } });
+  } catch (e) {
+    r = await req('http://m3ws.kugou.com/getSongInfo.php?' + qs({ cmd: 'playInfo', hash, plat: 0 }), { headers: { 'User-Agent': UA } });
+  }
+  if (!r || !r.url) throw new Error(r && r.status === 0 ? '酷狗该曲目为付费内容' : '酷狗无播放地址');
   return r.url;
 }
 async function urlKuwo(mi) {
@@ -145,9 +151,19 @@ lx.on(lx.EVENT_NAMES.request, (data) => {
     if (p === 'qq') return searchQQ(kw, page, size);
   }
   if (action === 'musicUrl') {
-    if (p === 'wy') return urlNetease(mi, info.type);
-    if (p === 'kg') return urlKugou(mi);
-    if (p === 'kw') return urlKuwo(mi);
+    // 原平台直链优先；失败走跨平台关键词取链兜底（歌曲不再锁死单一平台）
+    const direct = (async () => {
+      if (p === 'wy') return urlNetease(mi, info.type);
+      if (p === 'kg') return urlKugou(mi);
+      if (p === 'kw') return urlKuwo(mi);
+      throw new Error('不支持的平台取链: ' + p);
+    })();
+    const keyword = String(info.keyword || (mi.name && (mi.name + ' ' + (mi.singer || ''))) || '').trim();
+    if (!keyword) return direct;
+    return direct.catch(e => urlCross(keyword, p, String(info.type || '128k')).then(u => {
+      lx.console && lx.console.log && console.log('[unified] 跨平台换链成功:', keyword, '->', u.slice(0, 60));
+      return u;
+    }).catch(() => { throw e; }));
   }
   if (action === 'lyric' && p === 'wy') return lyricNetease(mi);
   if (action === 'pic') {
@@ -157,5 +173,44 @@ lx.on(lx.EVENT_NAMES.request, (data) => {
   }
   return Promise.reject(new Error('不支持的请求: ' + p + '/' + action));
 });
+
+/* ---------------- 跨平台取链兜底：歌名+歌手 在 wy/kg/kw 搜同曲，返回首个可用直链 ---------------- */
+const crossCache = new Map();
+function urlCross(keyword, originPlatform, quality) {
+  const key = quality + '|' + keyword;
+  const hit = crossCache.get(key);
+  if (hit && Date.now() - hit.at < 5 * 60 * 1000) return Promise.resolve(hit.url);
+  const order = ['wy', 'kg', 'kw'].filter(x => x !== originPlatform);
+  const tryOne = async plat => {
+    let songs = [];
+    if (plat === 'wy') songs = await searchNetease(keyword, 1, 6);
+    else if (plat === 'kg') songs = await searchKugou(keyword, 1, 6);
+    else if (plat === 'kw') songs = await searchKuwo(keyword, 1, 6);
+    for (const s of songs) {
+      if (!s.name) continue;
+      const mi = Object.assign({}, s, { musicInfo: s });
+      try {
+        let u = '';
+        if (plat === 'wy') u = await urlNetease(mi, quality);
+        else if (plat === 'kg') u = await urlKugou(mi);
+        else if (plat === 'kw') u = await urlKuwo(mi);
+        if (u && /^https?:\/\//.test(u)) return u;
+      } catch (e) { /* 该曲目不可播，下一首 */ }
+    }
+    throw new Error(plat + ' 无可播同曲');
+  };
+  return (async () => {
+    const errs = [];
+    for (const plat of order) {
+      try {
+        const u = await tryOne(plat);
+        if (crossCache.size > 120) crossCache.clear();
+        crossCache.set(key, { at: Date.now(), url: u });
+        return u;
+      } catch (e) { errs.push(e.message); }
+    }
+    throw new Error('跨平台取链失败: ' + errs.join('；'));
+  })();
+}
 
 lx.send(lx.EVENT_NAMES.inited, unified);

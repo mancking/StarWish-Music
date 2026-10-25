@@ -8,7 +8,7 @@ import { usePlayerStore } from '@/stores/player'
 import { favPlaylists } from '@/platform/playlist-favorites'
 
 /**
- * 移动端「我的」—— 分模块设计（v2.3.2 重写）。
+ * 移动端「我的」—— 分模块设计（v1.0.0 重写）。
  *
  * 参照市面主流音乐 App（网易云 / QQ音乐）的「我的」页信息架构：
  * 每个功能域是独立模块，各模块各自成卡、互不掺放——
@@ -109,7 +109,7 @@ async function createPlaylist(): Promise<void> {
       </div>
     </section>
 
-    <!-- ④ 收藏的歌单（规格书 3.8 / Bug 13） -->
+ <!-- ④ 收藏的歌单 -->
     <section class="mod">
       <header class="mod-head">
         <h2>收藏的歌单</h2>

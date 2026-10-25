@@ -45,7 +45,7 @@ class PlayerService {
   private failures = 0
   /** 连续「换源用尽后跳下一首」仍失败的歌曲数，播放成功即清零 */
   private consecutiveFails = 0
-  /** 已写入播放历史的歌曲 id（规格书 3.3：开始播放即记录，切歌后重置） */
+ /** 已写入播放历史的歌曲 id */
   private histMarked = ''
   private broadcast: Broadcast = () => {}
   private shuffleHistory: number[] = []
@@ -84,7 +84,7 @@ class PlayerService {
         }
         if (st === 'playing') {
           this.consecutiveFails = 0
-          // 规格书 3.3：开始播放即写入历史（同一首只记一次，切歌后重置）
+ //开始播放即写入历史（同一首只记一次，切歌后重置）
           const cur = this.state.song
           if (cur && this.histMarked !== cur.id) {
             this.histMarked = cur.id
@@ -109,7 +109,7 @@ class PlayerService {
         this.handlePlaybackError(String(msg.message || '音频加载失败'), Number(msg.code) || 0)
         break
       case 'spectrum':
-        // 频谱数据（规格书 v2.7 · 1.6）：直接转发给渲染层，主进程不做平滑
+ // 频谱数据 ：直接转发给渲染层，主进程不做平滑
         this.broadcast('player:spectrum', Array.isArray(msg.data) ? msg.data : [])
         break
       case 'log':
@@ -156,12 +156,12 @@ class PlayerService {
     this.state.volume = s.volume
     this.state.mode = s.playMode
     this.state.quality = s.quality
-    // Bug 80：倍速重启保持
+ //倍速重启保持
     const rate = Math.max(0.5, Math.min(2, Number((s as any).playbackRate) || 1))
     this.state.rate = rate
     this.send({ type: 'config', volume: s.volume, fadeMs: s.fadeMs })
     this.send({ type: 'rate', rate })
-    // Bug 42/105：定时关闭重启回填（过期即清除）
+ //定时关闭重启回填（过期即清除）
     const until = Number(dbGetSetting('sleep.until')) || 0
     if (until > Date.now()) {
       const remainMin = Math.max(1, Math.ceil((until - Date.now()) / 60000))
@@ -176,7 +176,7 @@ class PlayerService {
     if (!last?.songId) return
     const song = getSong(last.songId)
     if (!song) return
-    // Bug 107：恢复队列快照（含当前曲位置）
+ //恢复队列快照（含当前曲位置）
     const snapshot = Array.isArray(last.queue) ? last.queue.filter(x => x?.id) : []
     if (snapshot.length) {
       this.state.queue = snapshot
@@ -191,14 +191,14 @@ class PlayerService {
     this.state.position = Math.max(0, Number(last.position) || 0)
     this.state.duration = song.duration || 0
     this.state.status = 'paused'
-    // Bug 99：给播放宿主发 load（暂停态不发 autoplay），重启后点播放即有声
+ //给播放宿主发 load（暂停态不发 autoplay），重启后点播放即有声
     this.load(song, false, this.state.position).catch(() => {})
     this.emitState()
   }
 
   saveSession(): void {
     if (!this.state.song) return
-    // Bug 107：队列一并快照，重启后恢复
+ //队列一并快照，重启后恢复
     dbSetSetting('player.last', {
       songId: this.state.song.id,
       position: this.state.position,
@@ -360,7 +360,7 @@ class PlayerService {
 
   private handleEnded(): void {
     if (this.state.song) {
-      // 历史已在「开始播放」时写入（规格书 3.3），这里只负责推进队列
+ // 历史已在「开始播放」时写入，这里只负责推进队列
     }
     const mode = this.state.mode
     if (mode === 'repeat-one') {
@@ -490,7 +490,7 @@ class PlayerService {
     const r = Math.max(0.5, Math.min(2, Number(rate) || 1))
     this.state.rate = r
     this.send({ type: 'rate', rate: r })
-    // Bug 97：倍速落库，重启保持
+ //倍速落库，重启保持
     try {
       saveSettings({ playbackRate: r } as any)
     } catch {
@@ -512,7 +512,7 @@ class PlayerService {
       return { until: 0 }
     }
     this.sleepUntil = Date.now() + minutes * 60 * 1000
-    // Bug 105：结束时间戳持久化（xinyuan_sleep_until 语义），重启回填
+ //结束时间戳持久化（xinyuan_sleep_until 语义），重启回填
     dbSetSetting('sleep.until', this.sleepUntil)
     this.sleepTimer = setTimeout(() => {
       this.sleepTimer = null
@@ -530,7 +530,7 @@ class PlayerService {
     return this.sleepUntil
   }
 
-  /** 音效（规格书 v2.7 · 1.11）：bands 为 5 段增益，单位 dB，范围 -12~12 */
+ /** 音效 ：bands 为 5 段增益，单位 dB，范围 -12~12 */
   setEq(bands: number[]): void {
     const safe = [0, 1, 2, 3, 4].map(i => {
       const v = Number(bands?.[i])
@@ -539,13 +539,13 @@ class PlayerService {
     this.send({ type: 'eq', bands: safe })
   }
 
-  /** 频谱订阅开关（规格书 v2.7 · 1.6）：只在舞台视图可见时打开 */
+ /** 频谱订阅开关 ：只在舞台视图可见时打开 */
   setSpectrum(on: boolean): void {
     this.send({ type: 'spectrum', on: !!on })
   }
 
   setQuality(q: string): void {
-    // Bug 106：切音质清零失败计数，避免残留影响换源判断
+ //切音质清零失败计数，避免残留影响换源判断
     this.failures = 0
     this.consecutiveFails = 0
     if (this.state.quality === q) return

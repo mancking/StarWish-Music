@@ -26,7 +26,7 @@ let lastPosition = 0
 let tickTimer: number | null = null
 let loadingSince = 0
 
-/* ---------------- 音效图（规格书 v2.7 · 1.11 EQ / 1.6 频谱） ----------------
+/* ---------------- 音效图 ----------------
  * audio → MediaElementSource → 5×BiquadFilter(60/230/910/3.6k/14k) → Analyser → 输出。
  * 安全性：swmedia 协议响应带 Access-Control-Allow-Origin: *，且 audio 已设
  * crossOrigin='anonymous'，属于 CORS 干净媒体，createMediaElementSource 不会把

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /**
- * 字幕渲染层（规格书 2.11）：VideoStage 叠加层，渲染当前活动字幕行。
+ * 字幕渲染层 ：VideoStage 叠加层，渲染当前活动字幕行。
  * 数据由父页经 subtitles.ts（解析/偏移/查找）提供，本组件只管排版。
  */
 import { computed } from 'vue'

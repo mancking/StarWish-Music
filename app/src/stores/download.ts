@@ -39,7 +39,7 @@ export const useDownloadStore = defineStore('download', () => {
   )
   const runningCount = computed(() => active.value.length)
 
-  /** 规格书 0.5：下载清单镜像到 xinyuan_downloads，供离线页/设置页快速读取 */
+ /**下载清单镜像到 xinyuan_downloads，供离线页/设置页快速读取 */
   function mirror(): void {
     try {
       localStorage.setItem(
@@ -95,7 +95,7 @@ export const useDownloadStore = defineStore('download', () => {
     await call('download:cancel', { id })
   }
 
-  /** 规格书 1.12 / Bug 7：暂停 / 继续（.part 断点续传，进度不从 0 开始） */
+ /**暂停 / 继续（.part 断点续传，进度不从 0 开始） */
   async function pause(id: string): Promise<void> {
     await call('download:pause', { id })
     const t = tasks.value.find(x => x.id === id)

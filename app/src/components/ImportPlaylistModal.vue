@@ -26,7 +26,7 @@ const PLATFORMS: { key: string; name: string; hint: string }[] = [
   { key: 'kg', name: '小枸音乐', hint: '分享歌单 / 歌单 ID' },
   { key: 'kw', name: '小蜗音乐', hint: '分享歌单 / ID' },
   { key: 'mg', name: '小蜜音乐', hint: '分享歌单 / ID' },
-  { key: 'bili', name: '视频源', hint: 'B 站合集 / 收藏夹' },
+  { key: 'bili', name: '视频源', hint: 'B站合集 / 收藏夹' },
 ]
 
 /** 域名 → 音源 key。粘贴链接后自动切到对应音源（与落雪 deeplink 同思路） */
@@ -159,7 +159,7 @@ async function submit(): Promise<void> {
 
         <div class="tip">
           <p>粘贴链接后会自动切换到对应音源；不同音源的分享链接不互通。</p>
-          <p>支持用歌单 ID 或概念版链接打开；部分平台（如 B 站合集）需登录态或 Cookie 才能解析。</p>
+          <p>支持用歌单 ID 或概念版链接打开；部分平台（如 B站合集）需登录态或 Cookie 才能解析。</p>
         </div>
       </div>
     </div>

@@ -50,10 +50,16 @@ export const BrowserWindow = class { static getAllWindows() { return [] } }
 export const nativeTheme = { themeSource: 'dark', shouldUseDarkColors: true, on: () => undefined }
 export const globalShortcut = { register: () => undefined, unregisterAll: () => undefined }
 export const Menu = { setApplicationMenu: () => undefined, buildFromTemplate: () => ({ popup: () => undefined }) }
-export const screen = { getDisplayMatching: () => ({ bounds: { x: 0, y: 0, width: 375, height: 812 } }) }
+export const screen = {
+  getDisplayMatching: () => ({ bounds: { x: 0, y: 0, width: 375, height: 812 } }),
+  getPrimaryDisplay: () => ({ workArea: { x: 0, y: 0, width: 375, height: 812 } }),
+  getAllDisplays: () => [{ workArea: { x: 0, y: 0, width: 375, height: 812 } }],
+}
+export const nativeImage = { createFromPath: () => undefined }
 export const clipboard = { writeText: () => undefined, readText: () => '' }
 
 export default {
   app, shell, protocol, net, ipcRenderer, ipcMain, contextBridge, dialog,
   BrowserWindow, nativeTheme, globalShortcut, Menu, screen, clipboard,
+  nativeImage,
 }

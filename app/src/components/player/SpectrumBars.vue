@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /**
- * 舞台频谱（规格书 v2.7 · 1.6）
+ * 舞台频谱
  * 桌面底部 64 柱（0~200px）/ 平板底部 32 柱（0~120px）/ 手机顶部 24px 窄条 16 柱 / 车机不显示。
  * 数据来自真实 AnalyserNode（见 src/audio/spectrum.ts），无数据时柱高归零而不是假跳动。
  */

@@ -16,6 +16,7 @@ export default defineConfig({
   define: {
     __MOBILE__: 'false',
     __APP_VERSION__: JSON.stringify(pkg.version),
+    __BUILD_CHANNEL__: JSON.stringify(process.env.BUILD_CHANNEL || 'dev'),
   },
   build: {
     outDir: path.resolve(__dirname, 'dist/renderer'),

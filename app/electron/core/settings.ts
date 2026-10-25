@@ -36,7 +36,11 @@ export const DEFAULT_SETTINGS: AppSettings = {
   particle: true,
   skipOnError: true,
   playerBg: 'cover',
-  playerWallpaper: '',
+  playerSpinSec: 16,
+  playerVolume: 80,
+  activeTheme: 'default',
+  pixabayKey: '',
+  pexelsKey: '',
   mvVolume: 0.8,
 
   wallpaperEnabled: true,
@@ -64,13 +68,13 @@ export const DEFAULT_SETTINGS: AppSettings = {
   danmakuArea: 'half',
   danmakuAntiSubtitle: true,
   danmakuBlockWords: '',
-  /** F-17：音源调试日志开关（logs/sources/<源名>.log） */
+ /**音源调试日志开关（logs/sources/<源名>.log） */
   sourceDebug: false,
-  /** F-21：首次启动引导标记 */
+ /**首次启动引导标记 */
   onboarded: false,
-  /** N29：自定义源市场 URL（空 = 官方分支 manifest） */
+ /**自定义源市场 URL（空 = 官方分支 manifest） */
   marketUrl: '',
-  /** N31：git 私有仓库下载令牌 */
+ /**git 私有仓库下载令牌 */
   gitToken: '',
 
   webdavEnabled: false,
@@ -91,6 +95,9 @@ export const DEFAULT_SETTINGS: AppSettings = {
   downloadConcurrency: 2,
 }
 
+/** 3.14/ 背景模式合法值（cover/lyric-wall/particle/spectrum + gradient 降级 + solid 兜底） */
+const PLAYER_BG_MODES = ['cover', 'lyric-wall', 'particle', 'spectrum', 'gradient', 'solid', 'wallpaper'] as const
+
 let cache: AppSettings = { ...DEFAULT_SETTINGS }
 
 export function loadSettings(): AppSettings {
@@ -98,6 +105,8 @@ export function loadSettings(): AppSettings {
     if (fs.existsSync(settingsFile())) {
       const raw = JSON.parse(fs.readFileSync(settingsFile(), 'utf8'))
       cache = { ...DEFAULT_SETTINGS, ...(raw || {}) }
+      // 4.7+ ②（v4.24）：wallpaper 回归为「主题与壁纸」壁纸子项（本地库 + 开源壁纸）
+      if (!PLAYER_BG_MODES.includes(cache.playerBg as any)) cache.playerBg = 'cover'
     }
   } catch (e: any) {
     logger.warn('设置读取失败，使用默认值', e?.message)

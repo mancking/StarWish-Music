@@ -445,6 +445,12 @@
   pointer-events: none;
   z-index: 999;
 }
+/* 右缘手势（右缘左滑 = 返回上一层）：指示条贴右缘，圆角镜像 */
+.sw-back-bar.from-right {
+  left: auto;
+  right: 0;
+  border-radius: 4px 0 0 4px;
+}
 
 /* ---- 画布与排版节奏 ---- */
 #app .m-shell .page {
@@ -744,6 +750,14 @@
 #app .m-shell .toggle {
   min-width: 52px;
   min-height: 32px;
+}
+/* 修「界面动画等开关开启时滑块停在中间」：容器被撑到 52px 后，
+   knob 位移与垂直居中必须同步适配（组件内 16px 是 38px 容器的值） */
+#app .m-shell .toggle .knob {
+  top: 8px;
+}
+#app .m-shell .toggle.on .knob {
+  transform: translateX(33px);
 }
 
 /* ---- 我的歌单 / 收藏 / 历史 / 本地：列表卡化 ---- */

@@ -1,10 +1,10 @@
 <script setup lang="ts">
 /**
- * 视频播放设置面板（规格书 2.2 / 2.3 / 2.4 / 2.7 / 2.9 / 2.11 / 2.12）
+ * 视频播放设置面板
  *
  * 移动端是底部抽屉，桌面是右侧弹出面板，两者共用这一份结构：
  * 画质 / 倍速 / 画面 / 循环与 AB / 其它（画中画、音频模式、字幕延迟）。
- * 车机端不渲染本面板（规格书 3.0：车机隐藏循环、适应、画质菜单）。
+ * 车机端不渲染本面板。
  */
 import { computed } from 'vue'
 import Icon from '@/components/Icon.vue'
@@ -21,14 +21,14 @@ const props = withDefaults(
     qualities?: QualityOption[]
     quality?: string
     rate?: number
-    fill?: 'contain' | 'cover' | 'fill' | 'actual'
+    fill?: 'contain' | 'cover' | 'fill' | 'actual' | 'force16x9'
     loopMode?: 'off' | 'one' | 'list'
     abA?: number | null
     abB?: number | null
     pipSupported?: boolean
     audioMode?: boolean
     subtitleDelay?: number
-    /** 本地视频隐藏画质（规格书 2.4） */
+ /** 本地视频隐藏画质 */
     localVideo?: boolean
   }>(),
   {
@@ -64,6 +64,7 @@ const emit = defineEmits<{
 
 const RATES = [0.5, 0.75, 1, 1.25, 1.5, 2]
 const FILL_LABEL: Record<string, string> = {
+  force16x9: '16:9',
   contain: '适应窗口',
   cover: '填充',
   fill: '拉伸',
@@ -170,7 +171,7 @@ const abLabel = computed(() => {
 .mask {
   position: fixed;
   inset: 0;
-  z-index: 60;
+  z-index: 900;
   background: rgba(0, 0, 0, 0.55);
   display: flex;
   align-items: flex-end;

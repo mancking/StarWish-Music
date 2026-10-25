@@ -1,30 +1,30 @@
 <script setup lang="ts">
 /**
- * 桌面 / 平板播放页（规格书 1.1 ~ 1.11）
+ * 桌面 / 平板播放页：唱片区与歌词区各占一半，左侧实时频谱位于进度条上方。
+ * 底部固定播放条 60px（全局 MiniBar，App.vue）；MINI 模式由 win:mini IPC 管理。
  *
- * 页面只做装配：封面与歌词在 CoverStage / LyricsPane，
- * 进度、控制、功能行在 ProgressBar / TransportBar / FunctionBar，
- * 粒子与频谱按端降级（0.3），EQ 面板在 EqPanel。
+ * 背景：settings.playerBg 四模式（封面魔法色渐变 / 歌词墙 / 粒子 / 舞台）
+ * 由 PlayerBackground 渲染；切换入口 = 顶栏「背景」按钮 + 更多菜单。
+ * 红心收藏色 #FF4D4F（QQ 红，区别于音乐主色紫）。
  */
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import Icon from '@/components/Icon.vue'
-import ParticleField from '@/components/player/ParticleField.vue'
-import SpectrumBars from '@/components/player/SpectrumBars.vue'
 import EqPanel from '@/components/player/EqPanel.vue'
 import CoverStage from '@/player-music/components/CoverStage.vue'
 import LyricsPane from '@/player-music/components/LyricsPane.vue'
 import ProgressBar from '@/player-music/components/ProgressBar.vue'
 import TransportBar from '@/player-music/components/TransportBar.vue'
 import FunctionBar from '@/player-music/components/FunctionBar.vue'
-import { useMvHint } from '@/player-music/mv-hint'
 import PlayerBackground from '@/player-music/components/PlayerBackground.vue'
+import { useMvHint } from '@/player-music/mv-hint'
 import { useLyricSync } from '@/player-music/lyrics'
-import { LOOP_ICON, STAGE_ICON, STAGE_LABEL } from '@/player-music/stages'
+import { BG_ICON, BG_LABEL, BG_ORDER, LOOP_ICON, type BgMode } from '@/player-music/stages'
 import { usePlayerStore } from '@/stores/player'
 import { useLibraryStore } from '@/stores/library'
 import { useUiStore } from '@/stores/ui'
-import { lsGet, lsSet, particleCount, platform } from '@/platform'
+import { lsGet, lsSet, platform } from '@/platform'
+import { call } from '@/api'
 import CarPlayer from '@/pages/CarPlayer.vue'
 
 defineOptions({ name: 'Player' })
@@ -41,11 +41,16 @@ const lyric = useLyricSync(
   computed(() => player.lyric),
   computed(() => player.displayPosition)
 )
+const spectrumBars = Array.from({ length: 36 }, (_, index) => ({
+  delay: `${(index % 9) * 0.07}s`,
+  height: `${18 + ((index * 17 + index * index * 3) % 72)}%`,
+}))
 
 const queueOpen = ref(false)
 const eqOpen = ref(false)
 const lyricsVisible = ref(lsGet('lyrics_panel') !== '0')
 const sleepOpen = ref(false)
+const bgPanelOpen = ref(false)
 
 const song = computed(() => player.song)
 /* 规格 2.18：播放页 MV 按钮（mvBySong 命中才显示，5 分钟缓存 + 30s 失败防抖） */
@@ -58,17 +63,30 @@ function openMv(): void {
 }
 const cover = computed(() => player.coverUrl || '')
 const liked = computed(() => (song.value ? library.isFavorite(song.value.id) : false))
-const stage = computed(() => player.stage)
-const stageLabel = computed(() => STAGE_LABEL[stage.value] || '封面')
-const stageIcon = computed(() => STAGE_ICON[stage.value] || 'disc')
 const modeIcon = computed(() => LOOP_ICON[player.state.mode] || 'repeat')
 
-function setStage(s: 'cover' | 'lyrics' | 'particle' | 'stage'): void {
-  player.setStage(s)
-}
+/* ---------------- 背景模式（四模式） ---------------- */
+const bgMode = computed<BgMode>(() => {
+  const v = String(settings.value.playerBg || 'cover')
+  return (BG_ORDER as string[]).includes(v) ? (v as BgMode) : 'cover'
+})
+const bgLabel = computed(() => BG_LABEL[bgMode.value])
+const bgIcon = computed(() => BG_ICON[bgMode.value])
 
-function cycleVisual(): void {
-  player.cycleStage()
+function cycleBg(): void {
+  const i = BG_ORDER.indexOf(bgMode.value)
+  void ui.patch({ playerBg: BG_ORDER[(i + 1) % BG_ORDER.length]! })
+}
+function pickBg(m: BgMode): void {
+  void ui.patch({ playerBg: m })
+  bgPanelOpen.value = false
+}
+const spinSec = computed<8 | 16 | 24>(() => {
+  const v = Number(settings.value.playerSpinSec)
+  return v === 8 || v === 16 || v === 24 ? v : 16
+})
+function pickSpin(sec: 8 | 16 | 24): void {
+  void ui.patch({ playerSpinSec: sec })
 }
 
 function toggleLyricsPanel(): void {
@@ -78,6 +96,9 @@ function toggleLyricsPanel(): void {
 
 function toggleLike(): void {
   if (song.value) void library.toggleFavorite(song.value)
+}
+function goMore(): void {
+  router.push('/discover')
 }
 
 function openSleep(): void {
@@ -94,6 +115,11 @@ function openEq(): void {
   eqOpen.value = true
 }
 
+/**MINI 模式独立悬浮窗（贴边 5s 缩边条 / hover 呼出） */
+function openMini(): void {
+  void call('win:mini').catch(() => ui.toast('迷你模式启动失败', 'error', 1800))
+}
+
 onMounted(() => {
   if (!player.song && player.state.queue.length) void player.playAt(0)
 })
@@ -101,25 +127,19 @@ onMounted(() => {
 onBeforeUnmount(() => {
   queueOpen.value = false
 })
-
-watch(
-  () => player.stage,
-  s => {
-    if (s === 'lyrics') lyricsVisible.value = true
-  }
-)
 </script>
 
 <template>
   <CarPlayer v-if="car" />
 
   <div v-else class="player" :class="kind">
-    <!-- 背景（规格书 4.7 背景四态：封面模糊/动态渐变/壁纸/纯色，三端复用组件） -->
-    <PlayerBackground class="bg" :cover="cover" />
-    <div class="veil" />
-
-    <ParticleField v-if="stage === 'particle'" :count="particleCount()" :enabled="settings.particle !== false" />
-    <SpectrumBars v-if="stage === 'stage'" placement="bottom" />
+ <!-- 背景（四模式：封面魔法色渐变 / 歌词墙 / 粒子 / 舞台，三端复用组件） -->
+    <PlayerBackground
+      class="bg"
+      :cover="cover"
+      :lines="lyric.lines.value"
+      :active-index="lyric.activeIndex.value"
+    />
 
     <header class="top">
       <button class="ghost" aria-label="返回" @click="router.back()">
@@ -130,9 +150,9 @@ watch(
         <span>{{ song?.singer || '星河音乐' }}</span>
       </div>
       <div class="tactions">
-        <button class="pill" :class="{ on: stage === 'lyrics' }" @click="cycleVisual">
-          <Icon :name="stageIcon" :size="15" />
-          <span>{{ stageLabel }}</span>
+        <button class="pill" :title="`背景：${bgLabel}（点击切换）`" @click="cycleBg">
+          <Icon :name="bgIcon" :size="15" />
+          <span>{{ bgLabel }}</span>
         </button>
         <button class="ghost" :class="{ on: lyricsVisible }" aria-label="歌词面板" @click="toggleLyricsPanel">
           <Icon name="lyric" :size="17" />
@@ -146,6 +166,13 @@ watch(
         <button class="ghost" aria-label="桌面歌词" @click="ui.patch({ showDesktopLyric: !ui.settings.showDesktopLyric })">
           <Icon name="quote" :size="17" />
         </button>
+        <button class="ghost" aria-label="更多" title="更多" @click="goMore">
+          <Icon name="more" :size="17" />
+        </button>
+ <!--MINI 模式（贴边自动缩边条 / hover 呼出） -->
+        <button class="ghost" aria-label="迷你模式" title="迷你模式（贴边自动收窄）" @click="openMini">
+          <Icon name="minus" :size="16" />
+        </button>
       </div>
     </header>
 
@@ -157,17 +184,34 @@ watch(
           :name="song?.name || ''"
           :singer="song?.singer || ''"
           :playing="player.playing"
-          :visible="stage !== 'lyrics'"
-          @tap="setStage(stage === 'lyrics' ? 'cover' : 'lyrics')"
         />
+        <!-- 进度条上方：实时频谱 + 功能行（音效 / 倍速 / 背景切换 / 定时） -->
+        <div v-if="lyricsVisible" class="spectrum" :class="{ playing: player.playing }" aria-label="实时频谱" role="img">
+          <span v-for="(bar, index) in spectrumBars" :key="index" :style="{ height: bar.height, animationDelay: bar.delay }" />
+        </div>
 
         <div class="meta">
           <h1>{{ song?.name || '未在播放' }}</h1>
           <p>{{ song?.singer || '—' }}</p>
-          <button class="like" :class="{ on: liked }" aria-label="收藏" @click="toggleLike">
-            <Icon :name="liked ? 'heart-filled' : 'heart'" :size="17" />
-          </button>
         </div>
+
+        <FunctionBar
+          class="functions"
+          variant="desktop"
+          :rate="player.state.rate"
+          :bg-label="bgLabel"
+          :bg-icon="bgIcon"
+          :bg-active="bgMode !== 'cover'"
+          :eq-active="eqOpen"
+          :sleep-on="player.sleepUntil > 0"
+          :mv-on="mvHint.has.value"
+          @eq="openEq"
+          @rate="player.cycleRate()"
+          @bg="cycleBg()"
+          @bg-panel="bgPanelOpen = true"
+          @sleep="openSleep()"
+          @mv="openMv"
+        />
 
         <ProgressBar
           class="progress"
@@ -178,6 +222,7 @@ watch(
           @seek="player.seekTo"
         />
 
+        <!-- 底部主控：播放模式 / 上一首 / 播放暂停 / 下一首 / 播放队列 -->
         <TransportBar
           class="transport"
           :playing="player.playing"
@@ -189,32 +234,23 @@ watch(
           @toggle="player.toggle()"
           @cycle-mode="player.cycleMode()"
           @queue="queueOpen = !queueOpen"
-        />
-
-        <FunctionBar
-          class="functions"
-          variant="desktop"
-          :rate="player.state.rate"
-          :stage-label="stageLabel"
-          :stage-icon="stageIcon"
-          :stage-active="stage !== 'cover'"
-          :eq-active="eqOpen"
-          :sleep-on="player.sleepUntil > 0"
-          :mv-on="mvHint.has.value"
-          @eq="openEq"
-          @rate="player.cycleRate()"
-          @visual="cycleVisual()"
-          @sleep="openSleep()"
-          @mv="openMv"
-        />
+        >
+          <template #prepend>
+            <button class="like transport-like" :class="{ on: liked }" aria-label="收藏" @click.stop="toggleLike">
+              <Icon :name="liked ? 'heart-filled' : 'heart'" :size="18" />
+            </button>
+          </template>
+        </TransportBar>
       </section>
 
-      <aside v-if="lyricsVisible" class="right">
+      <!-- 唱片与歌词两栏各占一半；实时频谱显示在左栏进度条上方。 -->
+      <aside v-if="lyricsVisible" class="right" aria-label="歌词">
         <div class="lyric-head">LYRICS</div>
         <LyricsPane
           class="lyric-pane"
           :lines="lyric.lines.value"
           :active-index="lyric.activeIndex.value"
+          :position="player.displayPosition"
           variant="desktop"
           @seek="player.seekTo"
         />
@@ -261,6 +297,33 @@ watch(
       </div>
     </div>
 
+    <!-- 背景模式面板（3.14 切换入口：「背景」按钮长按） -->
+    <div v-if="bgPanelOpen" class="mask" @click.self="bgPanelOpen = false">
+      <div class="panel small">
+        <header class="phead">
+          <b>播放页背景</b>
+          <button class="txt" @click="bgPanelOpen = false">关闭</button>
+        </header>
+        <div class="sleep-grid">
+          <button
+            v-for="m in BG_ORDER"
+            :key="m"
+            class="txt"
+            :class="{ on: bgMode === m }"
+            @click="pickBg(m)"
+          >
+            {{ BG_LABEL[m] }}
+          </button>
+        </div>
+        <p class="panel-sub">唱片转速（QQ 口径 24 / 16 / 8 秒一圈）</p>
+        <div class="sleep-grid">
+          <button class="txt" :class="{ on: spinSec === 24 }" @click="pickSpin(24)">24s</button>
+          <button class="txt" :class="{ on: spinSec === 16 }" @click="pickSpin(16)">16s</button>
+          <button class="txt" :class="{ on: spinSec === 8 }" @click="pickSpin(8)">8s</button>
+        </div>
+      </div>
+    </div>
+
     <EqPanel v-if="eqOpen" @close="eqOpen = false" />
   </div>
 </template>
@@ -277,15 +340,7 @@ watch(
 }
 .bg {
   position: absolute;
-  inset: -8%;
-  background: #13131b center/cover no-repeat;
-  transform: scale(1.06);
-  transition: opacity 300ms ease;
-}
-.veil {
-  position: absolute;
   inset: 0;
-  background: rgba(0, 0, 0, 0.5);
 }
 .top {
   position: relative;
@@ -360,17 +415,34 @@ watch(
   gap: 24px;
   padding: 8px 28px 24px;
 }
+/* 唱片与歌词各占一半；实时频谱在进度条上方。 */
 .main.split {
-  grid-template-columns: minmax(0, 1fr) 280px;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 24px;
 }
 .left {
   display: flex;
   flex-direction: column;
   align-items: center;
-  justify-content: center;
-  gap: 14px;
+  justify-content: flex-end;
+  gap: 16px;
   min-height: 0;
+  padding-bottom: clamp(18px, 4vh, 48px);
 }
+.left > .progress,
+.left > .transport,
+.left > .functions {
+  width: min(720px, 100%);
+}
+.left > .transport { transform: scale(1.12); margin: 4px 0; }
+.left > .functions { transform: scale(1.06); margin: 2px 0; }
+.transport-like {
+  position: static;
+  flex: none;
+}
+.left > .transport :deep(.btn) { flex: none; }
+.left > .transport :deep(.btn.main) { width: 58px; height: 58px; }
+.left > .transport :deep(.btn:not(.main)) { width: 48px; height: 48px; }
 .meta {
   position: relative;
   text-align: center;
@@ -400,27 +472,91 @@ watch(
   color: #9b9ba8;
   cursor: pointer;
 }
+/* 3.14：红心收藏色 = QQ 红 #FF4D4F */
 .like.on {
-  color: #f472b6;
+  color: #ff4d4f;
 }
+.like.transport-like {
+  position: static;
+  width: 40px;
+  height: 40px;
+  margin-right: 4px;
+  flex: none;
+}
+.main:not(.split) .like.transport-like { position: static; }
 .progress {
-  width: min(560px, 100%);
+  width: min(640px, 100%);
 }
 .transport,
 .functions {
-  width: min(560px, 100%);
+  width: min(640px, 100%);
 }
-.right {
+.right,
+.lyrics-column {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+.lyrics-column {
+  overflow: hidden;
+  border-left: 0;
+  padding-left: 0;
+}
+.right { overflow: hidden; }
+.score-pane {
   display: flex;
   flex-direction: column;
   min-height: 0;
-  border-left: 1px solid rgba(255, 255, 255, 0.06);
-  padding-left: 20px;
+  height: 100%;
+}
+.spectrum {
+  width: min(640px, 86%);
+  height: clamp(28px, 5vh, 48px);
+  display: flex;
+  align-items: end;
+  justify-content: center;
+  gap: 3px;
+  overflow: hidden;
+  opacity: .68;
+}
+.spectrum span {
+  flex: 1;
+  max-width: 8px;
+  min-height: 3px;
+  border-radius: 999px;
+  background: linear-gradient(180deg, var(--accent, #a78bfa), color-mix(in srgb, var(--accent, #a78bfa) 32%, transparent));
+  transform-origin: bottom;
+  opacity: .65;
+}
+.spectrum.playing span { animation: spectrum-pulse 680ms ease-in-out infinite alternate; }
+@keyframes spectrum-pulse {
+  from { transform: scaleY(.35); opacity: .38; }
+  to { transform: scaleY(1); opacity: .9; }
+}
+.score-empty {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: #8a8a98;
+  font-size: 13px;
+  text-align: center;
+}
+.score-empty b {
+  color: #c6c6d2;
+  font-weight: 500;
+}
+.score-empty span {
+  font-size: 12px;
 }
 .lyric-head {
+  flex: none;
   font-size: 11px;
-  letter-spacing: 1.6px;
-  color: #63636f;
+  letter-spacing: 1.2px;
+  color: #858592;
   padding: 6px 0 10px;
 }
 .lyric-pane {
@@ -466,6 +602,15 @@ watch(
   padding: 6px 12px;
   border-radius: 999px;
   cursor: pointer;
+}
+.txt.on {
+  border-color: #a78bfa;
+  color: #a78bfa;
+}
+.panel-sub {
+  margin: 12px 0 8px;
+  font-size: 12px;
+  color: #9b9ba8;
 }
 .qlist {
   display: flex;
@@ -514,9 +659,23 @@ watch(
 }
 @media (max-width: 1120px) {
   .main.split {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 14px;
+    padding-inline: 16px;
+  }
+  .left {
+    gap: 10px;
+    padding-bottom: 12px;
+  }
+  .left > .transport { transform: scale(1.04); }
+  .spectrum { width: min(100%, 440px); }
+}
+@media (max-width: 760px) {
+  .main.split {
     grid-template-columns: minmax(0, 1fr);
   }
-  .right {
+  .right,
+  .lyrics-column {
     display: none;
   }
 }

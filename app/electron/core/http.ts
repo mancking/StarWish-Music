@@ -54,7 +54,7 @@ function isNativeCap(): boolean {
 /**
  * 真机原生 HTTP 通道。
  *
- * v2.3.1 根因修复：v2.3.0 走 `import('@capacitor-community/http')`，该 npm 包
+ * v1.0.0 根因修复：v1.0.0 走 `import('@capacitor-community/http')`，该 npm 包
  * 在生产构建里是独立动态 chunk，真机上一旦加载失败（CSP/分包/版本错配），
  * 所有请求集体报错 →「所有功能网络不可用」。现改为直连 Capacitor 运行时
  * 内置的 `CapacitorHttp` 插件（`Capacitor.nativePromise`，零 npm 依赖），

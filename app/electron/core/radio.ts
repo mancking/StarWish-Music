@@ -3,6 +3,7 @@ import { createLogger } from './log'
 import { favoriteSongs, historySongs, onRepeat } from './db'
 import { neteaseNewSongs, searchNetease, toplistSongs } from './providers'
 import { buildHomeFeed } from './recommend'
+import { getJson, qs, UA } from './http'
 
 const logger = createLogger('radio')
 
@@ -166,6 +167,8 @@ export async function buildRadio(force = false, size = 60): Promise<RadioResult>
   }
   logger.info(`电台生成 ${filtered.length} 首（跨区块去重前 ${before}）`)
 
+ //电台歌曲封面回填（与首页每日推荐同链路）
+  await backfillRadioCovers(filtered).catch(() => undefined)
   const songs = interleaveBySinger(shuffle(filtered)).slice(0, size)
   const result: RadioResult = { songs, seeds: seedArtists.slice(0, 3), generatedAt: Date.now() }
   radioCache = result
@@ -194,4 +197,34 @@ async function collectFeedSongIds(): Promise<Set<string>> {
 
 export function invalidateRadio(): void {
   radioCache = null
+}
+
+/** wy picId → song/detail 批量封面回填（50/批，失败静默） */
+async function backfillRadioCovers(songs: Song[]): Promise<void> {
+  const need = songs.filter(s => s && s.source === 'wy' && !s.pic && s.songId)
+  if (!need.length) return
+  for (let i = 0; i < need.length; i += 50) {
+    const batch = need.slice(i, i + 50)
+    try {
+      // song/detail 的 ids 参数 = 歌曲 id（非专辑 picId）
+      const ids = JSON.stringify(batch.map(s => s.songId))
+      const body = await getJson<any>(
+        `https://music.163.com/api/song/detail?${qs({ id: batch[0]!.songId, ids })}`,
+        { 'User-Agent': UA, Referer: 'https://music.163.com/', Cookie: 'os=pc' },
+        8000
+      )
+      const list: any[] = body?.songs || []
+      const bySong = new Map<string, string>()
+      for (const it of list) {
+        const pic = String(it?.album?.picUrl || '').replace(/^http:\/\//i, 'https://')
+        if (pic) bySong.set(String(it?.id || ''), pic)
+      }
+      for (const s of batch) {
+        const pic = bySong.get(String(s.songId || ''))
+        if (pic) s.pic = pic
+      }
+    } catch {
+      /* 静默 */
+    }
+  }
 }

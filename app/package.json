@@ -1,7 +1,7 @@
 {
   "name": "starwish-music",
   "productName": "星河音乐",
-  "version": "2.3.5",
+  "version": "1.0.0",
   "description": "星河音乐 StarWish Music —— 多音源聚合桌面音乐播放器（Electron + Vue3 + TypeScript 新架构）",
   "main": "dist/electron/main.js",
   "author": {
@@ -14,13 +14,17 @@
     "dev": "node scripts/dev.mjs",
     "build:renderer": "vite build",
     "build:electron": "node scripts/build-electron.mjs",
-    "build": "npm run build:renderer && npm run build:electron",
+    "build": "npm run build:renderer && npm run build:electron && node scripts/copy-dev-sources.mjs",
     "start": "npm run build && electron .",
     "typecheck": "vue-tsc --noEmit -p tsconfig.json",
     "icon": "node scripts/make-icon.mjs",
-    "dist": "npm run build && electron-builder --win portable nsis",
-    "dist:portable": "npm run build && electron-builder --win portable",
+    "dist": "npm run build && electron-builder --config electron-builder.cjs --win portable nsis",
+    "dist:release": "node scripts/release-build.mjs",
+    "dist:android:release": "node scripts/release-android.mjs",
+    "dist:portable": "npm run build && electron-builder --config electron-builder.cjs --win portable",
+    "gate:zero-source": "node scripts/gate-zero-source.mjs",
     "test:core": "node scripts/test-core.mjs",
+    "test:back-handler": "node --import ./scripts/test-hooks.mjs --experimental-strip-types scripts/test-back-handler.ts",
     "test:paths": "node scripts/paths-check.mjs",
     "test:playlists": "node scripts/playlists-check.mjs",
     "test:podcast": "node scripts/podcast-check.mjs",
@@ -62,124 +66,6 @@
     "vue-router": "^4.5.0",
     "vue-tsc": "^2.2.0"
   },
-  "build": {
-    "appId": "com.starwish.music",
-    "productName": "星河音乐",
-    "copyright": "Copyright © 2026 StarWish Music",
-    "directories": {
-      "output": "dist/release",
-      "buildResources": "resources"
-    },
-    "asar": true,
-    "files": [
-      "dist/electron/**/*",
-      "dist/renderer/**/*",
-      "node_modules/sql.js/dist/sql-wasm.wasm",
-      "node_modules/sql.js/dist/sql-wasm.js",
-      "package.json",
-      "!**/*.map",
-      "!**/node_modules/@capacitor/**",
-      "!**/node_modules/@capacitor-community/**",
-      "!**/node_modules/sql.js/dist/sql-asm*",
-      "!**/node_modules/sql.js/dist/sql-shell.js",
-      "!**/node_modules/sql.js/dist/sqljs-all.zip",
-      "!**/node_modules/sql.js/dist/*.map"
-    ],
-    "extraResources": [
-      {
-        "from": "sources",
-        "to": "sources",
-        "filter": [
-          "starwish-unified.js",
-          "星愿内置音源.js",
-          "starwish-bilibili.js"
-        ]
-      },
-      {
-        "from": "resources",
-        "to": "resources"
-      }
-    ],
-    "win": {
-      "target": [
-        {
-          "target": "nsis",
-          "arch": [
-            "x64"
-          ]
-        },
-        {
-          "target": "portable",
-          "arch": [
-            "x64"
-          ]
-        },
-        {
-          "target": "zip",
-          "arch": [
-            "x64"
-          ]
-        }
-      ],
-      "icon": "resources/icon.ico",
-      "requestedExecutionLevel": "asInvoker",
-      "artifactName": "StarWish-${version}-win-${arch}.${ext}"
-    },
-    "nsis": {
-      "oneClick": false,
-      "perMachine": false,
-      "allowToChangeInstallationDirectory": true,
-      "createDesktopShortcut": true,
-      "createStartMenuShortcut": true,
-      "shortcutName": "星河音乐",
-      "artifactName": "StarWish-${version}-Setup.${ext}",
-      "deleteAppDataOnUninstall": false
-    },
-    "portable": {
-      "artifactName": "StarWish-${version}-win-portable.${ext}"
-    },
-    "mac": {
-      "target": [
-        {
-          "target": "dmg",
-          "arch": [
-            "x64",
-            "arm64"
-          ]
-        },
-        {
-          "target": "zip",
-          "arch": [
-            "x64",
-            "arm64"
-          ]
-        }
-      ],
-      "icon": "resources/icon.png",
-      "category": "public.app-category.music",
-      "identity": null,
-      "artifactName": "StarWish-${version}-mac-${arch}.${ext}"
-    },
-    "linux": {
-      "target": [
-        {
-          "target": "AppImage",
-          "arch": [
-            "x64"
-          ]
-        },
-        {
-          "target": "deb",
-          "arch": [
-            "x64"
-          ]
-        }
-      ],
-      "icon": "resources/icon.png",
-      "category": "AudioVideo",
-      "artifactName": "StarWish-${version}-linux-${arch}.${ext}"
-    }
-  },
   "repository": {
     "type": "git",
     "url": "https://github.com/mancking/StarWish-Music.git"
@@ -187,5 +73,11 @@
   "homepage": "https://github.com/mancking/StarWish-Music#readme",
   "bugs": {
     "url": "https://github.com/mancking/StarWish-Music/issues"
+  },
+  "allowScripts": {
+    "electron@31.7.7": true,
+    "esbuild@0.24.2": true,
+    "esbuild@0.25.12": true,
+    "vue-demi@0.14.10": true
   }
 }

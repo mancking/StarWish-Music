@@ -19,7 +19,7 @@ import { isNativeWebView } from './util'
 /** http(s) URL → 展示用地址。
  * 真机：走同源 /swmedia/ 原生代理（SwMediaClient 按 CDN 注入 Referer/UA）——
  * B 站 hdslb、酷我等图片 CDN 有防盗链，WebView 直连会带 https://localhost
- * 的 Referer 被 403 拒图（v2.3.4「MV 封面获取不到」的根因）。
+ * 的 Referer 被 403 拒图（v1.0.0「MV 封面获取不到」的根因）。
  * 冒烟 http(s)：走 /__cors 代理；桌面不用本 shim。 */
 function proxied(url: string): string {
   try {
@@ -32,6 +32,16 @@ function proxied(url: string): string {
     }
   } catch { /* ignore */ }
   return url
+}
+
+/**
+ * 移动端没有 swcover:// 自定义协议，桌面侧 `coverProtocolUrl` 在这里退化为
+ * 「转成同源 /swmedia/ 代理地址」——调用方（如搜索封面增量补丁）不需要分端写两套。
+ */
+export function coverProtocolUrl(remoteUrl: string): string {
+  const u = String(remoteUrl || '')
+  if (!u) return ''
+  return /^https?:\/\//i.test(u) ? proxied(u) : u
 }
 
 export async function resolveCoverUrl(song: Song): Promise<string> {

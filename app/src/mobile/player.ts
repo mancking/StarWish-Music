@@ -29,13 +29,13 @@ let position = 0
 let duration = 0
 let buffered = 0
 let sleepUntil = 0
-/** 已写入播放历史的歌曲 id（规格书 3.3） */
+/** 已写入播放历史的歌曲 id */
 let histMarked = ''
 let retryCount = 0
 const MAX_RETRY = 2
-/** Bug 46：play() reject 与 error 事件同源失败的互斥标记（1.5s 内 error 事件不重复处理） */
+/**play reject 与 error 事件同源失败的互斥标记（1.5s 内 error 事件不重复处理） */
 let errorHandledAt = 0
-/** Bug 75：error 事件归属歌曲（切歌后旧错误不生效） */
+/**error 事件归属歌曲（切歌后旧错误不生效） */
 let errorSongId = ''
 /** 本曲已失败的音源（取链/媒体报错时累计，换源重试时跳过） */
 let failedSources: string[] = []
@@ -44,7 +44,7 @@ let lastSource = ''
 let consecutiveFails = 0
 const QUEUE_KEY = 'xinyuan_queue'
 
-/** 队列持久化（规格书 1.13）：写入/排序/删除后镜像到 localStorage，重启恢复 */
+/** 队列持久化 ：写入/排序/删除后镜像到 localStorage，重启恢复 */
 function persistQueue(): void {
   try {
     localStorage.setItem(
@@ -143,10 +143,14 @@ async function load(i: number, autoplay = true, keepFailures = false, startAt = 
   duration = 0
   publish()
   try {
-    // Bug 49/88：取链 10s 超时，弱网不永卡 loading
+ //取链 30s 超时兜底（与；10s 会误杀慢源导致整链失败）
     const r = await Promise.race([
       resolveUrl(song, getSettings().quality, getSettings().autoSwitchSource, failedSources),
-      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('取链超时')), 10_000)),
+      new Promise<never>((_, reject) => {
+        const t = setTimeout(() => reject(new Error('取链超时（30s）')), 30_000)
+        // 竞速落败方静默：避免 unhandled rejection 噪声
+        ;(t as any)?.unref?.()
+      }),
     ])
     if (index !== i) return // 已切歌
     lastSource = r.matched?.source || song.source
@@ -254,9 +258,9 @@ el.addEventListener('ratechange', () => publish())
 el.addEventListener('volumechange', () => publish())
 el.addEventListener('error', () => {
   if (!el.src) return
-  // Bug 46：load() 的 catch 已处理过同一次失败（play() reject 先行）则不重复计数
+ //load 的 catch 已处理过同一次失败（play reject 先行）则不重复计数
   if (Date.now() - errorHandledAt < 1500) return
-  // Bug 75：error 事件校验触发曲与当前曲一致，旧失败不污染新曲
+ //error 事件校验触发曲与当前曲一致，旧失败不污染新曲
   const cur = state().song
   if (errorSongId && cur && errorSongId !== cur.id) return
   const song = cur
@@ -269,7 +273,7 @@ el.addEventListener('error', () => {
   failCurrent(song, '音频加载失败，可能链接已失效')
 })
 el.addEventListener('playing', () => {
-  // 规格书 3.3：开始播放即写入历史（同一首只记一次，切歌后重置）
+ //开始播放即写入历史（同一首只记一次，切歌后重置）
   const song = state().song
   if (song && histMarked !== song.id) {
     histMarked = song.id
@@ -280,7 +284,7 @@ el.addEventListener('ended', () => {
   stopTick()
   next(true)
 })
-// Bug 79：进度统一由 interval 驱动（250ms 兜底），timeupdate/progress 不再重复 tick
+//进度统一由 interval 驱动（250ms 兜底），timeupdate/progress 不再重复 tick
 el.addEventListener('timeupdate', () => {
   // 只同步缓冲显示，不重复推进度
   try {
@@ -294,7 +298,7 @@ el.addEventListener('progress', () => {
 })
 
 /* ---------------- MediaSession：锁屏 / 通知栏 / 蓝牙线控 ----------------
- * v2.3.1 新增系统能力：后台播放时锁屏出现「封面 + 标题 + 上/下/播控」，
+ * v1.0.0 新增系统能力：后台播放时锁屏出现「封面 + 标题 + 上/下/播控」，
  * 耳机线控与蓝牙按键同样生效（此前移动端完全没有系统集成，表现为
  * 「系统能力受限」）。WebView 的 MediaSession 由系统直接取 URL 拉封面，
  * 所以 artwork 用原始 pic 直链，而不是 /swmedia/ 代理路径。 */
@@ -355,13 +359,13 @@ export const player = {
   init(): void {
     const s = getSettings()
     el.volume = typeof s.volume === 'number' ? s.volume : 0.8
-    // Bug 80/105：重启恢复倍速与定时关闭
+ //重启恢复倍速与定时关闭
     const rate = Math.max(0.5, Math.min(2, Number((s as any).playbackRate) || 1))
     el.playbackRate = rate
     const until = Number((s as any).sleepUntil) || 0
     if (until > Date.now()) sleepUntil = until
     else if (until) saveSettings({ sleepUntil: 0 } as any)
-    // 规格书 1.13：重启恢复队列与当前播放位置（暂停态，点播放即续）
+ //重启恢复队列与当前播放位置（暂停态，点播放即续）
     restoreQueue()
     publish()
   },
@@ -397,7 +401,7 @@ export const player = {
   toggle(): PlayerState {
     if (!queue.length) return state()
     if (el.paused) {
-      // 重启恢复的队列：audio 尚无 src，点播放从当前曲起播（规格书 1.13）
+ // 重启恢复的队列：audio 尚无 src，点播放从当前曲起播
       if (!el.src) { void load(Math.max(0, index), true); return state() }
       void el.play().catch(() => undefined)
     } else {
@@ -427,7 +431,7 @@ export const player = {
   },
   setQuality(q: string): PlayerState {
     saveSettings({ quality: q as any })
-    // 与桌面一致：品质变化即时重取链；Bug 30/104：保留当前进度
+ // 与桌面一致：品质变化即时重取链；保留当前进度
     if (index >= 0 && !el.paused) {
       const pos = el.currentTime || 0
       void load(index, true, false, pos)
@@ -451,7 +455,7 @@ export const player = {
   getSleepUntil(): number { return sleepUntil },
 
   addNext(song: Song): PlayerState {
-    // Bug 33：插播去重（与桌面一致），同 id 只保留插入位
+ //插播去重（与桌面一致），同 id 只保留插入位
     queue = queue.filter(x => x.id !== song.id)
     if (index >= queue.length) index = queue.length - 1
     queue.splice(index + 1, 0, song)
@@ -471,7 +475,7 @@ export const player = {
     const n = Number(i)
     if (n < 0 || n >= queue.length) return state()
     const wasCurrent = n === index
-    // Bug 32：删当前曲时若处于暂停态，补位歌曲保持暂停不自动播
+ //删当前曲时若处于暂停态，补位歌曲保持暂停不自动播
     const wasPlaying = !el.paused
     queue.splice(n, 1)
     persistQueue()
@@ -523,7 +527,7 @@ export const player = {
     }
   },
 
-  /* ---------------- 音效与频谱（规格书 v2.7 · 1.11 / 1.6） ---------------- */
+ /* ---------------- 音效与频谱 ---------------- */
 
   /** 写入 5 段 EQ 增益（dB，-12~12）。图按需建立：正在播放时立刻生效，否则等下次播放 */
   setEqBands(bands: number[]): void {

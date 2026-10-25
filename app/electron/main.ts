@@ -12,7 +12,6 @@ import { registerCoverProtocol } from './core/cover'
 import { registerMediaProtocol } from './core/media'
 import * as mfHost from './core/mf-host'
 import { beginWindowInitWatch, clearWindowInitMark, type GpuLevel } from './core/crash-guard'
-import { migrateLegacyWallpaper } from './core/wallpaper'
 import { trace, writeBootTrace, isDiagnoseMode } from './core/boot-trace'
 import { player } from './core/player-service'
 import { registerIpc, navigateMain, applyProxy, markBootReady } from './ipc'
@@ -295,16 +294,6 @@ async function bootstrap(): Promise<void> {
   try {
     loadSettings()
     trace('boot:settings')
-    // 旧版只存了一张壁纸路径，首次启动时把它登记进壁纸库，避免用户重选
-    try {
-      const legacy = getSettings().playerWallpaper
-      if (legacy) {
-        const item = migrateLegacyWallpaper(legacy)
-        if (item) saveSettings({ playerWallpaper: '', wallpaperId: item.id })
-      }
-    } catch (e: any) {
-      logger.warn('旧壁纸迁移失败', e?.message)
-    }
 
     // ---- 窗口先行 --------------------------------------------------------
     // 旧顺序：initDb() → lxHost.load() → registerIpc() → createMainWindow()。
@@ -416,7 +405,7 @@ app.whenReady().then(() => {
 })
 
 app.on('window-all-closed', () => {
-  // Bug 63：macOS 惯例 —— 关窗不退出，保 Dock 常驻
+ //macOS 惯例 —— 关窗不退出，保 Dock 常驻
   if (process.platform === 'darwin') return
   if (!getSettings().closeToTray) app.quit()
 })

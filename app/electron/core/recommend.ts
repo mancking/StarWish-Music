@@ -4,7 +4,116 @@ import { favoriteSongs, dbGetSetting, dbSetSetting, historySongs, onRepeat, rece
 import { getSongs } from './db'
 import { neteaseNewSongs, neteasePlaylists, searchNetease, searchPodcast, toplistSongs, toplistTree } from './providers'
 import { searchAll } from './music-service'
-import { sleep } from './http'
+import { sleep, getJson, qs, UA } from './http'
+
+/**
+ * 批量补封面：wy search/get/web 只给 picId 不给 picUrl，
+ * 每日推荐/电台等聚合列表构建后按 50 首/批调 song/detail 回填 album.picUrl。
+ * 失败静默（封面缺失不阻断 feed），仅处理缺 pic 的 wy 歌曲。
+ */
+export async function backfillCovers(
+  songs: Song[],
+ /** 每批补完就回调一次（用于实时把封面推给渲染层， */
+  onPatch?: (batch: Song[]) => void
+): Promise<void> {
+ // kg 公开接口无封面：先按 歌名+歌手 跨源查 wy 拿 songId，再走 song/detail 批量回填
+  const kgNeed = songs.filter(s => s && s.source === 'kg' && !s.pic && s.songId && s.name)
+  if (kgNeed.length) {
+    await Promise.all(
+      kgNeed.slice(0, 12).map(async s => {
+        try {
+          const hits = await searchNetease(`${s.name} ${String(s.singer || '').split('/')[0]}`, 1, 3)
+          const hit = hits.find(x => x.name && s.name && (x.name.includes(s.name.slice(0, 4)) || s.name.includes(x.name.slice(0, 4))))
+          if (hit) {
+            s.source = 'kg'
+            ;(s as any).wyCoverId = hit.songId
+          }
+        } catch {
+          /* 跨源封面失败静默 */
+        }
+      })
+    )
+    // 统一回填：kg 借用 wy 封面
+    for (const s of kgNeed) {
+      const wid = (s as any).wyCoverId
+      if (wid) {
+        try {
+          const body = await getJson<any>(
+            `https://music.163.com/api/song/detail?${qs({ id: wid, ids: JSON.stringify([wid]) })}`,
+            { 'User-Agent': UA, Referer: 'https://music.163.com/', Cookie: 'os=pc' },
+            6000
+          )
+          const pic = String(body?.songs?.[0]?.album?.picUrl || '').replace(/^http:\/\//i, 'https://')
+          if (pic) s.pic = pic
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+    onPatch?.(kgNeed.filter(s => s.pic))
+  }
+ // QQ：smartbox 搜索不带专辑图→ fcg_play_single_song 支持 songmid 逗号批量，一次拿全
+  const qqNeed = songs.filter(s => s && s.source === 'qq' && !s.pic && s.songId)
+  if (qqNeed.length) {
+    for (let i = 0; i < qqNeed.length; i += 20) {
+      const batch = qqNeed.slice(i, i + 20)
+      try {
+        const body = await getJson<any>(
+          `https://c.y.qq.com/v8/fcg-bin/fcg_play_single_song.fcg?${qs({
+            songmid: batch.map(s => s.songId).join(','),
+            format: 'json',
+          })}`,
+          { 'User-Agent': UA, Referer: 'https://y.qq.com/' },
+          8000
+        )
+        const arr: any[] = body?.data || []
+        for (const s of batch) {
+          const hit = arr.find(x => String(x?.mid || x?.songmid || '') === s.songId)
+          const albumMid = String(hit?.album?.mid || '')
+          if (albumMid) {
+            s.pic = `https://y.gtimg.cn/music/photo_new/T002R300x300M000${albumMid}.jpg`
+            s.album = String(hit?.album?.name || s.album || '')
+          }
+        }
+      } catch {
+        /* 单批失败静默 */
+      }
+      onPatch?.(batch.filter(s => s.pic))
+    }
+  }
+
+  const need = songs.filter(s => s && s.source === 'wy' && !s.pic && s.songId)
+  if (!need.length) return
+  for (let i = 0; i < need.length; i += 50) {
+    const batch = need.slice(i, i + 50)
+    try {
+      // song/detail 的 ids 参数 = 歌曲 id（非专辑 picId）
+      const ids = JSON.stringify(batch.map(s => s.songId))
+      const body = await getJson<any>(
+        `https://music.163.com/api/song/detail?${qs({ id: batch[0]!.songId, ids })}`,
+        { 'User-Agent': UA, Referer: 'https://music.163.com/', Cookie: 'os=pc' },
+        8000
+      )
+      const list: any[] = body?.songs || []
+      const bySong = new Map<string, string>()
+      for (const it of list) {
+        const pic = https(it?.album?.picUrl || '')
+        if (pic) bySong.set(String(it?.id || ''), pic)
+      }
+      for (const s of batch) {
+        const pic = bySong.get(String(s.songId || ''))
+        if (pic) s.pic = pic
+      }
+      onPatch?.(batch.filter(s => s.pic))
+    } catch {
+      /* 封面回填失败静默 */
+    }
+  }
+}
+
+function https(u: string): string {
+  return String(u || '').replace(/^http:\/\//i, 'https://')
+}
 
 const logger = createLogger('recommend')
 
@@ -29,7 +138,14 @@ let feedCache: { at: number; data: any } | null = null
 export async function buildDailyMix(): Promise<Song[]> {
   const key = `home.daily.${todayKey()}`
   const cached = dbGetSetting<Song[]>(key)
-  if (cached && Array.isArray(cached) && cached.length) return cached
+  if (cached && Array.isArray(cached) && cached.length) {
+ //旧缓存可能缺封面（回填逻辑上线前生成）——补齐后再返回
+    if (cached.some(s => s.source === 'wy' && !s.pic)) {
+      await backfillCovers(cached).catch(() => undefined)
+      try { dbSetSetting(key, cached) } catch { /* ignore */ }
+    }
+    return cached
+  }
 
   const favs = favoriteSongs()
   const history = historySongs(120)
@@ -148,6 +264,8 @@ export async function buildHomeFeed(force = false): Promise<any> {
   // 用户反馈过「介绍语中的排行榜是重复内容」——榜单卡片展示的是榜单前几首，
   // 若新歌区也含同一批曲目，用户会看到同一首歌出现两次。
   const topSongs = topCards.flatMap(c => c.songs)
+ //每日推荐封面回填（wy picId → song/detail 批量）
+  await backfillCovers(daily).catch(() => undefined)
   const data = {
     daily: dedupeAgainst(daily, newSongs, topSongs),
     playlists: playlists.slice(0, 12),

@@ -10,6 +10,7 @@ const logger = createLogger('bili')
 
 interface LoginState {
   sessdata: string
+  jct: string
   mid: string
   uname: string
   avatar: string
@@ -20,6 +21,7 @@ interface LoginState {
 }
 
 let state: LoginState = {
+  jct: '',
   sessdata: '',
   mid: '',
   uname: '',
@@ -54,7 +56,7 @@ export function initBiliLogin(): void {
  * B 站从 2023 年起对无 buvid/假 buvid 的请求做风控（-352），passport 接口
  * 尤其敏感：generate/poll 前先确保带真实 buvid 可显著降低失败率。
  */
-async function ensureBuvid(): Promise<void> {
+export async function ensureBuvid(): Promise<void> {
   if (state.buvid3 && state.buvid4) return
   try {
     const res = await request('https://api.bilibili.com/x/frontend/finger/spi', {
@@ -80,6 +82,12 @@ function save(): void {
   } catch {
     /* ignore */
   }
+}
+
+/** 从 Set-Cookie/整串 Cookie 提取 bili_jct（点赞 csrf， */
+function extractJct(jar: string): string {
+  const m = String(jar || '').match(/bili_jct=([^;\s]+)/)
+  return m ? decodeURIComponent(m[1]) : ''
 }
 
 export function biliCookie(): string {
@@ -140,6 +148,7 @@ export async function biliQrPoll(key: string): Promise<{ ok: boolean; status: st
     const midMatch = jar.match(/DedeUserID=(\d+)/)
     if (sessMatch) state.sessdata = decodeURIComponent(sessMatch[1])
     if (midMatch) state.mid = midMatch[1]
+    state.jct = extractJct(jar) || state.jct
     if (!state.sessdata) return { ok: false, status: 'error', message: '登录成功但未获取到 SESSDATA，请重试' }
     state.at = Date.now()
     try {
@@ -164,7 +173,7 @@ export async function biliQrPoll(key: string): Promise<{ ok: boolean; status: st
 }
 
 export function biliLogout() {
-  state = { ...state, sessdata: '', mid: '', uname: '', avatar: '', at: 0 }
+  state = { ...state, sessdata: '', jct: '', mid: '', uname: '', avatar: '', at: 0 }
   save()
   return biliStatus()
 }
@@ -208,6 +217,7 @@ export async function biliCookieLogin(input: string) {
   const sessdata = extractSessdata(input)
   if (!sessdata) throw new Error('未识别到 SESSDATA，请粘贴完整 Cookie 或仅 SESSDATA 值')
   state.sessdata = sessdata
+  state.jct = extractJct(input) || state.jct
   const ok = await verifyAndSave()
   if (!ok) {
     state.sessdata = ''
@@ -279,6 +289,7 @@ export async function biliPasswordLogin(username: string, password: string) {
   const sessMatch = jar.match(/SESSDATA=([^;]+)/)
   if (!sessMatch) throw new Error('登录成功但未获取到凭证，请重试')
   state.sessdata = decodeURIComponent(sessMatch[1])
+  state.jct = extractJct(jar) || state.jct
   const ok = await verifyAndSave()
   if (!ok) throw new Error('登录态校验失败，请重试')
   return biliStatus()
@@ -327,8 +338,29 @@ export async function biliSubtitleLrc(bvid: string, cid: string): Promise<string
   return jsonToLrc(res.raw)
 }
 
-export async function importBiliSeason(sid: string): Promise<{
-  name: string
+/**
+ * B 站点赞：archive/like，like=1 点赞 / like=2 取消。
+ * 需要登录态 + csrf（cookie 里的 bili_jct）；未登录抛错由渲染层提示。
+ */
+export async function biliLike(bvid: string, like: boolean): Promise<{ ok: boolean; message: string }> {
+  if (!state.sessdata) throw new Error('点赞需要 B 站登录（设置 → 账号）')
+  if (!state.jct) throw new Error('登录态缺少 csrf，请重新登录 B 站')
+  // csrf 取 cookie 里的 bili_jct；登录时可能未保存，补存一次
+  const jct = state.jct || ''
+  const res = await request('https://api.bilibili.com/x/web-interface/archive/like', {
+    method: 'POST',
+    headers: { ...biliHeaders(), 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: qs({ bvid, like: like ? 1 : 2, csrf: jct, csrf_token: jct }),
+    timeout: 12000,
+  })
+  const code = Number(res.body?.code)
+  if (code === 0) return { ok: true, message: like ? '已点赞' : '已取消点赞' }
+  if (code === -101) throw new Error('登录态已过期，请重新登录 B 站')
+  if (code === 65006) return { ok: true, message: '已赞过' }
+  throw new Error(res.body?.message || `点赞失败（${code}）`)
+}
+
+export async function importBiliSeason(sid: string): Promise<{  name: string
   pic: string
   description: string
   songs: Song[]

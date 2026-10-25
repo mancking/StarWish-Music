@@ -179,7 +179,13 @@ function loadAll(): void {
 
 export function list(): PluginInfo[] {
   if (!plugins.size) loadAll()
-  return [...plugins.values()].map(p => p.info).sort((a, b) => a.name.localeCompare(b.name))
+  return [...plugins.values()]
+    .map(p => ({
+      ...p.info,
+      // 初始化状态（落雪口径）：加载失败即 failed，启用即 ready
+      initState: initState.get(p.file) || (p.info.loadError ? 'failed' : p.info.enabled ? 'ready' : 'idle'),
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name))
 }
 
 export function getSourceCode(file: string): string {
@@ -189,12 +195,45 @@ export function getSourceCode(file: string): string {
   return fs.readFileSync(p.fullPath, 'utf8')
 }
 
-export function togglePlugin(file: string, enabled: boolean): PluginInfo[] {
+/**
+ * 插件初始化状态（落雪式「初始化中 / 初始化成功 / 初始化失败」）。
+ * 停用→启用时 loadAll() 会重新 eval 脚本，状态由这里对外展示。
+ */
+const initState = new Map<string, 'idle' | 'initing' | 'ready' | 'failed'>()
+
+export function togglePlugin(file: string, enabled: boolean): { list: PluginInfo[]; ok: boolean; message?: string } {
   const reg = readRegistry()
   reg.entries[file] = { ...(reg.entries[file] || { origin: 'local' }), enabled }
   writeRegistry(reg)
+  if (!enabled) {
+    initState.set(file, 'idle')
+    loadAll()
+    return { list: list(), ok: true }
+  }
+  // 启用：重新初始化（loadAll 重新 eval 全部插件，含目标插件）
+  initState.set(file, 'initing')
   loadAll()
-  return list()
+  const p = plugins.get(file)
+  if (!p || p.info.loadError) {
+    // 初始化失败 → 回滚为停用，避免「开关显示已启用但实际不可用」
+    initState.set(file, 'failed')
+    const reg2 = readRegistry()
+    reg2.entries[file] = { ...(reg2.entries[file] || { origin: 'local' }), enabled: false }
+    writeRegistry(reg2)
+    loadAll()
+    return {
+      list: list(),
+      ok: false,
+      message: `初始化失败：${p?.info.loadError || '插件加载后未导出有效对象'}`,
+    }
+  }
+  initState.set(file, 'ready')
+  return { list: list(), ok: true }
+}
+
+/** 插件初始化状态（渲染层展示用） */
+export function getInitState(file: string): 'idle' | 'initing' | 'ready' | 'failed' {
+  return initState.get(file) || 'idle'
 }
 
 export function deletePlugin(file: string): PluginInfo[] {
@@ -246,12 +285,12 @@ export function importFromContent(
       file = `${base}-${i++}.js`
     }
   }
-  // Bug 124：原子安装 —— 先写 .tmp 再 rename，注册表写成功后生效（断电/磁盘满不留半截文件）
+ //原子安装 —— 先写 .tmp 再 rename，注册表写成功后生效（断电/磁盘满不留半截文件）
   const tmp = path.join(dir, `${file}.tmp`)
   fs.writeFileSync(tmp, content, 'utf8')
   fs.renameSync(tmp, path.join(dir, file))
   const reg = readRegistry()
-  // 原地替换保留原启用状态；新装（市场/订阅/URL）默认启用（N26），本地导入默认关闭
+ // 原地替换保留原启用状态；新装（市场/订阅/URL）默认启用，本地导入默认关闭
   const isNew = !reg.entries[file]
   reg.entries[file] = {
     ...(reg.entries[file] || {}),
@@ -272,7 +311,7 @@ export async function importFromUrl(url: string, replaceFile?: string): Promise<
   const content = typeof body === 'string' ? body : res.raw || ''
   if (!content || content.length < 10) throw new Error('下载内容为空或过短，可能不是插件脚本')
   if (replaceFile) {
-    // Bug 127：更新前备份 .bak.<ts>，失败可一键回滚
+ //更新前备份 .bak.<ts>，失败可一键回滚
     const dir = userPluginsDir()
     const target = path.join(dir, path.basename(replaceFile))
     if (fs.existsSync(target)) {
@@ -302,7 +341,7 @@ function prunePluginBackups(dir: string): void {
   }
 }
 
-/** 回滚到上一版（Bug 127：设置页「回滚到上一版」按钮） */
+/** 回滚到上一版（设置页「回滚到上一版」按钮） */
 export function rollbackPlugin(file: string): PluginInfo[] {
   const dir = userPluginsDir()
   const target = path.join(dir, path.basename(file))
@@ -389,7 +428,7 @@ export async function importSubscription(url: string, name?: string): Promise<{ 
   return { added, updated, subscriptions: reg.subscriptions }
 }
 
-/** F-26/F-30：移除订阅；uninstall=true 时同时卸载该订阅安装的插件，并刷新订阅 count */
+/** /F-30：移除订阅；uninstall=true 时同时卸载该订阅安装的插件，并刷新订阅 count */
 export function removeSubscription(url: string, uninstall = false): PluginSubscription[] {
   const reg = readRegistry()
   if (uninstall) {
@@ -418,7 +457,7 @@ function subUrlMatches(sourceUrl: string, subUrl: string): boolean {
   }
 }
 
-/** C-25：启动后距上次刷新 >24h 自动补拉一次订阅（错过周期优先补拉） */
+/**启动后距上次刷新 >24h 自动补拉一次订阅（错过周期优先补拉） */
 export async function refreshSubscriptionsIfStale(): Promise<void> {
   const reg = readRegistry()
   const DAY = 24 * 60 * 60_000

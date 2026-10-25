@@ -1,33 +1,39 @@
 <script setup lang="ts">
 /**
- * 手机 / 平板播放页（规格书 1.1 ~ 1.11）
+ * 手机 / 平板播放页
  *
- * 这一版只做「装配」：封面、歌词、进度、主控、功能行全部来自
- * src/player/components，手势来自 src/player/usePlaybackGestures，
- * 页面本身不再重复实现这些逻辑。
+ * 布局（竖屏单列）：顶部标题行（「正在播放」14px + 文案 12px + 红心 #FF4D4F 右侧 40px）
+ * → 唱片区（唱片直径 = 屏宽 62% 下限 240px）→ 歌名 16px 600 + 歌手 12px
+ * → 进度条 → 主控 5 钮（上一首 44 / 播放 56 / 下一首 44 / 列表 / 更多）
+ * → 底部四等分操作行（音效 / 倍速 / 背景 / 定时，图标 22px + 文字 11px）。
+ *
+ * 手势：左右滑 = 页面级双切换（左滑=封面页、右滑=歌词页）；
+ * 切歌 = 唱片区垂直滑（上=下一首 / 下=上一首）；唱片外左半屏亮度 / 右半屏音量（仅封面页）；
+ * 歌词页上下滑只滚歌词；双击播停；上滑收起开队列。
+ *
+ * 背景：settings.playerBg 四模式由 PlayerBackground 渲染
+ * （封面魔法色渐变 / 歌词墙 / 粒子 / 舞台），切换入口 =「背景」按钮位（长按弹面板）+ 更多菜单。
  */
 import { computed, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import Icon from '@/components/Icon.vue'
-import ParticleField from '@/components/player/ParticleField.vue'
-import SpectrumBars from '@/components/player/SpectrumBars.vue'
 import EqPanel from '@/components/player/EqPanel.vue'
 import CoverStage from '@/player-music/components/CoverStage.vue'
 import LyricsPane from '@/player-music/components/LyricsPane.vue'
 import ProgressBar from '@/player-music/components/ProgressBar.vue'
 import TransportBar from '@/player-music/components/TransportBar.vue'
 import FunctionBar from '@/player-music/components/FunctionBar.vue'
+import GestureHud from '@/player-music/components/GestureHud.vue'
+import PlayerBackground from '@/player-music/components/PlayerBackground.vue'
 import { useLyricSync } from '@/player-music/lyrics'
 import { usePlaybackGestures } from '@/player-music/usePlaybackGestures'
-import GestureHud from '@/player-music/components/GestureHud.vue'
-import { useMvHint, mvFailToast } from '@/player-music/mv-hint'
-import PlayerBackground from '@/player-music/components/PlayerBackground.vue'
+import { useMvHint } from '@/player-music/mv-hint'
+import { BG_ICON, BG_LABEL, BG_ORDER, LOOP_ICON, type BgMode } from '@/player-music/stages'
 import { registerPopupCloser } from '@/mobile/popup-stack'
-import { LOOP_ICON, STAGE_ICON, STAGE_LABEL, STAGE_ORDER } from '@/player-music/stages'
-import { usePlayerStore, type StageMode } from '@/stores/player'
+import { usePlayerStore } from '@/stores/player'
 import { useLibraryStore } from '@/stores/library'
 import { useUiStore } from '@/stores/ui'
-import { lsGet, lsSet, platform, particleCount } from '@/platform'
+import { lsSet, platform } from '@/platform'
 
 const router = useRouter()
 const player = usePlayerStore()
@@ -35,33 +41,64 @@ const library = useLibraryStore()
 const ui = useUiStore()
 
 const kind = computed(() => (platform.value.kind === 'pad' ? 'pad' : 'phone'))
-const settings = computed(() => ui.settings as { particle?: boolean } | undefined)
+const settings = computed(() => ui.settings as Record<string, any>)
 const song = computed(() => player.song)
 const liked = computed(() => (song.value ? library.isFavorite(song.value.id) : false))
-const stage = computed<StageMode>(() => player.stage)
+const stage = computed(() => player.stage)
 const lyricSync = useLyricSync(
   computed(() => player.lyric),
   computed(() => player.displayPosition)
 )
 
-/* ---------------- 视觉模式（规格书 1.4：四态循环） ---------------- */
-const visual = computed(() => STAGE_LABEL[stage.value])
-const visualIcon = computed(() => STAGE_ICON[stage.value])
+/* ---------------- 背景模式（四模式 + 长按面板） ---------------- */
+const bgMode = computed<BgMode>(() => {
+  const v = String(settings.value.playerBg || 'cover')
+  return (BG_ORDER as string[]).includes(v) ? (v as BgMode) : 'cover'
+})
+const bgLabel = computed(() => BG_LABEL[bgMode.value])
+const bgIcon = computed(() => BG_ICON[bgMode.value])
+const bgPanelOpen = ref(false)
+
+function cycleBg(): void {
+  const order = platform.value.car ? (['cover', 'gradient'] as BgMode[]) : BG_ORDER
+  const i = order.indexOf(bgMode.value)
+  const next = order[(i + 1) % order.length]!
+  void ui.patch({ playerBg: next })
+}
+function pickBg(m: BgMode): void {
+  void ui.patch({ playerBg: m })
+  bgPanelOpen.value = false
+}
+/** 视觉设置收纳（A4）：转速档位在背景面板与更多菜单内 */
+function pickSpin(sec: 8 | 16 | 24): void {
+  void ui.patch({ playerSpinSec: sec })
+}
+const spinSec = computed<8 | 16 | 24>(() => {
+  const v = Number(settings.value.playerSpinSec)
+  return v === 8 || v === 16 || v === 24 ? v : 16
+})
+
 const loopIcon = computed(() => LOOP_ICON[player.state.mode] || 'repeat')
 
-function cycleVisual(): void {
-  const i = STAGE_ORDER.indexOf(stage.value)
-  player.setStage(STAGE_ORDER[(i + 1) % STAGE_ORDER.length]!)
-}
+/* ---------------- 手势（3.14） ---------------- */
+const discEl = ref<HTMLElement | null>(null)
 
-/* ---------------- 手势（规格书 1.10 / Bug 11/19/20/41 模块化重构） ---------------- */
 const gestures = usePlaybackGestures({
   getVolume: () => player.state.volume,
   onVolume: v => void player.setVolume(v),
   onToggle: () => void player.toggle(),
+ // 方向：左滑=封面页、右滑=歌词页
   onSwipeView: dir => player.setStage(dir === 'lyrics' ? 'lyrics' : 'cover'),
+ //唱片区垂直滑切歌
+  onDiscSwipe: up => (up ? player.next() : player.prev()),
+  inDiscArea: (x, y) => {
+    const el = discEl.value
+    if (!el) return false
+    const r = el.getBoundingClientRect()
+    return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom
+  },
   onCollapse: () => {
-    // Bug 11 上滑收起：开 Up Next 队列面板（返回键/下滑关闭，逐级退出由 back-handler 兜底）
+ // 上滑收起：开 Up Next 队列面板（返回键/下滑关闭，逐级退出由 back-handler 兜底）
     queueOpen.value = true
   },
   view: () => (stage.value === 'lyrics' ? 'lyrics' : 'cover'),
@@ -71,20 +108,25 @@ const gestures = usePlaybackGestures({
 
 watch(gestures.brightness, v => lsSet('brightness', String(v)))
 
-/** 视图平移（规格书 1.10/6.9）：跟手 + 松手 200ms 回弹/翻页 */
+/** 视图平移（歌词页在封面页左侧，右滑进歌词）：跟手 + 松手 200ms 回弹/翻页 */
 const viewStyle = computed(() => {
   const dragging = gestures.viewShift.value !== 0
-  const base = stage.value === 'lyrics' ? -100 : 0
+  // DOM 顺序 [lyrics, cover]：封面页基准 -100%，歌词页基准 0
+  const base = stage.value === 'cover' ? -100 : 0
   return {
     transform: `translateX(calc(${base}% + ${gestures.viewShift.value}px))`,
     transition: dragging ? 'none' : 'transform 200ms ease',
   }
 })
 
-/* ---------------- 弹层登记（Bug 39：返回键先关弹层） ---------------- */
+/* ---------------- 弹层登记（返回键先关弹层） ---------------- */
 registerPopupCloser(() => {
   if (eqOpen.value) {
     eqOpen.value = false
+    return true
+  }
+  if (bgPanelOpen.value) {
+    bgPanelOpen.value = false
     return true
   }
   if (moreOpen.value) {
@@ -136,7 +178,7 @@ function back(): void {
   router.back()
 }
 
-/* ---------------- MV 按钮（规格书 2.18） ---------------- */
+/* ---------------- MV 按钮 ---------------- */
 const mvHint = useMvHint()
 watch(song, s => void mvHint.refresh(s), { immediate: true })
 
@@ -155,16 +197,20 @@ function openMv(): void {
     :class="`is-${kind}`"
     :style="{ filter: `brightness(${gestures.brightness.value})` }"
   >
-    <!-- 背景（规格书 4.7 背景四态，Bug 21 接线） -->
-    <PlayerBackground class="bg" :cover="player.coverUrl" />
-    <div class="dim" />
+ <!-- 背景（四模式：封面魔法色渐变 / 歌词墙 / 粒子 / 舞台） -->
+    <PlayerBackground
+      class="bg"
+      :cover="player.coverUrl"
+      :lines="lyricSync.lines.value"
+      :active-index="lyricSync.activeIndex.value"
+    />
 
     <header class="bar">
       <button class="icon-btn" aria-label="返回" @click="back">
         <Icon name="shrink" :size="20" />
       </button>
       <div class="mid">
-        <b>{{ stage === 'lyrics' ? '歌词' : '正在播放' }}</b>
+        <b>正在播放</b>
         <span>{{ song?.album || song?.singer || '星河音乐' }}</span>
       </div>
       <button class="icon-btn" aria-label="更多" @click="moreOpen = true">
@@ -180,46 +226,68 @@ function openMv(): void {
         @touchend="gestures.onTouchEnd"
       >
         <div class="views" :style="viewStyle">
-          <div class="view">
-            <CoverStage
-              :kind="kind"
-              :cover="player.coverUrl"
-              :name="song?.name"
-              :singer="song?.singer"
-              :playing="player.playing"
-              @tap="player.setStage('lyrics')"
-            />
-            <ParticleField
-              v-if="stage === 'particle'"
-              :count="particleCount()"
-              :enabled="settings?.particle !== false"
-            />
-            <SpectrumBars v-if="stage === 'stage'" placement="top" />
-          </div>
+ <!--歌词页在封面页左侧（右滑进歌词、左滑回封面） -->
           <div class="view">
             <LyricsPane
               v-if="stage === 'lyrics'"
               class="pane"
               :lines="lyricSync.lines.value"
               :active-index="lyricSync.activeIndex.value"
+              :position="player.displayPosition"
               variant="phone"
               @seek="seekLyric"
             />
+          </div>
+          <div class="view">
+            <div v-if="stage === 'cover'" ref="discEl" class="disc-wrap">
+              <CoverStage
+                :kind="kind"
+                :cover="player.coverUrl"
+                :name="song?.name"
+                :singer="song?.singer"
+                :playing="player.playing"
+                @tap="player.setStage('lyrics')"
+              />
+            </div>
           </div>
         </div>
         <GestureHud v-if="gestures.hudKind.value" :kind="gestures.hudKind.value" :percent="gestures.hudPercent.value" />
       </section>
 
       <section class="info">
-        <div class="title-row">
-          <div class="names">
-            <b class="name">{{ song?.name || '未在播放' }}</b>
-            <span class="singer">{{ song?.singer || '星河音乐' }}</span>
-          </div>
-          <button class="like" :class="{ on: liked }" aria-label="喜欢" @click="toggleLike">
-            <Icon :name="liked ? 'heart-filled' : 'heart'" :size="20" />
-          </button>
+        <div class="names">
+          <b class="name">{{ song?.name || '未在播放' }}</b>
+          <span class="singer">{{ song?.singer || '星河音乐' }}</span>
         </div>
+      </section>
+
+      <!-- 进度条上方：喜欢、功能行（音效 / 倍速 / 封面切换 / 定时）、更多 -->
+      <section class="above-progress">
+        <button class="t-like" :class="{ on: liked }" aria-label="喜欢" @click="toggleLike">
+          <Icon :name="liked ? 'heart-filled' : 'heart'" :size="20" />
+        </button>
+
+        <FunctionBar
+          class="func-row"
+          :rate="player.state.rate"
+          :bg-label="bgLabel"
+          :bg-icon="bgIcon"
+          :bg-active="bgMode !== 'cover'"
+          :eq-active="eqOpen"
+          :sleep-on="player.sleepUntil > 0"
+          :mv-on="mvHint.has.value"
+          variant="phone"
+          @eq="eqOpen = true"
+          @rate="player.cycleRate()"
+          @bg="cycleBg()"
+          @bg-panel="bgPanelOpen = true"
+          @sleep="sleepOpen = true"
+          @mv="openMv"
+        />
+
+        <button class="t-more" aria-label="更多" @click="moreOpen = true">
+          <Icon name="more" :size="20" />
+        </button>
       </section>
 
       <ProgressBar
@@ -229,32 +297,18 @@ function openMv(): void {
         @seek="seek"
       />
 
+      <!-- 底部主控：播放模式 / 上一首 / 播放暂停 / 下一首 / 播放列表 -->
       <TransportBar
         :playing="player.playing"
         variant="phone"
         :mode-label="player.modeLabel"
         :mode-icon="loopIcon"
+        :show-more="false"
         @prev="player.prev()"
         @next="player.next()"
         @toggle="player.toggle()"
         @cycle-mode="player.cycleMode()"
         @queue="openQueue"
-      />
-
-      <FunctionBar
-        :rate="player.state.rate"
-        :stage-label="visual"
-        :stage-icon="visualIcon"
-        :stage-active="stage !== 'cover'"
-        :eq-active="eqOpen"
-        :sleep-on="player.sleepUntil > 0"
-        :mv-on="mvHint.has.value"
-        variant="phone"
-        @eq="eqOpen = true"
-        @rate="player.cycleRate()"
-        @visual="cycleVisual()"
-        @sleep="sleepOpen = true"
-        @mv="openMv"
       />
     </main>
 
@@ -299,6 +353,34 @@ function openMv(): void {
       </div>
     </div>
 
+    <!-- 背景模式面板（3.14 切换入口：「背景」按钮长按） -->
+    <div v-if="bgPanelOpen" class="sheet-mask" @click.self="bgPanelOpen = false">
+      <div class="sheet">
+        <div class="grip" />
+        <header class="sheet-head">
+          <b>播放页背景</b>
+          <button class="done" @click="bgPanelOpen = false">关闭</button>
+        </header>
+        <div class="bg-grid">
+          <button
+            v-for="m in BG_ORDER"
+            :key="m"
+            class="cell"
+            :class="{ on: bgMode === m }"
+            @click="pickBg(m)"
+          >
+            {{ BG_LABEL[m] }}
+          </button>
+        </div>
+        <p class="panel-sub">唱片转速（QQ 口径 24 / 16 / 8 秒一圈）</p>
+        <div class="bg-grid">
+          <button class="cell" :class="{ on: spinSec === 24 }" @click="pickSpin(24)">24s</button>
+          <button class="cell" :class="{ on: spinSec === 16 }" @click="pickSpin(16)">16s</button>
+          <button class="cell" :class="{ on: spinSec === 8 }" @click="pickSpin(8)">8s</button>
+        </div>
+      </div>
+    </div>
+
     <!-- 更多 -->
     <div v-if="moreOpen" class="sheet-mask" @click.self="moreOpen = false">
       <div class="sheet">
@@ -310,14 +392,17 @@ function openMv(): void {
         <button class="row" @click="openQueue">
           <Icon name="queue" :size="18" /> 播放队列
         </button>
-        <button class="row" @click="player.setStage('lyrics'); moreOpen = false">
-          <Icon name="lyric" :size="18" /> 查看歌词
+        <button class="row" @click="player.setStage(stage === 'lyrics' ? 'cover' : 'lyrics'); moreOpen = false">
+          <Icon name="lyric" :size="18" /> {{ stage === 'lyrics' ? '返回封面' : '查看歌词' }}
         </button>
         <button class="row" @click="sleepOpen = true; moreOpen = false">
           <Icon name="clock" :size="18" /> 定时关闭
         </button>
         <button class="row" @click="eqOpen = true; moreOpen = false">
           <Icon name="sliders" :size="18" /> 音效均衡器
+        </button>
+        <button class="row" @click="bgPanelOpen = true; moreOpen = false">
+          <Icon :name="bgIcon" :size="18" /> 背景与转速
         </button>
       </div>
     </div>
@@ -338,17 +423,7 @@ function openMv(): void {
 }
 .bg {
   position: absolute;
-  inset: -40px;
-  background-size: cover;
-  background-position: center;
-  filter: blur(30px) brightness(0.4);
-  transform: scale(1.1);
-  z-index: 0;
-}
-.dim {
-  position: absolute;
   inset: 0;
-  background: rgba(0, 0, 0, 0.5);
   z-index: 0;
 }
 .bar {
@@ -372,6 +447,10 @@ function openMv(): void {
   color: #ececf1;
   border-radius: 50%;
 }
+.icon-btn.like.on {
+  /* 3.14：红心收藏色 = QQ 红 #FF4D4F（区别于音乐主色紫） */
+  color: #ff4d4f;
+}
 .mid {
   display: flex;
   flex-direction: column;
@@ -380,13 +459,13 @@ function openMv(): void {
   min-width: 0;
 }
 .mid b {
-  font-size: 13px;
+  font-size: 14px;
   font-weight: 600;
 }
 .mid span {
-  font-size: 11px;
+  font-size: 12px;
   color: #9b9ba8;
-  max-width: 60vw;
+  max-width: 56vw;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -398,8 +477,8 @@ function openMv(): void {
   min-height: 0;
   display: flex;
   flex-direction: column;
-  padding: 0 20px calc(18px + env(safe-area-inset-bottom, 0px));
-  gap: 14px;
+  padding: 0 20px calc(14px + env(safe-area-inset-bottom, 0px));
+  gap: 8px;
 }
 .stage-area {
   position: relative;
@@ -428,16 +507,52 @@ function openMv(): void {
   justify-content: center;
   min-width: 0;
 }
+.disc-wrap {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+}
 .info {
   flex: none;
 }
-.title-row {
+/* 进度条上方工具行：喜欢（左）/ 功能行（中）/ 更多（右） */
+.above-progress {
+  flex: none;
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 4px;
+}
+.above-progress .func-row {
+  flex: 1;
+  min-width: 0;
+}
+.t-like,
+.t-more {
+  flex: none;
+  width: 36px;
+  height: 36px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: #9b9ba8;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+.t-like:active,
+.t-more:active {
+  background: rgba(255, 255, 255, 0.08);
+}
+.t-like.on {
+  color: #ff4d4f;
 }
 .names {
-  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
   min-width: 0;
 }
 .name {
@@ -450,22 +565,8 @@ function openMv(): void {
 }
 .singer {
   display: block;
-  margin-top: 2px;
   font-size: 12px;
   color: #9b9ba8;
-}
-.like {
-  width: 36px;
-  height: 36px;
-  display: grid;
-  place-items: center;
-  border: 0;
-  background: transparent;
-  color: #9b9ba8;
-  border-radius: 50%;
-}
-.like.on {
-  color: #f472b6;
 }
 .sheet-mask {
   position: fixed;
@@ -505,6 +606,11 @@ function openMv(): void {
   background: transparent;
   color: #a78bfa;
   font-size: 14px;
+}
+.panel-sub {
+  margin: 12px 0 8px;
+  font-size: 12px;
+  color: #9b9ba8;
 }
 .queue {
   display: flex;
@@ -546,11 +652,15 @@ function openMv(): void {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.grid {
+.grid,
+.bg-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 8px;
   padding-bottom: 6px;
+}
+.grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 .cell {
   height: 46px;
@@ -559,6 +669,11 @@ function openMv(): void {
   background: rgba(255, 255, 255, 0.03);
   color: #ececf1;
   font-size: 14px;
+}
+.cell.on {
+  border-color: #a78bfa;
+  color: #a78bfa;
+  background: rgba(167, 139, 250, 0.12);
 }
 .row {
   display: flex;

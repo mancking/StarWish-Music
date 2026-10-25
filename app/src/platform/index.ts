@@ -1,10 +1,10 @@
 /**
- * 全端平台模型（规格书 v2.7 · 0.1 断点矩阵 / 0.3 性能分级 / 0.5 存储键）
+ * 全端平台模型
  * ------------------------------------------------------------------
  * 唯一职责：把「当前是哪一端」和「该端允许的渲染档位」收敛成一份数据，
  * 播放页 / 视频页 / 粒子 / 频谱 / EQ 全部从这里取值，不再各自 matchMedia。
  *
- * 判定顺序（与规格书逐条对应）：
+ * 判定顺序（与
  *   ① 车机：UA 含 automotive / CarBrowser，或 URL ?platform=car，或本地配置
  *      xinyuan_car=1（车机配置项）→ 无视宽度走车机布局；
  *   ② 否则按 CSS 宽度：<600 手机 / 600~1024 平板 / ≥1024 桌面；
@@ -22,7 +22,7 @@ export interface PlatformTier {
   blur: number
   /** 舞台频谱柱数：桌面 64 / 平板 32 / 手机 16 / 车机 0 */
   bars: number
-  /** 唱片是否旋转：规格书 1.2 全端统一圆形旋转（手机/平板/桌面），车机不渲染唱片 */
+ /** 唱片是否旋转：，车机不渲染唱片 */
   rotate: boolean
   /** 粒子默认开启：桌面 / 平板开，手机默认关（需设置里手动开启） */
   particleDefault: boolean
@@ -32,7 +32,7 @@ export interface PlatformTier {
 
 const PREFIX = 'xinyuan_'
 
-/** 规格书 0.5：统一 xinyuan_ 前缀 */
+/**统一 xinyuan_ 前缀 */
 export function lsGet(name: string): string | null {
   try {
     return localStorage.getItem(PREFIX + name)
@@ -98,7 +98,7 @@ export function tierFor(kind: PlatformKind): PlatformTier {
     case 'car':
       return { kind, particles: 0, blur: 0, bars: 0, rotate: false, particleDefault: false, car: true, touch: true }
     case 'phone':
-      // Bug 9：手机封面统一圆形唱片旋转（12s/圈），不再是静态
+ //手机封面统一圆形唱片旋转（12s/圈），不再是静态
       return { kind, particles: 50, blur: 8, bars: 16, rotate: true, particleDefault: false, car: false, touch: true }
     case 'pad':
       return { kind, particles: 80, blur: 12, bars: 32, rotate: true, particleDefault: true, car: false, touch: true }
@@ -110,13 +110,13 @@ export function tierFor(kind: PlatformKind): PlatformTier {
 export const platform = computed<PlatformTier>(() => tierFor(kindRef.value))
 export const width = computed(() => winW.value)
 export const height = computed(() => winH.value)
-/** 平板横屏判定：规格书 0.1 ③ 平板 ≥900 宽走两栏 */
+/** 平板横屏判定：宽度 ≥900 且接近或超过高度 */
 export const landscape = computed(() => winW.value >= 900 && winW.value >= winH.value)
 export const isCar = computed(() => platform.value.car)
 export const isPhone = computed(() => kindRef.value === 'phone')
 export const isPad = computed(() => kindRef.value === 'pad')
 
-/** Bug 29/45：四档断点体系（<600 / 600~839 / 840~1199 / ≥1200），页面据此选栏数 */
+/**四档断点体系（<600 / 600~839 / 840~1199 / ≥1200），页面据此选栏数 */
 export type LayoutBand = 'compact' | 'narrow' | 'wide' | 'xwide'
 export const layoutBand = computed<LayoutBand>(() => {
   const w = winW.value
@@ -154,7 +154,7 @@ export function isCarDevice(): boolean {
   return isCarDeviceInner()
 }
 
-/** Bug 66：退出车机模式（设置页入口），清除配置后按宽度重新分档 */
+/**退出车机模式（设置页入口），清除配置后按宽度重新分档 */
 export function clearCarMode(): void {
   try {
     localStorage.removeItem(PREFIX + 'car')
@@ -180,7 +180,7 @@ function applyDom(): void {
   el.dataset.kind = kindRef.value
   el.dataset.car = kindRef.value === 'car' ? '1' : '0'
   el.dataset.landscape = winW.value >= winH.value ? '1' : '0'
-  // 规格书 0.5：启动写入端类型
+ //启动写入端类型
   lsSet('platform', kindRef.value)
 }
 
@@ -206,12 +206,12 @@ export function usePlatform() {
     kind: kindRef,
     width,
     height,
-    landscape,
-    layoutBand,
-    isCar,
-    isPhone,
-    isPad,
-    lowPerf,
+    landscape: landscape,
+    layoutBand: layoutBand,
+    isCar: isCar,
+    isPhone: isPhone,
+    isPad: isPad,
+    lowPerf: lowPerf,
     particles: computed(() => particleCount()),
   }
 }

@@ -21,6 +21,7 @@ import './styles/mobile.css'
 import { installBridge } from './mobile/bridge'
 import { installPullRefresh } from './mobile/pull-refresh'
 import { installBackHandler } from './mobile/back-handler'
+import { installEdgeBack } from './mobile/gestures'
 import { initPlatform } from './platform'
 import { registerEqBackend } from './player-core/eq'
 import { feedSpectrum, registerLocalSpectrumSource } from './player-core/spectrum'
@@ -33,7 +34,7 @@ async function bootstrap(): Promise<void> {
   const osName = typeof cap?.getPlatform === 'function' ? cap.getPlatform() : 'android'
   document.documentElement.dataset.platform = 'mobile'
   document.documentElement.dataset.os = osName === 'ios' ? 'ios' : 'android'
-  // 规格书 v2.7 · 0.1 / 0.3 / 0.5：断点（手机/平板/车机）、性能档位、xinyuan_* 键
+ //断点（手机/平板/车机）、性能档位、xinyuan_* 键
   initPlatform()
   await installBridge()
   installPullRefresh()
@@ -65,12 +66,12 @@ async function bootstrap(): Promise<void> {
   const ui = useUiStore(pinia)
   const player = usePlayerStore(pinia)
   const library = useLibraryStore(pinia)
-  // v2.3.1：先把界面挂上（页面自带骨架/加载态），仓库初始化在后台并行进行——
+  // v1.0.0：先把界面挂上（页面自带骨架/加载态），仓库初始化在后台并行进行——
   // 不再让用户盯着 splash 等数据库/收藏/播放队列全部就绪。
   ;(window as any).__swStores = { player, library, ui }
   app.mount('#app')
 
-  // 音效与频谱（规格书 v2.7 · 1.11 / 1.6）：WebView 里没有 IPC，
+ // 音效与频谱 ：WebView 里没有 IPC，
   // 直接把后端接到本地 <audio> 的 Web Audio 图（按需建图，不影响播放）。
   registerEqBackend({
     setBands: bands => mobileAudio.setEqBands(bands),
@@ -87,14 +88,17 @@ async function bootstrap(): Promise<void> {
   // 系统返回（含手势）：MainActivity 统一转 backButton 事件，这里接管
   // ——关弹层 → 回退 → 根页双击退后台，不再直接退出应用
   installBackHandler(router)
-  // Bug 55：splash 8s 超时兜底（任一 init 挂起时强制淡出）
+  // 左缘右滑返回手势（Android 肌肉记忆）：与系统返回汇入同一处理器
+  installEdgeBack(router)
+ //splash 8s 超时兜底（任一 init 挂起时强制淡出）
   const mobileSplash = document.getElementById('splash')
   const mobileSplashOut = (): void => {
     if (!mobileSplash || mobileSplash.classList.contains('splash-out')) return
     mobileSplash.classList.add('splash-out')
     setTimeout(() => mobileSplash.remove(), 450)
   }
-  const splashGuard = window.setTimeout(mobileSplashOut, 8000)
+ // Bug C：启动 3s 兜底（原 8s 过长，用户感知「加载太慢」）
+  const splashGuard = window.setTimeout(mobileSplashOut, 3000)
   void Promise.all([ui.init(), player.init(), library.init()])
     .catch(err => console.error('[renderer] 启动初始化失败', err))
     .finally(() => {

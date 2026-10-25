@@ -23,6 +23,15 @@ const order = ref<'hot' | 'new'>('hot')
 
 const playlists = ref<PlaylistMeta[]>([])
 const plLoading = ref(false)
+/**
+ * 切换分类/排序/音源期间的「进行中」标记
+ *
+ * 旧实现里 `plLoading` 只在无缓存时置真，且模板先判 `playlists.length`，
+ * 于是点标签后旧列表原样留在屏上、没有任何变化 —— 用户看到的就是
+ * 「点了没反应，得来回切两次才更新」。现在切换即刻进入 switching 态：
+ * 旧列表半透明 + 顶部进度条 + 标签高亮立即迁移，反馈与点击同帧发生。
+ */
+const plSwitching = ref(false)
 /** 当前页；上游接口无总数，故只给「首页/上一页/下一页」，页数由访问过的最大页推导 */
 const plPage = ref(1)
 const plFurthest = ref(1)
@@ -76,7 +85,7 @@ TAG_GROUPS.value = DEFAULT_PL_TAGS.map(g => ({
   tags: g.tags.map(t => ({ n: t, id: t })),
 }))
 
-/** Bug 25：内嵌 chips 当前组（默认第一组） */
+/**内嵌 chips 当前组（默认第一组） */
 const chipsGroup = ref(0)
 function switchChipsGroup(i: number): void {
   chipsGroup.value = i
@@ -90,6 +99,14 @@ const tagOpen = ref(false)
 const tagPopupWidth = ref(645)
 /** 该音源是否有标签体系（酷我/酷狗/咪咕无分类标签，隐藏入口） */
 const tagSupported = ref(true)
+/**
+ * 标签接口进行中
+ *
+ * 切平台时旧平台的标签会残留一段时间：用户在这段时间点到的还是旧标签，
+ * 于是拿旧标签去查新平台 → 空列表，看起来就是「切平台后分类筛选不能用了」。
+ * 现在切平台立刻清空旧标签并显示骨架，标签到位后再落新分类，避免误点。
+ */
+const tagsLoading = ref(false)
 
 /**
  * 传给上游的分类参数。
@@ -154,6 +171,13 @@ async function changePlSource(s: string): Promise<void> {
   plHasNext.value = true
   cat.value = '全部'
   tagOpen.value = false
+  chipsGroup.value = 0
+  // 立刻清掉旧平台标签，避免这段时间点到旧标签查出空列表
+  TAG_GROUPS.value = []
+  tagsLoading.value = true
+  plSwitching.value = true
+  // 先用「全部」把歌单拉起来（所有平台都支持），界面不等标签接口
+  void loadPlaylists(1)
   void call<PlaylistTagGroup[]>('music:playlistTags', { source: s })
     .then(gs => {
       if (plSource.value !== s) return // 已切到别的源，丢弃过期结果
@@ -161,6 +185,9 @@ async function changePlSource(s: string): Promise<void> {
         // 新源的标签整体替换（标签名即 id 的场景由后端提供）
         TAG_GROUPS.value = gs
         tagSupported.value = true
+        // 新平台若无「全部」标签，落到该组第一个标签并补一次请求
+        const hasAll = gs.some(g => g.tags.some(t => t.n === '全部'))
+        if (!hasAll && gs[0]?.tags?.length) selectCat(gs[0].tags[0]!.n)
       } else {
         TAG_GROUPS.value = []
         tagSupported.value = false
@@ -171,7 +198,9 @@ async function changePlSource(s: string): Promise<void> {
       TAG_GROUPS.value = []
       tagSupported.value = false
     })
-  void loadPlaylists(1)
+    .finally(() => {
+      if (plSource.value === s) tagsLoading.value = false
+    })
 }
 
 const groups = computed(() => tree.value?.tree[platform.value]?.groups || [])
@@ -194,15 +223,19 @@ async function loadPlaylists(page = 1): Promise<void> {
   // 请求序号：无论命中缓存还是走网络，本次请求都占用一个序号，
   // 让仍在飞的旧请求结果作废（否则快速切标签时旧结果会盖掉新内容）
   const seq = ++plReqSeq
+  plSwitching.value = true
   const key = `pl|${plSource.value}|${catId.value}|${order.value}|${page}`
   const hit = plCache.get(key)
   if (hit) {
     // 命中缓存：立即渲染（无骨架等待），**无论缓存多新都后台刷新**——
-    // v2.3.2 修复「切换歌单没反馈、要手动刷新」：原先 30s 防抖会吞掉切换后的
+    // v1.0.0 修复「切换歌单没反馈、要手动刷新」：原先 30s 防抖会吞掉切换后的
     // 后台刷新，用户看到的永远是旧列表且无任何更新迹象
     applyPlaylists(hit.list, page)
     window.scrollTo({ top: 0 })
-    void revalidatePlaylists(key, page, true)
+    // 缓存秒开也要有「在刷新」的可见反馈，且刷新完再收起 switching
+    void revalidatePlaylists(key, page, true).finally(() => {
+      if (seq === plReqSeq) plSwitching.value = false
+    })
     return
   }
   plLoading.value = true
@@ -225,7 +258,10 @@ async function loadPlaylists(page = 1): Promise<void> {
     plError.value = e?.message || '歌单加载失败'
     ui.toast(`歌单加载失败：${e.message}`, 'error')
   } finally {
-    if (seq === plReqSeq) plLoading.value = false
+    if (seq === plReqSeq) {
+      plLoading.value = false
+      plSwitching.value = false
+    }
   }
 }
 
@@ -369,8 +405,13 @@ function setTab(t: Tab): void {
 
 function selectCat(c: string): void {
   closeTags()
-  if (cat.value === c) return
+  // 同一标签且当前不是错误态：不重复请求（避免误触刷屏）；
+  // 但错误态下允许点同一标签重试，不再要求「先切走再切回」
+  if (cat.value === c && !plError.value) return
+  // 高亮与进度同帧生效：点下去立刻有反馈，不等网络
   cat.value = c
+  plSwitching.value = true
+  plError.value = ''
   router.replace({ path: '/discover', query: { ...route.query, tab: 'playlists', cat: c } })
   void loadPlaylists(1)
 }
@@ -378,6 +419,7 @@ function selectCat(c: string): void {
 function setOrder(o: 'hot' | 'new'): void {
   if (order.value === o) return
   order.value = o
+  plSwitching.value = true
   void loadPlaylists(1)
 }
 
@@ -469,7 +511,42 @@ onBeforeUnmount(() => {
         <button class="btn" @click="ui.importDialog = true"><Icon name="download" :size="15" />导入歌单</button>
       </div>
 
-      <div v-if="playlists.length" class="pl-grid">
+ <!-- 多级分类条：分组 → 标签，两级同时可见，点哪级都立刻反馈 -->
+      <div v-if="tagSupported && TAG_GROUPS.length" class="cat-bar">
+        <div class="cat-groups">
+          <button
+            v-for="(g, i) in TAG_GROUPS"
+            :key="g.name"
+            class="cat-group"
+            :class="{ on: chipsGroup === i }"
+            @click="switchChipsGroup(i)"
+          >
+            {{ g.name }}
+          </button>
+        </div>
+        <div v-if="tagsLoading" class="cat-tags">
+          <span v-for="i in 8" :key="i" class="sk cat-tag-sk" />
+        </div>
+        <div v-else class="cat-tags">
+          <button
+            v-for="t in TAG_GROUPS[chipsGroup]?.tags || []"
+            :key="t.id"
+            class="cat-tag-chip"
+            :class="{ on: cat === t.n }"
+            @click="selectCat(t.n)"
+          >
+            {{ t.n }}
+          </button>
+        </div>
+      </div>
+
+ <!-- 该平台无分类体系：明确说明，避免「筛选凭空消失」的错觉 -->
+      <p v-else-if="!tagsLoading" class="cat-none">该平台未提供歌单分类，已按「全部」展示</p>
+
+      <!-- 切换进行中：顶部细进度条，与点击同帧出现 -->
+      <div v-if="plSwitching" class="pl-progress" role="progressbar" aria-label="歌单加载中" />
+
+      <div v-if="playlists.length" class="pl-grid" :class="{ stale: plSwitching }">
         <PlaylistCard
           v-for="pl in playlists"
           :key="pl.id"
@@ -479,7 +556,7 @@ onBeforeUnmount(() => {
           @play="playPlaylist(pl)"
         />
       </div>
-      <div v-else-if="plLoading" class="pl-grid">
+      <div v-else-if="plLoading || plSwitching" class="pl-grid">
         <div v-for="i in 9" :key="i" class="sk" style="height: 108px; border-radius: 12px" />
       </div>
       <div v-else class="empty">
@@ -607,6 +684,107 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+/* 多级分类条 */
+.cat-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 2px 0 14px;
+}
+.cat-groups {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.cat-group {
+  height: 26px;
+  padding: 0 12px;
+  border-radius: 13px;
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--text-2);
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+.cat-group:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+.cat-group.on {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
+  font-weight: 600;
+}
+.cat-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.cat-tag-chip {
+  height: 26px;
+  padding: 0 11px;
+  border-radius: 13px;
+  border: 1px solid transparent;
+  background: var(--panel);
+  color: var(--text-2);
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+.cat-tag-chip:hover {
+  background: var(--panel-2);
+  color: var(--text);
+}
+.cat-tag-chip.on {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+.cat-none {
+  margin: 0 0 12px;
+  font-size: 12px;
+  color: var(--text-3);
+}
+.cat-tag-sk {
+  width: 54px;
+  height: 26px;
+  border-radius: 13px;
+}
+/* 切换中：顶部细进度条（无网络等待也有可见反馈） */
+.pl-progress {
+  position: relative;
+  height: 2px;
+  margin: -6px 0 12px;
+  overflow: hidden;
+  border-radius: 2px;
+  background: var(--panel-2);
+}
+.pl-progress::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  width: 38%;
+  border-radius: 2px;
+  background: linear-gradient(90deg, transparent, var(--accent), transparent);
+  animation: pl-slide 0.9s ease-in-out infinite;
+}
+@keyframes pl-slide {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(300%);
+  }
+}
+/* 旧列表在刷新中：压暗表示「这不是最终结果」，避免误以为没反应 */
+.pl-grid.stale {
+  opacity: 0.55;
+  transition: opacity 0.15s;
+  pointer-events: none;
+}
 .page-head {
   display: flex;
   align-items: flex-end;

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /**
- * 视频转音频模式（规格书 v2.7 · 2.12）
+ * 视频转音频模式
  *
  * 约定：本组件只负责「界面」，不持有播放状态。
  * 父页面在切到音频模式时继续用同一个 <video> 元素放声音（画面隐藏），
@@ -132,7 +132,7 @@ function onUp(): void {
       <button class="amv-f" @click="emit('cycle-loop')"><Icon name="repeat" :size="16" /><span>{{ loopLabel }}</span></button>
       <button class="amv-f" @click="emit('cycle-rate')"><Icon name="zap" :size="16" /><span>{{ rateLabel }}</span></button>
       <button class="amv-f" @click="emit('open-eq')"><Icon name="sliders" :size="16" /><span>音效</span></button>
-      <!-- 规格 2.12 / Bug 8：提取音频为 MP3 -->
+ <!-- 规格 2.12 / ：提取音频为 MP3 -->
       <button v-if="extractPct === undefined" class="amv-f" @click="emit('extract')">
         <Icon name="download" :size="16" /><span>提取音频</span>
       </button>

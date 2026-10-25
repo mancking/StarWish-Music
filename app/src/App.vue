@@ -7,7 +7,6 @@ import MiniBar from '@/components/MiniBar.vue'
 import TabBar from '@/components/mobile/TabBar.vue'
 import MiniPlayer from '@/components/mobile/MiniPlayer.vue'
 import EngineGuard from '@/components/mobile/EngineGuard.vue'
-import { installEdgeBack } from '@/mobile/gestures'
 import QueueDrawer from '@/components/QueueDrawer.vue'
 import ToastHost from '@/components/ToastHost.vue'
 import AddToPlaylistModal from '@/components/AddToPlaylistModal.vue'
@@ -46,7 +45,7 @@ watch(
 )
 
 /**
- * 规格书 v2.7 · 4.3（Bug：最近播放写入延迟）：
+ * 最近播放写入延迟）
  * 播放一开始就立刻写内存并刷新列表，DB 落库交给主进程异步完成，用户回到
  * 「最近播放」页时不再看到过期数据。
  */
@@ -81,7 +80,7 @@ watch(
   { immediate: true }
 )
 
-/** Bug 6：桌面快捷键统一走 useGlobalShortcuts 模块（App 内不再内联重复实现） */
+/**桌面快捷键统一走 useGlobalShortcuts 模块（App 内不再内联重复实现） */
 let offShortcuts: (() => void) | null = null
 
 let offNavigate: (() => void) | null = null
@@ -96,8 +95,8 @@ onMounted(() => {
   })
   // 下载队列全局初始化：侧栏计数、进度事件从启动就生效，不必等进入下载页
   void download.init()
-  // 移动端：全局边缘右滑返回（Android 肌肉记忆手势）
-  if (__MOBILE__) installEdgeBack(router)
+  // 移动端边缘滑动返回统一在 main.mobile.ts 安装（gestures.ts 已带幂等守卫，
+  // 此处不再重复安装 —— 旧版双装导致一次滑动连退两层，v1.0.0 修复）
   offNavigate = on('app:navigate', (p: any) => {
     if (p?.route) router.push(p.route)
   })
@@ -119,7 +118,7 @@ onBeforeUnmount(() => {
   <div v-else-if="isMobileApp" class="m-shell">
     <main ref="content" class="m-content">
       <RouterView v-slot="{ Component, route: r }">
-        <!-- Bug 72：KeepAlive 扩展到全部 Tab 根页（返回保留列表状态） -->
+ <!--KeepAlive 扩展到全部 Tab 根页（返回保留列表状态） -->
         <KeepAlive :include="['Home', 'Discover', 'Mv', 'Mine', 'Search', 'Local', 'Downloads', 'Offline', 'History', 'Favorites']">
           <component :is="Component" :key="r.name === 'playlist' || r.name === 'toplist' ? r.fullPath : undefined" />
         </KeepAlive>
@@ -136,7 +135,7 @@ onBeforeUnmount(() => {
       <TopBar ref="topbar" />
       <main ref="content" class="content">
         <RouterView v-slot="{ Component, route: r }">
-          <!-- Bug 72：KeepAlive 扩展到全部 Tab 根页（返回保留列表状态） -->
+ <!--KeepAlive 扩展到全部 Tab 根页（返回保留列表状态） -->
         <KeepAlive :include="['Home', 'Discover', 'Mv', 'Mine', 'Search', 'Local', 'Downloads', 'Offline', 'History', 'Favorites']">
             <component :is="Component" :key="r.name === 'playlist' || r.name === 'toplist' ? r.fullPath : undefined" />
           </KeepAlive>

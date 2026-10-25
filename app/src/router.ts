@@ -24,7 +24,7 @@ const routes = [
   },
   { path: '/welcome', name: 'welcome', component: () => import('@/pages/Welcome.vue'), meta: { title: '欢迎' } },
   {
-    // MV/视频统一播放路由（规格书 2.19 / C-16）：/mv/:source/:id；
+ // MV/视频统一播放路由 ：/mv/:source/:id；
     // 保留 /mv/:bvid 兼容旧链接（单段视为 bili）
     path: '/mv/:source/:id',
     name: 'mv-player-source',
@@ -84,6 +84,13 @@ const routes = [
     // 桌面与移动端各有一套播放页：功能一致，交互与布局按端重写
     component: () => (__MOBILE__ ? import('@/pages/mobile/Player.vue') : import('@/pages/Player.vue')),
     meta: { title: '正在播放', fullscreen: true },
+  },
+  {
+    path: '/mini',
+    name: 'mini',
+ //MINI 模式悬浮窗（贴边 5s 自动缩边条、hover 300ms 呼出）
+    component: () => import('@/pages/MiniMode.vue'),
+    meta: { title: '迷你模式', fullscreen: true },
   },
   {
     path: '/lyric',

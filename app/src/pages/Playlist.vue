@@ -37,7 +37,7 @@ const renameValue = ref('')
 const confirmDelete = ref(false)
 const importing = ref(false)
 
-/* 歌单收藏（规格书 3.8 / Bug 13）：xinyuan_fav_playlists 本地收藏 */
+/* 歌单收藏 ：xinyuan_fav_playlists 本地收藏 */
 const plFav = ref(false)
 const favId = computed(() => {
   if (isLocal.value) return ''

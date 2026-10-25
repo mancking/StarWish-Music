@@ -4,7 +4,7 @@ import path from 'node:path'
 import { createLogger } from './log'
 
 /**
- * 极简 ID3v2.3 写入器（规格书 1.12「下载时写入 ID3 封面」）。
+ * 极简 ID3v2.3 写入器。
  *
  * 只做三件事：写标题/歌手/专辑文本帧 + 一张 APIC 封面帧，然后拼到文件头部。
  * 已有 ID3 头的文件直接跳过——不做重写，避免破坏原标签。

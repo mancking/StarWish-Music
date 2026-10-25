@@ -17,7 +17,7 @@
   /* 结构尺寸（分端覆盖） */
   --titlebar-h: 44px;
   --sidebar-w: 232px;
-  --minibar-h: 92px;
+  --minibar-h: 72px; /* 3.1 第二十八轮布局⑥：桌面三段式 72px */
   --row-h: 52px;
   --font-base: 13.5px;
 
@@ -72,6 +72,12 @@
   --skeleton-2: rgba(255, 255, 255, 0.12);
   --shadow: 0 18px 50px rgba(0, 0, 0, 0.42);
   --shadow-sm: 0 6px 18px rgba(0, 0, 0, 0.24);
+  /* 视频/MV 播放器背景（Bug 169）：随主题变化，不再写死 #0a0a0a */
+  --video-bg: var(--bg);
+  --video-bg-2: var(--bg-2);
+  --video-stage-bg: color-mix(in srgb, var(--accent) 6%, var(--bg));
+  --video-veil: rgba(0, 0, 0, 0.65);
+  --video-veil-soft: rgba(0, 0, 0, 0.55);
 }
 
 :root[data-theme='light'] {
@@ -92,6 +98,12 @@
   --skeleton-2: rgba(16, 20, 32, 0.11);
   --shadow: 0 18px 50px rgba(30, 40, 70, 0.14);
   --shadow-sm: 0 6px 30px rgba(30, 40, 70, 0.1);
+  /* 视频/MV 播放器背景（Bug 169）：浅色主题用浅底 + 极轻遮罩，避免整页发黑 */
+  --video-bg: var(--bg);
+  --video-bg-2: var(--bg-2);
+  --video-stage-bg: color-mix(in srgb, var(--accent) 5%, var(--bg-3));
+  --video-veil: rgba(16, 20, 32, 0.28);
+  --video-veil-soft: rgba(16, 20, 32, 0.2);
 }
 
 /* ---------------- 分端覆盖 ---------------- */

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /**
- * EQ 音效面板（规格书 v2.7 · 1.11）
+ * EQ 音效面板
  * 6 预设（关闭/流行/摇滚/古典/人声/低音增强）+ 5 段滑块 ±12dB 步进 1dB。
  * 车机端只保留 关闭/人声/低音增强，隐藏手动滑块。
  * 手机是底部弹出面板，桌面是右侧抽屉 —— 由父级容器决定形态，本组件只管内容。
@@ -11,7 +11,7 @@ import { platform } from '@/platform'
 
 const emit = defineEmits<{ (e: 'close'): void }>()
 
-/** 桌面/平板用右侧抽屉，手机用底部弹出面板（规格书 1.11） */
+/** 桌面/平板用右侧抽屉，手机用底部弹出面板 */
 const drawer = computed(() => platform.value.kind === 'desktop' || platform.value.kind === 'pad')
 
 const labels = computed(() =>

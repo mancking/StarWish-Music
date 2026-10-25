@@ -15,6 +15,8 @@ const DEFAULT: AppSettings = {
   accentMode: 'auto',
   quality: '320k',
   volume: 0.8,
+ //主音量持久化（0~100），与 electron/core/settings.ts 默认值保持一致
+  playerVolume: 80,
   playMode: 'repeat-all',
   crossfade: true,
   crossfadeMs: 3000,
@@ -40,7 +42,10 @@ const DEFAULT: AppSettings = {
   particle: true,
   skipOnError: true,
   playerBg: 'cover',
-  playerWallpaper: '',
+  playerSpinSec: 16,
+  activeTheme: 'default',
+  pixabayKey: '',
+  pexelsKey: '',
   mvVolume: 0.8,
   wallpaperEnabled: true,
   wallpaperId: '',
@@ -144,6 +149,16 @@ export const useUiStore = defineStore('ui', () => {
     })
     on('window:state', (s: any) => {
       maximized.value = !!s?.maximized
+    })
+    // 4.7+：主题包即时生效（CSS 变量注入，不重建页面）。
+    // 修「预置皮肤切换无效」：主题换肤可能改 accent/背景 token，切完要重跑一次 apply。
+    on('theme:changed', (t: any) => {
+      const root = document.documentElement
+      if (typeof t?.fontScale === 'number') root.style.setProperty('--font-scale', String(t.fontScale))
+      else root.style.removeProperty('--font-scale')
+      if (typeof t?.borderRadius === 'number') root.style.setProperty('--radius', `${t.borderRadius}px`)
+      else root.style.removeProperty('--radius')
+      apply()
     })
   }
 

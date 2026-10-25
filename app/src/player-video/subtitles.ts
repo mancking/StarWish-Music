@@ -1,5 +1,5 @@
 /**
- * 外挂字幕（规格书 2.11 · 独立模块）
+ * 外挂字幕
  *
  * - 解析 .srt / .ass（含 .vtt 宽松兼容），任何畸形输入返回空列表不抛异常
  * - subtitleOffsetSec：字幕延迟 ±0.5s 步进、限 ±10s，跨视频记忆（独立于歌词 offset）
@@ -68,7 +68,7 @@ export function parseSubtitles(raw: string): SubCue[] {
   return cues.sort((a, b) => a.start - b.start)
 }
 
-/** 字幕延迟（±0.5s 步进，限 ±10s，规格书 2.11） */
+/** 字幕延迟（±0.5s 步进，限 ±10s） */
 export function nudgeSubtitleOffset(cur: number, delta: number): number {
   return Math.max(-10, Math.min(10, Math.round((cur + delta) * 10) / 10))
 }

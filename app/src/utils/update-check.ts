@@ -40,7 +40,7 @@ export async function checkUpdate(currentVersion: string): Promise<UpdateInfo> {
   // Android 安装包直链：优先 debug APK 之外命名规范的 release 产物
   const assets: Array<{ name?: string; browser_download_url?: string }> = Array.isArray(data.assets) ? data.assets : []
   const apk = assets.find(a => /\.(apk)$/i.test(String(a.name || ''))) || null
-  // Bug 12：按运行平台匹配产物 —— Win *.exe / macOS arm64|x64 dmg|zip / Linux AppImage|deb
+ //按运行平台匹配产物 —— Win *.exe / macOS arm64|x64 dmg|zip / Linux AppImage|deb
   const ua = String((navigator as any)?.userAgent || '')
   const plat = String((navigator as any)?.userAgentData?.platform || (navigator as any)?.platform || ua)
   const isMac = /mac/i.test(ua) || /Mac/.test(plat)

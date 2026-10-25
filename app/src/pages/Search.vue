@@ -17,7 +17,7 @@ import {
 } from '@/platform/search-history'
 
 /**
- * 搜索页（规格书 3.7 / Bug 15 / Bug 17）
+ * 搜索页
  * 历史 chips（xinyuan_search_history，≤20 条可删可清）+
  * 聚合结果三 Tab（歌曲 / 歌单 / 歌手）。
  */
@@ -32,7 +32,7 @@ const loading = ref(false)
 const error = ref('')
 const platform = ref('')
 const took = ref(0)
-/** Bug 17：结果分区 Tab */
+/**结果分区 Tab */
 const tab = ref<'songs' | 'playlists' | 'artists'>('songs')
 
 const keyword = computed(() => String(route.query.q || '').trim())
@@ -49,7 +49,7 @@ const history = searchHistory()
 
 const HOT = ['周杰伦', '林俊杰', '陈奕迅', '五月天', '邓紫棋', '薛之谦', '李荣浩', '毛不易', 'Taylor Swift', '米津玄師']
 
-/** Bug 123：平台 Tab 动态 —— sources:platforms 实时拉取 + sources:changed 刷新（自定义 platform 音源上 Tab） */
+/**平台 Tab 动态 —— sources:platforms 实时拉取 + sources:changed 刷新（自定义 platform 音源上 Tab） */
 const platforms = ref<PlatformOption[]>([
   { key: '', name: '全部音源' },
   { key: 'wy', name: platformLabel('wy') },
@@ -79,7 +79,7 @@ async function refreshPlatforms(): Promise<void> {
   }
 }
 
-/** Bug 17 歌手 Tab：从聚合歌曲结果按歌手聚合（头像占位 + 歌曲数） */
+/** 歌手 Tab：从聚合歌曲结果按歌手聚合（头像占位 + 歌曲数） */
 const artists = computed(() => {
   const map = new Map<string, { name: string; count: number; pic: string }>()
   for (const s of songs.value) {
@@ -212,7 +212,7 @@ onMounted(() => {
         </div>
       </header>
 
-      <!-- Bug 17：歌曲 / 歌单 / 歌手 三 Tab -->
+ <!--歌曲 / 歌单 / 歌手 三 Tab -->
       <nav class="tabs">
         <button :class="{ on: tab === 'songs' }" @click="tab = 'songs'">歌曲 {{ songs.length || '' }}</button>
         <button :class="{ on: tab === 'playlists' }" @click="tab = 'playlists'">歌单 {{ playlists.length || '' }}</button>

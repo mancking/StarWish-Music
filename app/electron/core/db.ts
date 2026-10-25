@@ -176,6 +176,25 @@ function markDirty(): void {
   }, 600)
 }
 
+/** 通用 kv（settings 表）：供模块持久化轻量状态（如 0.13/F-33 首选源记忆） */
+export function kvGet(key: string): string | null {
+  try {
+    const row = get<{ key: string; value: string }>('SELECT value FROM settings WHERE key = ?', [key])
+    return row ? row.value : null
+  } catch {
+    return null
+  }
+}
+
+export function kvSet(key: string, value: string): void {
+  try {
+    run('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', [key, value])
+    flush()
+  } catch {
+    /* 非致命 */
+  }
+}
+
 export function flush(): void {
   if (!db || closed || !dirty) return
   try {
@@ -432,7 +451,7 @@ export function reorderPlaylist(playlistId: string, ids: string[]): void {
 /* ============================ 本地音乐 ============================ */
 
 /**
- * 本地曲库分页读取（规格书 4.1：DB 分页懒加载，首屏不拉全量）。
+ * 本地曲库分页读取。
  * 默认一页 200 条；调用方可传 offset 追加下一页。
  */
 export function localSongs(limit = 200, offset = 0): Song[] {

@@ -16,7 +16,7 @@ const filter = ref('')
 /** 手机/平板走系统媒体库（MediaStore），桌面走目录扫描 */
 const mobile = computed(() => platform.value.kind === 'phone' || platform.value.kind === 'pad')
 
-/** 规格书 3.4 / Bug 18：歌曲 / 歌手 / 专辑 三分组 Tab */
+/**歌曲 / 歌手 / 专辑 三分组 Tab */
 type GroupTab = 'songs' | 'artists' | 'albums'
 const group = ref<GroupTab>('songs')
 /** 分组视图里被选中的歌手 / 专辑（null = 聚合列表） */
@@ -95,7 +95,7 @@ function cancel(): void {
   void (window as any).sw.invoke('library:cancel')
 }
 
-/** 规格书 4.4：权限被拒时给友好提示，而不是抛栈 */
+/**权限被拒时给友好提示，而不是抛栈 */
 async function scanNow(): Promise<void> {
   try {
     await library.pickAndScan()
@@ -207,7 +207,7 @@ async function rescan(): Promise<void> {
       </div>
     </template>
 
-    <!-- 规格书 4.1：分页懒加载，避免一次渲染上千条 -->
+ <!--分页懒加载，避免一次渲染上千条 -->
     <div v-if="hasMore" class="more">
       <button class="btn" :disabled="loadingMore" @click="loadMore">
         <Icon name="chevron-down" :size="14" />{{ loadingMore ? '加载中…' : `加载更多（已显示 ${library.localSongs.length} / ${library.localCount}）` }}

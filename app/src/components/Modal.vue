@@ -3,7 +3,7 @@ import { onBeforeUnmount, onMounted, watch } from 'vue'
 import Icon from './Icon.vue'
 
 const props = withDefaults(
-  defineProps<{ modelValue: boolean; title?: string; width?: number; closable?: boolean; padding?: number | string }>(),
+  defineProps<{ modelValue: boolean; title?: string; width?: number | string; closable?: boolean; padding?: number | string }>(),
   { title: '', width: 460, closable: true, padding: undefined }
 )
 const emit = defineEmits<{ (e: 'update:modelValue', v: boolean): void }>()
@@ -34,7 +34,7 @@ onBeforeUnmount(() => {
   <Teleport to="body">
     <Transition name="modal">
       <div v-if="modelValue" class="backdrop" @click.self="close">
-        <div class="modal" :style="{ width: width + 'px' }" role="dialog" aria-modal="true">
+        <div class="modal" :style="{ width: typeof width === 'number' ? width + 'px' : width }" role="dialog" aria-modal="true">
           <header class="head">
             <h3>{{ title }}</h3>
             <button v-if="closable" class="icon-btn" @click="close"><Icon name="close" :size="17" /></button>

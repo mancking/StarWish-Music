@@ -2,7 +2,7 @@ import { computed, type ComputedRef, type Ref } from 'vue'
 import type { LyricResult } from '@shared/types'
 
 /**
- * 歌词同步（规格书 1.3）
+ * 歌词同步
  *
  * 四端共用同一套歌词计算：手机/平板/桌面都只是渲染形态不同，
  * 因此把「行列表 + 当前行 + 下一行」的推导收敛到这里，页面只负责排版。
@@ -12,7 +12,7 @@ export interface LyricViewLine {
   time: number
   text: string
   trans?: string
-  /** 逐字时间（毫秒）：卡拉OK 逐字高亮（规格书 1.3） */
+ /** 逐字时间（毫秒）：卡拉OK 逐字高亮 */
   words?: { t: number; d: number; w: string }[]
 }
 
@@ -21,7 +21,7 @@ export interface LyricSync {
   /** 当前行下标，无歌词或尚未到第一行时为 -1 */
   activeIndex: ComputedRef<number>
   activeLine: ComputedRef<LyricViewLine | null>
-  /** 桌面歌词悬浮窗用（规格书 1.8：当前行 + 下一行预览） */
+ /** 桌面歌词悬浮窗用 */
   nextLine: ComputedRef<LyricViewLine | null>
   hasLyric: ComputedRef<boolean>
 }
@@ -63,7 +63,7 @@ export function useLyricSync(
 }
 
 /**
- * 卡拉OK 逐字高亮（规格书 1.3）：按「行起始时间 + 已播放进度」推导每个字的着色比例。
+ * 卡拉OK 逐字高亮 ：按「行起始时间 + 已播放进度」推导每个字的着色比例。
  * 返回当前行内每个字的已唱比例 0~1（无逐字数据时整行二值：0 或 1）。
  * 仅当前行做逐字计算，其余行整行着色（性能约定）。
  */

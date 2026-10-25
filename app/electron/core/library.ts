@@ -185,7 +185,7 @@ export async function scanLibrary(dirs: string[], onProgress: (p: ScanProgress) 
   }
   if (batch.length) saveSongs(batch.splice(0, batch.length))
 
-  // Bug 103：扫描后按现存文件集清理 DB 死链（已消失的本地文件记录删除）
+ //扫描后按现存文件集清理 DB 死链（已消失的本地文件记录删除）
   try {
     const alive = new Set(files)
     const rows = all<{ id: string; local_path: string }>(

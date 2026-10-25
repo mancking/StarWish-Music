@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import QRCode from 'qrcode'
 import Icon from '@/components/Icon.vue'
 import Toggle from '@/components/Toggle.vue'
@@ -14,24 +14,27 @@ import { useLibraryStore } from '@/stores/library'
 import { usePlayerStore } from '@/stores/player'
 import { useDownloadStore } from '@/stores/download'
 import { platformLabel } from '@/utils/labels'
-import type { AppSettings, SourceInfo, PluginInfo, PluginSubscription, WallpaperItem } from '@shared/types'
+import type { AppSettings, SourceInfo, PluginInfo, PluginSubscription } from '@shared/types'
 
 const ui = useUiStore()
 const library = useLibraryStore()
 const player = usePlayerStore()
 const download = useDownloadStore()
 const router = useRouter()
+const settingsRoute = useRoute()
 
-type Cat = 'appearance' | 'wallpaper' | 'playback' | 'lyric' | 'video' | 'download' | 'sources' | 'local' | 'cache' | 'shortcuts' | 'about'
+type Cat = 'appearance' | 'theme' | 'playback' | 'lyric' | 'video' | 'download' | 'sources' | 'local' | 'cache' | 'shortcuts' | 'about'
 const cat = ref<Cat>('appearance')
 /** 移动端设置页为「单页滚动 + 分区标题」结构，一次渲染全部分区；桌面保持单面板切换 */
 const isMobileSettings = __MOBILE__
 /** 移动端两级导航：'' = 分类列表页；否则为该分类的整页面板 */
 const mobileCat = ref<Cat | ''>('')
 
+/** 分类同步：URL ?cat= 任意合法分类都生效（附带修复；零音源 CTA 的 ?cat=sources 亦走此路径） */
 const cats: { key: Cat; label: string; icon: string }[] = [
-  { key: 'appearance', label: '外观主题', icon: 'palette' },
-  { key: 'wallpaper', label: '壁纸引擎', icon: 'sparkles' },
+ //旧版「外观主题」与「主题与壁纸」两个分区内容重叠（主题色/播放页背景两边都有），
+  // 合并为单一「外观与主题」分区：主题模式 → 强调色 → 皮肤 → 主题包 → 壁纸。
+  { key: 'appearance', label: '外观与主题', icon: 'palette' },
   { key: 'playback', label: '播放', icon: 'play-circle' },
   { key: 'lyric', label: '歌词', icon: 'lyric' },
   { key: 'video', label: '视频与弹幕', icon: 'video' },
@@ -42,6 +45,18 @@ const cats: { key: Cat; label: string; icon: string }[] = [
   { key: 'shortcuts', label: '快捷键', icon: 'keyboard' },
   { key: 'about', label: '关于', icon: 'info' },
 ]
+
+/** 分类同步：URL ?cat= 任意合法分类都生效（附带修复；零音源 CTA 的 ?cat=sources 亦走此路径） */
+watch(
+  () => settingsRoute.query.cat,
+  v => {
+    // 旧链接 ?cat=theme 兼容（分区已并入 appearance）
+    const raw = String(v || '')
+    const c = (raw === 'theme' ? 'appearance' : raw) as Cat
+    if (cats.some(x => x.key === c)) cat.value = c
+  },
+  { immediate: true }
+)
 
 /**
  * 设置项索引来自 schema（单一数据源），跨分区搜索直接查 schema。
@@ -103,9 +118,9 @@ const marketOpen = ref(false)
 const marketLoading = ref(false)
 const marketError = ref('')
 const marketUpdating = ref('')
-/** 统一源市场条目（规格书 0.10 / MarketItem v2，kind 路由三类源） */
+/** 统一源市场条目 */
 type MarketItem = {
-  kind: 'lx-source' | 'musicfree-plugin' | 'video-source'
+  kind: 'lx-source' | 'musicfree-plugin' | 'video-source' | 'theme'
   id: string
   name: string
   version?: string
@@ -122,17 +137,23 @@ const marketEntries = ref<MarketItem[]>([])
 const marketKind = ref<'all' | 'lx-source' | 'musicfree-plugin' | 'video-source'>('all')
 const marketKeyword = ref('')
 const marketDetailId = ref('')
+/** 插件市场与主题市场是两个不同分支：主题不混入插件市场（主题市场在「外观与主题」分区） */
 const KIND_TABS = [
   { key: 'all', label: '全部' },
   { key: 'lx-source', label: '音源' },
   { key: 'musicfree-plugin', label: '插件' },
   { key: 'video-source', label: '视频源' },
 ] as const
-const KIND_LABEL: Record<string, string> = { 'lx-source': '音源', 'musicfree-plugin': '插件', 'video-source': '视频源' }
+const KIND_LABEL: Record<string, string> = {
+  'lx-source': '音源',
+  'musicfree-plugin': '插件',
+  'video-source': '视频源',
+}
 const marketFiltered = computed(() => {
   const kw = marketKeyword.value.trim().toLowerCase()
   return marketEntries.value.filter(
     m =>
+      m.kind !== 'theme' &&
       (marketKind.value === 'all' || m.kind === marketKind.value) &&
       (!kw || `${m.name} ${m.description || ''} ${m.author || ''}`.toLowerCase().includes(kw))
   )
@@ -167,7 +188,7 @@ const qualityOptions: { value: AppSettings['quality']; label: string }[] = [
 
 const setting = computed(() => ui.settings)
 
-/* Bug 66：车机模式退出入口 + c10：手机粒子开关真实生效（写 xinyuan_particle_phone） */
+/*车机模式退出入口 + c10：手机粒子开关真实生效（写 xinyuan_particle_phone） */
 import { clearCarMode, isCarDevice, lsGet, lsSet } from '@/platform'
 const carMode = ref(isCarDevice())
 /* 4.8 局域网同步（桌面主机端） */
@@ -214,74 +235,248 @@ function exitCarMode(): void {
 
 async function patch(p: Partial<AppSettings>): Promise<void> {
   await ui.patch(p)
+  // Persisted accent updates (e.g. the hue spectrum) must immediately reach CSS tokens.
+  if (p.accent !== undefined || p.accentMode !== undefined || p.theme !== undefined) ui.apply()
 }
 
-/* ---------------- 播放页背景（封面模糊 / 动态渐变 / 壁纸 / 纯色） ---------------- */
+/* ---------------- 播放页背景（四模式 + 转速档） ---------------- */
 
 const isMobile = __MOBILE__
 /** 应用版本号：构建期注入，与 app/package.json 一致 */
 const appVersion = __APP_VERSION__
-const wallpaperInput = ref<HTMLInputElement | null>(null)
-/** 当前播放页背景模式 */
-const bgMode = computed<AppSettings['playerBg']>(() => setting.value.playerBg || 'cover')
-/** 壁纸的可显示地址：桌面是本地文件路径，移动端是 data URL */
-const wallpaperSrc = computed(() => {
-  const p = (setting.value.playerWallpaper || '').trim()
-  if (!p) return ''
-  if (/^(https?|data|file):/i.test(p)) return p
-  return 'file:///' + p.replace(/\\/g, '/').replace(/^\/+/, '')
-})
 
-/** 选壁纸：桌面走系统文件对话框，移动端走系统相册（<input type=file>） */
-async function pickWallpaper(): Promise<void> {
-  if (isMobile) {
-    wallpaperInput.value?.click()
-    return
+/* ---------------- 主题与壁纸（4.7+ · · · /39） ---------------- */
+type ThemeTab = 'theme' | 'wallpaper'
+const themeTab = ref<ThemeTab>('theme')
+
+interface ThemeItem {
+  id: string
+  name: string
+  author: string
+  version: string
+  colors: { primary?: string; accent?: string; bg?: string; text?: string }
+  kind: 'preset' | 'local' | 'market' | 'url' | 'branch'
+  desc?: string
+}
+const themes = ref<ThemeItem[]>([])
+const activeThemeId = ref('default')
+
+async function loadThemes(): Promise<void> {
+  try {
+    const r = await call<{ themes: ThemeItem[]; active: string }>('theme:list')
+    themes.value = r?.themes || []
+    activeThemeId.value = r?.active || 'default'
+  } catch {
+    themes.value = []
   }
+}
+
+async function useTheme(id: string): Promise<void> {
+  try {
+    await call('theme:apply', { id })
+    activeThemeId.value = id
+    ui.toast('主题已应用', 'success', 1400)
+  } catch (e: any) {
+    ui.toast(e?.message || '应用失败', 'error', 2000)
+  }
+}
+
+async function removeThemePkg(id: string): Promise<void> {
+  try {
+    const r = await call<{ restored: string }>('theme:remove', { id })
+    activeThemeId.value = r?.restored || 'default'
+    await loadThemes()
+    ui.toast('已卸载并恢复默认主题', 'info', 1600)
+  } catch (e: any) {
+    ui.toast(e?.message || '卸载失败', 'error', 2000)
+  }
+}
+
+/* 强调色预设与色相谱选择 */
+const THEME_SWATCHES = [
+  '#a78bfa', '#f472b6', '#60a5fa', '#34d399', '#fbbf24', '#f87171',
+  '#22d3ee', '#c084fc', '#fb923c', '#4ade80', '#e879f9', '#94a3b8',
+]
+const themeHue = ref(265)
+async function pickSwatch(c: string): Promise<void> {
+  await patch({ accentMode: 'custom', accent: c })
+}
+async function pickHue(h: number): Promise<void> {
+  const f = (n: number): number => {
+    const k = (n + h / 30) % 12
+    const a = 0.35 * 0.55
+    const v = 0.72 - a * Math.max(-1, Math.min(k - 3, Math.min(9 - k, 1)))
+    return Math.round(v * 255)
+  }
+  await patch({ accentMode: 'custom', accent: `#${[f(0), f(8), f(4)].map(x => x.toString(16).padStart(2, '0')).join('')}` })
+}
+
+/* 本地导入主题包 JSON（≤256KB 白名单校验， */
+const themeFileInput = ref<HTMLInputElement | null>(null)
+async function onThemeFile(e: Event): Promise<void> {
+  const input = e.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = ''
+  if (!file) return
+  try {
+    const text = await file.text()
+    const r = await call<{ theme: ThemeItem; dropped: string[] }>('theme:import', { content: text, origin: 'local' })
+    await loadThemes()
+    const dropped = r?.dropped?.length ? `（忽略非法字段：${r.dropped.join('、')}）` : ''
+    ui.toast(`主题包「${r.theme.name}」已导入${dropped}`, 'success', 2400)
+  } catch (err: any) {
+    ui.toast(err?.message || '导入失败', 'error', 2400)
+  }
+}
+
+/* 本地壁纸库（4.7+ ② 本地部分） */
+interface WallItem { id: string; name: string; url: string }
+const walls = ref<WallItem[]>([])
+async function loadWalls(): Promise<void> {
+  try {
+    const list = await call<any[]>('wallpaper:list')
+    walls.value = (list || []).map(w => ({ id: String(w.id), name: String(w.name || ''), url: String(w.url || w.file || '') }))
+  } catch {
+    walls.value = []
+  }
+}
+async function useWallpaper(id: string): Promise<void> {
+  await patch({ playerBg: 'wallpaper', wallpaperId: id, wallpaperEnabled: true })
+  ui.toast('壁纸已应用为播放页背景', 'success', 1600)
+}
+async function addLocalWallpaper(): Promise<void> {
   try {
     const p = await call<string>('wallpaper:pick')
     if (!p) return
-    await patch({ playerWallpaper: p, playerBg: 'wallpaper' })
-    ui.toast('壁纸已更新', 'success')
+    const item = await call<any>('wallpaper:import', { path: p })
+    await loadWalls()
+    await useWallpaper(item.id)
   } catch (e: any) {
-    ui.toast(e.message, 'error')
+    ui.toast(e?.message || '导入失败', 'error', 2000)
+  }
+}
+async function removeWall(id: string): Promise<void> {
+  try {
+    await call('wallpaper:remove', { id })
+    await loadWalls()
+  } catch (e: any) {
+    ui.toast(e?.message || '删除失败', 'error', 1800)
   }
 }
 
-/** 移动端选图：压到长边 1920 的 JPEG 再存，避免把几 MB 原图写进设置文件 */
-function onWallpaperFile(e: Event): void {
-  const input = e.target as HTMLInputElement
-  const f = input.files?.[0]
-  input.value = ''
-  if (!f) return
-  const reader = new FileReader()
-  reader.onload = () => {
-    const img = new Image()
-    img.onload = () => {
-      const scale = Math.min(1, 1920 / Math.max(img.width, img.height))
-      const cv = document.createElement('canvas')
-      cv.width = Math.max(1, Math.round(img.width * scale))
-      cv.height = Math.max(1, Math.round(img.height * scale))
-      const ctx = cv.getContext('2d')
-      if (!ctx) {
-        ui.toast('图片处理失败', 'error')
-        return
-      }
-      ctx.drawImage(img, 0, 0, cv.width, cv.height)
-      void patch({ playerWallpaper: cv.toDataURL('image/jpeg', 0.85), playerBg: 'wallpaper' })
-        .then(() => ui.toast('壁纸已更新', 'success'))
-        .catch((err: any) => ui.toast(err?.message || '设置失败', 'error'))
+/* 开源壁纸在线（/ / ：打开即默认列表 + 搜索过滤 + 加载更多） */
+interface OnlineWall { id: string; thumb: string; full: string; w: number; h: number; source: string; author?: string }
+const onlineWalls = ref<OnlineWall[]>([])
+const onlineLoading = ref(false)
+const onlineFailed = ref(false)
+const onlineEnd = ref(false)
+const onlineSource = ref('')
+const onlinePage = ref(0)
+const onlineQ = ref('')
+const onlineQInput = ref('')
+const onlinePreview = ref<OnlineWall | null>(null)
+let onlineSearchTimer = 0
+let onlineBusy = 0
+
+async function loadOnlineWalls(refresh = false): Promise<void> {
+  if (onlineLoading.value || (onlineEnd.value && !refresh)) return
+  onlineLoading.value = true
+  onlineFailed.value = false
+  try {
+    const page = refresh ? 1 : onlinePage.value + 1
+    const r = await call<{ list: OnlineWall[]; source: string; degraded: boolean; end: boolean }>('wallpaper:online:list', {
+      page,
+      q: onlineQ.value,
+      refresh,
+    })
+    const list = r?.list || []
+    if (refresh || page === 1) onlineWalls.value = list
+    else onlineWalls.value = [...onlineWalls.value, ...list]
+    onlinePage.value = page
+    onlineSource.value = r?.source || ''
+    onlineEnd.value = !!r?.end
+    onlineFailed.value = !!r?.degraded
+  } catch {
+    onlineFailed.value = true
+  } finally {
+    onlineLoading.value = false
+  }
+}
+
+function onOnlineSearchInput(): void {
+  window.clearTimeout(onlineSearchTimer)
+  onlineSearchTimer = window.setTimeout(() => {
+    const q = onlineQInput.value.trim()
+    if (q === onlineQ.value) return
+    onlineQ.value = q
+    onlineEnd.value = false
+    void loadOnlineWalls(true)
+  }, 300)
+}
+
+async function downloadOnline(w: OnlineWall): Promise<void> {
+  if (onlineBusy >= 2) {
+    ui.toast('下载并发已达上限（2），请稍候', 'info', 1600)
+    return
+  }
+  onlineBusy++
+  try {
+    const item = await call<any>('wallpaper:online:download', { url: w.full })
+    await loadWalls()
+    await useWallpaper(item.id)
+    onlinePreview.value = null
+  } catch (e: any) {
+    ui.toast(e?.message || '下载失败', 'error', 2200)
+  } finally {
+    onlineBusy--
+  }
+}
+
+const wallCache = ref<{ bytes: number; files: number }>({ bytes: 0, files: 0 })
+async function loadWallCache(): Promise<void> {
+  try {
+    wallCache.value = await call<{ bytes: number; files: number }>('wallpaper:cache:size')
+  } catch {
+    wallCache.value = { bytes: 0, files: 0 }
+  }
+}
+async function clearWallCache(): Promise<void> {
+  try {
+    await call('wallpaper:cache:clear')
+    await loadWallCache()
+    ui.toast('壁纸缓存已清理', 'success', 1600)
+  } catch (e: any) {
+    ui.toast(e?.message || '清理失败', 'error', 1800)
+  }
+}
+
+/* 大图预览浮层（≤1280px） */
+async function previewDownload(): Promise<void> {
+  if (onlinePreview.value) await downloadOnline(onlinePreview.value)
+}
+
+// 打开「主题与壁纸」即加载（打开即列表，不空白）
+watch(
+  themeTab,
+  t => {
+    if (t === 'theme' && !themes.value.length) void loadThemes()
+    if (t === 'wallpaper') {
+      if (!walls.value.length) void loadWalls()
+      if (!onlineWalls.value.length) void loadOnlineWalls(true)
+      void loadWallCache()
     }
-    img.onerror = () => ui.toast('图片读取失败', 'error')
-    img.src = String(reader.result || '')
-  }
-  reader.readAsDataURL(f)
-}
+  },
+  { immediate: true }
+)
 
-async function clearWallpaper(): Promise<void> {
-  await patch({ playerWallpaper: '' })
-  ui.toast('已清除壁纸', 'info')
-}
+/** 当前播放页背景模式 */
+const bgMode = computed<AppSettings['playerBg']>(() => {
+  const v = String(setting.value.playerBg || 'cover')
+ //旧 wallpaper 归并移除，存量值映射到 cover
+  return (v === 'wallpaper' ? 'cover' : v) as AppSettings['playerBg']
+})
+/** 唱片转速档（3.14：24/16/8，默认 16） */
+const spinSec = computed(() => Number(setting.value.playerSpinSec) || 16)
 
 /* ---------------- 睡眠定时 ---------------- */
 async function setSleep(minutes: number): Promise<void> {
@@ -325,62 +520,6 @@ async function uploadWebdav(): Promise<void> {
   }
 }
 
-/* ---------------- 壁纸引擎（图片库） ---------------- */
-const wallpapers = ref<WallpaperItem[]>([])
-const wallBusy = ref(false)
-
-function wallUrl(p: string): string {
-  if (!p) return ''
-  if (/^(https?|data|file):/i.test(p)) return p
-  return 'file:///' + p.replace(/\\/g, '/').replace(/^\/+/, '')
-}
-
-async function loadWallpapers(): Promise<void> {
-  if (!isDesktop) return
-  try {
-    const list = await call<WallpaperItem[]>('wallpaper:list')
-    wallpapers.value = Array.isArray(list) ? list : []
-  } catch {
-    wallpapers.value = []
-  }
-}
-
-async function addWallpaper(): Promise<void> {
-  if (isMobile) {
-    wallpaperInput.value?.click()
-    return
-  }
-  try {
-    const p = await call<string>('wallpaper:pick')
-    if (!p) return
-    wallBusy.value = true
-    const item = await call<WallpaperItem>('wallpaper:import', { path: p })
-    await loadWallpapers()
-    await patch({ wallpaperId: item.id, playerBg: 'wallpaper', wallpaperEnabled: true })
-    ui.toast('壁纸已加入库', 'success')
-  } catch (e: any) {
-    ui.toast(e?.message || '导入失败', 'error')
-  } finally {
-    wallBusy.value = false
-  }
-}
-
-async function applyWallpaper(id: string): Promise<void> {
-  await patch({ wallpaperId: id, playerBg: 'wallpaper', wallpaperEnabled: true })
-  ui.toast('已应用壁纸', 'success', 1400)
-}
-
-async function removeWallpaperItem(id: string): Promise<void> {
-  try {
-    await call('wallpaper:remove', { id })
-    await loadWallpapers()
-    if (setting.value.wallpaperId === id) await patch({ wallpaperId: '' })
-    ui.toast('已删除壁纸', 'info', 1400)
-  } catch (e: any) {
-    ui.toast(e?.message || '删除失败', 'error')
-  }
-}
-
 function fmtBytes(n: number): string {
   if (!n) return '0 B'
   if (n < 1024) return `${n} B`
@@ -413,7 +552,11 @@ async function loadMeta(): Promise<void> {
 
 async function toggleSource(s: SourceInfo): Promise<void> {
   try {
-    sources.value = await call<SourceInfo[]>('sources:toggle', { file: s.file, enabled: !s.enabled })
+    // 启用走重新初始化（落雪式状态机）：返回 {sources, ok, message}
+    const r = await call<{ sources: SourceInfo[]; ok: boolean; message?: string }>('sources:toggle', { file: s.file, enabled: !s.enabled })
+    sources.value = r.sources
+    if (r.ok) ui.toast(s.enabled ? `已停用 ${s.name}` : `${s.name} 初始化成功`, 'success', 1600)
+    else ui.toast(r.message || `${s.name} 初始化失败，已回滚为停用`, 'error', 3200)
   } catch (e: any) {
     ui.toast(e.message, 'error')
   }
@@ -509,20 +652,24 @@ async function loadSubs(): Promise<void> {
 
 async function togglePlugin(p: PluginInfo): Promise<void> {
   try {
-    plugins.value = await call<PluginInfo[]>('plugins:toggle', { file: p.file, enabled: !p.enabled })
+    const r = await call<{ list: PluginInfo[]; ok: boolean; message?: string }>('plugins:toggle', { file: p.file, enabled: !p.enabled })
+    plugins.value = r.list
+    if (r.ok) ui.toast(p.enabled ? `已停用 ${p.name}` : `${p.name} 初始化成功`, 'success', 1600)
+    else ui.toast(r.message || `${p.name} 初始化失败，已回滚为停用`, 'error', 3200)
   } catch (e: any) {
     ui.toast(e.message, 'error')
   }
 }
 
-/** 打开源市场（0.10）：统一 manifest，kind 分发三类源；自定义市场 URL（N29） */
-async function loadMarket(): Promise<void> {
+/** 打开源市场（0.10）：统一 manifest，kind 分发三类源；自定义市场 URL */
+/** force=true 绕过缓存强制拉远端（用户点「刷新」；修「上传新音源拉取不到」） */
+async function loadMarket(force = false): Promise<void> {
   marketOpen.value = true
   marketLoading.value = true
   marketError.value = ''
   try {
     const url = String(setting.value.marketUrl || '').trim() || OFFICIAL_SUB_URL
-    marketEntries.value = await call<MarketItem[]>('market:list', { url })
+    marketEntries.value = (await call<MarketItem[]>('market:list', { url, force })).filter(item => item.kind !== 'theme')
     if (!marketEntries.value.length) marketError.value = '目录为空'
   } catch (e: any) {
     marketError.value = `源市场加载失败：${e.message}`
@@ -536,13 +683,59 @@ function isInstalled(file: string): PluginInfo | undefined {
   return plugins.value.find(p => p.file === file)
 }
 
+/** 主题市场入口：独立于插件市场（Star-Wish-Theme-Library 分支）。
+ *  在线主题库列表在「外观与主题」分区的主题 Tab 内直接展示。 */
+async function openThemeMarket(): Promise<void> {
+  themeTab.value = 'theme'
+  void loadThemeMarket()
+}
+
+/** 在线主题库（Star-Wish-Theme-Library 分支 manifest；与插件市场分支相互独立） */
+const THEME_MARKET_URL =
+  'https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Theme-Library/manifest.json'
+const themeMarketItems = ref<MarketItem[]>([])
+const themeMarketLoading = ref(false)
+const themeMarketError = ref('')
+async function loadThemeMarket(force = false): Promise<void> {
+  themeMarketLoading.value = true
+  themeMarketError.value = ''
+  try {
+    themeMarketItems.value = await call<MarketItem[]>('market:themes', { url: THEME_MARKET_URL, force })
+  } catch (e: any) {
+    themeMarketItems.value = []
+    themeMarketError.value = e?.message || '主题库加载失败'
+  } finally {
+    themeMarketLoading.value = false
+  }
+}
+async function installThemeFromMarket(entry: MarketItem): Promise<void> {
+  try {
+    await call('market:install', { item: entry })
+    ui.toast(`已安装 ${entry.name}`, 'success', 1800)
+    await Promise.all([loadThemes(), loadThemeMarket()])
+  } catch (e: any) {
+    ui.toast(`安装失败：${e?.message || e}`, 'error', 3200)
+  }
+}
+async function uninstallThemeFromMarket(entry: MarketItem): Promise<void> {
+  try {
+    await call('market:uninstall', { item: entry })
+    ui.toast(`已卸载 ${entry.name}`, 'info', 1600)
+    await Promise.all([loadThemes(), loadThemeMarket()])
+  } catch (e: any) {
+    ui.toast(`卸载失败：${e?.message || e}`, 'error', 2800)
+  }
+}
+
 /** 从市场安装/更新一个插件 */
-/** F-31：统一安装（kind 路由 lxHost / mfHost） */
+/**统一安装（kind 路由 lxHost / mfHost） */
 async function installFromMarket(entry: MarketItem): Promise<void> {
   marketUpdating.value = entry.url
+  // 已装且有新版本 → 更新；已装且已是最新 → 不该再点（按钮已禁用，双保险）
+  const isUpdate = !!entry.installed && !!entry.canUpdate
   try {
-    await call(entry.installed ? 'market:update' : 'market:install', { item: entry })
-    ui.toast(`${entry.installed ? '已更新' : '已安装'} ${entry.name}（${KIND_LABEL[entry.kind]}）`, 'success')
+    await call(isUpdate ? 'market:update' : 'market:install', { item: entry })
+    ui.toast(`${isUpdate ? '已更新' : '已安装'} ${entry.name}（${KIND_LABEL[entry.kind]}）`, 'success')
     await loadPlugins()
     await loadMarket()
   } catch (e: any) {
@@ -552,7 +745,7 @@ async function installFromMarket(entry: MarketItem): Promise<void> {
   }
 }
 
-/** 卸载（按 sourceUrl 匹配，Bug 125） */
+/** 卸载（按 sourceUrl 匹配， */
 async function uninstallFromMarket(entry: MarketItem): Promise<void> {
   marketUpdating.value = entry.url
   try {
@@ -680,7 +873,7 @@ async function doSubscribe(): Promise<void> {
 }
 
 async function removeSub(url: string): Promise<void> {
-  // F-26：移除订阅时询问是否同时卸载该订阅下插件
+ //移除订阅时询问是否同时卸载该订阅下插件
   let uninstall = false
   try {
     uninstall = window.confirm('移除订阅时是否同时卸载该订阅安装的插件？（取消则仅移除订阅记录）')
@@ -916,7 +1109,7 @@ async function openUpdatePage(): Promise<void> {
     await call('app:openExternal', { url }).catch(() => {})
     return
   }
-  // v2.3.1：Release 里有 APK 产物时应用内直接下载并拉起安装器，不再跳浏览器
+  // v1.0.0：Release 里有 APK 产物时应用内直接下载并拉起安装器，不再跳浏览器
   const apkUrl = updateInfo.value?.apkUrl
   if (apkUrl) {
     ui.toast('开始下载安装包，完成后会自动拉起安装器…', 'info', 3600)
@@ -1133,7 +1326,7 @@ async function pickDirs(): Promise<void> {
 }
 
 onMounted(async () => {
-  await Promise.all([loadSources(), loadMeta(), loadPlugins(), loadSubs(), loadWallpapers()])
+  await Promise.all([loadSources(), loadMeta(), loadPlugins(), loadSubs()])
 })
 
 watch(qrOpen, v => {
@@ -1196,7 +1389,8 @@ onBeforeUnmount(stopPoll)
       <div class="panel">
         <!-- 外观 -->
         <section v-if="cat === 'appearance' || (isMobileSettings && mobileCat === 'appearance')">
-          <h2>外观主题</h2>
+          <h2>外观与主题</h2>
+          <p class="hint">主题模式、强调色、皮肤与壁纸集中在这里；播放页背景与唱片转速也归本区。</p>
           <div class="row">
             <div class="label"><b>主题模式</b><span>深色适合夜间长时间听歌</span></div>
             <div class="seg">
@@ -1207,23 +1401,23 @@ onBeforeUnmount(stopPoll)
           </div>
 
           <div class="row">
-            <div class="label"><b>强调色</b><span>自动模式下会跟随当前封面主色变化</span></div>
+            <div class="label"><b>强调色</b><span>色谱选择，应用后所有页面即时更新</span><input v-model.number="themeHue" type="range" min="0" max="360" step="1" class="hue-slider" @change="pickHue(themeHue)" /></div>
             <div class="accent-wrap">
-              <button class="mini-chip" :class="{ on: setting.accentMode === 'auto' }" @click="patch({ accentMode: 'auto' })">自动取色</button>
-              <button class="mini-chip" :class="{ on: setting.accentMode === 'custom' }" @click="patch({ accentMode: 'custom' })">自定义</button>
               <div class="swatches">
                 <button
                   v-for="c in ACCENTS"
                   :key="c"
                   class="swatch"
-                  :class="{ on: setting.accentMode === 'custom' && setting.accent.toLowerCase() === c }"
+                  :class="{ on: setting.accent.toLowerCase() === c }"
                   :style="{ background: c }"
+                  :aria-label="`选择强调色 ${c}`"
                   @click="patch({ accentMode: 'custom', accent: c })"
                 />
                 <input
                   type="color"
                   class="color-input"
                   :value="setting.accent"
+                  aria-label="自定义强调色"
                   @input="patch({ accentMode: 'custom', accent: ($event.target as HTMLInputElement).value })"
                 />
               </div>
@@ -1245,7 +1439,7 @@ onBeforeUnmount(stopPoll)
             <Toggle :model-value="particlePhone" @update:model-value="v => setParticlePhone(v)" />
           </div>
 
-          <!-- Bug 66：车机模式退出入口（识别为车机后此前不可逆） -->
+ <!--车机模式退出入口（识别为车机后此前不可逆） -->
           <div v-if="carMode" class="row">
             <div class="label"><b>车机模式</b><span>当前按车机布局渲染（琥珀黄大字大按钮）</span></div>
             <button class="btn" @click="exitCarMode"><Icon name="monitor" :size="14" />退出车机模式</button>
@@ -1261,162 +1455,219 @@ onBeforeUnmount(stopPoll)
           </div>
 
           <div class="row">
-            <div class="label"><b>播放页背景</b><span>封面模糊、动态渐变、自定义壁纸或纯色</span></div>
+            <div class="label"><b>播放页背景</b><span>封面魔法色渐变 / 歌词墙 / 粒子 / 舞台频谱（第十八轮修订）</span></div>
             <div class="seg">
-              <button :class="{ on: bgMode === 'cover' }" @click="patch({ playerBg: 'cover' })">封面模糊</button>
-              <button :class="{ on: bgMode === 'gradient' }" @click="patch({ playerBg: 'gradient' })">动态渐变</button>
-              <button :class="{ on: bgMode === 'wallpaper' }" @click="patch({ playerBg: 'wallpaper' })">壁纸</button>
+              <button :class="{ on: bgMode === 'cover' }" @click="patch({ playerBg: 'cover' })">封面</button>
+              <button :class="{ on: bgMode === 'lyric-wall' }" @click="patch({ playerBg: 'lyric-wall' })">歌词墙</button>
+              <button :class="{ on: bgMode === 'particle' }" @click="patch({ playerBg: 'particle' })">粒子</button>
+              <button :class="{ on: bgMode === 'spectrum' }" @click="patch({ playerBg: 'spectrum' })">舞台</button>
+              <button :class="{ on: bgMode === 'gradient' }" @click="patch({ playerBg: 'gradient' })">纯渐变</button>
               <button :class="{ on: bgMode === 'solid' }" @click="patch({ playerBg: 'solid' })">纯色</button>
             </div>
           </div>
 
-          <div v-if="bgMode === 'wallpaper'" class="row">
-            <div class="label"><b>壁纸图片</b><span>{{ wallpaperSrc ? '已设置自定义壁纸' : '还没有选择壁纸' }}</span></div>
-            <div class="inline">
-              <button class="btn sm" @click="pickWallpaper"><Icon name="folder-open" :size="14" />选择图片</button>
-              <button v-if="wallpaperSrc" class="btn sm ghost" @click="clearWallpaper">清除</button>
-              <img v-if="wallpaperSrc" class="wall-thumb" :src="wallpaperSrc" alt="壁纸预览" />
+          <div class="row">
+            <div class="label"><b>唱片转速</b><span>Q音口径：24 / 16 / 8 秒一圈，默认 16</span></div>
+            <div class="seg">
+              <button :class="{ on: spinSec === 24 }" @click="patch({ playerSpinSec: 24 })">24s</button>
+              <button :class="{ on: spinSec === 16 }" @click="patch({ playerSpinSec: 16 })">16s</button>
+              <button :class="{ on: spinSec === 8 }" @click="patch({ playerSpinSec: 8 })">8s</button>
             </div>
           </div>
-          <input
-            ref="wallpaperInput"
-            type="file"
-            accept="image/*"
-            class="hidden-file"
-            @change="onWallpaperFile"
-          />
         </section>
 
-        <!-- 壁纸引擎 -->
-        <section v-else-if="cat === 'wallpaper' || (isMobileSettings && mobileCat === 'wallpaper')">
-          <h2>壁纸引擎</h2>
-          <p class="hint">图片壁纸库：导入多张图片、轮播、调节显示属性。壁纸只作用于应用内播放页，不修改系统桌面。</p>
+
+ <!-- 主题 · 皮肤 · 壁纸（并入「外观与主题」分区， -->
+        <section v-if="cat === 'appearance' || (isMobileSettings && mobileCat === 'appearance')">
+          <h2>皮肤 · 主题包 · 壁纸</h2>
+          <p class="hint">预置皮肤 / 主题包（主题市场）/ 播放页壁纸（本地库 + 开源壁纸）。</p>
 
           <div class="row">
-            <div class="label"><b>启用壁纸</b><span>关闭后播放页回到封面模糊背景</span></div>
-            <Toggle :model-value="setting.wallpaperEnabled" @update:model-value="v => patch({ wallpaperEnabled: v })" />
+            <div class="label"><b>主题市场</b><span>独立分支（Star-Wish-Theme-Library）：在线主题包一键安装；开源壁纸在「壁纸」Tab</span></div>
+            <button class="btn sm" @click="openThemeMarket"><Icon name="download" :size="14" />进入</button>
           </div>
 
-          <div class="row">
-            <div class="label"><b>背景来源</b><span>决定播放页使用哪种背景</span></div>
-            <div class="seg">
-              <button :class="{ on: bgMode === 'cover' }" @click="patch({ playerBg: 'cover' })">封面模糊</button>
-              <button :class="{ on: bgMode === 'gradient' }" @click="patch({ playerBg: 'gradient' })">动态渐变</button>
-              <button :class="{ on: bgMode === 'wallpaper' }" @click="patch({ playerBg: 'wallpaper' })">壁纸</button>
-              <button :class="{ on: bgMode === 'solid' }" @click="patch({ playerBg: 'solid' })">纯色</button>
-            </div>
+          <div class="seg" style="margin-bottom: 14px">
+            <button :class="{ on: themeTab === 'theme' }" @click="themeTab = 'theme'">主题</button>
+            <button :class="{ on: themeTab === 'wallpaper' }" @click="themeTab = 'wallpaper'">壁纸</button>
           </div>
 
-          <template v-if="!isMobile">
-            <div class="wall-head">
-              <b>壁纸库</b>
-              <span>{{ wallpapers.length }} 张</span>
+          <!-- ==== 主题 Tab ==== -->
+          <template v-if="themeTab === 'theme'">
+            <div class="row col">
+              <div class="label"><b>预置皮肤</b><span>本地内置 5 套，无网络可切换</span></div>
+              <div class="theme-grid">
+                <button
+                  v-for="t in themes.filter(x => x.kind === 'preset')"
+                  :key="t.id"
+                  class="theme-chip"
+                  :class="{ on: activeThemeId === t.id }"
+                  @click="useTheme(t.id)"
+                >
+                  <span class="tc" :style="{ background: `linear-gradient(135deg, ${t.colors.primary}, ${t.colors.accent})` }" />
+                  <span class="tn">{{ t.name }}</span>
+                </button>
+              </div>
             </div>
-            <div class="wall-grid">
-              <button
-                v-for="w in wallpapers"
-                :key="w.id"
-                class="wall-item"
-                :class="{ on: setting.wallpaperId === w.id }"
-                :title="w.name"
-                @click="applyWallpaper(w.id)"
-              >
-                <img :src="wallUrl(w.thumb)" :alt="w.name" />
-                <span class="wall-name">{{ w.name }}</span>
-                <span class="wall-del" title="删除" @click.stop="removeWallpaperItem(w.id)">
-                  <Icon name="trash" :size="13" />
-                </span>
-              </button>
-              <button class="wall-add" :disabled="wallBusy" @click="addWallpaper">
-                <Icon name="plus" :size="20" />
-                <span>{{ wallBusy ? '导入中…' : '添加壁纸' }}</span>
-              </button>
+
+            <!-- 在线主题库（独立分支 Star-Wish-Theme-Library，与插件市场分离） -->
+            <div class="row col">
+              <div class="label">
+                <b>在线主题库</b>
+                <span>主题市场独立分支：在线浏览主题包并一键安装<template v-if="themeMarketError"> · {{ themeMarketError }}</template></span>
+                <button class="btn sm ghost" style="margin-left: auto" :disabled="themeMarketLoading" @click="loadThemeMarket(true)">
+                  <Icon name="refresh" :size="14" />刷新
+                </button>
+              </div>
+              <div v-if="themeMarketLoading" class="hint">正在拉取主题库…</div>
+              <div v-else-if="!themeMarketItems.length" class="hint">主题库暂未上架，敬请期待（可先使用预置皮肤或本地导入主题包）</div>
+              <div v-else class="theme-grid">
+                <div v-for="m in themeMarketItems" :key="m.url" class="theme-chip mk-theme-item">
+                  <span class="tc" :style="{ background: `linear-gradient(135deg, ${m.name.length % 2 ? '#a78bfa' : '#f472b6'}, ${m.name.length % 3 ? '#60a5fa' : '#34d399'})` }" />
+                  <span class="tn">{{ m.name }}<template v-if="m.version"> v{{ m.version }}</template></span>
+                  <span class="mk-theme-acts">
+                    <button class="btn sm" :class="{ ghost: m.installed && !m.canUpdate }" :disabled="m.installed && !m.canUpdate" @click="m.installed && !m.canUpdate ? undefined : installThemeFromMarket(m)">
+                      {{ m.installed ? (m.canUpdate ? '更新' : '已装') : '安装' }}
+                    </button>
+                    <button v-if="m.installed" class="btn sm ghost" @click="uninstallThemeFromMarket(m)">卸载</button>
+                  </span>
+                </div>
+              </div>
             </div>
+
+            <div class="row">
+              <div class="label"><b>主题色</b><span>主色/强调色 12 色预设 + 自定义取色（即时生效）</span></div>
+              <div class="swatches">
+                <button
+                  v-for="c in THEME_SWATCHES"
+                  :key="c"
+                  class="sw"
+                  :class="{ on: (setting.accent || '').toLowerCase() === c }"
+                  :style="{ background: c }"
+                  @click="pickSwatch(c)"
+                />
+              </div>
+              <div class="hue-row">
+                <input v-model.number="themeHue" type="range" min="0" max="360" step="1" class="hue-slider" @change="pickHue(themeHue)" />
+                <span class="hue-val">{{ themeHue }}°</span>
+              </div>
+            </div>
+
+            <div class="row col">
+              <div class="label">
+                <b>主题包</b>
+                <span>社区主题包（皮肤商店），JSON ≤256KB 白名单校验；卸载恢复默认</span>
+              </div>
+              <div class="inline" style="flex-wrap: wrap">
+                <button class="btn sm" @click="themeFileInput?.click()"><Icon name="folder-open" :size="14" />导入 JSON</button>
+              </div>
+              <div class="theme-pkgs">
+                <div v-for="t in themes.filter(x => x.kind !== 'preset')" :key="t.id" class="pkg-row">
+                  <span class="tc sm" :style="{ background: `linear-gradient(135deg, ${t.colors.primary || '#666'}, ${t.colors.accent || '#333'})` }" />
+                  <span class="pkg-meta">
+                    <b>{{ t.name }}</b>
+                    <span>{{ t.author }} · v{{ t.version }} · {{ t.kind }}</span>
+                  </span>
+                  <span class="pkg-acts">
+                    <button class="btn sm" @click="useTheme(t.id)">应用</button>
+                    <button class="btn sm ghost" @click="removeThemePkg(t.id)">卸载</button>
+                  </span>
+                </div>
+                <p v-if="!themes.some(x => x.kind !== 'preset')" class="hint">暂无已装主题包（可从主题市场或本地 JSON 导入）</p>
+              </div>
+            </div>
+            <input ref="themeFileInput" type="file" accept=".json,application/json" class="hidden-file" @change="onThemeFile" />
           </template>
 
-          <div v-else class="row">
-            <div class="label"><b>壁纸图片</b><span>{{ wallpaperSrc ? '已设置壁纸' : '还没有选择壁纸' }}</span></div>
-            <div class="inline">
-              <button class="btn sm" @click="addWallpaper"><Icon name="folder-open" :size="14" />选择图片</button>
-              <button v-if="wallpaperSrc" class="btn sm ghost" @click="clearWallpaper">清除</button>
-              <img v-if="wallpaperSrc" class="wall-thumb" :src="wallpaperSrc" alt="壁纸预览" />
+          <!-- ==== 壁纸 Tab ==== -->
+          <template v-else>
+            <div class="row col">
+              <div class="label">
+                <b>本地壁纸库</b>
+                <span>点击应用为播放页背景；蓝框为当前壁纸</span>
+              </div>
+              <div class="inline">
+                <button class="btn sm" @click="addLocalWallpaper"><Icon name="plus" :size="14" />添加壁纸</button>
+              </div>
+              <div class="wall-grid">
+                <button
+                  v-for="w in walls"
+                  :key="w.id"
+                  class="wall-item"
+                  :class="{ on: setting.playerBg === 'wallpaper' && setting.wallpaperId === w.id }"
+                  @click="useWallpaper(w.id)"
+                >
+                  <img :src="w.url" :alt="w.name" loading="lazy" />
+                  <span class="wall-name">{{ w.name }}</span>
+                  <span class="wall-del" title="删除" @click.stop="removeWall(w.id)"><Icon name="trash" :size="13" /></span>
+                </button>
+              </div>
+              <p v-if="!walls.length" class="hint">本地库为空：可从下方开源壁纸下载，或本地导入图片</p>
             </div>
-          </div>
 
-          <div class="row">
-            <div class="label"><b>轮播方式</b><span>按歌切换 / 定时轮播 / 随机</span></div>
-            <div class="inline">
-              <select
-                class="select"
-                :value="setting.wallpaperRotation"
-                @change="patch({ wallpaperRotation: ($event.target as HTMLSelectElement).value as any })"
-              >
-                <option value="off">关闭</option>
-                <option value="song">按歌切换</option>
-                <option value="timer">定时轮播</option>
-                <option value="random">随机</option>
-              </select>
-              <select
-                v-if="setting.wallpaperRotation === 'timer'"
-                class="select"
-                :value="String(setting.wallpaperIntervalMin)"
-                @change="patch({ wallpaperIntervalMin: Number(($event.target as HTMLSelectElement).value) })"
-              >
-                <option value="1">1 分钟</option>
-                <option value="5">5 分钟</option>
-                <option value="15">15 分钟</option>
-                <option value="30">30 分钟</option>
-              </select>
+            <div class="row col">
+              <div class="label">
+                <b>开源壁纸</b>
+                <span>无版权可商用源（Pixabay/Pexels 需在下方填 key；默认走无 key 兜底源）；仅作播放页背景</span>
+              </div>
+              <div class="inline">
+                <input
+                  v-model="onlineQInput"
+                  class="input"
+                  style="max-width: 260px"
+                  placeholder="搜索壁纸（过滤，清空回默认列表）"
+                  @input="onOnlineSearchInput"
+                />
+                <button class="btn sm" :disabled="onlineLoading" @click="loadOnlineWalls(true)"><Icon name="refresh" :size="14" />刷新</button>
+              </div>
+              <p v-if="onlineSource" class="hint">当前源：{{ onlineSource }}{{ onlineQ ? ` · 搜索“${onlineQ}”` : ' · 默认列表' }}</p>
+              <div class="wall-grid">
+                <div v-if="onlineLoading && !onlineWalls.length" v-for="i in 8" :key="'sk' + i" class="sk wall-item" style="aspect-ratio: 16 / 10" />
+                <button
+                  v-for="w in onlineWalls"
+                  :key="w.id"
+                  class="wall-item"
+                  @click="onlinePreview = w"
+                >
+                  <img :src="w.thumb" :alt="w.author || ''" loading="lazy" />
+                  <span class="wall-name">{{ w.source }} · {{ w.w }}×{{ w.h }}</span>
+                </button>
+              </div>
+              <p v-if="onlineFailed && !onlineWalls.length" class="hint" style="color: #f87171">
+                开源壁纸源不可达（可填 key 或检查网络）；本地壁纸库仍可用（上方）。
+              </p>
+              <div v-if="onlineWalls.length || onlineLoading" class="lm-row">
+                <button v-if="!onlineEnd" class="btn sm" :disabled="onlineLoading" @click="loadOnlineWalls()">
+                  {{ onlineLoading ? '加载中…' : '加载更多' }}
+                </button>
+                <span v-else class="hint">没有更多了</span>
+              </div>
             </div>
-          </div>
 
-          <div class="row">
-            <div class="label"><b>模糊</b><span>{{ setting.wallpaperBlur }} px</span></div>
-            <Slider :model-value="setting.wallpaperBlur" :max="40" :step="1" @update:model-value="v => patch({ wallpaperBlur: Math.round(v) })" />
-          </div>
-
-          <div class="row">
-            <div class="label"><b>遮罩浓度</b><span>{{ Math.round(setting.wallpaperMask * 100) }}%，越高文字越清晰</span></div>
-            <Slider :model-value="setting.wallpaperMask * 100" :max="100" :step="1" @update:model-value="v => patch({ wallpaperMask: v / 100 })" />
-          </div>
-
-          <div class="row">
-            <div class="label"><b>亮度</b><span>浅色壁纸建议调低</span></div>
-            <select
-              class="select"
-              :value="String(Math.round(setting.wallpaperBrightness * 100))"
-              @change="patch({ wallpaperBrightness: Number(($event.target as HTMLSelectElement).value) / 100 })"
-            >
-              <option value="70">70%</option>
-              <option value="85">85%</option>
-              <option value="100">100%</option>
-              <option value="115">115%</option>
-              <option value="130">130%</option>
-            </select>
-          </div>
-
-          <div class="row">
-            <div class="label"><b>填充方式</b><span>图片比例与屏幕不一致时如何处理</span></div>
-            <div class="seg">
-              <button :class="{ on: setting.wallpaperFit === 'cover' }" @click="patch({ wallpaperFit: 'cover' })">填充</button>
-              <button :class="{ on: setting.wallpaperFit === 'contain' }" @click="patch({ wallpaperFit: 'contain' })">适应</button>
-              <button :class="{ on: setting.wallpaperFit === 'fill' }" @click="patch({ wallpaperFit: 'fill' })">拉伸</button>
+            <div class="row col">
+              <div class="label"><b>壁纸源 API Key（可选）</b><span>Pixabay/Pexels 官方免费 key；不填则走无 key 兜底源；key 仅存本地</span></div>
+              <div class="inline" style="flex-wrap: wrap">
+                <input
+                  class="input"
+                  style="max-width: 240px"
+                  placeholder="Pixabay key"
+                  :value="setting.pixabayKey"
+                  @change="patch({ pixabayKey: ($event.target as HTMLInputElement).value.trim() })"
+                />
+                <input
+                  class="input"
+                  style="max-width: 240px"
+                  placeholder="Pexels key"
+                  :value="setting.pexelsKey"
+                  @change="patch({ pexelsKey: ($event.target as HTMLInputElement).value.trim() })"
+                />
+              </div>
             </div>
-          </div>
-
-          <div class="row">
-            <div class="label"><b>缩放</b><span>轻微放大可以避免边缘模糊</span></div>
-            <select
-              class="select"
-              :value="String(Math.round(setting.wallpaperScale * 100))"
-              @change="patch({ wallpaperScale: Number(($event.target as HTMLSelectElement).value) / 100 })"
-            >
-              <option value="100">100%</option>
-              <option value="106">106%</option>
-              <option value="115">115%</option>
-              <option value="130">130%</option>
-            </select>
-          </div>
+            <div class="row">
+              <div class="label"><b>壁纸缓存</b><span>{{ (wallCache.bytes / 1024 / 1024).toFixed(1) }} MB · {{ wallCache.files }} 个文件（≤50 张/500MB/30 天 LRU）</span></div>
+              <button class="btn sm ghost" @click="clearWallCache">清理缓存</button>
+            </div>
+          </template>
         </section>
 
         <!-- 视频与弹幕 -->
@@ -1779,7 +2030,7 @@ onBeforeUnmount(stopPoll)
             </div>
           </div>
 
-          <!-- N29/N31：自定义市场 URL 与 git 令牌 -->
+ <!-- / ：自定义市场 URL 与 git 令牌 -->
           <div class="sec-head" style="margin-top: 30px">
             <div>
               <h2>源市场</h2>
@@ -1817,7 +2068,7 @@ onBeforeUnmount(stopPoll)
               </p>
             </div>
             <div class="head-btns">
-              <button class="btn sm ghost" @click="loadMarket"><Icon name="download" :size="14" />插件市场</button>
+              <button class="btn sm ghost" @click="loadMarket(false)"><Icon name="download" :size="14" />插件市场</button>
               <button class="btn sm ghost" @click="subOpen = true"><Icon name="refresh" :size="14" />订阅源</button>
               <button class="btn primary sm" @click="pluginImportOpen = true"><Icon name="plus" :size="14" />导入插件</button>
             </div>
@@ -2128,6 +2379,20 @@ onBeforeUnmount(stopPoll)
             </div>
           </div>
         </section>
+
+ <!-- 开源壁纸大图预览浮层（≤1280px）；置于分区链之外，避免打断 v-else-if 互斥链 -->
+        <div v-if="onlinePreview" class="mask" @click.self="onlinePreview = null">
+          <div class="panel small">
+            <img :src="onlinePreview.thumb" style="width: 100%; border-radius: 10px; margin-bottom: 10px" alt="" />
+            <header class="phead">
+              <b>{{ onlinePreview.source }} · {{ onlinePreview.w }}×{{ onlinePreview.h }}</b>
+              <button class="txt" @click="onlinePreview = null">关闭</button>
+            </header>
+            <button class="btn primary wide" :disabled="onlineBusy >= 2" @click="previewDownload">
+              {{ onlineBusy >= 2 ? '下载中…' : '下载并应用为播放页背景' }}
+            </button>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -2205,11 +2470,18 @@ onBeforeUnmount(stopPoll)
     </Modal>
 
     <!-- 源市场（0.10 统一源市场：三类源 + 搜索 + kind Tab + 版本对比） -->
-    <Modal v-model="marketOpen" title="源市场" :width="620">
-      <p class="tip">统一源市场：音源 / 插件 / 视频源，一键安装与更新（N28/N30）</p>
-      <div class="market-toolbar">
-        <input v-model="marketKeyword" type="search" placeholder="搜索名称、作者、描述" style="flex: 1" />
-        <div class="imp-tabs" style="margin: 0">
+    <Modal v-model="marketOpen" title="插件与音源市场" width="min(900px, calc(100vw - 32px))" padding="16px 20px 18px">
+      <div class="market-editor">
+        <div class="market-editor-head">
+          <div>
+            <b>插件市场</b>
+            <p class="tip">浏览、搜索和管理音源、插件与视频源。主题包和开源壁纸请前往「主题市场」。</p>
+          </div>
+          <button class="btn sm ghost" :disabled="marketLoading" @click="loadMarket(true)"><Icon name="refresh" :size="14" />刷新</button>
+        </div>
+        <label class="market-search-label" for="market-search">搜索市场</label>
+        <input id="market-search" v-model="marketKeyword" class="market-search" type="search" placeholder="搜索名称、作者或描述…" />
+        <div class="imp-tabs market-tabs" role="tablist" aria-label="市场类别">
           <button
             v-for="t in KIND_TABS"
             :key="t.key"
@@ -2219,50 +2491,41 @@ onBeforeUnmount(stopPoll)
             {{ t.label }}
           </button>
         </div>
-      </div>
-      <div v-if="marketLoading" class="src-list" style="margin-top: 10px">
-        <div v-for="i in 3" :key="i" class="sk" style="height: 58px; border-radius: 10px; margin-bottom: 8px" />
-      </div>
-      <div v-else-if="marketError" class="imp-err">{{ marketError }}</div>
-      <div v-else class="src-list" style="margin-top: 10px; max-height: 46vh; overflow-y: auto">
-        <div v-for="m in marketFiltered" :key="m.url" class="src" @click="marketDetailId = marketDetailId === m.id ? '' : m.id">
-          <div class="src-main">
-            <div class="src-title">
-              <b>{{ m.name }}</b>
-              <span v-if="m.version" class="src-ver">v{{ m.version }}</span>
-              <span class="pf">{{ KIND_LABEL[m.kind] }}</span>
-              <!-- N30：可更新 badge -->
-              <span v-if="m.canUpdate" class="pf upd">可更新</span>
+        <div v-if="marketLoading" class="src-list market-results">
+          <div v-for="i in 3" :key="i" class="sk" style="height: 58px; border-radius: 10px; margin-bottom: 8px" />
+        </div>
+        <div v-else-if="marketError" class="imp-err market-results">{{ marketError }}</div>
+        <div v-else class="src-list market-results">
+          <div v-for="m in marketFiltered" :key="m.url" class="src" @click="marketDetailId = marketDetailId === m.id ? '' : m.id">
+            <div class="src-main">
+              <div class="src-title">
+                <b>{{ m.name }}</b>
+                <span v-if="m.version" class="src-ver">v{{ m.version }}</span>
+                <span class="pf">{{ KIND_LABEL[m.kind] }}</span>
+                <span v-if="m.canUpdate" class="pf upd">可更新</span>
+              </div>
+              <div v-if="m.author || m.description" class="src-plat">
+                <span v-if="m.author">{{ m.author }}</span>
+                <span v-if="m.description">· {{ m.description }}</span>
+              </div>
+              <div v-if="marketDetailId === m.id" class="src-detail">
+                <p v-if="m.changelog">更新说明：{{ m.changelog }}</p>
+                <p v-if="m.compat">最低应用版本：{{ m.compat }}</p>
+                <p v-if="m.commitSha">版本：{{ m.commitSha.slice(0, 8) }}</p>
+                <p class="src-url">{{ m.url }}</p>
+              </div>
             </div>
-            <div v-if="m.author || m.description" class="src-plat">
-              <span v-if="m.author">{{ m.author }}</span>
-              <span v-if="m.description">· {{ m.description }}</span>
+            <div class="src-actions">
+              <button class="btn sm" :disabled="marketUpdating === m.url || (!!m.installed && !m.canUpdate)" @click.stop="installFromMarket(m)">
+                {{ marketUpdating === m.url ? '处理中…' : m.installed ? (m.canUpdate ? '更新' : '已安装') : '安装' }}
+              </button>
+              <button v-if="m.installed" class="btn sm ghost" :disabled="marketUpdating === m.url" @click.stop="uninstallFromMarket(m)">卸载</button>
             </div>
-            <!-- F-29：条目详情（changelog / 最低版本 / commit） -->
-            <div v-if="marketDetailId === m.id" class="src-detail">
-              <p v-if="m.changelog">更新说明：{{ m.changelog }}</p>
-              <p v-if="m.compat">最低应用版本：{{ m.compat }}</p>
-              <p v-if="m.commitSha">版本：{{ m.commitSha.slice(0, 8) }}</p>
-              <p class="src-url">{{ m.url }}</p>
-            </div>
-          </div>
-          <div class="src-actions">
-            <button
-              class="btn sm"
-              :disabled="marketUpdating === m.url"
-              @click.stop="installFromMarket(m)"
-            >
-              {{ marketUpdating === m.url ? '处理中…' : m.installed ? (m.canUpdate ? '更新' : '已安装') : '安装' }}
-            </button>
-            <button v-if="m.installed" class="btn sm ghost" :disabled="marketUpdating === m.url" @click.stop="uninstallFromMarket(m)">
-              卸载
-            </button>
           </div>
         </div>
       </div>
       <template #footer>
         <button class="btn ghost" @click="marketOpen = false">关闭</button>
-        <button class="btn sm ghost" :disabled="marketLoading" @click="loadMarket"><Icon name="refresh" :size="14" />刷新</button>
       </template>
     </Modal>
 
@@ -2577,105 +2840,7 @@ h1 {
   line-height: 1.6;
 }
 
-/* ---------------- 壁纸库 ---------------- */
-.wall-head {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  padding: 18px 2px 10px;
-}
-.wall-head b {
-  font-size: 14px;
-}
-.wall-head span {
-  font-size: 12px;
-  color: var(--text-3);
-}
-.wall-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(148px, 1fr));
-  gap: 10px;
-  margin-bottom: 8px;
-}
-.wall-item {
-  position: relative;
-  padding: 0;
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  overflow: hidden;
-  background: var(--panel);
-  cursor: pointer;
-  aspect-ratio: 16 / 10;
-  transition: border-color 0.2s, transform 0.2s;
-}
-.wall-item:hover {
-  border-color: var(--line-2);
-  transform: translateY(-1px);
-}
-.wall-item.on {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 1px var(--accent) inset;
-}
-.wall-item img {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  display: block;
-}
-.wall-name {
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  padding: 14px 8px 6px;
-  font-size: 11.5px;
-  color: #fff;
-  text-align: left;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  background: linear-gradient(180deg, transparent, rgba(0, 0, 0, 0.68));
-}
-.wall-del {
-  position: absolute;
-  top: 6px;
-  right: 6px;
-  width: 24px;
-  height: 24px;
-  display: grid;
-  place-items: center;
-  border-radius: 8px;
-  background: rgba(0, 0, 0, 0.5);
-  color: #fff;
-  opacity: 0;
-  transition: opacity 0.18s;
-}
-.wall-item:hover .wall-del {
-  opacity: 1;
-}
-.wall-add {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 6px;
-  aspect-ratio: 16 / 10;
-  border: 1px dashed var(--line-2);
-  border-radius: 12px;
-  background: transparent;
-  color: var(--text-3);
-  font-size: 12px;
-  cursor: pointer;
-  transition: color 0.2s, border-color 0.2s;
-}
-.wall-add:hover:not(:disabled) {
-  color: var(--accent);
-  border-color: var(--accent);
-}
-.wall-add:disabled {
-  opacity: 0.6;
-  cursor: default;
-}
+/* ---------------- 恢复被误删的公共样式（壁纸样式已按 移除） ---------------- */
 .textarea {
   width: 100%;
   padding: 10px 12px;
@@ -2811,13 +2976,6 @@ h1 {
 .hidden-file {
   display: none;
 }
-.wall-thumb {
-  width: 64px;
-  height: 40px;
-  object-fit: cover;
-  border-radius: 8px;
-  border: 1px solid var(--line-2);
-}
 .row-slider {
   width: 200px;
 }
@@ -2940,12 +3098,40 @@ h1 {
   gap: 8px;
   flex-wrap: wrap;
 }
-.market-toolbar {
+.market-editor {
+  display: flex;
+  flex-direction: column;
+  min-height: 420px;
+  max-height: min(72vh, 760px);
+}
+.market-editor-head {
   display: flex;
   align-items: center;
-  gap: 10px;
-  margin-top: 10px;
+  justify-content: space-between;
+  gap: 16px;
+  flex: none;
+  margin-bottom: 16px;
 }
+.market-editor-head > div { min-width: 0; }
+.market-editor-head b { font-size: 18px; }
+.market-editor-head .tip { margin: 6px 0 0; }
+.market-search-label {
+  margin-bottom: 7px;
+  color: var(--text-2);
+  font-size: 12px;
+}
+.market-search {
+  flex: none;
+  width: 100%;
+  height: 46px;
+  padding: 0 14px;
+  border: 1px solid var(--line-2);
+  border-radius: 10px;
+  background: var(--panel);
+  color: var(--text);
+  font-size: 15px;
+}
+.market-search:focus { border-color: var(--accent); outline: none; }
 .src-detail {
   margin-top: 8px;
   padding: 8px 10px;
@@ -2970,10 +3156,18 @@ h1 {
   gap: 6px;
   margin: 6px 0;
 }
+.market-tabs {
+  flex: none;
+  margin: 12px 0 10px;
+  padding: 5px;
+  border-radius: 10px;
+  background: var(--panel-2);
+}
 .imp-tabs button {
   flex: 1;
-  padding: 6px 0;
-  font-size: 12px;
+  min-height: 38px;
+  padding: 8px 16px;
+  font-size: 14px;
   border-radius: 8px;
   border: 1px solid var(--line-2);
   background: transparent;
@@ -2983,6 +3177,15 @@ h1 {
 .imp-tabs button.on {
   border-color: var(--accent);
   color: var(--accent);
+}
+.market-results {
+  flex: 1;
+  min-height: 160px;
+  max-height: none;
+  margin-top: 0 !important;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
 }
 .field {
   margin: 8px 0;
@@ -3276,5 +3479,193 @@ kbd {
   color: var(--text-3);
   text-align: center;
   line-height: 1.6;
+}
+
+/* ---------------- 主题与壁纸（4.7+） ---------------- */
+.theme-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(104px, 1fr));
+  gap: 8px;
+}
+.theme-chip {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 6px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: transparent;
+  color: var(--text-2);
+  cursor: pointer;
+}
+.theme-chip.on {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: rgba(167, 139, 250, 0.08);
+}
+.tc {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+}
+.tc.sm {
+  width: 26px;
+  height: 26px;
+  flex: none;
+}
+.tn {
+  font-size: 12px;
+}
+.swatches {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.sw {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  border: 2px solid transparent;
+  cursor: pointer;
+}
+.sw.on {
+  border-color: #fff;
+  box-shadow: 0 0 0 2px var(--accent);
+}
+.hue-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 10px;
+}
+.hue-slider {
+  flex: 1;
+  max-width: 320px;
+  height: 10px;
+  appearance: none;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #f87171, #fbbf24, #34d399, #22d3ee, #a78bfa, #f472b6, #f87171);
+}
+.hue-slider::-webkit-slider-thumb {
+  appearance: none;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #fff;
+  border: 2px solid #0b0b10;
+  cursor: pointer;
+}
+.hue-val {
+  font-size: 12px;
+  color: var(--text-3);
+  min-width: 34px;
+}
+.theme-pkgs {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.pkg-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+}
+.pkg-meta {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.pkg-meta b {
+  font-size: 13px;
+}
+.pkg-meta span {
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+.pkg-acts {
+  display: flex;
+  gap: 6px;
+}
+.wall-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(148px, 1fr));
+  gap: 10px;
+}
+.wall-item {
+  position: relative;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow: hidden;
+  background: var(--panel);
+  cursor: pointer;
+  aspect-ratio: 16 / 10;
+}
+.wall-item.on {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent) inset;
+}
+.wall-item img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.wall-name {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 14px 8px 6px;
+  font-size: 11.5px;
+  color: #fff;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  background: linear-gradient(180deg, transparent, rgba(0, 0, 0, 0.68));
+}
+.wall-del {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 24px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.5);
+  color: #fff;
+  opacity: 0;
+  transition: opacity 0.18s;
+}
+.wall-item:hover .wall-del {
+  opacity: 1;
+}
+.lm-row {
+  display: flex;
+  justify-content: center;
+  padding-top: 6px;
+}
+
+</style>
+
+<style scoped>
+.mk-theme-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: default;
+}
+.mk-theme-acts {
+  margin-left: auto;
+  display: flex;
+  gap: 6px;
 }
 </style>

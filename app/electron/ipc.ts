@@ -30,6 +30,8 @@ import { buildHomeFeed, invalidateFeed } from './core/recommend'
 import { buildRadio, invalidateRadio } from './core/radio'
 import { player } from './core/player-service'
 import { listWallpapers, saveWallpaper, removeWallpaper, renameWallpaper, importWallpaperFromPath } from './core/wallpaper'
+import { listThemes, importThemeContent, applyTheme, removeTheme, getActiveTheme } from './core/theme-host'
+import { listOnlineWallpapers, downloadOnlineWallpaper, wallpaperCacheSize, clearWallpaperCache } from './core/wallpaper-online'
 import { getDanmaku } from './core/danmaku'
 import { testConnection, uploadBackup } from './core/webdav'
 import {
@@ -47,7 +49,7 @@ import {
 } from './core/download'
 import { getSettings, saveSettings } from './core/settings'
 import { downloadDesktopUpdate, relaunchWithUpdate } from './core/updater'
-import { applyTitleBarTheme, broadcast, sendToMain, setLyricLock, showLyricWindow, showTaskbarLyric, wins } from './windows'
+import { applyTitleBarTheme, broadcast, sendToMain, setLyricLock, showLyricWindow, showTaskbarLyric, wins, createMiniWindow, expandMiniWindow, closeMiniWindow } from './windows'
 import {
   addHistory,
   addSongsToPlaylist,
@@ -71,7 +73,7 @@ import {
   toggleFavorite,
   updatePlaylist,
 } from './core/db'
-import { biliLogout, biliQrGenerate, biliQrPoll, biliStatus, biliCookieLogin, biliPasswordLogin } from './core/bili'
+import { biliLogout, biliQrGenerate, biliQrPoll, biliStatus, biliCookieLogin, biliPasswordLogin, biliLike } from './core/bili'
 import { cancelScan, getScanProgress, scanLibrary } from './core/library'
 import { coverCacheSize, clearCoverCache, coverProtocolUrl } from './core/cover'
 import { downloadMediaTo, releaseMediaCache, saveOfflineVideo, listOfflineVideos, removeOfflineVideos, offlineVideoFile, offlineKeyOf } from './core/media'
@@ -273,11 +275,12 @@ const handlers: Record<string, Handler> = {
   },
   'sources:platforms': () => lxHost.platformList(),
   'sources:toggle': ({ file, enabled }: { file: string; enabled: boolean }) => {
-    lxHost.setEnabled(file, enabled)
+    // 启用时走重新初始化（落雪式状态机）；失败会回滚为停用并带回原因
+    const r = lxHost.setEnabled(file, enabled)
     dbSetSetting('sources.disabled', lxHost.getDisabledList())
     dbSetSetting('sources.enabled', lxHost.getUserEnabledList())
     broadcast('sources:changed', lxHost.list())
-    return lxHost.list()
+    return { sources: lxHost.list(), ok: r.ok, message: r.message }
   },
   'sources:import': async ({ url, content, file }: { url?: string; content?: string; file?: string }) => {
     const r = await lxHost.importSource({ url, content, file })
@@ -295,7 +298,7 @@ const handlers: Record<string, Handler> = {
   'sources:restore': () => {
     lxHost.restoreBuiltin()
     dbSetSetting('sources.deleted', [])
-    // F-25：恢复内置只清 deleted，用户 disabled 保留
+ //恢复内置只清 deleted，用户 disabled 保留
     dbSetSetting('sources.disabled', lxHost.getDisabledList())
     broadcast('sources:changed', lxHost.list())
     return lxHost.list()
@@ -307,7 +310,7 @@ const handlers: Record<string, Handler> = {
   'plugins:toggle': ({ file, enabled }: { file: string; enabled: boolean }) => mfHost.togglePlugin(file, enabled),
   'plugins:delete': ({ file }: { file: string }) => mfHost.deletePlugin(file),
   'plugins:import': async ({ url, content, file, origin }: { url?: string; content?: string; file?: string; origin?: string }) => {
-    // Bug 121：桌面补传 origin（市场/订阅来源标签此前被丢弃）
+ //桌面补传 origin（市场/订阅来源标签此前被丢弃）
     if (url) return await mfHost.importFromUrl(url, file)
     if (content) return mfHost.importFromContent(content, (origin as any) || 'local', undefined, file)
     throw new Error('请提供插件链接或内容')
@@ -317,25 +320,27 @@ const handlers: Record<string, Handler> = {
   'plugins:subs:list': () => mfHost.listSubscriptions(),
   'plugins:subs:remove': ({ url, uninstall }: { url: string; uninstall?: boolean }) =>
     mfHost.removeSubscription(url, !!uninstall),
-  /* C-25：订阅立即刷新 */
+ /*订阅立即刷新 */
   'plugins:subs:refresh': async ({ url, name }: { url: string; name?: string }) =>
     await mfHost.importSubscription(url, name),
-  /* Bug 127：回滚到上一版 */
+ /*回滚到上一版 */
   'plugins:rollback': ({ file }: { file: string }) => mfHost.rollbackPlugin(file),
   'plugins:market': async ({ url }: { url: string }) => await mfHost.fetchMarket(url),
   'plugins:search': async ({ file, query, page, type }: any) => await mfHost.search(file, query, page || 1, type || 'music'),
   'plugins:lyric': async ({ file, musicItem }: any) => await mfHost.getLyric(file, musicItem),
   'plugins:url': async ({ file, musicItem, quality }: any) => await mfHost.getMusicUrl(file, musicItem, quality || 'standard'),
 
-  /* ---------------- 统一源市场（规格书 0.10 / C-26 门面 IPC） ---------------- */
-  'market:list': async ({ url }: { url: string }) => await marketHost.listMarket(url),
+ /* ---------------- 统一源市场 ---------------- */
+  'market:list': async ({ url, force }: { url: string; force?: boolean }) => await marketHost.listMarket(url, !!force),
+  /** 在线主题库（独立分支 Star-Wish-Theme-Library；未上架返回空态） */
+  'market:themes': async ({ url, force }: { url?: string; force?: boolean }) => await marketHost.listThemeMarket(String(url || ''), !!force),
   'market:channels': () => marketHost.channels(),
   'market:install': async ({ item }: { item: any }) => await marketHost.installItem(item),
   'market:update': async ({ item }: { item: any }) => await marketHost.updateItem(item),
   'market:uninstall': async ({ item }: { item: any }) => await marketHost.uninstallItem(item),
   'market:detail': ({ item }: { item: any }) => item,
 
-  /* ---------------- 局域网同步（规格书 4.8） ---------------- */
+ /* ---------------- 局域网同步 ---------------- */
   'lan:info': () => lanSyncInfo(),
   'lan:start': async () => await startLanSync(),
   'lan:stop': () => {
@@ -345,7 +350,7 @@ const handlers: Record<string, Handler> = {
 
   /* ---------------- 音乐数据 ---------------- */
   'music:search': async ({ keyword, page, platform }: any) => decList(await searchAll(keyword, page || 1, { platform })),
-  /* 规格 3.7 / Bug 17：搜索页歌单 Tab */
+ /* 规格 3.7 / ：搜索页歌单 Tab */
   'music:searchPlaylists': async ({ keyword, page }: any) => await searchPlaylistList(keyword, page || 1),
   'music:url': async ({ song, quality }: { song: Song; quality: string }) => {
     const { resolveUrl } = await import('./core/music-service')
@@ -380,7 +385,7 @@ const handlers: Record<string, Handler> = {
     const r = await importPlaylist(input, platform)
     return { ...r, songs: decList(r.songs) }
   },
-  /* MV 多音源（规格书 2.17 / 3.10）：source 决定平台，bvid 仍作 B 站兼容参数 */
+ /* MV 多音源 ：source 决定平台，bvid 仍作 B 站兼容参数 */
   'music:mv': async ({ keyword, page, source }: any) => {
     const list = await searchMv(keyword || '音乐', page || 1, source || 'bili')
     return list.map(v => ({ ...v, pic: v.pic && /^https?:\/\//i.test(v.pic) ? coverProtocolUrl(v.pic) : v.pic }))
@@ -471,7 +476,7 @@ const handlers: Record<string, Handler> = {
     saveSettings({ quality })
     return decState(player.getState())
   },
-  // 音效与频谱（规格书 v2.7 · 1.11 / 1.6）
+ // 音效与频谱
   'player:eq': ({ bands }: any) => {
     player.setEq(Array.isArray(bands) ? bands : [])
     return true
@@ -599,7 +604,7 @@ const handlers: Record<string, Handler> = {
     fs.writeFileSync(file, buf)
     return { file, size: buf.length }
   },
-  /* 规格 2.12 / Bug 8：音频提取保存 MP3（lamejs 转码 + 进度 + 可取消） */
+ /* 规格 2.12 / ：音频提取保存 MP3（lamejs 转码 + 进度 + 可取消） */
   'audio:extract': async ({ url, title }: { url: string; title?: string }) => {
     if (!url) throw new Error('缺少音频地址')
     const id = `ex_${Date.now().toString(36)}`
@@ -636,9 +641,9 @@ const handlers: Record<string, Handler> = {
     if (ac) ac.abort()
     return cancelExtract(id)
   },
-  /* 规格书 v2.8 · 1.12：播放缓存信息（音频 50 首 / 500MB，视频 1GB） */
+ /*播放缓存信息（音频 50 首 / 500MB，视频 1GB） */
   'cache:info': () => playbackCacheInfo(),
-  /* 规格书 v2.8 · 1.12：清除播放缓存（scope: cover | media | all，不删除已下载文件） */
+ /*清除播放缓存（scope: cover | media | all，不删除已下载文件） */
   'cache:clear': ({ scope = 'all' }: { scope?: 'cover' | 'media' | 'all' } = {}) => {
     if (scope === 'all' || scope === 'cover') clearCoverCache()
     if (scope === 'all' || scope === 'media') clearPlaybackCache()
@@ -657,7 +662,7 @@ const handlers: Record<string, Handler> = {
   'video:offline:list': () => listOfflineVideos(),
   /* 视频：离线缓存 —— 删除单个（传 key）或清空全部（不传） */
   'video:offline:remove': ({ key, bvid, cid }: { key?: string; bvid?: string; cid?: string }) => {
-    // Bug 109/T-01：统一契约 —— 传 manifest 键或 bvid+cid 均可；两者都缺时视为「清空全部」
+ // /T-01：统一契约 —— 传 manifest 键或 bvid+cid 均可；两者都缺时视为「清空全部」
     const k = key || (bvid && cid ? offlineKeyOf(bvid, cid) : undefined)
     return removeOfflineVideos(k)
   },
@@ -698,10 +703,11 @@ const handlers: Record<string, Handler> = {
   'bili:logout': () => biliLogout(),
   'bili:cookieLogin': ({ cookie }: any) => biliCookieLogin(String(cookie || '')),
   'bili:passwordLogin': ({ username, password }: any) => biliPasswordLogin(String(username || ''), String(password || '')),
+  'bili:like': ({ bvid, like }: any) => biliLike(String(bvid || ''), !!like),
 
   /* ---------------- 窗口 ---------------- */
   'win:minimize': () => {
-    // Bug 34：开启「最小化到托盘」时隐藏窗口而非任务栏最小化
+ //开启「最小化到托盘」时隐藏窗口而非任务栏最小化
     if (getSettings().minimizeToTray) wins.main?.hide()
     else wins.main?.minimize()
     return true
@@ -718,6 +724,19 @@ const handlers: Record<string, Handler> = {
     return true
   },
   'win:state': () => ({ maximized: !!wins.main?.isMaximized() }),
+ /*MINI 模式悬浮窗（贴边 5s 缩边条 / hover 呼出） */
+  'win:mini': () => {
+    createMiniWindow()
+    return true
+  },
+  'mini:expand': () => {
+    expandMiniWindow()
+    return true
+  },
+  'mini:close': () => {
+    closeMiniWindow()
+    return true
+  },
   'lyric:visible': ({ visible }: any) => {
     showLyricWindow(!!visible)
     return true
@@ -753,6 +772,48 @@ const handlers: Record<string, Handler> = {
     if (r.canceled || !r.filePaths[0]) return ''
     return r.filePaths[0]
   },
+ /* ---------------- 主题自定义体系（4.7+ · /C-34/ /F-42） ---------------- */
+  'theme:list': () => ({ themes: listThemes(), active: getActiveTheme().id }),
+  'theme:import': ({ content, url, origin }: any) => {
+    let text = String(content || '')
+    // URL 导入：多镜像回退（与音源/插件一致）
+    if (!text && url) {
+      return (async () => {
+        const { request } = await import('./core/http')
+        const { mirrorCandidates } = await import('./core/market-host')
+        const cands = [String(url), ...(mirrorCandidates(String(url)))]
+        let lastErr: Error | null = null
+        for (const u of cands) {
+          try {
+            const res = await request(u, { timeout: 20000 })
+            if (res.status === 200 && res.raw) {
+              return { theme: importThemeContent(res.raw, 'url').theme, dropped: [] }
+            }
+            lastErr = new Error(`HTTP ${res.status}`)
+          } catch (e: any) {
+            lastErr = e
+          }
+        }
+        throw new Error(`主题包下载失败：${lastErr?.message || '网络错误'}`)
+      })()
+    }
+    const r = importThemeContent(text, origin === 'market' ? 'market' : 'local')
+    return { theme: r.theme, dropped: r.dropped }
+  },
+  'theme:apply': ({ id }: { id: string }) => applyTheme(String(id || 'default')),
+  'theme:remove': ({ id }: { id: string }) => removeTheme(String(id)),
+
+ /* ---------------- 开源壁纸在线（4.7+ ②） ---------------- */
+  'wallpaper:online:list': ({ page, q, refresh }: any) => listOnlineWallpapers({ page, q, refresh }),
+  'wallpaper:online:download': async ({ url }: { url: string }) => {
+    // 下载原图 → 导入本地壁纸库（使用即 playerBg=wallpaper + wallpaperId）
+    const { file } = await downloadOnlineWallpaper(String(url || ''))
+    const item = importWallpaperFromPath(file, '')
+    return item
+  },
+  'wallpaper:cache:size': () => wallpaperCacheSize(),
+  'wallpaper:cache:clear': () => clearWallpaperCache(),
+
   'wallpaper:pick': async () => {
     const r = await dialog.showOpenDialog(wins.main!, {
       title: '选择播放页壁纸',
@@ -866,7 +927,7 @@ const handlers: Record<string, Handler> = {
       } catch {
         /* 音源目录缺失时忽略 */
       }
-      // N27：迁移清单补 plugins 目录与 plugins-registry.json
+ //迁移清单补 plugins 目录与 plugins-registry.json
       try {
         fs.cpSync(path.join(oldDir, 'plugins'), path.join(target, 'plugins'), { recursive: true })
       } catch {
@@ -951,10 +1012,10 @@ export function markBootReady(): void {
 }
 
 /** 启动就绪信号（供其它模块 await） */
-/** 音频提取任务的中止器（Bug 8：进度反馈 + 可取消） */
+/** 音频提取任务的中止器（进度反馈 + 可取消） */
 const extractAborts = new Map<string, AbortController>()
 
-/* F-17：音源调试日志（logs/sources/<源名>.log），开关 settings.sourceDebug */
+/*音源调试日志（logs/sources/<源名>.log），开关 settings.sourceDebug */
 let debugLoggerCache: { on: boolean; dir: string } | null = null
 function wireSourceDebug(): void {
   const on = !!getSettings().sourceDebug
@@ -984,7 +1045,7 @@ export function whenBootReady(): Promise<void> {
 export function registerIpc(): void {
   restoreDownloads()
   sweepOrphanParts()
-  // C-25：订阅 >24h 自动补拉（后台进行，不阻塞启动）
+ //订阅 >24h 自动补拉（后台进行，不阻塞启动）
   void mfHost.refreshSubscriptionsIfStale().catch(() => undefined)
   setDownloadEmitter(t => broadcast('download:progress', t))
   ipcMain.handle('sw:invoke', async (event, channel: string, payload: any) => {

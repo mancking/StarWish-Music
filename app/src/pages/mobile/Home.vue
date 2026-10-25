@@ -1,16 +1,18 @@
 <script setup lang="ts">
-import { computed, defineOptions, onMounted, ref } from 'vue'
+import { computed, defineOptions, onBeforeUnmount, onMounted, ref } from 'vue'
+import NebulaBg from '@/components/NebulaBg.vue'
 import { useRouter } from 'vue-router'
 import Icon from '@/components/Icon.vue'
 import Cover from '@/components/Cover.vue'
 import { call } from '@/api'
 import brandIcon from '@/assets/brand-icon.png'
 import { usePlayerStore } from '@/stores/player'
+import { onPullRefresh, refreshDone } from '@/mobile/pull-refresh'
 import { useUiStore } from '@/stores/ui'
 import type { Song } from '@shared/types'
 
 /**
- * 移动端推荐页 —— 模板级重写（v2.3.4）。
+ * 移动端推荐页 —— 模板级重写（v1.0.0）。
  *
  * 重写要点（对齐市面移动音乐 App 的「推荐」页信息架构）：
  *  ① 顶部只有问候 + 搜索，不再堆快捷入口（与底栏重复）
@@ -129,6 +131,13 @@ function openToplist(card: any): void {
   router.push(`/toplist/${card.platform}/${card.id}`)
 }
 
+/* 下拉刷新：重拉本页数据，保留路由与滚动位置 */
+const offPull = onPullRefresh(async () => {
+  await load(true)
+  refreshDone()
+})
+onBeforeUnmount(() => offPull())
+
 onMounted(() => {
   void load()
   void loadRadio()
@@ -156,8 +165,15 @@ defineExpose({ refresh: () => load(true) })
     </div>
 
     <template v-else>
-      <!-- 问候头 + 搜索框 -->
-      <header class="m-head">
+ <!-- 顶部卡片：深色星云 + 品牌 / 问候 / 搜索（与桌面端 hero 同构，
+           星云只存在于这张卡片内，卡片外的一切跟随主题，不再整页铺背景 -->
+      <header class="m-head m-hero">
+        <NebulaBg compact />
+        <div class="m-hero-inner">
+        <div class="m-brand-top" aria-label="星河音乐">
+          <img class="m-brand-top-logo" :src="brandIcon" alt="星河音乐" draggable="false" />
+          <span class="m-brand-top-name">星河音乐</span>
+        </div>
         <div class="m-kicker">{{ dateText }}</div>
         <h1 class="m-greet">{{ greeting }}，欢迎回来</h1>
         <div class="m-search">
@@ -170,6 +186,7 @@ defineExpose({ refresh: () => load(true) })
             @keydown.enter="submitSearch"
           />
           <button class="m-search-go" @click="submitSearch">搜索</button>
+        </div>
         </div>
       </header>
 
@@ -314,15 +331,6 @@ defineExpose({ refresh: () => load(true) })
         </div>
       </section>
     </template>
-
-    <!-- 星河 Logo 背景卡片（规格书 3.1：页面底部、底部 Tab 上方，Logo 右对齐、半透明、融合渐变） -->
-    <section class="m-brand" aria-hidden="true">
-      <div class="m-brand-text">
-        <b>星河音乐</b>
-        <span>StarWish Music · 全端同步的私人曲库</span>
-      </div>
-      <img class="m-brand-logo" :src="brandIcon" alt="" draggable="false" />
-    </section>
   </div>
 </template>
 
@@ -330,53 +338,48 @@ defineExpose({ refresh: () => load(true) })
 .m-home {
   padding-bottom: 36px;
 }
-/* 星河 Logo 背景卡片：页面底部、底部 Tab 上方，Logo 右对齐、半透明、融合渐变 */
-.m-brand {
+/* 顶部卡片：深色星云固定视觉，卡片内语义色锁定为浅色，
+   卡片外（各内容区）继续跟随主题 —— 修掉「浅色主题下首页文字全隐形」的根因 */
+.m-head.m-hero {
   position: relative;
+  overflow: hidden;
+  margin: 4px 0 20px;
+  padding: 16px 14px 14px;
+  border-radius: 20px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  box-shadow: 0 18px 40px -24px rgba(20, 12, 50, 0.9);
+  --text: #eef1f8;
+  --text-2: rgba(255, 255, 255, 0.72);
+  --text-3: rgba(255, 255, 255, 0.52);
+  --bg-2: rgba(255, 255, 255, 0.09);
+  --bg-3: rgba(255, 255, 255, 0.13);
+  --line: rgba(255, 255, 255, 0.16);
+  --line-2: rgba(255, 255, 255, 0.24);
+  --panel: rgba(255, 255, 255, 0.07);
+  --hover: rgba(255, 255, 255, 0.1);
+}
+.m-hero-inner {
+  position: relative;
+  z-index: 1;
+}
+/* 顶部品牌行（用户指令：logo 置顶） */
+.m-brand-top {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  margin: 18px 0 4px;
-  padding: 16px 18px;
-  border-radius: 18px;
-  overflow: hidden;
-  pointer-events: none;
-  background: linear-gradient(
-    135deg,
-    rgba(167, 139, 250, 0.16),
-    rgba(244, 114, 182, 0.1) 55%,
-    rgba(11, 11, 16, 0) 100%
-  );
-  border: 1px solid rgba(255, 255, 255, 0.05);
+  gap: 8px;
+  margin-bottom: 8px;
 }
-.m-brand-text {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
+.m-brand-top-logo {
+  width: 26px;
+  height: 26px;
+  border-radius: 8px;
+  box-shadow: 0 6px 16px -8px rgba(0, 0, 0, 0.6);
 }
-.m-brand-text b {
-  font-size: 14px;
+.m-brand-top-name {
+  font-size: 13.5px;
   font-weight: 700;
-  letter-spacing: 0.4px;
+  letter-spacing: 0.5px;
   color: var(--text);
-  opacity: 0.72;
-}
-.m-brand-text span {
-  font-size: 11px;
-  color: var(--text-3);
-  opacity: 0.8;
-}
-.m-brand-logo {
-  width: 54px;
-  height: 54px;
-  border-radius: 14px;
-  opacity: 0.38;
-  flex: 0 0 auto;
-}
-/* 问候头 */
-.m-head {
-  padding: 10px 2px 4px;
 }
 .m-kicker {
   font-size: 12px;
@@ -389,6 +392,7 @@ defineExpose({ refresh: () => load(true) })
   font-weight: 800;
   letter-spacing: 0.3px;
   color: var(--text);
+  text-shadow: 0 2px 14px rgba(9, 7, 26, 0.55);
   white-space: nowrap;
   overflow: visible;
 }
@@ -676,3 +680,10 @@ defineExpose({ refresh: () => load(true) })
   filter: brightness(1.2);
 }
 </style>
+/*星云背景层在内容之下 */
+/* 卡片内的星云铺满卡片，不拦截点击 */
+.m-hero :deep(.nebula) {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+}

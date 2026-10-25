@@ -13,7 +13,9 @@ export const wins: {
   audio: BrowserWindow | null
   lyric: BrowserWindow | null
   taskbar: BrowserWindow | null
-} = { main: null, audio: null, lyric: null, taskbar: null }
+ /**MINI 模式悬浮窗（贴边 5s 自动缩边条 / hover 呼出） */
+  mini: BrowserWindow | null
+} = { main: null, audio: null, lyric: null, taskbar: null, mini: null }
 
 const isDev = !!process.env.VITE_DEV_SERVER_URL
 const DEV_URL = process.env.VITE_DEV_SERVER_URL || ''
@@ -229,7 +231,7 @@ export function createAudioHost(): BrowserWindow {
 }
 
 /**
- * 桌面歌词悬浮窗的几何常量（规格书 1.8）：固定 400×60，底部居中。
+ * 桌面歌词悬浮窗的几何常量 ：固定 400×60，底部居中。
  * 位置在拖动后写入 userData/lyric-win.json，下次启动复原。
  */
 const LYRIC_WIN = { width: 400, height: 60, margin: 90 }
@@ -276,7 +278,7 @@ export function createLyricWindow(): BrowserWindow {
     show: false,
     frame: false,
     // Windows 上透明无边框窗口默认带 WS_THICKFRAME，系统会把最小高度卡到 63px，
-    // 关掉 thickFrame 才能拿到规格书 1.8 要求的 400×60 精确尺寸。
+ // 关掉 thickFrame 才能拿到。
     thickFrame: false,
     transparent: true,
     resizable: false,
@@ -298,9 +300,9 @@ export function createLyricWindow(): BrowserWindow {
   })
   win.setAlwaysOnTop(true, 'screen-saver')
   // Windows 会在创建时把透明窗口高度向上取整（请求 60 实际得到 63/64），
-  // 创建后显式 setBounds 才能精确落在规格书 1.8 的 400×60。
+ // 创建后显式 setBounds 才能精确落在。
   win.setBounds({ width, height })
-  // 拖动后记住位置（规格书 1.8「位置写入本地存储」），但坐标要落在可见区域内
+ // 拖动后记住位置，但坐标要落在可见区域内
   win.on('moved', () => {
     if (win.isDestroyed()) return
     const [x, y] = win.getPosition()
@@ -403,7 +405,7 @@ export function applyTitleBarTheme(dark: boolean): void {
 }
 
 export function broadcast(channel: string, payload: any): void {
-  for (const key of ['main', 'lyric', 'taskbar'] as const) {
+  for (const key of ['main', 'lyric', 'taskbar', 'mini'] as const) {
     const w = wins[key]
     if (w && !w.isDestroyed()) {
       try {
@@ -424,4 +426,83 @@ export function sendToMain(channel: string, payload: any): void {
       /* ignore */
     }
   }
+}
+
+/**
+ * （3.14 桌面 MINI 模式）：贴边常驻迷你悬浮窗。
+ * 展开态 360×64；贴边 5s 无操作自动缩为高 28px 边条，鼠标悬停 300ms 呼出。
+ */
+const MINI_WIN = { w: 360, h: 64, stripH: 28 }
+let miniIdleTimer: ReturnType<typeof setTimeout> | null = null
+
+function armMiniIdle(): void {
+  const win = wins.mini
+  if (!win || win.isDestroyed()) return
+  if (miniIdleTimer) clearTimeout(miniIdleTimer)
+  miniIdleTimer = setTimeout(() => {
+    const w = wins.mini
+    if (!w || w.isDestroyed()) return
+    const [x, y] = w.getPosition()
+ // 贴近屏幕左右边缘才缩为边条（「贴边自动隐藏」）
+    const wa = screen.getPrimaryDisplay().workArea
+    const nearEdge = x <= wa.x + 8 || x + w.getBounds().width >= wa.x + wa.width - 8
+    if (nearEdge) w.setBounds({ x, y, width: MINI_WIN.w, height: MINI_WIN.stripH })
+  }, 5000)
+}
+
+export function createMiniWindow(): BrowserWindow {
+  if (wins.mini && !wins.mini.isDestroyed()) return wins.mini
+  const display = screen.getPrimaryDisplay()
+  const x = display.workArea.x + 48
+  const y = display.workArea.y + display.workArea.height - MINI_WIN.h - 56
+  const win = new BrowserWindow({
+    width: MINI_WIN.w,
+    height: MINI_WIN.h,
+    x,
+    y,
+    show: false,
+    frame: false,
+    thickFrame: false,
+    resizable: false,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    skipTaskbar: true,
+    alwaysOnTop: true,
+    backgroundColor: '#0b0b10',
+    webPreferences: {
+      preload: preloadPath('preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: false,
+      backgroundThrottling: false,
+    },
+  })
+  win.setAlwaysOnTop(true, 'floating')
+  win.on('moved', armMiniIdle)
+  win.on('closed', () => {
+    wins.mini = null
+    if (miniIdleTimer) clearTimeout(miniIdleTimer)
+  })
+  if (isDev) win.loadURL(`${DEV_URL}#/mini`)
+  else win.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'), { hash: '/mini' })
+  win.once('ready-to-show', () => {
+    win.showInactive()
+    armMiniIdle()
+  })
+  wins.mini = win
+  return win
+}
+
+/** 呼出（renderer hover 300ms 后调用）：恢复展开态并重置 5s 贴边计时 */
+export function expandMiniWindow(): void {
+  const win = wins.mini
+  if (!win || win.isDestroyed()) return
+  const b = win.getBounds()
+  if (b.height < MINI_WIN.h) win.setBounds({ x: b.x, y: b.y, width: MINI_WIN.w, height: MINI_WIN.h })
+  armMiniIdle()
+}
+
+export function closeMiniWindow(): void {
+  if (wins.mini && !wins.mini.isDestroyed()) wins.mini.close()
 }

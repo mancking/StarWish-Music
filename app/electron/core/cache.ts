@@ -4,7 +4,7 @@ import crypto from 'node:crypto'
 import { mediaCacheDir } from './paths'
 
 /**
- * 规格书 v2.8 · 1.12 播放缓存 / 视频缓存 / 缓存清理（主进程实现）。
+
  *  - 音频：在线歌曲播放后自动落盘，最多 50 首、总 500MB，超出按最旧访问时间清理。
  *  - 视频：边播边缓存的流文件（media.ts 写入 stream/），总量上限 1GB，超出清理最旧。
  *  - 清除缓存：只清播放缓存，不动「已下载」文件（下载目录在 downloads/ 下，与这里无关）。

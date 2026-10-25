@@ -6,7 +6,7 @@ import { usePlayerStore } from '@/stores/player'
 import { useUiStore } from '@/stores/ui'
 
 /**
- * 桌面歌词悬浮窗（规格书 1.8）。
+ * 桌面歌词悬浮窗。
  *
  * 定尺 400×60、底部居中、置顶、可拖动、位置由主进程持久化。
  * 版式只有两行：当前行 16px 白色居中 + 下一行 12px #63636F。

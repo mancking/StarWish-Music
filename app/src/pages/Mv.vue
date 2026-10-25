@@ -1,15 +1,18 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import Icon from '@/components/Icon.vue'
 import Cover from '@/components/Cover.vue'
 import { call } from '@/api'
+import { isVideoPlayed, markVideoPlayed, onVideoPlayed } from '@/utils/video-played'
 import type { MvItem } from '@shared/types'
 
 /**
- * 视频 / MV 聚合页（规格书 3.10 · 特色模块）：
- * B 站（默认兜底）+ 网易云/QQ/酷狗/酷我 MV 混合信息流，源 Tab 切换；
- * 酷狗/酷我本期只展示元数据，播放置灰「签名源二期」。
+ * 视频 / MV 聚合页
+ * B站 + 云村 + Q音 + 酷狗 + 酷我 **四平台聚合为一个信息流**（不再按平台分 Tab），
+ * 后端并发搜索后按「归一标题+歌手」去重、轮转交织，卡片右上角标来源。
+ * 顶部胶囊只是对已聚合结果做来源过滤（不重新请求、不切分列表）。
+ * 酷狗/酷我直链需平台签名 → 播放交给签名源插件，未装插件时播放器给出安装指引。
  */
 const router = useRouter()
 
@@ -20,22 +23,28 @@ const loadingMore = ref(false)
 const error = ref('')
 const page = ref(1)
 const hasMore = ref(true)
-/** 源 Tab（F-14）：bili 默认兜底 */
-const source = ref('bili')
+/** 聚合模式：默认 'all' = 四平台聚合；其余值仅作本地过滤 */
+const source = ref('all')
 
-/** 源能力：签名源（kg/kw）元数据可看、播放置灰（2.17） */
+/** 源能力：签名源（kg/kw）直链需平台签名，播放依赖签名源插件 */
 const isSignedSource = (v: MvItem): boolean => v.source === 'kg' || v.source === 'kw'
 
+/** 来源过滤胶囊（过滤已聚合结果，不重新请求） */
 const SOURCE_TABS = [
+  { key: 'all', label: '全部' },
   { key: 'bili', label: 'B站' },
-  { key: 'wy', label: '网易云' },
-  { key: 'qq', label: 'QQ' },
+  { key: 'wy', label: '云村' },
+  { key: 'qq', label: 'Q音' },
   { key: 'kg', label: '酷狗' },
   { key: 'kw', label: '酷我' },
 ]
 
+const shown = computed(() =>
+  source.value === 'all' ? list.value : list.value.filter(v => (v.source || 'bili') === source.value)
+)
+
 function sourceLabel(v: MvItem): string {
-  const map: Record<string, string> = { bili: 'B站', wy: '网易', qq: 'QQ', kg: '酷狗', kw: '酷我' }
+  const map: Record<string, string> = { bili: 'B站', wy: '云村', qq: 'Q音', kg: '酷狗', kw: '酷我' }
   return map[v.source || 'bili'] || v.source || 'B站'
 }
 
@@ -43,10 +52,34 @@ function mvId(v: MvItem): string {
   return v.sourceId || v.bvid || ''
 }
 
+/** 播放足迹：播放过的视频隐去卡片播放按钮（v1.0.0 用户口径） */
+const playedIds = ref<Set<string>>(new Set())
+function vid(v: MvItem): string {
+  return `${v.source || 'bili'}:${mvId(v)}`
+}
+function refreshPlayed(): void {
+  playedIds.value = new Set(list.value.filter(v => isVideoPlayed(vid(v))).map(vid))
+}
+let offPlayed: (() => void) | null = null
+onMounted(() => {
+  offPlayed = onVideoPlayed(() => refreshPlayed())
+})
+onBeforeUnmount(() => offPlayed?.())
+
 function open(v: MvItem): void {
-  if (isSignedSource(v)) return
+  markVideoPlayed(vid(v))
   const src = v.source || 'bili'
-  router.push(`/mv/${src}/${mvId(v)}`)
+  // 带上搜索卡片已有的标题/封面/歌手：Q音、酷狗、酷我的详情接口不返回元数据，
+  // 播放页用 query 兜底，避免进去后标题空白
+  router.push({
+    path: `/mv/${src}/${mvId(v)}`,
+    query: {
+      title: v.title || '',
+      pic: v.pic || '',
+      author: v.author || '',
+      dur: String(v.durationSec || 0),
+    },
+  })
 }
 
 async function search(): Promise<void> {
@@ -58,7 +91,7 @@ async function search(): Promise<void> {
     const res = await call<MvItem[]>('music:mv', {
       keyword: keyword.value.trim() || '音乐',
       page: 1,
-      source: source.value,
+      source: 'all',
     })
     list.value = res
     hasMore.value = res.length > 0
@@ -71,9 +104,7 @@ async function search(): Promise<void> {
 }
 
 function switchSource(k: string): void {
-  if (source.value === k) return
   source.value = k
-  void search()
 }
 
 async function loadMore(): Promise<void> {
@@ -84,7 +115,7 @@ async function loadMore(): Promise<void> {
     const res = await call<MvItem[]>('music:mv', {
       keyword: keyword.value.trim() || '音乐',
       page: next,
-      source: source.value,
+      source: 'all',
     })
     const seen = new Set(list.value.map(v => `${v.source || 'bili'}:${mvId(v)}`))
     const fresh = res.filter(v => !seen.has(`${v.source || 'bili'}:${mvId(v)}`))
@@ -124,7 +155,7 @@ onMounted(() => void search())
       </div>
     </header>
 
-    <!-- 源 Tab（F-14 / 3.10） -->
+ <!-- 源 Tab（.10） -->
     <nav class="src-tabs">
       <button
         v-for="t in SOURCE_TABS"
@@ -147,14 +178,14 @@ onMounted(() => void search())
     </div>
 
     <div v-else class="grid">
-      <div v-for="v in list" :key="`${v.source || 'bili'}:${mvId(v)}`" class="mv-card" @click="open(v)">
+      <div v-for="v in shown" :key="`${v.source || 'bili'}:${mvId(v)}`" class="mv-card" @click="open(v)">
         <div class="thumb">
           <Cover :src="v.pic" :alt="v.title" size="100%" :radius="12" />
           <span class="src-tag">{{ sourceLabel(v) }}</span>
           <span v-if="v.durationSec || v.duration" class="dur">{{ v.duration || fmt(Number(v.durationSec) || 0) }}</span>
           <span v-if="v.play" class="play-count"><Icon name="play" :size="10" />{{ fmt(v.play) }}</span>
-          <span class="overlay"><Icon name="play-circle" :size="38" /></span>
-          <span v-if="isSignedSource(v)" class="signed">签名源二期</span>
+          <span v-if="!playedIds.has(vid(v))" class="overlay"><Icon name="play-circle" :size="38" /></span>
+          <span v-if="isSignedSource(v)" class="signed">需签名源插件</span>
         </div>
         <div class="mv-title clamp-2">{{ v.title }}</div>
         <div class="mv-author ellipsis">{{ v.author }}</div>
@@ -309,13 +340,13 @@ h1 {
 }
 .signed {
   position: absolute;
-  inset: 0;
-  display: grid;
-  place-items: center;
-  background: rgba(0, 0, 0, 0.55);
-  color: #fff;
-  font-size: 12px;
-  border-radius: 12px;
+  right: 8px;
+  top: 8px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.62);
+  color: #fbbf24;
+  font-size: 10px;
 }
 .load-more {
   display: flex;

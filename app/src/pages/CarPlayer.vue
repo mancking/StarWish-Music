@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /**
- * 车机播放页（规格书 1.1 / 0.2 / 0.3）
+ * 车机播放页
  *
  * 横屏单栏：左 1/3 歌名 28px + 歌手 18px，右 2/3 三个大按钮（64 / 80px）。
  * 不显示封面、歌词、粒子、频谱；文字琥珀黄 #FBBF24；控件常显不自动隐藏。
@@ -20,7 +20,7 @@ const player = usePlayerStore()
 
 const song = computed(() => player.song)
 const library = useLibraryStore()
-/** Bug 44：四态文案（此前仅两态） */
+/**四态文案（此前仅两态） */
 const MODE_TEXT: Record<string, string> = {
   'repeat-all': '列表循环',
   'repeat-one': '单曲循环',
@@ -28,7 +28,7 @@ const MODE_TEXT: Record<string, string> = {
   order: '顺序播放',
 }
 const modeLabel = computed(() => MODE_TEXT[player.state.mode] || '列表循环')
-/** Bug 67：缓冲/错误状态文案（32sp，驾驶可见） */
+/**缓冲/错误状态文案（32sp，驾驶可见） */
 const statusText = computed(() => {
   if (player.state.status === 'loading') return '缓冲中…'
   if (player.state.status === 'error') return player.state.error || '加载失败'
@@ -60,7 +60,7 @@ async function toggleLike(): Promise<void> {
       <section class="info">
         <h1>{{ song?.name || '未在播放' }}</h1>
         <p>{{ song?.singer || '星河音乐' }}</p>
-        <!-- Bug 68：行驶中进度条只作指示、禁拖（驾驶安全） -->
+ <!--行驶中进度条只作指示、禁拖（驾驶安全） -->
         <ProgressBar class="bar" :position="player.displayPosition" :duration="player.duration" variant="car" accent="#fbbf24" />
         <span v-if="statusText" class="status">{{ statusText }}</span>
         <span class="mode" @click="cycleMode">{{ modeLabel }}</span>
@@ -76,7 +76,7 @@ async function toggleLike(): Promise<void> {
         <button class="btn side" aria-label="下一首" @click="player.next()">
           <Icon name="next" :size="30" />
         </button>
-        <!-- Bug 44：红心收藏（76dp 热区） -->
+ <!--红心收藏（76dp 热区） -->
         <button class="btn side" :class="{ on: liked }" aria-label="收藏" @click="toggleLike">
           <Icon :name="liked ? 'heart-filled' : 'heart'" :size="28" />
         </button>

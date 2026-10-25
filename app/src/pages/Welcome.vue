@@ -1,12 +1,12 @@
 <script setup lang="ts">
 /**
- * 首次启动引导（规格书 0.9.3 / F-21 · 独立页面）
+ * 首次启动引导
  *
  * DB 标记 onboarded=false → 首启进 /welcome（3 屏）：
- *  ① 应用已内置 X 个音源  ② 音源失效可从源市场一键安装  ③ 扫描本地音乐
+ *  ① 零音源发布说明 + 引导导入音源  ② 音源失效可从源市场一键安装  ③ 扫描本地音乐
  * 完成后写 onboarded=true 并回首页。无源时框架内容（本地/设置/下载）不受影响。
  */
-import { computed, onMounted, ref } from 'vue'
+import { computed, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import Icon from '@/components/Icon.vue'
 import brandIcon from '@/assets/brand-icon.png'
@@ -17,14 +17,12 @@ const router = useRouter()
 const ui = useUiStore()
 
 const step = ref(0)
-const sourceCount = ref(0)
-const enabledCount = ref(0)
 
 const steps = computed(() => [
   {
     icon: 'sparkles',
     title: '欢迎使用星河音乐',
-    desc: `应用已内置 ${sourceCount.value} 个音源（当前启用 ${enabledCount.value} 个），开箱即可听歌。`,
+    desc: `应用不预置任何音源（零音源发布），首次使用请先导入音源或扫描本地音乐。`,
   },
   {
     icon: 'download',
@@ -47,16 +45,6 @@ async function finish(): Promise<void> {
   ui.toast('开始体验星河音乐', 'success', 1400)
   void router.replace('/')
 }
-
-onMounted(async () => {
-  try {
-    const list = await call<any[]>('sources:list')
-    sourceCount.value = (list || []).length
-    enabledCount.value = (list || []).filter((x: any) => x.enabled && !x.loadError).length
-  } catch {
-    sourceCount.value = 0
-  }
-})
 </script>
 
 <template>

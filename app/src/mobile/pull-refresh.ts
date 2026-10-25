@@ -1,51 +1,83 @@
+import { subscribe } from './bus'
+
 /**
- * 移动端触屏下拉刷新（下拉超过阈值后松手即刷新）。
+ * 移动端触屏下拉刷新（顶部继续下拉超过阈值、松手刷新）。
  *
- * 手机没有 F5/刷新按钮：主滚动区（App 的 .m-content，桌面冒烟是 .content）
- * 在顶部时继续下拉超过阈值，顶部露出提示条，**松手立即整页 reload**，
- * 当前页所有数据（音源、榜单、推荐、播客）重新拉取。
+ * v1.0.0 修订——旧实现的两处硬伤
+ *  1. **不保留当前页面**：松手直接 `window.location.reload()`，整页重载后
+ *     路由回到初始页，用户从「我的/视频/发现」下拉刷新都会被扔回首页。
+ *  2. **闪烁**：reload 产生白屏重启动画，且 hint 常驻导致位置跳动。
  *
- * v2.3.1 修复：v2.3.0 绑定的是桌面滚动容器 `.content`，移动端外壳是
- * `.m-content`——真机上手势完全无响应；且旧版要求按住 3 秒才触发，
- * 体感「刷新时间过长」。现在两处一起修掉。
+ * 现在改为「事件驱动 + 页面自行刷新」：松手后广播 `app:pull-refresh`，
+ * 各页面订阅后重拉自己的数据（保留路由、滚动与组件状态），
+ * 拉完调用 `refreshDone()` 收起提示条；无人响应时 2.5s 自动收起，绝不 reload。
  */
-const THRESHOLD = 64 // 下拉多少 px 后松手即刷新
-const MAX = 110 // 提示条跟随位移上限
+
+const THRESHOLD = 64
+const MAX = 110
+/** 页面没响应时的兜底收起时间 */
+const STUCK_MS = 2500
+
+let hint: HTMLDivElement | null = null
+let active = false
+let ready = false
+let fired = false
+let busy = false
+let stuckTimer = 0
+
+function ensureHint(): HTMLDivElement {
+  if (hint) return hint
+  const el = document.createElement('div')
+  el.className = 'pull-refresh-hint'
+  el.textContent = '下拉刷新'
+  document.body.appendChild(el)
+  hint = el
+  return el
+}
+
+function show(d: number): void {
+  const el = ensureHint()
+  el.style.transition = 'none'
+  el.style.transform = `translateY(${Math.min(d, MAX) - 44}px)`
+  ready = d >= THRESHOLD
+  el.classList.toggle('ready', ready)
+  el.textContent = ready ? '松手刷新' : '下拉刷新'
+}
+
+function hide(): void {
+  const el = ensureHint()
+  ready = false
+  busy = false
+  fired = false
+  el.style.transition = 'transform .18s'
+  el.style.transform = 'translateY(-100%)'
+  el.classList.remove('ready')
+  if (stuckTimer) {
+    window.clearTimeout(stuckTimer)
+    stuckTimer = 0
+  }
+}
+
+function begin(): void {
+  const el = ensureHint()
+  el.style.transition = 'none'
+  el.style.transform = `translateY(${MAX - 44}px)`
+  el.classList.add('ready')
+  el.textContent = '正在刷新…'
+  // 兜底：没有页面认领这次刷新时，2.5s 后自动收起，避免提示条卡住
+  if (stuckTimer) window.clearTimeout(stuckTimer)
+  stuckTimer = window.setTimeout(hide, STUCK_MS)
+}
+
+const content = (): HTMLElement | null => document.querySelector<HTMLElement>('.m-content, .content')
+const atTop = (): boolean => {
+  const el = content()
+  return !el || el.scrollTop <= 0
+}
 
 export function installPullRefresh(): void {
-  const hint = document.createElement('div')
-  hint.className = 'pull-refresh-hint'
-  hint.textContent = '下拉刷新'
-  document.body.appendChild(hint)
-
-  const content = (): HTMLElement | null =>
-    document.querySelector<HTMLElement>('.m-content, .content')
-  const atTop = (): boolean => {
-    const el = content()
-    return !el || el.scrollTop <= 0
-  }
-
   let startX = 0
   let startY = 0
-  let active = false // 已确认是「顶部下拉」手势，接管后续 touchmove
-  let ready = false // 位移已达阈值，松手即刷新
-  let fired = false
-
-  const show = (d: number): void => {
-    hint.style.transition = 'none'
-    hint.style.transform = `translateY(${Math.min(d, MAX) - 44}px)`
-    ready = d >= THRESHOLD
-    hint.classList.toggle('ready', ready)
-    hint.textContent = ready ? '松手刷新' : '下拉刷新'
-  }
-
-  const hide = (): void => {
-    ready = false
-    fired = false
-    hint.style.transition = 'transform .18s'
-    hint.style.transform = 'translateY(-100%)'
-    hint.classList.remove('ready')
-  }
 
   document.addEventListener(
     'touchstart',
@@ -82,26 +114,36 @@ export function installPullRefresh(): void {
         return
       }
       show(dy)
-      if (e.cancelable) e.preventDefault() // 拦掉浏览器橡皮筋/继续滚动
+      if (e.cancelable) e.preventDefault()
     },
     { passive: false },
   )
 
-  // 松手：已达阈值立即刷新，否则取消
   const end = (): void => {
     if (!active || fired) return
     active = false
     if (ready) {
       fired = true
-      hint.style.transition = 'none'
-      hint.style.transform = `translateY(${MAX - 44}px)`
-      hint.classList.add('ready')
-      hint.textContent = '正在刷新…'
-      setTimeout(() => window.location.reload(), 200)
+      busy = true
+      begin()
+      // 通知当前页自行刷新（保留路由与状态），不再整页 reload
+      import('./bus').then(m => m.emit('app:pull-refresh', { at: Date.now() }))
     } else {
       hide()
     }
   }
   document.addEventListener('touchend', end, { passive: true })
   document.addEventListener('touchcancel', end, { passive: true })
+}
+
+/** 页面刷新完成时调用：收起提示条 */
+export function refreshDone(): void {
+  if (busy || (hint && hint.textContent === '正在刷新…')) hide()
+}
+
+/** 页面订阅下拉刷新（返回取消订阅函数） */
+export function onPullRefresh(cb: () => void | Promise<void>): () => void {
+  return subscribe('app:pull-refresh', () => {
+    void cb()
+  })
 }
