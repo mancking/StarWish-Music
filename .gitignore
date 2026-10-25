@@ -145,19 +145,17 @@ ttest/
 app/scripts/test-*.ts
 app/scripts/mini-dom-stub.mjs
 app/scripts/gate-zero-source.mjs
-app/scripts/copy-dev-sources.mjs
 app/scripts/release-android.mjs
 app/scripts/release-build.mjs
 app/scripts/test-hooks.mjs
 
-# 移动端种子/测试文件
-app/src/mobile/base64.ts
-app/src/mobile/seed-empty.ts
-app/src/mobile/seed-files.ts
-app/src/mobile/seed-source.ts
+# 移动端种子/测试文件（构建必需文件不在此列，勿忽略）
 
 # 旧版本号文件
 docs/StarWish-Music-v2.3.5-发布说明.md
 
 # 版本号注释清理前旧引用
 app/verify-final-state.json
+
+# 主题市场独立分支的本地检出目录（不入库，云构建按分支拉取）
+themes-market/

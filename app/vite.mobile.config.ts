@@ -1,10 +1,24 @@
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
+import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import pkg from './package.json'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
+
+/**
+ * 音源种子入口选择：
+ *   - release 通道 → 空种子
+ *   - dev 通道但本地没有 dev-sources/（干净 checkout / CI）→ 空种子
+ *   - dev 通道且有 dev-sources/ → seed-files.ts（内联音源）
+ * seed-files.ts 与 dev-sources/ 都不入库，CI 上没有它们时必须回落空种子，
+ * 否则 vite 解析别名时会因文件缺失直接构建失败。
+ */
+const hasDevSources = fs.existsSync(path.resolve(__dirname, 'dev-sources'))
+const seedEntry = process.env.BUILD_CHANNEL !== 'release' && hasDevSources
+  ? 'src/mobile/seed-files.ts'
+  : 'src/mobile/seed-empty.ts'
 
 /**
  * 移动端（WebView）打包配置。
@@ -39,8 +53,8 @@ export default defineConfig({
       './bili': path.resolve(__dirname, 'src/mobile/shims/bili-bridge.ts'),
       // paths.ts 的 sourcesDir 指向虚拟 fs 种子目录
       './paths': path.resolve(__dirname, 'src/mobile/shims/paths-mobile.ts'),
-      // 音源种子文件：dev 通道内联 dev-sources，release 通道为空种子
-      './seed-source': path.resolve(__dirname, process.env.BUILD_CHANNEL === 'release' ? 'src/mobile/seed-empty.ts' : 'src/mobile/seed-files.ts'),
+      // 音源种子文件：release / 无本地音源 → 空种子；dev 且有 dev-sources → 内联音源
+      './seed-source': path.resolve(__dirname, seedEntry),
       // 跟跳转：移动端走原生 CapacitorHttp（拿得到 302 的 Location）
       './redirect': path.resolve(__dirname, 'src/mobile/shims/redirect-mobile.ts'),
       // db.ts 里 require('sql.js')
