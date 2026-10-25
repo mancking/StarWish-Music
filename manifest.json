@@ -172,6 +172,55 @@
       ],
       "kind": "video-source",
       "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/starwish-video.js"
+    },
+    {
+      "name": "星海音乐源",
+      "file": "xinghai-music-source.js",
+      "version": "v3.2.15",
+      "author": "万去了了 / 科学大魔王",
+      "description": "多平台聚合音源（社区），项目内置随附",
+      "types": [
+        "music"
+      ],
+      "kind": "lx-source",
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/xinghai-music-source.js"
+    },
+    {
+      "name": "HYW音乐公益版",
+      "file": "hyw-music.js",
+      "version": "v1.2.0",
+      "author": "Ryn",
+      "description": "HYW 多平台聚合（社区，公益版）",
+      "types": [
+        "music"
+      ],
+      "kind": "lx-source",
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/hyw-music.js"
+    },
+    {
+      "name": "墨澜聚合音源",
+      "file": "molan-unified.js",
+      "version": "2.3.4",
+      "author": "白姬9527",
+      "description": "墨澜多平台聚合（社区）",
+      "types": [
+        "music"
+      ],
+      "kind": "lx-source",
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/molan-unified.js"
+    },
+    {
+      "name": "星河B站音源",
+      "file": "starwish-bilibili.js",
+      "version": "1.0.0",
+      "author": "StarWish Team",
+      "description": "B站音频（歌单=合集、曲目=分P）；未做 wbi 签名，风控网络下默认关闭（Bug 128）",
+      "types": [
+        "music",
+        "video"
+      ],
+      "kind": "lx-source",
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/starwish-bilibili.js"
     }
   ]
 }
