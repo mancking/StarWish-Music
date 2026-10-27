@@ -1,0 +1,69 @@
+name: Auto Update Theme Manifest
+
+# 功能：用户只需往 Star-Wish-Theme-Library 分支上传主题文件夹
+#（themes/<id>/{theme.json,preview.png,thumb.jpg,bg.jpg,bg.gif,iframe.html}）
+# 或旧版单文件主题（themes/<id>.json），本工作流自动扫描该分支并生成
+# schemaVersion=2 的 manifest.json 提交回分支，
+# 客户端「个性主题 → 在线主题」稍后即可拉到全部主题
+#（镜像缓存通常几分钟，最长约 24h）。
+#
+# 触发：
+#   1. push：主题分支上 themes/ 下的任何变更（上传/修改/删除）立即触发
+#   2. schedule：每 24 小时兜底扫描（错过 push 或 push 失败也能自愈）
+#   3. workflow_dispatch：GitHub 网页上点 "Run workflow" 手动立即刷新
+#
+# 防循环：manifest.json 的自动提交不带 themes/ 变更，不满足 paths 过滤条件；
+#         且提交信息带 [skip ci] 双保险。清单无变化时不产生提交。
+
+on:
+  push:
+    branches:
+      - Star-Wish-Theme-Library
+    paths:
+      - 'themes/**'
+  schedule:
+    # 每 24 小时一次（UTC 03:41 ≡ 北京时间 11:41），与插件清单错峰
+    - cron: '41 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: auto-theme-manifest-sync
+  cancel-in-progress: false
+
+jobs:
+  sync-theme-manifest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout default branch (script)
+        uses: actions/checkout@v4
+        with:
+          path: lib
+          ref: main
+
+      - name: Checkout theme branch
+        uses: actions/checkout@v4
+        with:
+          path: branch
+          ref: Star-Wish-Theme-Library
+
+      - name: Generate theme manifest v2
+        run: python lib/.github/scripts/generate_theme_manifest.py branch
+        env:
+          OWNER_REPO: mancking/StarWish-Music
+          BRANCH: Star-Wish-Theme-Library
+
+      - name: Commit and push if changed
+        working-directory: branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet -- manifest.json; then
+            echo "manifest 无变化，跳过提交"
+          else
+            git add manifest.json
+            git commit -m "chore: auto-sync theme manifest v2 [skip ci]"
+            git push origin Star-Wish-Theme-Library
+          fi
