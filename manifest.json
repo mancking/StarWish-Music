@@ -1,7 +1,7 @@
 {
   "name": "星河官方插件库",
   "description": "星河音乐官方插件市场，提供可在线安装/更新的音源与歌词插件。",
-  "updated": "2026-10-28T03:08:57Z",
+  "updated": "2026-10-28T09:40:38Z",
   "plugins": [
     {
       "name": "5sing",
@@ -9,91 +9,373 @@
       "version": "0.0.3",
       "author": "SoEasy同学",
       "platform": "5sing",
-      "description": "",
       "types": [
         "music",
         "album",
         "artist",
         "sheet"
       ],
+      "kind": "musicfree-plugin",
+      "hash": "a1668b0ad5948555cd1b27079c5b3176fc62a4bdd0b05702057485c31c81c530",
+      "size": 14251,
       "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/5s.js"
     },
     {
-      "name": "安妮独家音源 v5",
-      "file": "安妮独家音源 v5.js",
+      "name": "HYWmusic_beta_公益测试 v0.74.0",
+      "file": "HYWmusic_beta_公益测试 v0.74.0.js",
+      "version": "v0.74.0",
+      "platform": "platform",
       "kind": "lx-source",
-      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E5%AE%89%E5%A6%AE%E7%8B%AC%E5%AE%B6%E9%9F%B3%E6%BA%90%20v5.js",
-      "size": 6968
+      "hash": "cc5150108b833a2e1d92a0d43cca7667e571055043c51bcfca1348cca610c681",
+      "size": 9057,
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/HYWmusic_beta_%E5%85%AC%E7%9B%8A%E6%B5%8B%E8%AF%95%20v0.74.0.js"
     },
     {
-      "name": "非常刀 v5",
-      "file": "非常刀 v5.js",
+      "name": "HYWmusic_公益版V1.2.0",
+      "file": "HYWmusic_公益版V1.2.0.js",
+      "version": "v1.2.0",
+      "platform": "platform",
       "kind": "lx-source",
-      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E9%9D%9E%E5%B8%B8%E5%88%80%20v5.js",
-      "size": 17846
+      "hash": "0f48bdab4205e4423397f970b926565085a5af4f3b8a8a19f4cdc0e755647cd5",
+      "size": 12082,
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/HYWmusic_%E5%85%AC%E7%9B%8A%E7%89%88V1.2.0.js"
     },
     {
-      "name": "幻音音源 v3",
-      "file": "幻音音源 v3.js",
+      "name": "HelloWorld音源(中秋快乐)",
+      "file": "HelloWorld音源(中秋快乐).js",
       "kind": "lx-source",
-      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E5%B9%BB%E9%9F%B3%E9%9F%B3%E6%BA%90%20v3.js",
-      "size": 7316
+      "hash": "32ff5f7b44c1d7d038cb548cb6fac0349befb538bdae26fb658684115e823427",
+      "size": 21421,
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/HelloWorld%E9%9F%B3%E6%BA%90%28%E4%B8%AD%E7%A7%8B%E5%BF%AB%E4%B9%90%29.js"
     },
     {
-      "name": "回避聚合V0.0.1",
-      "file": "回避聚合V0.0.1.js",
+      "name": "K×H测试_v1.7.16",
+      "file": "K×H测试_v1.7.16.js",
+      "platform": "23",
       "kind": "lx-source",
-      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E5%9B%9E%E9%81%BF%E8%81%9A%E5%90%88V0.0.1.js",
-      "size": 83639
+      "hash": "324aac4d0111ee623f9a11aed4a1fd08035c1804143ec55e5b8f17b012f099fa",
+      "size": 72149,
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/K%C3%97H%E6%B5%8B%E8%AF%95_v1.7.16.js"
     },
     {
-      "name": "聚合API接口 (CF) v3",
-      "file": "聚合API接口 (CF) v3.js",
+      "name": "fish-music",
+      "file": "fish-music.js",
       "kind": "lx-source",
-      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E8%81%9A%E5%90%88API%E6%8E%A5%E5%8F%A3%20%28CF%29%20v3.js",
-      "size": 1005
+      "hash": "a711e152c4f28c32fd46b38839a70f476e0b669905773a90e2ce63246136af47",
+      "size": 639619,
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/fish-music.js"
     },
     {
-      "name": "裤佬SVIP音源(二改整合版) v3.0.0",
-      "file": "裤佬SVIP音源(二改整合版) v3.0.0.js",
+      "name": "gdstudio音乐源 v1.0.1（仅支持网易）",
+      "file": "gdstudio音乐源 v1.0.1（仅支持网易）.js",
+      "version": "globalThis.lx.version",
       "kind": "lx-source",
-      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E8%A3%A4%E4%BD%ACSVIP%E9%9F%B3%E6%BA%90%28%E4%BA%8C%E6%94%B9%E6%95%B4%E5%90%88%E7%89%88%29%20v3.0.0.js",
-      "size": 16108
+      "hash": "05631b29ff18a4b8688b4464abf0f38952474cd4d8d6c4149c365b0190c7fd28",
+      "size": 8689,
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/gdstudio%E9%9F%B3%E4%B9%90%E6%BA%90%20v1.0.1%EF%BC%88%E4%BB%85%E6%94%AF%E6%8C%81%E7%BD%91%E6%98%93%EF%BC%89.js"
     },
     {
-      "name": "墨澜音乐源v2.3.4",
-      "file": "墨澜音乐源v2.3.4.js",
+      "name": "HYW音乐公益版",
+      "file": "hyw-music.js",
+      "version": "v1.2.0",
+      "author": "Ryn",
+      "platform": "platform",
+      "description": "HYW 多平台聚合（社区，公益版）",
+      "types": [
+        "music"
+      ],
       "kind": "lx-source",
-      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E5%A2%A8%E6%BE%9C%E9%9F%B3%E4%B9%90%E6%BA%90v2.3.4.js",
-      "size": 130161
+      "hash": "9f1cb9791c9abda54b34f5c5b945fa7e0b992702523694f66d6128a655492f86",
+      "size": 12211,
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/hyw-music.js"
     },
     {
-      "name": "念心音源 v1.0.2",
-      "file": "念心音源 v1.0.2.js",
+      "name": "lx-music-source-v6 (修复)",
+      "file": "lx-music-source-v6 (修复).js",
       "kind": "lx-source",
-      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E5%BF%B5%E5%BF%83%E9%9F%B3%E6%BA%90%20v1.0.2.js",
-      "size": 26672
+      "hash": "ef5289ddc2e8fd98ec7ac9e096878d9e6fed5e4ae1669d21e4484eac247aeda7",
+      "size": 64094,
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/lx-music-source-v6%20%28%E4%BF%AE%E5%A4%8D%29.js"
+    },
+    {
+      "name": "lx-玉宁熙1.2.5",
+      "file": "lx-玉宁熙1.2.5.js",
+      "kind": "lx-source",
+      "hash": "5dd4752c16c17f7bab45dccf87dcd3f3c2a6e251e62bad68bde9554bfd275f79",
+      "size": 144621,
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/lx-%E7%8E%89%E5%AE%81%E7%86%991.2.5.js"
+    },
+    {
+      "name": "星河B站音源",
+      "file": "starwish-bilibili.js",
+      "version": "1.0.0",
+      "author": "StarWish Team",
+      "description": "B站音频（歌单=合集、曲目=分P）；未做 wbi 签名，风控网络下默认关闭（Bug 128）",
+      "types": [
+        "music",
+        "video"
+      ],
+      "kind": "lx-source",
+      "hash": "4cdd1b192617dddc4a43cfbc71ee84a72d85c8643fae0cc6100f9deb7265e479",
+      "size": 4817,
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/starwish-bilibili.js"
+    },
+    {
+      "name": "星河国际曲库",
+      "file": "starwish-builtin.js",
+      "version": "1.0.0",
+      "author": "StarWish Team",
+      "platform": "it/kw",
+      "description": "iTunes 国际曲库直链 + 酷我备用直链（无歌词/封面依赖重）",
+      "types": [
+        "music"
+      ],
+      "kind": "lx-source",
+      "hash": "0679a0dceea9cd879b76d2a3197201c3495cab3223565c14c98341a59e9958a1",
+      "size": 6690,
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/starwish-builtin.js"
+    },
+    {
+      "name": "星河聚合音源",
+      "file": "starwish-unified.js",
+      "version": "1.1.0",
+      "author": "StarWish Team",
+      "platform": "wy/kg/kw/qq",
+      "description": "自研多平台聚合：网易云/酷狗/酷我/QQ 搜索取链 + 跨平台换链兜底（取链失败自动换平台搜同曲）",
+      "types": [
+        "music"
+      ],
+      "kind": "lx-source",
+      "hash": "202a1e047c1e26eb6df5e5b6d1cb713b24ab7814801a68b2888aaf7c2509c229",
+      "size": 11442,
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/starwish-unified.js"
+    },
+    {
+      "name": "星河B站视频源",
+      "file": "starwish-video.js",
+      "version": "1.0.0",
+      "author": "StarWish Team",
+      "platform": "bili",
+      "description": "B站视频/MV 视频源（videoSearch/videoInfo/videoParts/videoUrl 四函数）：搜索/详情/分P/取链，接管视频页全部数据",
+      "types": [
+        "music",
+        "video"
+      ],
+      "kind": "video-source",
+      "hash": "44608c65f9ba29ce0f924afdfb7977175025ebff4a96e214f3e3c739f69f351b",
+      "size": 7218,
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/starwish-video.js"
+    },
+    {
+      "name": "stellarwave-v4.0.0（酷我稍后支持）",
+      "file": "stellarwave-v4.0.0（酷我稍后支持）.js",
+      "kind": "lx-source",
+      "hash": "c27f8d8ff94b9cdc02721430c46632f51a7c2a15ef0618e8c3bbfc6c08ef0092",
+      "size": 48464,
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/stellarwave-v4.0.0%EF%BC%88%E9%85%B7%E6%88%91%E7%A8%8D%E5%90%8E%E6%94%AF%E6%8C%81%EF%BC%89.js"
     },
     {
       "name": "全豆要-聚合音源-V4.1（酷狗挂了）",
       "file": "全豆要-聚合音源-V4.1（酷狗挂了）.js",
       "kind": "lx-source",
-      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E5%85%A8%E8%B1%86%E8%A6%81-%E8%81%9A%E5%90%88%E9%9F%B3%E6%BA%90-V4.1%EF%BC%88%E9%85%B7%E7%8B%97%E6%8C%82%E4%BA%86%EF%BC%89.js",
-      "size": 32392
+      "hash": "e501fa90f8136a714e0b8e7b44a50d9ee344083a9a5164da7f87a07b6f763650",
+      "size": 32392,
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E5%85%A8%E8%B1%86%E8%A6%81-%E8%81%9A%E5%90%88%E9%9F%B3%E6%BA%90-V4.1%EF%BC%88%E9%85%B7%E7%8B%97%E6%8C%82%E4%BA%86%EF%BC%89.js"
+    },
+    {
+      "name": "bilibili",
+      "file": "原力.js",
+      "version": "0.3.0",
+      "author": "猫头猫",
+      "platform": "bilibili",
+      "types": [
+        "music",
+        "album",
+        "artist"
+      ],
+      "kind": "musicfree-plugin",
+      "hash": "ab8526120b3f3a44bfc1a8439cbd0241ad40be512d5c6f911b0b5979a8c99e55",
+      "size": 20465,
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E5%8E%9F%E5%8A%9B.js"
+    },
+    {
+      "name": "回避聚合V0.0.1",
+      "file": "回避聚合V0.0.1.js",
+      "kind": "lx-source",
+      "hash": "9c35f66bf39c6b66e6dc64d3df27535f329a5e146fe80921406f5db910f63e33",
+      "size": 83639,
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E5%9B%9E%E9%81%BF%E8%81%9A%E5%90%88V0.0.1.js"
+    },
+    {
+      "name": "墨澜音乐源v2.3.4",
+      "file": "墨澜音乐源v2.3.4.js",
+      "kind": "lx-source",
+      "hash": "328e06c473dfc0ba6de338a7b04f00e3b67a69f59205ca6903d553a80b57c706",
+      "size": 130161,
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E5%A2%A8%E6%BE%9C%E9%9F%B3%E4%B9%90%E6%BA%90v2.3.4.js"
+    },
+    {
+      "name": "安妮独家音源 v5",
+      "file": "安妮独家音源 v5.js",
+      "kind": "lx-source",
+      "hash": "337376552140487185c66eb3d7ffc2fc162135ed6f5a4fe683ee37f1b1799d2a",
+      "size": 6968,
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E5%AE%89%E5%A6%AE%E7%8B%AC%E5%AE%B6%E9%9F%B3%E6%BA%90%20v5.js"
+    },
+    {
+      "name": "小芸音乐",
+      "file": "小云.js",
+      "version": "0.0.3",
+      "author": "SoEasy同学",
+      "platform": "小芸音乐",
+      "types": [
+        "music",
+        "album",
+        "sheet",
+        "artist",
+        "lyric"
+      ],
+      "kind": "musicfree-plugin",
+      "hash": "9fc9c3a0411ad561838d8c4696c1726cfafd0a1364332050da1ec71159492cf1",
+      "size": 23372,
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E5%B0%8F%E4%BA%91.js"
+    },
+    {
+      "name": "歌词千寻",
+      "file": "小千.js",
+      "version": "0.0.0",
+      "platform": "歌词千寻",
+      "types": [
+        "lyric"
+      ],
+      "kind": "musicfree-plugin",
+      "hash": "fa1b5563e358306f18cf83cd21619aa6c68bf159b6a01ab2fb7d9cb1e2d17c0d",
+      "size": 1615,
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E5%B0%8F%E5%8D%83.js"
+    },
+    {
+      "name": "音悦台",
+      "file": "小月.js",
+      "version": "0.0.1",
+      "author": "猫头猫",
+      "platform": "音悦台",
+      "types": [
+        "music"
+      ],
+      "kind": "musicfree-plugin",
+      "hash": "a25da2aae6f96914c70e244b10de70457b963a228e2defaf83a24d2dc9cc76f0",
+      "size": 2950,
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E5%B0%8F%E6%9C%88.js"
+    },
+    {
+      "name": "小枸音乐",
+      "file": "小枸.js",
+      "version": "0.0.3",
+      "author": "SoEasy同学",
+      "platform": "小枸音乐",
+      "types": [
+        "music",
+        "album",
+        "sheet"
+      ],
+      "kind": "musicfree-plugin",
+      "hash": "bddea24392270cb99535768a02091c251bb4df9fdd1890d6d8d4436a74af5881",
+      "size": 18063,
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E5%B0%8F%E6%9E%B8.js"
+    },
+    {
+      "name": "小秋音乐",
+      "file": "小秋.js",
+      "version": "0.0.3",
+      "author": "SoEasy同学",
+      "platform": "小秋音乐",
+      "types": [
+        "music",
+        "album",
+        "sheet",
+        "artist",
+        "lyric"
+      ],
+      "kind": "musicfree-plugin",
+      "hash": "79768ba9ee0254d850bd6048d4e9d296a3e684ef03630250fdee39233c2c3c4b",
+      "size": 19801,
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E5%B0%8F%E7%A7%8B.js"
+    },
+    {
+      "name": "小蜗音乐",
+      "file": "小蜗.js",
+      "version": "0.0.3",
+      "author": "SoEasy同学",
+      "platform": "小蜗音乐",
+      "types": [
+        "music",
+        "album",
+        "sheet",
+        "artist"
+      ],
+      "kind": "musicfree-plugin",
+      "hash": "0f20da363c0a801ae8becd62b6978d750ec4d45f563e530f42151777a1de7ddb",
+      "size": 20398,
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E5%B0%8F%E8%9C%97.js"
+    },
+    {
+      "name": "屿溪-终章",
+      "file": "屿溪-终章.js",
+      "kind": "lx-source",
+      "hash": "b45e05b8c043f0e715f9856ea400707bdf131b9c05b5014e1de9d0821a9972a7",
+      "size": 128060,
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E5%B1%BF%E6%BA%AA-%E7%BB%88%E7%AB%A0.js"
+    },
+    {
+      "name": "幻音音源 v3",
+      "file": "幻音音源 v3.js",
+      "platform": "platformMap[source]",
+      "kind": "lx-source",
+      "hash": "4a81129240ecae3ebf6b42f28c73e2d37bbcb6fccac9a73a401d90cdd36bee5f",
+      "size": 7316,
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E5%B9%BB%E9%9F%B3%E9%9F%B3%E6%BA%90%20v3.js"
+    },
+    {
+      "name": "念心音源 v1.0.2",
+      "file": "念心音源 v1.0.2.js",
+      "version": "_0x2eea19(0x18f)",
+      "kind": "lx-source",
+      "hash": "86f6c05f8fef7169fd010a1da362824b5c4b7f5695f89d384fe53564f3fa88d2",
+      "size": 26672,
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E5%BF%B5%E5%BF%83%E9%9F%B3%E6%BA%90%20v1.0.2.js"
+    },
+    {
+      "name": "星海音乐源V3.2.15",
+      "file": "星海音乐源V3.2.15.js",
+      "version": "/lx/versionh2.php",
+      "kind": "lx-source",
+      "hash": "807d6157e4fd7cdd05b8727efd73778b54a3b05a0b5e4c6bb28dedc0668e94e9",
+      "size": 38858,
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E6%98%9F%E6%B5%B7%E9%9F%B3%E4%B9%90%E6%BA%90V3.2.15.js"
     },
     {
       "name": "溯音音源_v1",
       "file": "溯音音源_v1.js",
       "kind": "lx-source",
-      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E6%BA%AF%E9%9F%B3%E9%9F%B3%E6%BA%90_v1.js",
-      "size": 17656
+      "hash": "d10c9c28823b5c2ce4e3fef3b25b8ff16d2d165bd0883e2b866900ef7c0dc0ee",
+      "size": 17656,
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E6%BA%AF%E9%9F%B3%E9%9F%B3%E6%BA%90_v1.js"
+    },
+    {
+      "name": "稳定版音源 v1.0.3",
+      "file": "稳定版音源 v1.0.3.js",
+      "kind": "lx-source",
+      "hash": "5e5f39c1a51b6c005104f382b22cd0a3e0af2ba30c7003e4fd03bfcf9f6a088a",
+      "size": 3292,
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E7%A8%B3%E5%AE%9A%E7%89%88%E9%9F%B3%E6%BA%90%20v1.0.3.js"
     },
     {
       "name": "统一音乐源",
       "file": "统一音乐源.js",
       "kind": "lx-source",
-      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E7%BB%9F%E4%B8%80%E9%9F%B3%E4%B9%90%E6%BA%90.js",
-      "size": 9245
+      "hash": "a18bdd58fd3f5e26d00c8c18d7b0825367f54a1c01bb8f8321ac7f5d374f1a7c",
+      "size": 9245,
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E7%BB%9F%E4%B8%80%E9%9F%B3%E4%B9%90%E6%BA%90.js"
     },
     {
       "name": "网易音乐",
@@ -109,283 +391,63 @@
         "artist",
         "lyric"
       ],
+      "kind": "musicfree-plugin",
+      "hash": "0cb8339e8d435aa347b94a0101c937fca07871552113eb5b0756f5bc0576c0ef",
+      "size": 24620,
       "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E7%BD%91%E6%98%93%E4%BA%91.js"
     },
     {
-      "name": "稳定版音源 v1.0.3",
-      "file": "稳定版音源 v1.0.3.js",
+      "name": "聚合API接口 (CF) v3",
+      "file": "聚合API接口 (CF) v3.js",
+      "version": "v",
       "kind": "lx-source",
-      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E7%A8%B3%E5%AE%9A%E7%89%88%E9%9F%B3%E6%BA%90%20v1.0.3.js",
-      "size": 3292
+      "hash": "47648623f242fa8bccc8965d33666ac36147f63b68bd7776bb082e44e1c2d6f8",
+      "size": 1005,
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E8%81%9A%E5%90%88API%E6%8E%A5%E5%8F%A3%20%28CF%29%20v3.js"
+    },
+    {
+      "name": "裤佬SVIP音源(二改整合版) v3.0.0",
+      "file": "裤佬SVIP音源(二改整合版) v3.0.0.js",
+      "platform": "==",
+      "kind": "lx-source",
+      "hash": "58e8cb1403a0eb394d6405dc560c3cd4329fa62aa19c5d753d048a9a6e626d97",
+      "size": 16108,
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E8%A3%A4%E4%BD%ACSVIP%E9%9F%B3%E6%BA%90%28%E4%BA%8C%E6%94%B9%E6%95%B4%E5%90%88%E7%89%88%29%20v3.0.0.js"
     },
     {
       "name": "西瓜聚合",
       "file": "西瓜聚合.js",
+      "version": "lx.version",
       "kind": "lx-source",
-      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E8%A5%BF%E7%93%9C%E8%81%9A%E5%90%88.js",
-      "size": 42834
-    },
-    {
-      "name": "小枸音乐",
-      "file": "小枸.js",
-      "version": "0.0.3",
-      "author": "SoEasy同学",
-      "platform": "小枸音乐",
-      "description": "",
-      "types": [
-        "music",
-        "album",
-        "sheet"
-      ],
-      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E5%B0%8F%E6%9E%B8.js"
-    },
-    {
-      "name": "歌词千寻",
-      "file": "小千.js",
-      "version": "0.0.0",
-      "author": "",
-      "platform": "歌词千寻",
-      "description": "",
-      "types": [
-        "lyric"
-      ],
-      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E5%B0%8F%E5%8D%83.js"
-    },
-    {
-      "name": "小秋音乐",
-      "file": "小秋.js",
-      "version": "0.0.3",
-      "author": "SoEasy同学",
-      "platform": "小秋音乐",
-      "description": "",
-      "types": [
-        "music",
-        "album",
-        "sheet",
-        "artist",
-        "lyric"
-      ],
-      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E5%B0%8F%E7%A7%8B.js"
-    },
-    {
-      "name": "小蜗音乐",
-      "file": "小蜗.js",
-      "version": "0.0.3",
-      "author": "SoEasy同学",
-      "platform": "小蜗音乐",
-      "description": "",
-      "types": [
-        "music",
-        "album",
-        "sheet",
-        "artist"
-      ],
-      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E5%B0%8F%E8%9C%97.js"
-    },
-    {
-      "name": "音悦台",
-      "file": "小月.js",
-      "version": "0.0.1",
-      "author": "猫头猫",
-      "platform": "音悦台",
-      "description": "",
-      "types": [
-        "music"
-      ],
-      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E5%B0%8F%E6%9C%88.js"
-    },
-    {
-      "name": "小芸音乐",
-      "file": "小云.js",
-      "version": "0.0.3",
-      "author": "SoEasy同学",
-      "platform": "小芸音乐",
-      "description": "",
-      "types": [
-        "music",
-        "album",
-        "sheet",
-        "artist",
-        "lyric"
-      ],
-      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E5%B0%8F%E4%BA%91.js"
-    },
-    {
-      "name": "星海音乐源V3.2.15",
-      "file": "星海音乐源V3.2.15.js",
-      "kind": "lx-source",
-      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E6%98%9F%E6%B5%B7%E9%9F%B3%E4%B9%90%E6%BA%90V3.2.15.js",
-      "size": 38858
-    },
-    {
-      "name": "野草音源",
-      "file": "野草音源.js",
-      "kind": "lx-source",
-      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E9%87%8E%E8%8D%89%E9%9F%B3%E6%BA%90.js",
-      "size": 7155
+      "hash": "d38afb4498fa72c6c34e98891bf3d454a01d2683d4a7e5144602f8298308948d",
+      "size": 42834,
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E8%A5%BF%E7%93%9C%E8%81%9A%E5%90%88.js"
     },
     {
       "name": "野花音源",
       "file": "野花音源.js",
+      "version": "d",
       "kind": "lx-source",
-      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E9%87%8E%E8%8A%B1%E9%9F%B3%E6%BA%90.js",
-      "size": 7452
-    },
-    {
-      "name": "屿溪-终章",
-      "file": "屿溪-终章.js",
-      "kind": "lx-source",
-      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E5%B1%BF%E6%BA%AA-%E7%BB%88%E7%AB%A0.js",
-      "size": 128060
-    },
-    {
-      "name": "bilibili",
-      "file": "原力.js",
-      "version": "0.3.0",
-      "author": "猫头猫",
-      "platform": "bilibili",
-      "description": "",
-      "types": [
-        "music",
-        "album",
-        "artist"
-      ],
-      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E5%8E%9F%E5%8A%9B.js"
+      "hash": "4f677c4c655ffe353116db8921fd8b14aa06bb6c94787f317863ec33a637e2c4",
+      "size": 7452,
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E9%87%8E%E8%8A%B1%E9%9F%B3%E6%BA%90.js"
     },
     {
       "name": "长青SVIP音源 v1.2.0",
       "file": "长青SVIP音源 v1.2.0.js",
+      "version": "_0xaa95a0(",
       "kind": "lx-source",
-      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E9%95%BF%E9%9D%92SVIP%E9%9F%B3%E6%BA%90%20v1.2.0.js",
-      "size": 44876
+      "hash": "48d5fed8b46344e9298d55427382ce573485a264a2ae287ed829e2f2548223e8",
+      "size": 44876,
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E9%95%BF%E9%9D%92SVIP%E9%9F%B3%E6%BA%90%20v1.2.0.js"
     },
     {
-      "name": "fish-music",
-      "file": "fish-music.js",
+      "name": "非常刀 v5",
+      "file": "非常刀 v5.js",
       "kind": "lx-source",
-      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/fish-music.js",
-      "size": 639619
-    },
-    {
-      "name": "gdstudio音乐源 v1.0.1（仅支持网易）",
-      "file": "gdstudio音乐源 v1.0.1（仅支持网易）.js",
-      "kind": "lx-source",
-      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/gdstudio%E9%9F%B3%E4%B9%90%E6%BA%90%20v1.0.1%EF%BC%88%E4%BB%85%E6%94%AF%E6%8C%81%E7%BD%91%E6%98%93%EF%BC%89.js",
-      "size": 8689
-    },
-    {
-      "name": "HelloWorld音源(中秋快乐)",
-      "file": "HelloWorld音源(中秋快乐).js",
-      "kind": "lx-source",
-      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/HelloWorld%E9%9F%B3%E6%BA%90%28%E4%B8%AD%E7%A7%8B%E5%BF%AB%E4%B9%90%29.js",
-      "size": 21421
-    },
-    {
-      "name": "HYW音乐公益版",
-      "file": "hyw-music.js",
-      "version": "v1.2.0",
-      "author": "Ryn",
-      "description": "HYW 多平台聚合（社区，公益版）",
-      "types": [
-        "music"
-      ],
-      "kind": "lx-source",
-      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/hyw-music.js"
-    },
-    {
-      "name": "HYWmusic_公益版V1.2.0",
-      "file": "HYWmusic_公益版V1.2.0.js",
-      "kind": "lx-source",
-      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/HYWmusic_%E5%85%AC%E7%9B%8A%E7%89%88V1.2.0.js",
-      "size": 12082
-    },
-    {
-      "name": "HYWmusic_beta_公益测试 v0.74.0",
-      "file": "HYWmusic_beta_公益测试 v0.74.0.js",
-      "kind": "lx-source",
-      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/HYWmusic_beta_%E5%85%AC%E7%9B%8A%E6%B5%8B%E8%AF%95%20v0.74.0.js",
-      "size": 9057
-    },
-    {
-      "name": "K×H测试_v1.7.16",
-      "file": "K×H测试_v1.7.16.js",
-      "kind": "lx-source",
-      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/K%C3%97H%E6%B5%8B%E8%AF%95_v1.7.16.js",
-      "size": 72149
-    },
-    {
-      "name": "lx-玉宁熙1.2.5",
-      "file": "lx-玉宁熙1.2.5.js",
-      "kind": "lx-source",
-      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/lx-%E7%8E%89%E5%AE%81%E7%86%991.2.5.js",
-      "size": 144621
-    },
-    {
-      "name": "lx-music-source-v6 (修复)",
-      "file": "lx-music-source-v6 (修复).js",
-      "kind": "lx-source",
-      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/lx-music-source-v6%20%28%E4%BF%AE%E5%A4%8D%29.js",
-      "size": 64094
-    },
-    {
-      "name": "星河B站音源",
-      "file": "starwish-bilibili.js",
-      "version": "1.0.0",
-      "author": "StarWish Team",
-      "description": "B站音频（歌单=合集、曲目=分P）；未做 wbi 签名，风控网络下默认关闭（Bug 128）",
-      "types": [
-        "music",
-        "video"
-      ],
-      "kind": "lx-source",
-      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/starwish-bilibili.js"
-    },
-    {
-      "name": "星河国际曲库",
-      "file": "starwish-builtin.js",
-      "version": "1.0.0",
-      "author": "StarWish Team",
-      "platform": "it/kw",
-      "description": "iTunes 国际曲库直链 + 酷我备用直链（无歌词/封面依赖重）",
-      "types": [
-        "music"
-      ],
-      "kind": "lx-source",
-      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/starwish-builtin.js"
-    },
-    {
-      "name": "星河聚合音源",
-      "file": "starwish-unified.js",
-      "version": "1.1.0",
-      "author": "StarWish Team",
-      "platform": "wy/kg/kw/qq",
-      "description": "自研多平台聚合：网易云/酷狗/酷我/QQ 搜索取链 + 跨平台换链兜底（取链失败自动换平台搜同曲）",
-      "types": [
-        "music"
-      ],
-      "kind": "lx-source",
-      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/starwish-unified.js"
-    },
-    {
-      "name": "星河B站视频源",
-      "file": "starwish-video.js",
-      "version": "1.0.0",
-      "author": "StarWish Team",
-      "platform": "bili",
-      "description": "B站视频/MV 视频源（videoSearch/videoInfo/videoParts/videoUrl 四函数）：搜索/详情/分P/取链，接管视频页全部数据",
-      "types": [
-        "music",
-        "video"
-      ],
-      "kind": "video-source",
-      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/starwish-video.js"
-    },
-    {
-      "name": "stellarwave-v4.0.0（酷我稍后支持）",
-      "file": "stellarwave-v4.0.0（酷我稍后支持）.js",
-      "kind": "lx-source",
-      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/stellarwave-v4.0.0%EF%BC%88%E9%85%B7%E6%88%91%E7%A8%8D%E5%90%8E%E6%94%AF%E6%8C%81%EF%BC%89.js",
-      "size": 48464
+      "hash": "49486cab064e64d5ad63723e670c44ee55eadadcc790ccf493351fbde64284d7",
+      "size": 17846,
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E9%9D%9E%E5%B8%B8%E5%88%80%20v5.js"
     }
   ]
 }
