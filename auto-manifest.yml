@@ -1,0 +1,65 @@
+name: Auto Update Plugin Manifest
+
+# 功能：用户只需往 Star-Wish-Plugin-Library 分支上传/更新 *.js 音源或插件，
+# 本工作流自动扫描该分支目录并生成 manifest.json 提交回分支，
+# 客户端插件市场稍后即可拉到全部内容（镜像缓存通常几分钟，最长约 24h）。
+#
+# 触发：
+#   1. push：插件分支上任何 *.js 文件变更（上传/修改/删除）立即触发
+#   2. schedule：每 3 小时兜底扫描（错过 push 或 push 失败也能自愈）
+#   3. workflow_dispatch：GitHub 网页上点 "Run workflow" 手动立即刷新
+#
+# 防循环：manifest.json 的自动提交不带 .js，不满足 paths 过滤条件；
+#         且提交信息带 [skip ci] 双保险。清单无变化时不产生提交。
+
+on:
+  push:
+    branches:
+      - Star-Wish-Plugin-Library
+    paths:
+      - '**.js'
+  schedule:
+    - cron: '23 */3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: auto-manifest-sync
+  cancel-in-progress: false
+
+jobs:
+  sync-manifest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout default branch (script)
+        uses: actions/checkout@v4
+        with:
+          path: lib
+          ref: main
+
+      - name: Checkout plugin branch
+        uses: actions/checkout@v4
+        with:
+          path: branch
+          ref: Star-Wish-Plugin-Library
+
+      - name: Generate manifest
+        run: python lib/.github/scripts/generate_manifest.py branch
+        env:
+          OWNER_REPO: mancking/StarWish-Music
+          BRANCH: Star-Wish-Plugin-Library
+
+      - name: Commit and push if changed
+        working-directory: branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet -- manifest.json; then
+            echo "manifest 无变化，跳过提交"
+          else
+            git add manifest.json
+            git commit -m "chore: auto-sync plugin manifest [skip ci]"
+            git push origin Star-Wish-Plugin-Library
+          fi
