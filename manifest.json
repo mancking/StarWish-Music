@@ -1,7 +1,7 @@
 {
   "name": "星河官方插件库",
   "description": "星河音乐官方插件市场，提供可在线安装/更新的音源与歌词插件。",
-  "updated": "2026-11-08T12:25:33Z",
+  "updated": "2026-11-09T11:33:11Z",
   "plugins": [
     {
       "name": "5sing",
@@ -248,6 +248,15 @@
       "hash": "d38afb4498fa72c6c34e98891bf3d454a01d2683d4a7e5144602f8298308948d",
       "size": 42834,
       "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E8%A5%BF%E7%93%9C%E8%81%9A%E5%90%88.js"
+    },
+    {
+      "name": "_0x1b391f",
+      "file": "长青SVIP音源(二改修复版) v1.2.0.js",
+      "version": "_0xaa95a0(",
+      "kind": "lx-source",
+      "hash": "48d5fed8b46344e9298d55427382ce573485a264a2ae287ed829e2f2548223e8",
+      "size": 44876,
+      "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/%E9%95%BF%E9%9D%92SVIP%E9%9F%B3%E6%BA%90%28%E4%BA%8C%E6%94%B9%E4%BF%AE%E5%A4%8D%E7%89%88%29%20v1.2.0.js"
     },
     {
       "name": "非常刀 v5",
