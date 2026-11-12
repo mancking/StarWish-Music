@@ -1,25 +1,28 @@
 /* ============================================================
- * StarWish 聚合音源 v1.0.0（starwish-unified.js）
+ * StarWish 聚合音源 v1.2.0（starwish-unified.js）
  * 覆盖：网易云 / 酷狗 / 酷我 / QQ音乐（lx-music v2 协议）
- * 自研，不依赖第三方脚本。实测时间：2026-10-16
- *   - 网易云: search 官方 web API + outer wrapper 直链 + 歌词 + songDetail 封面
+ * 自研，不依赖第三方脚本。
+ *   - 网易云: search 官方 web API + GD Studio 聚合直链（320k/FLAC/Hi-Res，公开可达）
+ *     + outer wrapper 兜底 + 歌词 + songDetail 封面
  *   - 酷狗:   mobilecdn 搜索 + getSongInfo.php 直链 + album_img 封面
  *   - 酷我:   search.kuwo.cn r.s（单引号 JSON 清洗）+ antiserver 直链
- *   - QQ:     c.y.qq.com search_for_qq_cp 搜索 + y.gtimg.cn 封面（取链需登录态 vkey，标降级）
- * 咪咕：公开接口全部被 WAF 拦截（需登录态/签名），暂未接入。
- * 作为 v1.1 §2.1.1「内置聚合音源」范本：完整实现 lx-music 协议 search/musicUrl/lyric/pic。
+ *   - QQ:     c.y.qq.com 搜索 + fcg_music_express_mobile3 登录态 vkey 取链
+ *     （凭据经宿主 __swCredentials.qq 注入：设置→账号 登录 QQ 后生效）
+ *   - 跨平台兜底: 歌名+歌手在 wy/kg/kw/tx 搜同曲换链（单曲失败不锁死单一平台）
+ * 音质档位按通道如实声明（GD netease 支持 320k/FLAC/Hi-Res；QQ 登录态支持
+ * 128k/320k；kw/kg 公开直链支持 128k/320k）。
  * ============================================================ */
 const unified = {
   name: 'StarWish 聚合音源',
-  version: '1.1.0',
+  version: '1.2.0',
   author: 'StarWish Team',
-  description: '自研多平台聚合：网易云/酷狗/酷我/QQ（lx-music v2 协议范本）',
+  description: '自研多平台聚合：网易云(FLAC/Hi-Res)/酷狗/酷我/QQ（lx-music v2 协议）',
   homepage: '',
   sources: {
-    wy: { name: '网易云', actions: ['musicSearch', 'musicUrl', 'lyric', 'pic'], qualitys: ['128k', '320k'] },
+    wy: { name: '网易云', actions: ['musicSearch', 'musicUrl', 'lyric', 'pic'], qualitys: ['128k', '320k', 'flac', 'hires'] },
     kg: { name: '酷狗', actions: ['musicSearch', 'musicUrl', 'pic'], qualitys: ['128k', '320k'] },
     kw: { name: '酷我', actions: ['musicSearch', 'musicUrl'], qualitys: ['128k', '320k'] },
-    qq: { name: 'QQ音乐', actions: ['musicSearch', 'pic'], qualitys: ['128k'] },
+    qq: { name: 'QQ音乐', actions: ['musicSearch', 'musicUrl', 'pic'], qualitys: ['128k', '320k'] },
   },
 };
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36';
@@ -83,7 +86,32 @@ async function searchQQ(kw, page, size) {
 async function urlNetease(mi, type) {
   const id = String(mi.songId || mi.songmid || mi.id || '');
   if (!id) throw new Error('缺网易云 id');
+  // GD Studio 聚合直链：宿主音质经 QUALITY_MAP 映射为 lx 生态名（flac24bit=Hi-Res 24bit），
+  // br 对齐星海源 GD_BR_MAP（740=FLAC / 999=Hi-Res）；失败回落 outer wrapper
+  const brMap = { '128k': '128', '320k': '320', flac: '740', flac24bit: '999' };
+  const br = brMap[type];
+  if (br) {
+    try {
+      const r = await req('https://music-api.gdstudio.xyz/api.php?' + qs({ use_xbridge3: 'true', loader_name: 'forest', need_sec_link: '1', sec_link_scene: 'im', theme: 'light', types: 'url', source: 'netease', id, br }) + '&', { headers: { 'User-Agent': 'LX-Music-Mobile' } });
+      if (r && r.url && /^https?:\/\//.test(r.url)) return r.url;
+    } catch (e) { /* 回落 outer */ }
+  }
   return 'https://music.163.com/song/media/outer/url?id=' + id + '.mp3';
+}
+async function urlQQ(mi) {
+  const mid = mi.songmid || mi.songId;
+  if (!mid) throw new Error('缺 QQ songmid');
+  // 登录态 vkey：凭据经宿主 __swCredentials.qq 注入（设置→账号 登录 QQ 后生效）；
+  // 未登录时报错并引导（匿名请求服务端一律拒绝）
+  const cred = (globalThis.__swCredentials && globalThis.__swCredentials.qq) || {};
+  const uin = String(cred.uin || '').replace(/^o/, '') || '0';
+  if (!cred.skey) throw new Error('QQ 取链需要登录态：到「设置 → 账号」登录 QQ 音乐后再试');
+  const guid = 'sw' + Math.floor(Math.random() * 1e8);
+  const filename = 'M800' + mid + '.mp3';
+  const r = await req('https://c.y.qq.com/base/fcgi-bin/fcg_music_express_mobile3.fcg?' + qs({ format: 'json', platform: 'yqq', cid: '205361747', songmid: mid, filename, guid, uin }), { headers: { 'User-Agent': UA, Referer: 'https://y.qq.com/', Cookie: 'uin=o' + uin + '; skey=' + cred.skey + (cred.ptcz ? '; ptcz=' + cred.ptcz : '') } });
+  const vkey = r && r.data && r.data.items && r.data.items[0] && r.data.items[0].vkey;
+  if (!vkey) throw new Error('QQ 未返回 vkey（登录态可能过期，请重新登录）');
+  return 'https://dl.stream.qqmusic.qq.com/' + filename + '?vkey=' + vkey + '&guid=' + guid + '&uin=' + uin + '&fromtag=66';
 }
 async function urlKugou(mi) {
   const hash = mi.hash || mi.songId;
@@ -156,6 +184,7 @@ lx.on(lx.EVENT_NAMES.request, (data) => {
       if (p === 'wy') return urlNetease(mi, info.type);
       if (p === 'kg') return urlKugou(mi);
       if (p === 'kw') return urlKuwo(mi);
+      if (p === 'qq') return urlQQ(mi);
       throw new Error('不支持的平台取链: ' + p);
     })();
     const keyword = String(info.keyword || (mi.name && (mi.name + ' ' + (mi.singer || ''))) || '').trim();
@@ -180,8 +209,7 @@ function urlCross(keyword, originPlatform, quality) {
   const key = quality + '|' + keyword;
   const hit = crossCache.get(key);
   if (hit && Date.now() - hit.at < 5 * 60 * 1000) return Promise.resolve(hit.url);
-  const order = ['wy', 'kg', 'kw'].filter(x => x !== originPlatform);
-  const tryOne = async plat => {
+  const order = ['wy', 'kg', 'kw'].filter(x => x !== originPlatform);  const tryOne = async plat => {
     let songs = [];
     if (plat === 'wy') songs = await searchNetease(keyword, 1, 6);
     else if (plat === 'kg') songs = await searchKugou(keyword, 1, 6);
