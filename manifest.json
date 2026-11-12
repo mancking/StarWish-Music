@@ -105,7 +105,7 @@
     {
       "name": "星河聚合音源",
       "file": "starwish-unified.js",
-      "version": "1.1.0",
+      "version": "1.2.0",
       "author": "StarWish Team",
       "platform": "wy/kg/kw/qq",
       "description": "自研多平台聚合：网易云/酷狗/酷我/QQ 搜索取链 + 跨平台换链兜底（取链失败自动换平台搜同曲）",
@@ -113,8 +113,8 @@
         "music"
       ],
       "kind": "lx-source",
-      "hash": "202a1e047c1e26eb6df5e5b6d1cb713b24ab7814801a68b2888aaf7c2509c229",
-      "size": 11442,
+      "hash": "fdfa7725943c4f182a9ec1bb91d7c4651e874b09bfc0246e0a10093113900e9e",
+      "size": 13715,
       "url": "https://raw.githubusercontent.com/mancking/StarWish-Music/Star-Wish-Plugin-Library/starwish-unified.js"
     },
     {
